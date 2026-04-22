@@ -1,0 +1,3 @@
+[env]
+# Use our local arm64 libopus build (Rosetta brew provides x86_64 only)
+PKG_CONFIG_PATH = { value = "deps/opus-arm64/lib/pkgconfig", relative = true }

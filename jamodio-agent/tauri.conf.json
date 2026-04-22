@@ -1,0 +1,83 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Jamodio Audio Engine",
+  "version": "0.1.0",
+  "identifier": "com.jamodio.audio-engine",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Jamodio Audio Engine",
+        "width": 300,
+        "height": 260,
+        "resizable": false,
+        "visible": false,
+        "decorations": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ws://localhost:9876; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
+    },
+    "trayIcon": {
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": false,
+      "tooltip": "Jamodio Audio Engine",
+      "showMenuOnLeftClick": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist",
+      "frameworks": [],
+      "infoPlist": "info.plist",
+      "dmg": {
+        "windowSize": {
+          "width": 460,
+          "height": 280
+        },
+        "appPosition": {
+          "x": 120,
+          "y": 140
+        },
+        "applicationFolderPosition": {
+          "x": 340,
+          "y": 140
+        }
+      }
+    },
+    "windows": {
+      "wix": {
+        "language": "fr-FR"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/jamodio-app/audio-engine/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEMUQzOTI4N0Q0RkM5QkIKUldTN3lVOTlLRGtkSGRqTDJhWFN6VnBHSmRoZHdkMmloT3dXZ21tR3hMQnVUbGxUZ2loSmtEZXoK%"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["jamodio"]
+      }
+    },
+    "autostart": null
+  }
+}

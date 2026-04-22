@@ -1,0 +1,23 @@
+/target/
+/deps/
+
+# Tauri
+**/target/
+**/gen/schemas/
+**/.DS_Store
+
+# Rust
+*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Keys / secrets — ne JAMAIS commit
+*.p8
+*.p12
+*.mobileprovision
+**/tauri.private.key
+

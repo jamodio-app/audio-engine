@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Jamodio Audio Engine</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo">Jamodio</div>
+      <div class="badge" id="status">IDLE</div>
+    </div>
+    <div class="info">
+      <div class="row">
+        <span class="label">Device</span>
+        <span class="value" id="device">—</span>
+      </div>
+      <div class="row">
+        <span class="label">Buffer</span>
+        <span class="value" id="buffer">—</span>
+      </div>
+      <div class="row">
+        <span class="label">Latence</span>
+        <span class="value" id="latency">—</span>
+      </div>
+      <div class="row">
+        <span class="label">Recv</span>
+        <span class="value" id="streams">0</span>
+      </div>
+    </div>
+    <div class="ws-status" id="ws-status">ws://localhost:9876 — en attente</div>
+    <div class="version">v0.1.0</div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    let ws = null;
+    let statsInterval = null;
+
+    function connect() {
+      try {
+        ws = new WebSocket('ws://localhost:9876');
+      } catch { setTimeout(connect, 3000); return; }
+
+      ws.onopen = () => {
+        $('ws-status').textContent = 'ws://localhost:9876 — connecté';
+        $('ws-status').classList.add('ok');
+        ws.send(JSON.stringify({ type: 'get-stats' }));
+        statsInterval = setInterval(() => {
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'get-stats' }));
+          }
+        }, 2000);
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        switch (msg.type) {
+          case 'status': {
+            const active = msg.state === 'capturing';
+            $('status').textContent = active ? 'ACTIF' : 'IDLE';
+            $('status').classList.toggle('active', active);
+            // Reset display when idle
+            if (!active) {
+              $('buffer').textContent = '—';
+              $('latency').textContent = '—';
+              $('streams').textContent = '0';
+            }
+            break;
+          }
+
+          case 'devices':
+            if (msg.inputs && msg.inputs.length > 0) {
+              const def = msg.inputs.find(d => d.isDefault) || msg.inputs[0];
+              const name = def.name.length > 22 ? def.name.substring(0, 22) + '…' : def.name;
+              $('device').textContent = name;
+              $('device').title = def.name;
+            }
+            break;
+
+          case 'stats': {
+            // Device name
+            if (msg.device) {
+              const name = msg.device.length > 22 ? msg.device.substring(0, 22) + '…' : msg.device;
+              $('device').textContent = name;
+              $('device').title = msg.device;
+            }
+            // Streams count
+            $('streams').textContent = msg.streams || 0;
+            // Buffer & latency (only show when we have real values)
+            const bufMs = msg.bufferMs || 0;
+            const capMs = msg.captureLatencyMs || 0;
+            const playMs = msg.playbackLatencyMs || 0;
+            if (bufMs > 0 || capMs > 0) {
+              $('buffer').textContent = bufMs.toFixed(1) + 'ms';
+              $('latency').textContent = (capMs + playMs + bufMs).toFixed(1) + 'ms';
+            }
+            break;
+          }
+        }
+      };
+
+      ws.onclose = () => {
+        clearInterval(statsInterval);
+        $('ws-status').textContent = 'ws://localhost:9876 — déconnecté';
+        $('ws-status').classList.remove('ok');
+        $('status').textContent = 'IDLE';
+        $('status').classList.remove('active');
+        $('device').textContent = '—';
+        $('buffer').textContent = '—';
+        $('latency').textContent = '—';
+        $('streams').textContent = '0';
+        setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    }
+
+    connect();
+  </script>
+</body>
+</html>

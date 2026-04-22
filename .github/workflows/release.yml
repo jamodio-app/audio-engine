@@ -1,0 +1,159 @@
+name: Release
+
+# Déclenché par un push de tag `vX.Y.Z` (ex: git tag v0.1.0 && git push --tags).
+# Build en parallèle sur 3 runners → 3 artefacts (macOS ARM, macOS Intel,
+# Windows x64), signés pour l'updater Tauri, publiés en draft.
+# Puis un job `publish` renomme les assets en noms stables
+# (Jamodio-Audio-Engine-macOS-AppleSilicon.dmg, etc.) et passe le draft en
+# release publiée.
+#
+# Secrets requis côté repo GitHub :
+#   TAURI_SIGNING_PRIVATE_KEY           — clé privée updater (tauri signer generate)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — son password
+#
+# Secrets plus tard (signature Apple / notarisation, optionnel) :
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14          # Apple Silicon runner
+            target: aarch64-apple-darwin
+          - runner: macos-13          # Intel runner
+            target: x86_64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+          key: ${{ matrix.target }}
+
+      # Le crate `audiopus` (dans jamodio-audio-core) lie libopus via
+      # pkg-config. Chaque runner doit fournir libopus + pkg-config.
+      - name: Install libopus (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opus pkg-config
+
+      - name: Install libopus (Windows via vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static-md
+          "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH
+      # relatif vers deps/opus-arm64/ (workaround local pour le dev sur Mac M*
+      # avec Homebrew x86 sous Rosetta). En CI ce dossier n'existe pas et
+      # l'override empêche pkg-config de trouver la lib système → on retire.
+      - name: Remove local dev .cargo/config.toml override
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - name: Build + upload (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Signature Apple — à ajouter quand le certificat sera acheté
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: ./jamodio-agent
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Jamodio Audio Engine ${{ github.ref_name }}'
+          releaseBody: |
+            Voir le [CHANGELOG](./CHANGELOG.md) pour les détails de cette version.
+
+            **Téléchargements** (liens permanents, toujours la dernière version) :
+            - macOS Apple Silicon : [Jamodio-Audio-Engine-macOS-AppleSilicon.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg)
+            - macOS Intel : [Jamodio-Audio-Engine-macOS-Intel.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-Intel.dmg)
+            - Windows : [Jamodio-Audio-Engine-Windows.exe](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.exe)
+          releaseDraft: true      # chaque matrix complète le draft
+          prerelease: false
+          includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
+          args: --target ${{ matrix.target }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Add stable-named copies and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          cd "$WORK"
+
+          echo "▸ Téléchargement des artefacts du draft $TAG"
+          gh release download "$TAG" -R "$REPO"
+          ls -lh
+
+          echo "▸ Duplication en noms stables (les originaux restent pour l'updater)"
+          for f in *.dmg *.exe *.msi; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *aarch64*.dmg)
+                cp -v "$f" 'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg'
+                ;;
+              *x64.dmg|*x86_64*.dmg|*universal*.dmg)
+                cp -v "$f" 'Jamodio-Audio-Engine-macOS-Intel.dmg'
+                ;;
+              *setup.exe)
+                cp -v "$f" 'Jamodio-Audio-Engine-Windows.exe'
+                ;;
+            esac
+          done
+
+          echo "▸ Upload des copies stables (clobber → remplace si re-run)"
+          for stable in \
+            'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg' \
+            'Jamodio-Audio-Engine-macOS-Intel.dmg' \
+            'Jamodio-Audio-Engine-Windows.exe'; do
+            if [ -f "$stable" ]; then
+              gh release upload "$TAG" "$stable" -R "$REPO" --clobber
+              echo "  ✓ $stable"
+            else
+              echo "  ⚠ $stable introuvable, passé"
+            fi
+          done
+
+          echo "▸ Publication (draft → published)"
+          gh release edit "$TAG" -R "$REPO" --draft=false
+
+          echo "✓ Release $TAG publiée"
