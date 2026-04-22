@@ -78,6 +78,10 @@ jobs:
       - name: Build + upload (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
+          # Requis pour créer / uploader la release via l'API GitHub.
+          # Injecté automatiquement par Actions, mais doit être explicitement
+          # passé à l'action sinon elle échoue avec "GITHUB_TOKEN is required".
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Signature Apple — à ajouter quand le certificat sera acheté
