@@ -1,10 +1,12 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;400;700;800&display=swap');
 
+/* Palette alignée sur jamodio.com (landing + app web). */
 :root {
   --bg: #0e0f11;
   --surface: #161820;
   --border: #252830;
-  --accent: #f0c040;
+  --accent: #e8ff3a;        /* Jaune-lime Jamodio V5 */
+  --accent-text: #0a0a0b;
   --green: #3dd68c;
   --muted: #6b7280;
   --text: #e8eaf0;
@@ -16,7 +18,7 @@
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: 'Syne', sans-serif;
+  font-family: 'DM Sans', sans-serif;
   font-size: 13px;
   line-height: 1.5;
   width: 280px;
@@ -24,37 +26,71 @@ body {
   user-select: none;
 }
 
-.container { display: flex; flex-direction: column; gap: 12px; }
+.container { display: flex; flex-direction: column; gap: 10px; }
 
+/* ─── Brand (icône V5 + wordmark jam·o·dio) ─── */
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
 
-.logo {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--accent);
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.brand-icon {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.brand-wordmark {
+  font-family: 'Outfit', sans-serif;
+  font-size: 22px;
+  line-height: 1;
   letter-spacing: -0.02em;
 }
 
+.brand-wordmark .w-jam { font-weight: 300; color: var(--muted); }
+.brand-wordmark .w-o   { font-weight: 800; color: var(--accent); }
+.brand-wordmark .w-dio { font-weight: 700; color: var(--text); }
+
+.tagline {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  letter-spacing: 0.22em;
+  color: var(--muted);
+  text-align: center;
+  opacity: 0.85;
+  margin-top: -4px;
+  text-transform: uppercase;
+}
+
+.tagline-accent { color: var(--accent); }
+
+/* ─── Status badge ─── */
 .badge {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 10px;
-  letter-spacing: 0.08em;
+  font-size: 9px;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  padding: 2px 8px;
+  padding: 3px 8px;
   border-radius: 3px;
   border: 1px solid var(--muted);
   color: var(--muted);
+  font-weight: 600;
 }
 
 .badge.active {
   color: var(--green);
   border-color: var(--green);
+  box-shadow: 0 0 6px rgba(61, 214, 140, 0.3);
 }
 
+/* ─── Info panel ─── */
 .info {
   background: var(--surface);
   border: 1px solid var(--border);

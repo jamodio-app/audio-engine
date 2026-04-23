@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Jamodio tray icon — 32x32 template-style (monochrome noir, macOS menubar
+     rend en blanc/gris selon thème). Fond transparent. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="32" height="32">
+  <g fill="none" stroke="#000000" stroke-linecap="round">
+    <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.55"/>
+    <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
+  </g>
+  <circle cx="50" cy="50" r="15" fill="#ffffff" stroke="#000000" stroke-width="4"/>
+  <circle cx="50" cy="50" r="9" fill="#000000"/>
+</svg>
