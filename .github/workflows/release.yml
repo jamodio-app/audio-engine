@@ -60,32 +60,19 @@ jobs:
       # pkg-config. Chaque runner doit fournir libopus + pkg-config pour
       # l'architecture ciblée.
 
+      # Pour le target macOS ARM natif, Homebrew fournit libopus (ARM) ; audiopus_sys
+      # la trouve via pkg-config, pas de build from source → rapide.
       - name: Install libopus (macOS ARM native)
         if: matrix.target == 'aarch64-apple-darwin'
         run: brew install opus pkg-config
 
-      # Cross-compile macOS Intel depuis runner ARM : le libopus Homebrew est
-      # ARM (incompatible linker pour cible x86_64). On build libopus from
-      # source pour x86_64 via `-arch x86_64` (support natif de clang sur
-      # Apple Silicon). Minuscule (~1 Mo source, ~30 s de build).
-      - name: Build libopus for Intel target (cross-compile)
+      # Pour le cross-compile vers Intel : Homebrew n'a pas de libopus x86_64
+      # disponible sur runner ARM. audiopus_sys détecte l'absence et compile
+      # son opus vendored via CMake avec les flags x86_64 appropriés (il sait
+      # cross-compiler nativement). Installer juste pkg-config pour l'env.
+      - name: Install pkg-config (macOS Intel cross-compile)
         if: matrix.target == 'x86_64-apple-darwin'
-        run: |
-          brew install pkg-config
-          curl -L https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz | tar xz
-          cd opus-1.4
-          ./configure \
-            --host=x86_64-apple-darwin \
-            CC="cc -arch x86_64" \
-            --disable-shared --enable-static \
-            --prefix="$PWD/../libopus-x86_64"
-          make -j"$(sysctl -n hw.logicalcpu)"
-          make install
-          cd ..
-          echo "PKG_CONFIG_PATH=$PWD/libopus-x86_64/lib/pkgconfig" >> $GITHUB_ENV
-          # Forcer le link statique côté Rust (audiopus_sys) pour éviter une
-          # tentative de résolution dylib au runtime.
-          echo "RUSTFLAGS=-L $PWD/libopus-x86_64/lib" >> $GITHUB_ENV
+        run: brew install pkg-config
 
       - name: Install libopus (Windows via vcpkg)
         if: runner.os == 'Windows'
@@ -112,6 +99,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CMake 4.x installé sur les runners refuse de processer les
+          # CMakeLists.txt avec `cmake_minimum_required(VERSION < 3.5)`.
+          # L'opus vendored dans audiopus_sys 0.2.2 utilise une syntaxe
+          # plus ancienne. Cette variable indique à CMake d'utiliser les
+          # policies de v3.5 pour processer quand même (back-compat).
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
           # Signature Apple — à ajouter quand le certificat sera acheté
           # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
