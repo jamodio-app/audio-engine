@@ -30,9 +30,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14          # Apple Silicon runner
+          # Les 2 targets macOS tournent sur le même runner Apple Silicon :
+          # la native ARM + le cross-compile vers Intel. Évite la queue
+          # notoirement longue des runners macos-13 (Intel déprécié).
+          - runner: macos-14
             target: aarch64-apple-darwin
-          - runner: macos-13          # Intel runner
+          - runner: macos-14
             target: x86_64-apple-darwin
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
@@ -54,10 +57,35 @@ jobs:
           key: ${{ matrix.target }}
 
       # Le crate `audiopus` (dans jamodio-audio-core) lie libopus via
-      # pkg-config. Chaque runner doit fournir libopus + pkg-config.
-      - name: Install libopus (macOS)
-        if: runner.os == 'macOS'
+      # pkg-config. Chaque runner doit fournir libopus + pkg-config pour
+      # l'architecture ciblée.
+
+      - name: Install libopus (macOS ARM native)
+        if: matrix.target == 'aarch64-apple-darwin'
         run: brew install opus pkg-config
+
+      # Cross-compile macOS Intel depuis runner ARM : le libopus Homebrew est
+      # ARM (incompatible linker pour cible x86_64). On build libopus from
+      # source pour x86_64 via `-arch x86_64` (support natif de clang sur
+      # Apple Silicon). Minuscule (~1 Mo source, ~30 s de build).
+      - name: Build libopus for Intel target (cross-compile)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          brew install pkg-config
+          curl -L https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz | tar xz
+          cd opus-1.4
+          ./configure \
+            --host=x86_64-apple-darwin \
+            CC="cc -arch x86_64" \
+            --disable-shared --enable-static \
+            --prefix="$PWD/../libopus-x86_64"
+          make -j"$(sysctl -n hw.logicalcpu)"
+          make install
+          cd ..
+          echo "PKG_CONFIG_PATH=$PWD/libopus-x86_64/lib/pkgconfig" >> $GITHUB_ENV
+          # Forcer le link statique côté Rust (audiopus_sys) pour éviter une
+          # tentative de résolution dylib au runtime.
+          echo "RUSTFLAGS=-L $PWD/libopus-x86_64/lib" >> $GITHUB_ENV
 
       - name: Install libopus (Windows via vcpkg)
         if: runner.os == 'Windows'
