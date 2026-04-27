@@ -1,5 +1,6 @@
 //! JSON protocol types for browser ↔ agent communication via localhost WebSocket.
 
+use crate::net::srtp::SrtpParameters;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -28,6 +29,10 @@ pub enum BrowserMessage {
         /// Canal mono à extraire (0..N-1). Si `None`, capture stéréo standard.
         #[serde(rename = "channelIndex", default)]
         channel_index: Option<u8>,
+        /// Clés SRTP du SFU (chiffrement des paquets SFU → agent).
+        /// Le browser les a reçues dans `plain-transport-created`.
+        #[serde(rename = "srtpParameters")]
+        srtp_parameters: SrtpParameters,
     },
     AddStream {
         #[serde(rename = "producerId")]
@@ -40,6 +45,9 @@ pub enum BrowserMessage {
         sfu_port: u16,
         #[serde(rename = "payloadType")]
         payload_type: u8,
+        /// Clés SRTP du SFU pour ce flux (reçues dans `plain-consumer-created`).
+        #[serde(rename = "srtpParameters")]
+        srtp_parameters: SrtpParameters,
     },
     RemoveStream {
         #[serde(rename = "producerId")]
@@ -89,11 +97,15 @@ pub enum AgentMessage {
     Error {
         message: String,
     },
-    /// Agent reports the local UDP port it's receiving on (for SFU connect).
+    /// Agent reports the local UDP port + SRTP keys.
+    /// Le browser doit relayer `srtpParameters` au SFU via `connect-plain-transport`
+    /// (clés agent → SFU pour le déchiffrement côté SFU).
     LocalPort {
         #[serde(rename = "producerId")]
         producer_id: String,
         port: u16,
+        #[serde(rename = "srtpParameters")]
+        srtp_parameters: SrtpParameters,
     },
     /// Per-stream RMS levels for VU meters.
     StreamLevels {

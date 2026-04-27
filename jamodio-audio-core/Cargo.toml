@@ -12,3 +12,12 @@ ringbuf = "0.4"            # SPSC lock-free ring buffer (jitter management)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
+# SRTP — chiffrement+auth du flux RTP agent ↔ SFU (AEAD AES-256-GCM).
+# `build-libsrtp`     : compile libsrtp2 depuis sources (pas de dep système)
+# `build-openssl`     : vendore + compile OpenSSL (requis pour AEAD-GCM)
+#                       → binaire 100% autonome, distribuable tel quel,
+#                       et fonctionne sur tout setup (arm64/x86_64, brew/no-brew).
+# Coût : 1er build long (~3-5 min pour OpenSSL), ensuite caché.
+srtp = { version = "0.7", default-features = false, features = ["bytes", "log", "build-libsrtp", "build-openssl"] }
+base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
+getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres

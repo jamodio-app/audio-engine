@@ -8,6 +8,7 @@ use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
+use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::protocol::AgentState;
 use parking_lot::Mutex;
@@ -79,7 +80,9 @@ impl PipelineState {
     /// `channel_index` : si `Some(i)`, extrait le canal physique i et duplique
     /// L=R=canal[i] avant encodage Opus (mode mono propre, centré à la lecture).
     /// Si `None`, capture stéréo standard (canaux 1+2 du device).
-    /// Returns the local UDP port so the browser can inform the SFU.
+    /// `sfu_srtp` : clés SRTP du SFU (chiffrement RTP entrant côté agent).
+    /// Returns `(local_port, agent_srtp)` — le browser relaie `agent_srtp`
+    /// au SFU via `connect-plain-transport`.
     pub async fn start_capture(
         &mut self,
         ssrc: u32,
@@ -87,7 +90,8 @@ impl PipelineState {
         sfu_port: u16,
         payload_type: u8,
         channel_index: Option<u8>,
-    ) -> Result<u16, String> {
+        sfu_srtp: SrtpParameters,
+    ) -> Result<(u16, SrtpParameters), String> {
         // Stop any existing capture
         self.stop_capture();
 
@@ -95,14 +99,18 @@ impl PipelineState {
             .parse()
             .map_err(|e| format!("Bad SFU address: {}", e))?;
 
-        // 1. Create UDP sender
-        let sender = RtpSender::new(sfu_addr)
+        // 1. Create SRTP context: nos clés (TX, à transmettre au SFU) + clés SFU (RX).
+        let agent_srtp = SrtpParameters::generate_aead_aes_256_gcm();
+        let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp)?);
+
+        // 2. Create UDP sender (chiffre via le contexte SRTP).
+        let sender = RtpSender::new(sfu_addr, srtp_ctx)
             .await
             .map_err(|e| format!("UDP bind: {}", e))?;
         let local_port = sender.local_addr().map_err(|e| format!("{}", e))?.port();
 
-        // Send a punch packet so SFU discovers us (comedia)
-        let _ = sender.send(&[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await;
+        // Pas de punch ici : le 1er paquet audio chiffré (sous 10 ms) sert de punch
+        // pour comedia. Un punch en clair serait rejeté par le SFU (enableSrtp:true).
 
         // 2. Channel: CPAL callback → accumulator thread
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
@@ -145,13 +153,13 @@ impl PipelineState {
             })
             .map_err(|e| format!("Spawn encoder: {}", e))?;
 
-        // 8. Spawn tokio task for UDP sending
+        // 8. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to)
         let sender = Arc::new(sender);
         tokio::spawn({
             let sender = sender.clone();
             async move {
                 while let Some(packet) = rtp_rx.recv().await {
-                    let _ = sender.send(&packet).await;
+                    let _ = sender.send(packet).await;
                 }
             }
         });
@@ -170,18 +178,21 @@ impl PipelineState {
 
         self.state = AgentState::Capturing;
         self.buffer_samples = 128; // matches capture.rs BufferSize::Fixed(128)
-        eprintln!("[Jamodio] Capture → {}:{} (UDP {})", sfu_ip, sfu_port, local_port);
-        Ok(local_port)
+        eprintln!("[Jamodio] Capture → {}:{} (UDP {}, SRTP)", sfu_ip, sfu_port, local_port);
+        Ok((local_port, agent_srtp))
     }
 
     /// Add a receive pipeline for one remote stream.
-    /// Returns the local UDP port for the SFU to send to.
+    /// `sfu_srtp` : clés du SFU pour ce flux (déchiffrement SFU → agent).
+    /// Returns `(local_port, agent_srtp)` — clés agent pour ce transport,
+    /// à transmettre au SFU via `connect-plain-transport`.
     pub async fn add_stream(
         &mut self,
         producer_id: String,
         sfu_ip: String,
         sfu_port: u16,
-    ) -> Result<u16, String> {
+        sfu_srtp: SrtpParameters,
+    ) -> Result<(u16, SrtpParameters), String> {
         // Remove existing if any
         self.remove_stream(&producer_id);
 
@@ -189,16 +200,20 @@ impl PipelineState {
             .parse()
             .map_err(|e| format!("Bad SFU address: {}", e))?;
 
+        // SRTP context : clés agent (TX) générées localement + clés SFU (RX).
+        let agent_srtp = SrtpParameters::generate_aead_aes_256_gcm();
+        let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp)?);
+
         // Create UDP receiver
-        let receiver = RtpReceiver::new()
+        let receiver = RtpReceiver::new(srtp_ctx)
             .await
             .map_err(|e| format!("UDP bind: {}", e))?;
         let local_port = receiver.local_addr().map_err(|e| format!("{}", e))?.port();
 
-        // Punch hole for comedia — multiple attempts for reliability (UDP can drop)
-        for _ in 0..3 {
-            receiver.punch(sfu_addr).await.map_err(|e| format!("Punch: {}", e))?;
-        }
+        // Note : pas de punch synchrone ici. Le punch SRTP serait rejeté par le SFU
+        // tant que celui-ci n'a pas reçu nos clés via connect-plain-transport
+        // (qui n'est envoyé par le browser qu'après cette réponse). On punch en boucle
+        // dans recv_decode_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
 
         // Add stream to mixer
         self.mixer.lock().add_stream(&producer_id);
@@ -207,10 +222,10 @@ impl PipelineState {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.recv_stops.insert(producer_id.clone(), stop_tx);
 
-        // Spawn receive + decode task
+        // Spawn receive + decode task (reçoit aussi sfu_addr pour le punch périodique)
         let mixer = self.mixer.clone();
         tokio::spawn(async move {
-            recv_decode_task(receiver, producer_id, mixer, stop_rx).await;
+            recv_decode_task(receiver, sfu_addr, producer_id, mixer, stop_rx).await;
         });
 
         // Start playback if not running
@@ -222,8 +237,8 @@ impl PipelineState {
             self.playback_stream = Some(SendStream(out_stream));
         }
 
-        eprintln!("[Jamodio] Stream + {}:{} (UDP {})", sfu_ip, sfu_port, local_port);
-        Ok(local_port)
+        eprintln!("[Jamodio] Stream + {}:{} (UDP {}, SRTP)", sfu_ip, sfu_port, local_port);
+        Ok((local_port, agent_srtp))
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
@@ -382,6 +397,7 @@ fn encoder_thread(
 
 async fn recv_decode_task(
     receiver: RtpReceiver,
+    sfu_addr: SocketAddr,
     producer_id: String,
     mixer: Arc<Mutex<AudioMixer>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -394,21 +410,35 @@ async fn recv_decode_task(
         }
     };
 
-    let mut buf = vec![0u8; 4096];
+    // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut last_seq: Option<u16> = None;
     let mut pkt_count: u64 = 0;
     let mut logged_large_jump = false;
 
+    // Punch périodique pour comedia : 1er paquet SRTP valide reçu par le SFU
+    // = src_addr enregistrée. On retry jusqu'au 1er paquet entrant côté agent.
+    // 100 ms × 30 = 3 s : marge confortable pour que le browser pousse
+    // connect-plain-transport au SFU avant qu'on stoppe.
+    let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut punch_remaining: u32 = 30;
+
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
+            _ = punch_interval.tick(), if punch_remaining > 0 => {
+                let _ = receiver.punch(sfu_addr).await;
+                punch_remaining -= 1;
+            }
             result = receiver.recv(&mut buf) => {
                 match result {
                     Ok((len, _addr)) => {
-                        // Skip RTCP packets (PT 200..=204) to avoid corrupting RTP sequence tracking
-                        if len >= 2 && buf[1] >= 200 && buf[1] <= 204 {
-                            continue;
-                        }
+                        // len == 0 : RTCP filtré ou échec SRTP unprotect (déjà loggé en amont)
+                        if len == 0 { continue; }
+
+                        // 1er paquet valide reçu : comedia activé, on stoppe les punches
+                        if pkt_count == 0 { punch_remaining = 0; }
 
                         pkt_count += 1;
                         if pkt_count == 1 {

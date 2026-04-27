@@ -122,7 +122,7 @@ async fn handle_message(
             }]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, srtp_parameters } => {
             eprintln!("[Jamodio] StartCapture ssrc={} → {}:{} device={:?} channel={:?}",
                 ssrc, sfu_ip, sfu_port, input_device, channel_index);
             let mut pl = pipeline.lock().await;
@@ -131,24 +131,26 @@ async fn handle_message(
             if input_device.is_some() {
                 pl.select_devices(input_device, None);
             }
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index).await {
-                Ok(local_port) => {
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
+                Ok((local_port, agent_srtp)) => {
                     vec![AgentMessage::LocalPort {
                         producer_id: String::new(),
                         port: local_port,
+                        srtp_parameters: agent_srtp,
                     }]
                 }
                 Err(e) => vec![AgentMessage::Error { message: e }],
             }
         }
 
-        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, .. } => {
+        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, .. } => {
             eprintln!("[Jamodio] AddStream {} → {}:{}", &producer_id[..8.min(producer_id.len())], sfu_ip, sfu_port);
             let mut pl = pipeline.lock().await;
-            match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port).await {
-                Ok(local_port) => vec![AgentMessage::LocalPort {
+            match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters).await {
+                Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id,
                     port: local_port,
+                    srtp_parameters: agent_srtp,
                 }],
                 Err(e) => vec![AgentMessage::Error { message: e }],
             }
