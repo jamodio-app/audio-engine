@@ -68,21 +68,35 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
 
-      # Windows : libsrtp2 + OpenSSL viennent de vcpkg (build from-source
-      # de libsrtp2 non supporté sur MSVC). libopus aussi.
-      # Triplet `x64-windows-static-md` = lib statique avec MSVCRT dynamique
-      # (compatible Tauri). VCPKGRS_TRIPLET dit aux build scripts (srtp2-sys
-      # via vcpkg-rs, openssl-sys idem) lequel utiliser.
+      # Windows : libsrtp + OpenSSL via vcpkg (build from-source de libsrtp2
+      # non supporté sur MSVC). libopus aussi.
+      #
+      # `libsrtp[openssl]` : feature flag pour activer le backend OpenSSL =
+      # support AEAD-GCM (notre crypto suite). Sans cette feature, libsrtp
+      # ne compile que AES-CM → notre code link échoue avec "undefined symbol
+      # srtp_crypto_policy_set_aes_gcm_256_16_auth".
+      #
+      # Triplet `x64-windows-static-md` = lib statique + MSVCRT dynamique
+      # (compatible Tauri).
+      #
+      # Variables env exportées vers les steps suivants :
+      #   VCPKG_ROOT       → vcpkg-rs (utilisé par srtp2-sys::build.rs)
+      #   VCPKGRS_TRIPLET  → force le triplet pour vcpkg-rs
+      #   OPENSSL_DIR      → openssl-sys (court-circuit la détection automatique)
+      #   OPENSSL_STATIC   → static link OpenSSL
+      #   PKG_CONFIG_PATH  → audiopus_sys → libopus via pkg-config
+      #   LIBOPUS_STATIC   → idem
       - name: Install libopus + libsrtp + OpenSSL (Windows via vcpkg)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           vcpkg install opus:x64-windows-static-md
-          vcpkg install libsrtp:x64-windows-static-md
           vcpkg install openssl:x64-windows-static-md
+          vcpkg install "libsrtp[openssl]:x64-windows-static-md"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKGRS_TRIPLET=x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
           "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKGRS_TRIPLET=x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
           "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
