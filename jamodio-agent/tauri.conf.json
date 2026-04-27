@@ -71,7 +71,7 @@
       "endpoints": [
         "https://github.com/jamodio-app/audio-engine/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEMUQzOTI4N0Q0RkM5QkIKUldTN3lVOTlLRGtkSGRqTDJhWFN6VnBHSmRoZHdkMmloT3dXZ21tR3hMQnVUbGxUZ2loSmtEZXoK%"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFEMUQzOTI4N0Q0RkM5QkIKUldTN3lVOTlLRGtkSGRqTDJhWFN6VnBHSmRoZHdkMmloT3dXZ21tR3hMQnVUbGxUZ2loSmtEZXoK"
     },
     "deep-link": {
       "desktop": {
