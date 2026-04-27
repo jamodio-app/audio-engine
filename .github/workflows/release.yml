@@ -39,8 +39,31 @@ jobs:
           # ignore les flags target → .o produits arm64, link x86_64 échoue).
           - runner: macos-13
             target: x86_64-apple-darwin
-          - runner: windows-2022
-            target: x86_64-pc-windows-msvc
+          # ─────────────────────────────────────────────────────────────────
+          # Windows : DÉSACTIVÉ depuis v0.1.2 (Phase 1 SRTP).
+          #
+          # Bloqueur : la crate `srtp 0.7` (dernière version sur crates.io) a
+          # un bug de portabilité Windows. À session.rs:333 :
+          #     policy.window_size = self.window_size;   // u32 := u64 → error[E0308]
+          # `policy.window_size` provient de bindgen sur `srtp_policy_t.window_size`
+          # (typé `unsigned long` en C). Sur Linux/macOS LP64 = u64 → match.
+          # Sur Windows MSVC LLP64 = u32 → mismatch avec u64 hardcodé côté Rust.
+          # Le fix amont serait `as _` ou `try_into()`. Pas de 0.7.1 publié.
+          #
+          # Solutions futures (à explorer pour v0.1.3+) :
+          #   1. Maintenir un fork de HyeonuPark/srtp avec le fix 1-ligne,
+          #      référencé via [patch.crates-io] dans Cargo.toml.
+          #   2. Migrer vers webrtc-srtp (pure Rust, no system deps), au prix
+          #      d'~25 crates webrtc-rs supplémentaires.
+          #   3. Implémenter SRTP custom sur aes-gcm + hmac (risqué, KDF
+          #      AES-CM + nonce ROC|SEQ + replay protection à coder à la main).
+          #
+          # Impact utilisateurs Windows v0.1.1 quand SFU passe en SRTP :
+          #   - Mode agent ne marchera plus → fallback mode browser (~60 ms).
+          #   - Mode browser inchangé (DTLS-SRTP WebRTC, indépendant de Phase 1).
+          #
+          # - runner: windows-2022
+          #   target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
     steps:
