@@ -1,6 +1,6 @@
 //! Audio pipeline orchestration.
 //!
-//! Capture: CPAL input → accumulate 480 samples → Opus encode → RTP → UDP send
+//! Capture: CPAL input → accumulate 240 samples (2.5ms stéréo) → Opus encode → RTP → UDP send
 //! Receive: UDP recv → RTP parse → Opus decode → JitterBuffer → AudioMixer → CPAL output
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -340,8 +340,8 @@ fn encoder_thread(
         }
     };
 
-    let frame_size = encoder.frame_size(); // 240 samples/channel
-    let frame_len = frame_size * CHANNELS; // 480 f32s (stereo interleaved)
+    let frame_size = encoder.frame_size(); // 120 samples/channel
+    let frame_len = frame_size * CHANNELS; // 240 f32s (stereo interleaved, 2.5ms @ 48kHz)
     let channels_in = channels_in as usize;
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_len * 2);
     let mut opus_buf = vec![0u8; 4000];
@@ -368,7 +368,7 @@ fn encoder_thread(
 
                 accumulator.extend_from_slice(&stereo);
 
-                // Encode complete frames (480 f32 stéréo = 10ms)
+                // Encode complete frames (240 f32 stéréo = 2.5ms)
                 while accumulator.len() >= frame_len {
                     let frame: Vec<f32> = accumulator.drain(..frame_len).collect();
 
