@@ -33,12 +33,29 @@ jobs:
           # macOS Apple Silicon : runner ARM natif.
           - runner: macos-14
             target: aarch64-apple-darwin
-          # macOS Intel : runner Intel natif obligatoire.
-          # Le cross-compile depuis macos-14 fonctionnait pour audiopus mais pas
-          # pour libsrtp2 (son ./configure auto-détecte l'arch host = arm64 et
-          # ignore les flags target → .o produits arm64, link x86_64 échoue).
-          - runner: macos-13
-            target: x86_64-apple-darwin
+          # ─────────────────────────────────────────────────────────────────
+          # macOS Intel : DÉSACTIVÉ depuis v0.1.2 (Phase 1 SRTP).
+          #
+          # Bloqueur 1 : queue runner macos-13 inutilisable (jobs attendent
+          # 9+ heures sans être pickup, Intel déprécié par GitHub).
+          # Bloqueur 2 : cross-compile depuis macos-14 cassé pour libsrtp2
+          # (le ./configure auto-détecte arch host = arm64, ignore les flags
+          # target → .o ARM, link x86_64 échoue).
+          #
+          # Solutions futures (à explorer pour v0.1.3+) :
+          #   1. Forcer cross-compile depuis macos-14 via CFLAGS=-arch x86_64
+          #      + LDFLAGS=-arch x86_64 exportés AVANT cargo build. Configure
+          #      honore CFLAGS (à valider), mais ses tests d'env tournent via
+          #      Rosetta sur runner ARM → résultats potentiellement faux.
+          #   2. Runner macos-13-large (payant, ~$0.16/min, queue prioritaire).
+          #   3. Build matrix sur runner self-hosted Intel local.
+          #
+          # Apple Silicon couvre ~85 % de la base utilisateur musicienne Mac
+          # (M1 launched 2020, Intel arrêté 2022). Intel users : fallback mode
+          # browser comme Windows en attendant v0.1.3.
+          #
+          # - runner: macos-13
+          #   target: x86_64-apple-darwin
           # ─────────────────────────────────────────────────────────────────
           # Windows : DÉSACTIVÉ depuis v0.1.2 (Phase 1 SRTP).
           #
