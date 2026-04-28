@@ -11,6 +11,7 @@ use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::protocol::AgentState;
+use jamodio_audio_core::sync::drift::DriftEstimator;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -419,6 +420,10 @@ async fn recv_decode_task(
         }
     };
 
+    // T4.2a — DriftEstimator (mesure pure pour l'instant, log toutes les 30s)
+    let drift_label = producer_id.chars().take(8).collect::<String>();
+    let mut drift = DriftEstimator::new(drift_label);
+
     // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut last_seq: Option<u16> = None;
@@ -457,6 +462,8 @@ async fn recv_decode_task(
                         }
 
                         if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
+                            // T4.2a — alimente l'estimateur de dérive d'horloge
+                            drift.observe(_header.timestamp, std::time::Instant::now());
                             // Detect packet loss → PLC
                             if let Some(prev) = last_seq {
                                 let expected = prev.wrapping_add(1);
