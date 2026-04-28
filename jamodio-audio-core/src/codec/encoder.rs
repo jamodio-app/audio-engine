@@ -19,7 +19,7 @@ impl MusicEncoder {
         )?;
 
         // Low-latency music settings
-        encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(256000))?;
+        encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(320000))?;
         encoder.set_inband_fec(false)?;
         encoder.set_dtx(false)?;
         encoder.set_vbr(false)?; // CBR for predictable latency
