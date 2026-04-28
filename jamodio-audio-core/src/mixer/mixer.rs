@@ -5,6 +5,9 @@ use std::collections::HashMap;
 /// Each stream has its own jitter buffer and volume control.
 pub struct AudioMixer {
     streams: HashMap<String, StreamState>,
+    /// Buffer de travail réutilisé par mix_into — évite ~400 alloc/s
+    /// dans le callback CPAL temps-réel.
+    temp_buf: Vec<f32>,
 }
 
 struct StreamState {
@@ -18,6 +21,7 @@ impl AudioMixer {
     pub fn new() -> Self {
         Self {
             streams: HashMap::new(),
+            temp_buf: Vec::new(),
         }
     }
 
@@ -76,13 +80,17 @@ impl AudioMixer {
     pub fn mix_into(&mut self, output: &mut [f32]) {
         output.fill(0.0);
 
-        let mut temp = vec![0.0f32; output.len()];
+        // Resize uniquement si la taille du callback change (typiquement jamais
+        // après le 1er appel : CPAL livre des blocs de taille fixe).
+        if self.temp_buf.len() != output.len() {
+            self.temp_buf.resize(output.len(), 0.0);
+        }
 
         for stream in self.streams.values_mut() {
-            stream.jitter.pull(&mut temp);
+            stream.jitter.pull(&mut self.temp_buf);
 
             let vol = stream.volume;
-            for (out, &sample) in output.iter_mut().zip(temp.iter()) {
+            for (out, &sample) in output.iter_mut().zip(self.temp_buf.iter()) {
                 *out += sample * vol;
             }
         }
