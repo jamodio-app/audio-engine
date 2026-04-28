@@ -323,6 +323,15 @@ fn encoder_thread(
     channels_in: u16,
     channel_index: Option<u8>,
 ) {
+    // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
+    // dans ce cas on continue en priorité normale plutôt que de planter.
+    let prio = thread_priority::ThreadPriority::Crossplatform(
+        95u8.try_into().expect("0..=100"),
+    );
+    if let Err(e) = thread_priority::set_current_thread_priority(prio) {
+        eprintln!("[ENCODER] RT priority refusée ({:?}) — fallback prio normale", e);
+    }
+
     let encoder = match MusicEncoder::new() {
         Ok(e) => e,
         Err(e) => {
