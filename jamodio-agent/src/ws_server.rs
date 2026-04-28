@@ -182,7 +182,7 @@ async fn handle_message(
             } else {
                 0.0
             };
-            let opus_ms: f32 = 10.0; // Opus frame 480 samples @ 48kHz
+            let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz (Phase 2)
 
             vec![
                 AgentMessage::Status {

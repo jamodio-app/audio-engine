@@ -1,13 +1,13 @@
 use audiopus::{coder::Encoder as OpusEncoder, Application, Channels, SampleRate};
 
 /// Opus encoder configured for low-latency music streaming.
-/// Frame size: 480 samples = 10ms at 48kHz stereo.
+/// Frame size: 120 samples = 2.5ms at 48kHz stereo.
 pub struct MusicEncoder {
     encoder: OpusEncoder,
     frame_size: usize,
 }
 
-const FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
+const FRAME_SAMPLES: usize = 120; // 2.5ms at 48kHz
 pub const MAX_PACKET_SIZE: usize = 4000;
 
 impl MusicEncoder {
