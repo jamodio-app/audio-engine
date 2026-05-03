@@ -128,8 +128,11 @@ async fn handle_message(
             let mut pl = pipeline.lock().await;
             // Le browser peut passer le device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
+            // ⚠ Bug fix : utiliser set_input_device() au lieu de select_devices(_, None)
+            //   qui écrasait à None l'output_device_name précédemment configuré
+            //   → fallback sur device par défaut système (Mac speakers).
             if input_device.is_some() {
-                pl.select_devices(input_device, None);
+                pl.set_input_device(input_device);
             }
             match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
                 Ok((local_port, agent_srtp)) => {
