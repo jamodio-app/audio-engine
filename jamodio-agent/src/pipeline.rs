@@ -63,6 +63,14 @@ impl PipelineState {
         }
     }
 
+    /// Set ONLY the input device, preserving the current output_device_name.
+    /// Évite le bug où start-capture appelait select_devices(input, None) et
+    /// écrasait à None l'output précédemment configuré (= silent fallback
+    /// sur le device par défaut système au lieu du device choisi par le user).
+    pub fn set_input_device(&mut self, input: Option<String>) {
+        self.input_device_name = input;
+    }
+
     pub fn select_devices(&mut self, input: Option<String>, output: Option<String>) {
         // Sprint 3.1 — restart live du stream playback si l'output change.
         // Sans ça, modifier la sortie audio dans les settings n'a aucun effet
