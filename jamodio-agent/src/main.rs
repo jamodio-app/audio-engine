@@ -37,7 +37,7 @@ fn main() {
         ))
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
-            eprintln!("[Jamodio] Audio Engine v0.1.2");
+            eprintln!("[Jamodio] Audio Engine v0.1.3");
 
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             // Utile pour voir ce que CPAL expose réellement sur le poste :
