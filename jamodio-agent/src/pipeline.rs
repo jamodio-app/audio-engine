@@ -64,8 +64,38 @@ impl PipelineState {
     }
 
     pub fn select_devices(&mut self, input: Option<String>, output: Option<String>) {
+        // Sprint 3.1 — restart live du stream playback si l'output change.
+        // Sans ça, modifier la sortie audio dans les settings n'a aucun effet
+        // tant qu'on ne quitte/rejoint pas la session (le stream CPAL est
+        // démarré une fois dans start_capture et jamais touché ensuite).
+        let output_changed = self.output_device_name != output;
         self.input_device_name = input;
         self.output_device_name = output;
+        if output_changed && self.playback_stream.is_some() {
+            self.restart_playback();
+        }
+    }
+
+    /// Sprint 3.1 — Recrée le CPAL output stream avec le device courant.
+    /// Le mixer est conservé (Arc partagé), aucun audio en cours n'est perdu :
+    /// le ring buffer continue d'accumuler côté décodeur pendant la transition.
+    fn restart_playback(&mut self) {
+        let Some(out_device) = crate::audio::device::get_output_device(self.output_device_name.as_deref()) else {
+            eprintln!("[PIPELINE] Output device introuvable, fallback default au prochain frame");
+            self.playback_stream.take();
+            return;
+        };
+        use cpal::traits::DeviceTrait;
+        let name = out_device.name().unwrap_or_default();
+        match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
+            Ok(stream) => {
+                // Drop l'ancien APRÈS avoir créé le nouveau pour minimiser le gap audio.
+                let new_stream = SendStream(stream);
+                let _old = std::mem::replace(&mut self.playback_stream, Some(new_stream));
+                eprintln!("[Jamodio] Output device switched → '{}'", name);
+            }
+            Err(e) => eprintln!("[PIPELINE] restart_playback échoué ({}) : on garde l'ancien", e),
+        }
     }
 
     /// Return the currently selected (or default) input device name.
