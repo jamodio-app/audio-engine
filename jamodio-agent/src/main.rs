@@ -17,6 +17,20 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 fn main() {
     tauri::Builder::default()
+        // ─── Single-instance lock ─────────────────────────────
+        // Si un 2e process est lancé (clic répété sur "Lancer", deep link
+        // jamodio://launch alors que l'agent tourne déjà, double-clic DMG…),
+        // ce hook est appelé dans le 1er process avec les args du 2e, puis
+        // le 2e exit immédiatement. On (re-)montre + focus la fenêtre
+        // principale pour que l'utilisateur voie qu'elle existe déjà.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            eprintln!("[Jamodio] 2nd instance detected — focusing existing window");
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
