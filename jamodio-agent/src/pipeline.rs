@@ -96,26 +96,17 @@ impl PipelineState {
             return;
         };
         let resolved_name = out_device.name().unwrap_or_default();
-        eprintln!("[PIPELINE] restart_playback : requested='{:?}' resolved='{}'",
-            self.output_device_name, resolved_name);
 
-        // ⚠ DROP l'ancien stream AVANT de créer le nouveau.
-        // Sur macOS CoreAudio, garder 2 streams actifs simultanément (même
-        // brièvement via mem::replace) peut causer un conflit où le nouveau
-        // stream échoue silencieusement à claim le nouveau device → l'audio
-        // reste joué sur l'ancien device (souvent = défaut système).
-        // Le gap audio est de l'ordre de 50-100ms, acceptable.
-        if let Some(old) = self.playback_stream.take() {
-            drop(old);
-            eprintln!("[PIPELINE] Old playback stream dropped");
-        }
-
+        // mem::replace : crée le nouveau stream AVANT de drop l'ancien
+        // → minimise le gap audio (sinon brève silence → jitter buffer
+        // overflow → crackles au resume).
         match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
             Ok(stream) => {
-                self.playback_stream = Some(SendStream(stream));
+                let _old = std::mem::replace(&mut self.playback_stream, Some(SendStream(stream)));
                 eprintln!("[Jamodio] ✓ Output device switched → '{}'", resolved_name);
+                // _old drop ici (fin de scope) → CPAL stoppe l'ancien stream
             }
-            Err(e) => eprintln!("[PIPELINE] ✗ restart_playback échoué ({}) — pas de playback actif !", e),
+            Err(e) => eprintln!("[PIPELINE] ✗ restart_playback échoué ({}) — on garde l'ancien", e),
         }
     }
 
