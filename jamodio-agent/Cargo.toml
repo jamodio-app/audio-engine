@@ -23,6 +23,9 @@ thread-priority = "0.10"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-deep-link = "2"
+# Empêche un 2e process agent de démarrer (fix double-launch macOS/Windows).
+# Doit être enregistré AVANT deep-link cf. doc Tauri.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
