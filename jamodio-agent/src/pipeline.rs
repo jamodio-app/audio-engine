@@ -80,21 +80,34 @@ impl PipelineState {
     /// Le mixer est conservé (Arc partagé), aucun audio en cours n'est perdu :
     /// le ring buffer continue d'accumuler côté décodeur pendant la transition.
     fn restart_playback(&mut self) {
+        use cpal::traits::DeviceTrait;
         let Some(out_device) = crate::audio::device::get_output_device(self.output_device_name.as_deref()) else {
-            eprintln!("[PIPELINE] Output device introuvable, fallback default au prochain frame");
+            eprintln!("[PIPELINE] Output device introuvable ({:?}), fallback default au prochain frame",
+                self.output_device_name);
             self.playback_stream.take();
             return;
         };
-        use cpal::traits::DeviceTrait;
-        let name = out_device.name().unwrap_or_default();
+        let resolved_name = out_device.name().unwrap_or_default();
+        eprintln!("[PIPELINE] restart_playback : requested='{:?}' resolved='{}'",
+            self.output_device_name, resolved_name);
+
+        // ⚠ DROP l'ancien stream AVANT de créer le nouveau.
+        // Sur macOS CoreAudio, garder 2 streams actifs simultanément (même
+        // brièvement via mem::replace) peut causer un conflit où le nouveau
+        // stream échoue silencieusement à claim le nouveau device → l'audio
+        // reste joué sur l'ancien device (souvent = défaut système).
+        // Le gap audio est de l'ordre de 50-100ms, acceptable.
+        if let Some(old) = self.playback_stream.take() {
+            drop(old);
+            eprintln!("[PIPELINE] Old playback stream dropped");
+        }
+
         match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
             Ok(stream) => {
-                // Drop l'ancien APRÈS avoir créé le nouveau pour minimiser le gap audio.
-                let new_stream = SendStream(stream);
-                let _old = std::mem::replace(&mut self.playback_stream, Some(new_stream));
-                eprintln!("[Jamodio] Output device switched → '{}'", name);
+                self.playback_stream = Some(SendStream(stream));
+                eprintln!("[Jamodio] ✓ Output device switched → '{}'", resolved_name);
             }
-            Err(e) => eprintln!("[PIPELINE] restart_playback échoué ({}) : on garde l'ancien", e),
+            Err(e) => eprintln!("[PIPELINE] ✗ restart_playback échoué ({}) — pas de playback actif !", e),
         }
     }
 
