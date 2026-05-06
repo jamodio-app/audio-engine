@@ -60,17 +60,21 @@ pub fn log_devices() {
     let host = cpal::default_host();
     let def_in = host.default_input_device().and_then(|d| d.name().ok()).unwrap_or_default();
     let def_out = host.default_output_device().and_then(|d| d.name().ok()).unwrap_or_default();
-    eprintln!("[Jamodio] ── CPAL devices ──────────────────────");
-    eprintln!("[Jamodio] Default input  : '{}'", def_in);
-    eprintln!("[Jamodio] Default output : '{}'", def_out);
+    tracing::info!(target: "jamodio::devices", default_input = %def_in, default_output = %def_out, "CPAL devices");
     if let Ok(devices) = host.input_devices() {
         for d in devices {
             let name = d.name().unwrap_or_else(|_| "<err>".into());
             let cfg = d.default_input_config().ok();
             let ch = cfg.as_ref().map(|c| c.channels()).unwrap_or(0);
             let sr = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
-            let mark = if name == def_in { " [default]" } else { "" };
-            eprintln!("[Jamodio]   IN  '{}' — {}ch @ {}Hz{}", name, ch, sr, mark);
+            tracing::info!(
+                target: "jamodio::devices",
+                kind = "input",
+                name = %name,
+                channels = ch,
+                sample_rate = sr,
+                is_default = name == def_in,
+            );
         }
     }
     if let Ok(devices) = host.output_devices() {
@@ -79,11 +83,16 @@ pub fn log_devices() {
             let cfg = d.default_output_config().ok();
             let ch = cfg.as_ref().map(|c| c.channels()).unwrap_or(0);
             let sr = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
-            let mark = if name == def_out { " [default]" } else { "" };
-            eprintln!("[Jamodio]   OUT '{}' — {}ch @ {}Hz{}", name, ch, sr, mark);
+            tracing::info!(
+                target: "jamodio::devices",
+                kind = "output",
+                name = %name,
+                channels = ch,
+                sample_rate = sr,
+                is_default = name == def_out,
+            );
         }
     }
-    eprintln!("[Jamodio] ──────────────────────────────────────");
 }
 
 /// Comparaison "fuzzy" : on normalise (lowercase + retrait d'espaces/ponctuation)
@@ -120,10 +129,16 @@ pub fn get_input_device(name: Option<&str>) -> Option<cpal::Device> {
         if let Some(dev) = devices.iter().find(|d| {
             d.name().ok().as_deref().map_or(false, |dn| fuzzy_match(dn, n))
         }) {
-            eprintln!("[DEVICE] Input '{}' matched fuzzy → '{}'", n, dev.name().unwrap_or_default());
+            tracing::info!(
+                target: "jamodio::devices",
+                kind = "input",
+                requested = %n,
+                matched = %dev.name().unwrap_or_default(),
+                "fuzzy match"
+            );
             return Some(dev.clone());
         }
-        eprintln!("[DEVICE] Input '{}' not found, using default", n);
+        tracing::warn!(target: "jamodio::devices", kind = "input", requested = %n, "not found, using default");
     }
     host.default_input_device()
 }
@@ -140,10 +155,16 @@ pub fn get_output_device(name: Option<&str>) -> Option<cpal::Device> {
         if let Some(dev) = devices.iter().find(|d| {
             d.name().ok().as_deref().map_or(false, |dn| fuzzy_match(dn, n))
         }) {
-            eprintln!("[DEVICE] Output '{}' matched fuzzy → '{}'", n, dev.name().unwrap_or_default());
+            tracing::info!(
+                target: "jamodio::devices",
+                kind = "output",
+                requested = %n,
+                matched = %dev.name().unwrap_or_default(),
+                "fuzzy match"
+            );
             return Some(dev.clone());
         }
-        eprintln!("[DEVICE] Output '{}' not found, using default", n);
+        tracing::warn!(target: "jamodio::devices", kind = "output", requested = %n, "not found, using default");
     }
     host.default_output_device()
 }

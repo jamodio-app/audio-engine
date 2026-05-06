@@ -15,13 +15,18 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;          /* fenêtre Tauri non-resizable, pas d'ascenseur */
+}
+
 body {
   background: var(--bg);
   color: var(--text);
   font-family: 'DM Sans', sans-serif;
   font-size: 13px;
   line-height: 1.5;
-  width: 280px;
   padding: 16px;
   user-select: none;
 }
@@ -119,6 +124,35 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
   color: var(--text2);
+}
+
+.actions {
+  display: flex;
+  justify-content: center;
+}
+
+.actions button {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: var(--surface);
+  color: var(--text2);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms;
+}
+
+.actions button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.actions button.ok {
+  border-color: var(--green);
+  color: var(--green);
 }
 
 .ws-status {

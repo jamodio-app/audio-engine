@@ -21,7 +21,7 @@ fn bind_udp_dscp_ef() -> std::io::Result<UdpSocket> {
     let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
     sock.bind(&local.into())?;
     if let Err(e) = sock.set_tos(DSCP_EF_TOS) {
-        eprintln!("[udp] set_tos(EF) non appliqué ({e}) — trafic en best-effort");
+        tracing::warn!(target: "jamodio::udp", error = %e, "set_tos(EF) non appliqué — trafic en best-effort");
     }
     let std_sock: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_sock)
@@ -47,7 +47,7 @@ impl RtpSender {
     pub async fn send(&self, packet: Vec<u8>) -> std::io::Result<usize> {
         let mut buf = packet;
         if let Err(e) = self.srtp.protect(&mut buf) {
-            eprintln!("[RtpSender] SRTP protect failed: {e}");
+            tracing::error!(target: "jamodio::srtp", role = "sender", error = ?e, "SRTP protect failed");
             return Ok(0);
         }
         self.socket.send_to(&buf, self.target).await
@@ -107,7 +107,7 @@ impl RtpReceiver {
         punch.extend_from_slice(&ts.to_be_bytes());
         punch.extend_from_slice(&self.punch_ssrc.to_be_bytes());
         if let Err(e) = self.srtp.protect(&mut punch) {
-            eprintln!("[RtpReceiver] punch SRTP protect failed: {e}");
+            tracing::error!(target: "jamodio::srtp", role = "receiver", op = "punch", error = ?e, "SRTP protect failed");
             return Ok(());
         }
         self.socket.send_to(&punch, sfu_addr).await?;
@@ -130,7 +130,7 @@ impl RtpReceiver {
             return Ok((0, addr));
         }
         if let Err(e) = self.srtp.unprotect(buf) {
-            eprintln!("[RtpReceiver] SRTP unprotect failed: {e}");
+            tracing::warn!(target: "jamodio::srtp", role = "receiver", error = ?e, "SRTP unprotect failed");
             return Ok((0, addr));
         }
         Ok((buf.len(), addr))

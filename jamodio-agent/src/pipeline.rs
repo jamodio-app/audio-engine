@@ -90,8 +90,11 @@ impl PipelineState {
     fn restart_playback(&mut self) {
         use cpal::traits::DeviceTrait;
         let Some(out_device) = crate::audio::device::get_output_device(self.output_device_name.as_deref()) else {
-            eprintln!("[PIPELINE] Output device introuvable ({:?}), fallback default au prochain frame",
-                self.output_device_name);
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                requested = ?self.output_device_name,
+                "output device introuvable, fallback default au prochain frame"
+            );
             self.playback_stream.take();
             return;
         };
@@ -103,10 +106,14 @@ impl PipelineState {
         match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
             Ok(stream) => {
                 let _old = std::mem::replace(&mut self.playback_stream, Some(SendStream(stream)));
-                eprintln!("[Jamodio] ✓ Output device switched → '{}'", resolved_name);
+                tracing::info!(target: "jamodio::pipeline", device = %resolved_name, "output device switched");
                 // _old drop ici (fin de scope) → CPAL stoppe l'ancien stream
             }
-            Err(e) => eprintln!("[PIPELINE] ✗ restart_playback échoué ({}) — on garde l'ancien", e),
+            Err(e) => tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "restart_playback échoué — on garde l'ancien"
+            ),
         }
     }
 
@@ -174,16 +181,21 @@ impl PipelineState {
             .ok_or("No input device found")?;
         use cpal::traits::DeviceTrait;
         let in_name = device.name().unwrap_or_default();
-        eprintln!("[Jamodio] Input device: '{}'", in_name);
+        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
         let (stream, channels_in) = crate::audio::capture::start_capture(&device, sample_tx)
             .map_err(|e| format!("CPAL input: {}", e))?;
         self.capture_stream = Some(SendStream(stream));
-        eprintln!("[Jamodio] Input channels: {} — channel_index: {:?}", channels_in, channel_index);
+        tracing::info!(target: "jamodio::pipeline", channels_in, ?channel_index, "input config");
 
         // Valider que le canal mono demandé existe bien sur le device
         let effective_channel = channel_index.and_then(|idx| {
             if (idx as u16) < channels_in { Some(idx) } else {
-                eprintln!("[Jamodio] channel_index {} hors plage (device a {} canaux) — fallback stéréo", idx, channels_in);
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested_channel = idx,
+                    available_channels = channels_in,
+                    "channel_index hors plage — fallback stéréo"
+                );
                 None
             }
         });
@@ -213,7 +225,7 @@ impl PipelineState {
                 .ok_or("No output device found")?;
             use cpal::traits::DeviceTrait;
             let out_name = out_device.name().unwrap_or_default();
-            eprintln!("[Jamodio] Output device: '{}'", out_name);
+            tracing::info!(target: "jamodio::pipeline", device = %out_name, "output device opened");
             let out_stream = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
                 .map_err(|e| format!("CPAL output: {}", e))?;
             self.playback_stream = Some(SendStream(out_stream));
@@ -221,7 +233,12 @@ impl PipelineState {
 
         self.state = AgentState::Capturing;
         self.buffer_samples = 128; // matches capture.rs BufferSize::Fixed(128)
-        eprintln!("[Jamodio] Capture → {}:{} (UDP {}, SRTP)", sfu_ip, sfu_port, local_port);
+        tracing::info!(
+            target: "jamodio::pipeline",
+            sfu = format!("{}:{}", sfu_ip, sfu_port),
+            local_port,
+            "capture started (SRTP)"
+        );
         Ok((local_port, agent_srtp))
     }
 
@@ -280,7 +297,12 @@ impl PipelineState {
             self.playback_stream = Some(SendStream(out_stream));
         }
 
-        eprintln!("[Jamodio] Stream + {}:{} (UDP {}, SRTP)", sfu_ip, sfu_port, local_port);
+        tracing::info!(
+            target: "jamodio::pipeline",
+            sfu = format!("{}:{}", sfu_ip, sfu_port),
+            local_port,
+            "stream added (SRTP)"
+        );
         Ok((local_port, agent_srtp))
     }
 
@@ -299,15 +321,24 @@ impl PipelineState {
     }
 
     pub fn stop_all(&mut self) {
+        // Évite le bruit en idle : si rien ne tourne, on log en debug pour
+        // pas spammer info à chaque WS disconnect du browser (le probe agent
+        // ouvre/ferme une WS toutes les 30 s, ce qui appelait stop_all).
+        let was_active = self.capture_stream.is_some()
+            || self.playback_stream.is_some()
+            || !self.recv_stops.is_empty();
         self.stop_capture();
-        // Stop all receive tasks
         let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
         for id in ids {
             self.remove_stream(&id);
         }
         self.playback_stream.take();
         self.state = AgentState::Idle;
-        eprintln!("[Jamodio] Stopped");
+        if was_active {
+            tracing::info!(target: "jamodio::pipeline", "pipeline stopped");
+        } else {
+            tracing::debug!(target: "jamodio::pipeline", "stop_all on idle pipeline (no-op)");
+        }
     }
 }
 
@@ -372,13 +403,13 @@ fn encoder_thread(
         95u8.try_into().expect("0..=100"),
     );
     if let Err(e) = thread_priority::set_current_thread_priority(prio) {
-        eprintln!("[ENCODER] RT priority refusée ({:?}) — fallback prio normale", e);
+        tracing::warn!(target: "jamodio::encoder", error = ?e, "RT priority refusée — fallback prio normale");
     }
 
     let encoder = match MusicEncoder::new() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("[ENCODER] Failed to create Opus encoder: {}", e);
+            tracing::error!(target: "jamodio::encoder", error = %e, "failed to create Opus encoder");
             return;
         }
     };
@@ -426,14 +457,28 @@ fn encoder_thread(
                             };
                             let packet = rtp::build_packet(&header, &opus_buf[..encoded_len]);
 
-                            // Non-blocking send to tokio
-                            let _ = rtp_tx.try_send(packet);
+                            // Non-blocking send to tokio. Si le canal sature
+                            // (CPU/réseau saturé côté task UDP), on log mais
+                            // on n'avance pas le timestamp non plus → le peer
+                            // verra un trou et son PLC remplira.
+                            if let Err(e) = rtp_tx.try_send(packet) {
+                                static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n == 0 || n.is_power_of_two() {
+                                    tracing::warn!(
+                                        target: "jamodio::encoder",
+                                        drop_count = n + 1,
+                                        error = ?e,
+                                        "RTP channel full — packet dropped (CPU/network overload?)"
+                                    );
+                                }
+                            }
 
                             sequence = sequence.wrapping_add(1);
                             timestamp = timestamp.wrapping_add(frame_size as u32);
                         }
                         Err(e) => {
-                            eprintln!("[ENCODER] Opus error: {}", e);
+                            tracing::error!(target: "jamodio::encoder", error = %e, "Opus encode error");
                         }
                     }
                 }
@@ -457,7 +502,7 @@ async fn recv_decode_task(
     let mut decoder = match MusicDecoder::new() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[RECV:{}] Failed to create decoder: {}", producer_id, e);
+            tracing::error!(target: "jamodio::recv", producer = %producer_id, error = %e, "failed to create decoder");
             return;
         }
     };
@@ -498,9 +543,19 @@ async fn recv_decode_task(
 
                         pkt_count += 1;
                         if pkt_count == 1 {
-                            eprintln!("[Jamodio] Recv first RTP packet ({} bytes) for {}", len, &producer_id[..8.min(producer_id.len())]);
+                            tracing::info!(
+                                target: "jamodio::recv",
+                                producer = &producer_id[..8.min(producer_id.len())],
+                                bytes = len,
+                                "first RTP packet received"
+                            );
                         } else if pkt_count % 5000 == 0 {
-                            eprintln!("[Jamodio] Recv {} packets for {}", pkt_count, &producer_id[..8.min(producer_id.len())]);
+                            tracing::debug!(
+                                target: "jamodio::recv",
+                                producer = &producer_id[..8.min(producer_id.len())],
+                                count = pkt_count,
+                                "RTP packets received"
+                            );
                         }
 
                         if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
@@ -513,26 +568,54 @@ async fn recv_decode_task(
                                     let gap = _header.sequence.wrapping_sub(expected);
                                     if gap <= 10 {
                                         for _ in 0..gap.min(3) {
-                                            if let Some(plc) = decoder.decode_loss() {
-                                                mixer.lock().push_samples(&producer_id, &plc);
+                                            // PLC : copie obligatoire avant le push_samples car
+                                            // decode_loss() rend une slice référencant un buffer
+                                            // interne au decoder qui sera écrasé par le decode
+                                            // suivant (cf. Sprint 3 BUG 7).
+                                            let plc_owned: Option<Vec<f32>> = decoder.decode_loss().map(|s| s.to_vec());
+                                            if let Some(plc) = plc_owned {
+                                                // block_in_place : signale au scheduler tokio
+                                                // qu'on prend un lock parking_lot bloquant
+                                                // (le callback CPAL peut le tenir pendant
+                                                // mix_into). Sans ça, le worker tokio peut
+                                                // être bloqué → backpressure UDP recv.
+                                                tokio::task::block_in_place(|| {
+                                                    mixer.lock().push_samples(&producer_id, &plc);
+                                                });
                                             }
                                         }
                                     } else if !logged_large_jump {
-                                        eprintln!("[RECV] large seq jump: prev={} got={} gap={} (skipping PLC)", prev, _header.sequence, gap);
+                                        tracing::warn!(
+                                            target: "jamodio::recv",
+                                            producer = &producer_id[..8.min(producer_id.len())],
+                                            prev_seq = prev,
+                                            got_seq = _header.sequence,
+                                            gap,
+                                            "large seq jump (skipping PLC)"
+                                        );
                                         logged_large_jump = true;
                                     }
                                 }
                             }
                             last_seq = Some(_header.sequence);
 
-                            // Decode actual packet
+                            // Decode actual packet : on push directement la slice
+                            // pendant qu'elle est valide (pas de re-emprunt de
+                            // decoder avant la fin du push).
                             if let Some(pcm) = decoder.decode(payload) {
-                                mixer.lock().push_samples(&producer_id, &pcm);
+                                tokio::task::block_in_place(|| {
+                                    mixer.lock().push_samples(&producer_id, pcm);
+                                });
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[RECV:{}] UDP error: {}", producer_id, e);
+                        tracing::warn!(
+                            target: "jamodio::recv",
+                            producer = %producer_id,
+                            error = %e,
+                            "UDP recv error"
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }

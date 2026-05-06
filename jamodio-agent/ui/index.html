@@ -28,27 +28,84 @@
         <span class="label">Device</span>
         <span class="value" id="device">—</span>
       </div>
-      <div class="row">
-        <span class="label">Buffer</span>
-        <span class="value" id="buffer">—</span>
-      </div>
-      <div class="row">
+      <div class="row" title="Latence end-to-end estimée : capture + encode + decode + jitter + playback">
         <span class="label">Latence</span>
         <span class="value" id="latency">—</span>
       </div>
-      <div class="row">
-        <span class="label">Recv</span>
+      <div class="row" title="Cible adaptative du jitter buffer (moyenne sur les streams actifs)">
+        <span class="label">Jitter</span>
+        <span class="value" id="jitter">—</span>
+      </div>
+      <div class="row" title="Buffer matériel CPAL (capture/playback) — fixe à 128 samples">
+        <span class="label">CPAL</span>
+        <span class="value" id="buffer">—</span>
+      </div>
+      <div class="row" title="Nombre de flux audio reçus des autres musiciens">
+        <span class="label">Streams</span>
         <span class="value" id="streams">0</span>
       </div>
+      <div class="row" title="Underruns du jitter buffer depuis le démarrage — doit rester proche de 0">
+        <span class="label">Underruns</span>
+        <span class="value" id="underruns">0</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="export-logs" type="button">Exporter les logs</button>
     </div>
     <div class="ws-status" id="ws-status">ws://localhost:9876 — en attente</div>
-    <div class="version">v0.1.3</div>
+    <div class="version" id="version">—</div>
   </div>
 
   <script>
     const $ = id => document.getElementById(id);
     let ws = null;
     let statsInterval = null;
+
+    // Tauri 2 expose le pont JS sur window.__TAURI__ uniquement si
+    // `withGlobalTauri: true` dans tauri.conf.json (ce qu'on a activé).
+    // Helper qui résout invoke pour rester safe en preview navigateur (où
+    // __TAURI__ n'existe pas) — dans ce cas le fallback retourne null.
+    function tauriInvoke(cmd, args) {
+      const invoke = window.__TAURI__?.core?.invoke;
+      if (!invoke) return Promise.resolve(null);
+      return invoke(cmd, args);
+    }
+
+    // ─── Version dynamique ────────────────────────────────────
+    // Lit CARGO_PKG_VERSION via une commande Tauri pour éviter de
+    // hardcoder la version dans l'HTML (et risquer un mismatch Cargo
+    // vs UI à chaque release).
+    tauriInvoke('get_version').then(v => {
+      if (v) $('version').textContent = 'v' + v;
+    }).catch(() => {});
+
+    // ─── Bouton "Exporter les logs" ────────────────────────────
+    // Ouvre le dossier de logs OS-spécifique (Finder / Explorer / Files).
+    // Le user copie le dernier fichier agent.log.YYYY-MM-DD pour l'envoyer.
+    const exportBtn = $('export-logs');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', async () => {
+        try {
+          const invoke = window.__TAURI__?.core?.invoke;
+          if (!invoke) {
+            exportBtn.textContent = 'Tauri indisponible';
+            return;
+          }
+          const path = await invoke('open_log_dir');
+          exportBtn.textContent = '✓ Dossier ouvert';
+          exportBtn.classList.add('ok');
+          exportBtn.title = path;
+          setTimeout(() => {
+            exportBtn.textContent = 'Exporter les logs';
+            exportBtn.classList.remove('ok');
+          }, 2500);
+        } catch (err) {
+          exportBtn.textContent = '✗ Échec';
+          exportBtn.title = String(err);
+          setTimeout(() => { exportBtn.textContent = 'Exporter les logs'; }, 2500);
+        }
+      });
+    }
 
     function connect() {
       try {
@@ -73,11 +130,12 @@
             const active = msg.state === 'capturing';
             $('status').textContent = active ? 'ACTIF' : 'IDLE';
             $('status').classList.toggle('active', active);
-            // Reset display when idle
             if (!active) {
               $('buffer').textContent = '—';
               $('latency').textContent = '—';
+              $('jitter').textContent = '—';
               $('streams').textContent = '0';
+              $('underruns').textContent = '0';
             }
             break;
           }
@@ -98,15 +156,23 @@
               $('device').textContent = name;
               $('device').title = msg.device;
             }
-            // Streams count
             $('streams').textContent = msg.streams || 0;
-            // Buffer & latency (only show when we have real values)
+            $('underruns').textContent = msg.underruns || 0;
+            // Stats latence : on utilise les valeurs pré-calculées par l'agent
+            // (totalLatencyMs / jitterTargetMs / bufferMs) — sans recombinaison
+            // côté UI (les champs capture/playback exposés séparément contiennent
+            // déjà bufferMs, ne pas les additionner ici).
             const bufMs = msg.bufferMs || 0;
-            const capMs = msg.captureLatencyMs || 0;
-            const playMs = msg.playbackLatencyMs || 0;
-            if (bufMs > 0 || capMs > 0) {
+            const totalMs = msg.totalLatencyMs || 0;
+            const jitterMs = msg.jitterTargetMs || 0;
+            if (totalMs > 0) {
+              $('latency').textContent = totalMs.toFixed(1) + 'ms';
               $('buffer').textContent = bufMs.toFixed(1) + 'ms';
-              $('latency').textContent = (capMs + playMs + bufMs).toFixed(1) + 'ms';
+              $('jitter').textContent = jitterMs > 0 ? jitterMs.toFixed(1) + 'ms' : '—';
+            } else {
+              $('latency').textContent = '—';
+              $('buffer').textContent = '—';
+              $('jitter').textContent = '—';
             }
             break;
           }

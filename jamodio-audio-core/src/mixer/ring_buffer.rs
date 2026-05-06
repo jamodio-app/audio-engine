@@ -7,6 +7,11 @@ pub struct JitterBuffer {
     target_samples: usize,
     underruns: u64,
     last_adapt: std::time::Instant,
+    /// Pre-fill gate : on n'autorise le playout qu'une fois `target_samples`
+    /// accumulés. Évite le silence au démarrage (CPAL tire avant que le 1er
+    /// paquet RTP n'arrive) et la rafale d'underruns après un burst de jitter.
+    /// Repasse à false sur underrun → ré-attente d'un buffer plein.
+    primed: bool,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -28,6 +33,7 @@ impl JitterBuffer {
             target_samples: INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000,
             underruns: 0,
             last_adapt: std::time::Instant::now(),
+            primed: false,
         }
     }
 
@@ -38,10 +44,26 @@ impl JitterBuffer {
 
     /// Pull samples for playback.
     /// If not enough data, fills remainder with silence and counts an underrun.
+    ///
+    /// Pre-fill gate : avant de jouer, on attend que le buffer ait accumulé
+    /// au moins `target_samples` (état `primed`). Sans ça le callback CPAL
+    /// démarre immédiatement à l'init (avant le 1er paquet RTP) et chaque
+    /// pull retourne du silence → silence permanent au démarrage. Sur
+    /// underrun on repasse à false pour ré-attendre un buffer plein avant
+    /// de reprendre le playout.
     pub fn pull(&mut self, output: &mut [f32]) -> usize {
         let available = self.consumer.occupied_len();
-        let needed = output.len();
 
+        if !self.primed {
+            if available >= self.target_samples {
+                self.primed = true;
+            } else {
+                output.fill(0.0);
+                return 0;
+            }
+        }
+
+        let needed = output.len();
         if available >= needed {
             self.consumer.pop_slice(&mut output[..needed]);
             self.adapt_down();
@@ -53,6 +75,7 @@ impl JitterBuffer {
             output[available..].fill(0.0);
             self.underruns += 1;
             self.adapt_up();
+            self.primed = false;
             available
         }
     }
@@ -63,6 +86,16 @@ impl JitterBuffer {
 
     pub fn target_ms(&self) -> usize {
         self.target_samples * 1000 / (SAMPLE_RATE * CHANNELS)
+    }
+
+    /// Override la cible du buffer (utilisé par le handler SetBuffer côté UI).
+    /// Clamp dans [MIN_TARGET_MS, MAX_TARGET_MS]. Repasse en `unprimed` pour
+    /// que le pull attende le nouveau target avant de reprendre le playout.
+    pub fn set_target_ms(&mut self, target_ms: usize) {
+        let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
+        self.target_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
+        self.last_adapt = std::time::Instant::now();
+        self.primed = false;
     }
 
     pub fn underruns(&self) -> u64 {

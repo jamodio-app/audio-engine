@@ -1,6 +1,7 @@
 //! Jamodio Desktop Audio Agent
 
 mod audio;
+mod logging;
 mod pipeline;
 mod ws_server;
 
@@ -15,7 +16,33 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
 
+#[tauri::command]
+fn open_log_dir() -> Result<String, String> {
+    let dir = logging::log_dir();
+    opener::open(&dir).map_err(|e| format!("Cannot open log dir: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn get_log_dir() -> String {
+    logging::log_dir().to_string_lossy().into_owned()
+}
+
+/// Retourne la version du binaire (CARGO_PKG_VERSION figé au build).
+/// L'UI l'appelle au boot pour remplir le label `.version` — évite la
+/// duplication entre Cargo.toml et l'HTML statique.
+#[tauri::command]
+fn get_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn main() {
+    // Init tracing AVANT tout le reste : tous les eprintln! ont été migrés
+    // vers tracing::{info,warn,error,debug,trace}, et on veut capturer même
+    // les events pendant le setup Tauri. Le guard doit rester vivant : on le
+    // bind à _log_guard au scope de main() (drop = fin du process = OK).
+    let _log_guard = logging::init();
+
     tauri::Builder::default()
         // ─── Single-instance lock ─────────────────────────────
         // Si un 2e process est lancé (clic répété sur "Lancer", deep link
@@ -24,7 +51,7 @@ fn main() {
         // le 2e exit immédiatement. On (re-)montre + focus la fenêtre
         // principale pour que l'utilisateur voie qu'elle existe déjà.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            eprintln!("[Jamodio] 2nd instance detected — focusing existing window");
+            tracing::info!(target: "jamodio::lifecycle", "2nd instance detected — focusing existing window");
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.unminimize();
@@ -36,8 +63,9 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_deep_link::init())
+        .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version])
         .setup(|app| {
-            eprintln!("[Jamodio] Audio Engine v0.1.3");
+            tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
 
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             // Utile pour voir ce que CPAL expose réellement sur le poste :
@@ -69,7 +97,7 @@ fn main() {
                     _ => {}
                 });
             } else {
-                eprintln!("[TRAY] No tray icon found");
+                tracing::warn!(target: "jamodio::tray", "no tray icon found");
             }
 
 
@@ -80,7 +108,7 @@ fn main() {
             let autostart = app.autolaunch();
             if !autostart.is_enabled().unwrap_or(false) {
                 let _ = autostart.enable();
-                eprintln!("[Jamodio] Autostart enabled");
+                tracing::info!(target: "jamodio::lifecycle", "autostart enabled");
             }
 
             // ─── Spawn WS server (audio pipeline) ───────────

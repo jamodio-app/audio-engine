@@ -77,9 +77,13 @@ impl DriftEstimator {
 
         let last_log = self.last_log.unwrap();
         if instant.duration_since(last_log).as_secs() >= LOG_INTERVAL_SECS {
-            eprintln!(
-                "[DRIFT:{}] {:+.1} ppm after {:.0}s ({} packets)",
-                self.label, self.drift_ppm, elapsed_secs, self.observations,
+            tracing::debug!(
+                target: "jamodio::drift",
+                producer = %self.label,
+                ppm = self.drift_ppm,
+                elapsed_secs,
+                observations = self.observations,
+                "clock drift estimate"
             );
             self.last_log = Some(instant);
         }

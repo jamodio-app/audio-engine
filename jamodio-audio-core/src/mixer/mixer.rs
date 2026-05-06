@@ -8,6 +8,10 @@ pub struct AudioMixer {
     /// Buffer de travail réutilisé par mix_into — évite ~400 alloc/s
     /// dans le callback CPAL temps-réel.
     temp_buf: Vec<f32>,
+    /// Cible jitter buffer par défaut (ms) — appliquée aux nouveaux streams.
+    /// Si `None`, JitterBuffer utilise sa cible initiale par défaut. Override
+    /// via `set_target_ms_all` (handler SetBuffer côté UI).
+    default_target_ms: Option<usize>,
 }
 
 struct StreamState {
@@ -22,13 +26,18 @@ impl AudioMixer {
         Self {
             streams: HashMap::new(),
             temp_buf: Vec::new(),
+            default_target_ms: None,
         }
     }
 
     /// Add a new remote stream.
     pub fn add_stream(&mut self, producer_id: &str) {
+        let mut jitter = JitterBuffer::new();
+        if let Some(ms) = self.default_target_ms {
+            jitter.set_target_ms(ms);
+        }
         self.streams.insert(producer_id.to_string(), StreamState {
-            jitter: JitterBuffer::new(),
+            jitter,
             volume: 1.0,
             rms: 0.0,
             buffer_full_count: 0,
@@ -65,12 +74,21 @@ impl AudioMixer {
             if pushed < samples.len() {
                 stream.buffer_full_count += 1;
                 if stream.buffer_full_count == 1 || stream.buffer_full_count % 100 == 0 {
-                    eprintln!("[MIXER] Buffer full for {} (#{}) — dropped {} samples",
-                        &producer_id[..8.min(producer_id.len())], stream.buffer_full_count, samples.len() - pushed);
+                    tracing::warn!(
+                        target: "jamodio::mixer",
+                        producer = &producer_id[..8.min(producer_id.len())],
+                        full_count = stream.buffer_full_count,
+                        dropped = samples.len() - pushed,
+                        "jitter buffer full — samples dropped"
+                    );
                 }
             }
         } else {
-            eprintln!("[MIXER] No stream found for {}", &producer_id[..8.min(producer_id.len())]);
+            tracing::warn!(
+                target: "jamodio::mixer",
+                producer = &producer_id[..8.min(producer_id.len())],
+                "push_samples on unknown stream"
+            );
         }
     }
 
@@ -100,7 +118,7 @@ impl AudioMixer {
         let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if c % 7500 == 0 && !self.streams.is_empty() {
             let rms: f32 = (output.iter().map(|s| s * s).sum::<f32>() / output.len() as f32).sqrt();
-            eprintln!("[MIXER] mix_into: {} streams, rms={:.6}", self.streams.len(), rms);
+            tracing::debug!(target: "jamodio::mixer", streams = self.streams.len(), rms, "mix_into heartbeat");
         }
 
         // Soft clamp to prevent distortion
@@ -119,5 +137,30 @@ impl AudioMixer {
     /// Number of active streams.
     pub fn stream_count(&self) -> usize {
         self.streams.len()
+    }
+
+    /// Total underruns aggregated across all per-stream jitter buffers.
+    /// Used by GetStats to surface jitter-buffer health to the browser dashboard.
+    pub fn total_underruns(&self) -> u64 {
+        self.streams.values().map(|s| s.jitter.underruns()).sum()
+    }
+
+    /// Cible jitter buffer moyenne (ms) sur les streams actifs.
+    /// 0 si pas de stream — utilisé comme indicateur de tuning dans l'UI.
+    pub fn mean_target_ms(&self) -> f32 {
+        if self.streams.is_empty() {
+            return 0.0;
+        }
+        let sum: usize = self.streams.values().map(|s| s.jitter.target_ms()).sum();
+        sum as f32 / self.streams.len() as f32
+    }
+
+    /// Override la target_ms de tous les streams existants ET stocke la valeur
+    /// comme défaut pour les futurs streams. Appelé par le handler SetBuffer.
+    pub fn set_target_ms_all(&mut self, target_ms: usize) {
+        self.default_target_ms = Some(target_ms);
+        for stream in self.streams.values_mut() {
+            stream.jitter.set_target_ms(target_ms);
+        }
     }
 }

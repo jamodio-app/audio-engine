@@ -24,7 +24,7 @@ pub fn start_playback(
             mx.mix_into(data);
         },
         |err| {
-            eprintln!("[PLAYBACK] Error: {}", err);
+            tracing::error!(target: "jamodio::playback", error = %err, "CPAL playback error");
         },
         None,
     )?;

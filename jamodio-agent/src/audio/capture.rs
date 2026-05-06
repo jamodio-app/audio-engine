@@ -27,11 +27,25 @@ pub fn start_capture(
     let stream = device.build_input_stream(
         &config,
         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-            // Send a copy of the audio samples to the encoder thread
-            let _ = sample_tx.try_send(data.to_vec());
+            // Send a copy of the audio samples to the encoder thread.
+            // Si l'encoder est saturé (canal bounded(64) plein), on log mais
+            // on drop le bloc — sinon on bloquerait le callback CPAL temps-réel.
+            if let Err(e) = sample_tx.try_send(data.to_vec()) {
+                static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 || n.is_power_of_two() {
+                    tracing::warn!(
+                        target: "jamodio::capture",
+                        drop_count = n + 1,
+                        samples_dropped = data.len(),
+                        error = ?e,
+                        "sample channel full — block dropped"
+                    );
+                }
+            }
         },
         |err| {
-            eprintln!("[CAPTURE] Error: {}", err);
+            tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
         },
         None, // No timeout
     )?;

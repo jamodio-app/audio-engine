@@ -80,12 +80,25 @@ pub enum AgentMessage {
     },
     Stats {
         device: Option<String>,
+        /// Latence d'encodage côté capture : buffer CPAL + frame Opus.
         #[serde(rename = "captureLatencyMs")]
         capture_latency_ms: f32,
+        /// Latence playback : buffer CPAL output uniquement.
         #[serde(rename = "playbackLatencyMs")]
         playback_latency_ms: f32,
+        /// Buffer CPAL I/O en ms (capture/playback). Identique côté in/out
+        /// car on utilise BufferSize::Fixed(128) des deux côtés.
         #[serde(rename = "bufferMs")]
         buffer_ms: f32,
+        /// Cible adaptative du jitter buffer (moyenne des streams actifs, ms).
+        /// 0 si aucun stream actif. C'est le levier principal de tuning latence
+        /// vs robustesse au jitter — affiché dans l'UI agent.
+        #[serde(rename = "jitterTargetMs")]
+        jitter_target_ms: f32,
+        /// Latence end-to-end agent estimée (capture + encode + decode + jitter + playback).
+        /// Pré-calculée côté agent pour éviter les double-comptages côté UI.
+        #[serde(rename = "totalLatencyMs")]
+        total_latency_ms: f32,
         streams: usize,
         underruns: u64,
     },

@@ -1,17 +1,18 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
   "productName": "Jamodio Audio Engine",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "identifier": "com.jamodio.audio-engine",
   "build": {
     "frontendDist": "./ui"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Jamodio Audio Engine",
         "width": 300,
-        "height": 260,
+        "height": 380,
         "resizable": false,
         "visible": false,
         "decorations": true,
@@ -20,11 +21,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ws://localhost:9876; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
+      "csp": "default-src 'self'; connect-src 'self' ws://localhost:9876 ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
     },
     "trayIcon": {
       "iconPath": "icons/tray.png",
-      "iconAsTemplate": false,
+      "iconAsTemplate": true,
       "tooltip": "Jamodio Audio Engine",
       "showMenuOnLeftClick": true
     }

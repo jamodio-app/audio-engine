@@ -24,13 +24,15 @@ pub async fn start(pipeline: Arc<tokio::sync::Mutex<PipelineState>>) {
     let listener = match tokio::net::TcpListener::bind("127.0.0.1:9876").await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[Jamodio] Port 9876 already in use — another instance running?");
+            tracing::error!(target: "jamodio::ws", error = %e, "port 9876 already in use — another instance running?");
             return;
         }
     };
 
-    eprintln!("[Jamodio] Listening on ws://localhost:9876");
-    axum::serve(listener, app).await.unwrap();
+    tracing::info!(target: "jamodio::ws", addr = "ws://localhost:9876", "listening");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(target: "jamodio::ws", error = %e, "axum serve terminated");
+    }
 }
 
 async fn handle_connection(socket: WebSocket, pipeline: Arc<tokio::sync::Mutex<PipelineState>>) {
@@ -123,8 +125,14 @@ async fn handle_message(
         }
 
         BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, srtp_parameters } => {
-            eprintln!("[Jamodio] StartCapture ssrc={} → {}:{} device={:?} channel={:?}",
-                ssrc, sfu_ip, sfu_port, input_device, channel_index);
+            tracing::info!(
+                target: "jamodio::ws",
+                ssrc,
+                sfu = format!("{}:{}", sfu_ip, sfu_port),
+                ?input_device,
+                ?channel_index,
+                "StartCapture"
+            );
             let mut pl = pipeline.lock().await;
             // Le browser peut passer le device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
@@ -147,7 +155,12 @@ async fn handle_message(
         }
 
         BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, .. } => {
-            eprintln!("[Jamodio] AddStream {} → {}:{}", &producer_id[..8.min(producer_id.len())], sfu_ip, sfu_port);
+            tracing::info!(
+                target: "jamodio::ws",
+                producer = &producer_id[..8.min(producer_id.len())],
+                sfu = format!("{}:{}", sfu_ip, sfu_port),
+                "AddStream"
+            );
             let mut pl = pipeline.lock().await;
             match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
@@ -169,7 +182,10 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::SetBuffer { .. } => {
+        BrowserMessage::SetBuffer { target_ms } => {
+            let pl = pipeline.lock().await;
+            pl.mixer.lock().set_target_ms_all(target_ms as usize);
+            tracing::info!(target: "jamodio::ws", target_ms, "SetBuffer");
             vec![]
         }
 
@@ -185,7 +201,22 @@ async fn handle_message(
             } else {
                 0.0
             };
-            let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz (Phase 2)
+            let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz
+
+            let mixer = pl.mixer.lock();
+            let underruns = mixer.total_underruns();
+            let jitter_target_ms = mixer.mean_target_ms();
+            drop(mixer);
+
+            // Latence end-to-end estimée : capture + encode + decode + jitter + playback.
+            // Calculée ici (côté agent) pour éviter les double-comptages côté UI :
+            // les champs capture_latency_ms / playback_latency_ms / buffer_ms sont
+            // exposés séparément pour debug mais NE DOIVENT PAS être additionnés naïvement.
+            let total_latency_ms = if is_capturing {
+                buf_ms + opus_ms + opus_ms + jitter_target_ms + buf_ms
+            } else {
+                0.0
+            };
 
             vec![
                 AgentMessage::Status {
@@ -196,8 +227,10 @@ async fn handle_message(
                     capture_latency_ms: if is_capturing { buf_ms + opus_ms } else { 0.0 },
                     playback_latency_ms: if is_capturing { buf_ms } else { 0.0 },
                     buffer_ms: if is_capturing { buf_ms } else { 0.0 },
+                    jitter_target_ms,
+                    total_latency_ms,
                     streams: stream_count,
-                    underruns: 0,
+                    underruns,
                 },
             ]
         }
