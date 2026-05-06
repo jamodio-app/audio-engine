@@ -457,20 +457,35 @@ fn encoder_thread(
                             };
                             let packet = rtp::build_packet(&header, &opus_buf[..encoded_len]);
 
-                            // Non-blocking send to tokio. Si le canal sature
-                            // (CPU/réseau saturé côté task UDP), on log mais
-                            // on n'avance pas le timestamp non plus → le peer
-                            // verra un trou et son PLC remplira.
+                            // Non-blocking send to tokio. Distinguer Full vs
+                            // Closed pour ne pas polluer les logs en shutdown :
+                            // - Full   : task UDP saturée → vrai overload, warn.
+                            // - Closed : task UDP terminée (stop_capture) →
+                            //            attendu, debug only.
                             if let Err(e) = rtp_tx.try_send(packet) {
-                                static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if n == 0 || n.is_power_of_two() {
-                                    tracing::warn!(
-                                        target: "jamodio::encoder",
-                                        drop_count = n + 1,
-                                        error = ?e,
-                                        "RTP channel full — packet dropped (CPU/network overload?)"
-                                    );
+                                use tokio::sync::mpsc::error::TrySendError;
+                                match e {
+                                    TrySendError::Full(_) => {
+                                        static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                        let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n == 0 || n.is_power_of_two() {
+                                            tracing::warn!(
+                                                target: "jamodio::encoder",
+                                                drop_count = n + 1,
+                                                "RTP channel full — packet dropped (CPU/network overload?)"
+                                            );
+                                        }
+                                    }
+                                    TrySendError::Closed(_) => {
+                                        static CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                        let n = CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n == 0 {
+                                            tracing::debug!(
+                                                target: "jamodio::encoder",
+                                                "RTP channel closed — UDP task gone (post stop_capture)"
+                                            );
+                                        }
+                                    }
                                 }
                             }
 

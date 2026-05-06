@@ -6,6 +6,33 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-06
+
+### Auto-update — vraiment fonctionnel
+- **`bundle.createUpdaterArtifacts: true`** dans `tauri.conf.json`. Sans
+  ce flag (Tauri 2 par défaut `false`), le `.app.tar.gz.sig` n'était pas
+  généré → tauri-action skipait `latest.json` → l'updater côté agent ne
+  pouvait pas trouver de version à proposer. Diagnostic confirmé dans
+  les logs CI v0.1.5 :
+  > `Signature not found for the updater JSON. Skipping upload...`
+- À partir de cette release, le `latest.json` est publié avec la release
+  GitHub. Les agents 0.1.6+ vérifient et s'updatent automatiquement.
+
+### Logs — bruit éliminé pendant le shutdown
+- Distinction `Full` vs `Disconnected/Closed` dans les logs `try_send` :
+  - capture → encoder (`crossbeam_channel::TrySendError`)
+  - encoder → tokio mpsc (`tokio::sync::mpsc::error::TrySendError`)
+- Avant : milliers de warns parasites pendant ~45 s après stop_capture
+  (callback CPAL macOS continue à pousser après drop, le canal devient
+  Disconnected → on logguait "channel full" à tort).
+- Après : Disconnected/Closed = `debug` une seule fois (cas attendu de
+  shutdown). Full reste `warn` power-of-2 (vrai signal d'overload).
+
+### Note interne
+- Le bug "CPAL stream continue 45 s après drop sur macOS" reste à
+  investiguer (probablement besoin d'un `stream.pause()` explicite avant
+  drop). Pas critique pour le user, juste cosmétique.
+
 ## [0.1.5] — 2026-05-06
 
 ### Auto-update débloqué (BUG B mémoire `agent_release_checklist`)
@@ -135,7 +162,8 @@ Première release publique.
   la première ouverture (« Informations complémentaires » → « Exécuter
   quand même ») tant que la signature Authenticode n'est pas en place.
 
-[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.5
 [0.1.4]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.4
 [0.1.3]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.3

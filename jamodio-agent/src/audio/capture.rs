@@ -1,6 +1,6 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleRate, StreamConfig, BufferSize};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 
 /// Start capturing audio from the given device.
 /// Returns (stream, channels_captured). The number of channels is the hardware's
@@ -28,19 +28,37 @@ pub fn start_capture(
         &config,
         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
             // Send a copy of the audio samples to the encoder thread.
-            // Si l'encoder est saturé (canal bounded(64) plein), on log mais
-            // on drop le bloc — sinon on bloquerait le callback CPAL temps-réel.
-            if let Err(e) = sample_tx.try_send(data.to_vec()) {
-                static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n == 0 || n.is_power_of_two() {
-                    tracing::warn!(
-                        target: "jamodio::capture",
-                        drop_count = n + 1,
-                        samples_dropped = data.len(),
-                        error = ?e,
-                        "sample channel full — block dropped"
-                    );
+            // Deux cas d'erreur distincts à ne PAS confondre :
+            // - Full       : encoder saturé (CPU/IO surchargé) → vrai signal
+            //                d'overload qu'on veut voir → warn power-of-2.
+            // - Disconnected : l'encoder thread a quitté (stop_capture) →
+            //                attendu, mais le callback CPAL peut continuer à
+            //                pousser pendant quelques centaines de ms (drop
+            //                cpal::Stream est asynchrone côté CoreAudio) →
+            //                debug only, pas de pollution dans les logs.
+            match sample_tx.try_send(data.to_vec()) {
+                Ok(_) => {}
+                Err(TrySendError::Full(_)) => {
+                    static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 || n.is_power_of_two() {
+                        tracing::warn!(
+                            target: "jamodio::capture",
+                            drop_count = n + 1,
+                            samples_dropped = data.len(),
+                            "sample channel full — encoder thread saturé (CPU overload?)"
+                        );
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    static DISCONNECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = DISCONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        tracing::debug!(
+                            target: "jamodio::capture",
+                            "sample channel disconnected — CPAL still pushing post stop_capture (will stop soon)"
+                        );
+                    }
                 }
             }
         },
