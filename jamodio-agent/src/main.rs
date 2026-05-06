@@ -15,6 +15,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_updater::UpdaterExt;
 
 #[tauri::command]
 fn open_log_dir() -> Result<String, String> {
@@ -34,6 +35,71 @@ fn get_log_dir() -> String {
 #[tauri::command]
 fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Vérifie une éventuelle update via l'endpoint configuré dans
+/// tauri.conf.json (`updater` bloc), télécharge + installe + restart si
+/// dispo. Tout est silencieux — pas de prompt, pas de friction. Si l'user
+/// quitte avant la fin, l'update reprendra au prochain démarrage.
+async fn check_for_update(app: tauri::AppHandle) {
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(target: "jamodio::updater", error = %e, "updater unavailable");
+            return;
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            tracing::info!(
+                target: "jamodio::updater",
+                current = env!("CARGO_PKG_VERSION"),
+                available = %update.version,
+                "update available — downloading & installing"
+            );
+            let mut downloaded: u64 = 0;
+            let download_result = update
+                .download_and_install(
+                    |chunk_length, content_length| {
+                        downloaded += chunk_length as u64;
+                        if let Some(total) = content_length {
+                            tracing::debug!(
+                                target: "jamodio::updater",
+                                progress = format!("{}/{}", downloaded, total),
+                                "download progress"
+                            );
+                        }
+                    },
+                    || tracing::info!(target: "jamodio::updater", "download finished, installing"),
+                )
+                .await;
+
+            match download_result {
+                Ok(_) => {
+                    tracing::info!(target: "jamodio::updater", "update installed — restarting");
+                    app.restart();
+                }
+                Err(e) => tracing::error!(
+                    target: "jamodio::updater",
+                    error = %e,
+                    "download/install failed"
+                ),
+            }
+        }
+        Ok(None) => {
+            tracing::info!(
+                target: "jamodio::updater",
+                version = env!("CARGO_PKG_VERSION"),
+                "already on latest version"
+            );
+        }
+        Err(e) => tracing::warn!(
+            target: "jamodio::updater",
+            error = %e,
+            "update check failed (offline ? endpoint down ?)"
+        ),
+    }
 }
 
 fn main() {
@@ -63,6 +129,7 @@ fn main() {
             None,
         ))
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version])
         .setup(|app| {
             tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
@@ -117,6 +184,17 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 ws_server::start(pipeline).await;
+            });
+
+            // ─── Vérification d'update au boot ──────────────
+            // Endpoint + pubkey configurés dans tauri.conf.json (`updater` bloc).
+            // Délai de 5 s pour laisser le démarrage se finir avant de hit
+            // GitHub releases. Fire-and-forget : si l'install échoue ou si
+            // l'user n'a pas le réseau, on log et on n'embête pas l'utilisateur.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                check_for_update(app_handle).await;
             });
 
             Ok(())

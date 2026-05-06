@@ -6,6 +6,26 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-06
+
+### Auto-update débloqué (BUG B mémoire `agent_release_checklist`)
+- **`tauri-plugin-updater` ajouté** : le bloc `updater` de `tauri.conf.json`
+  était inerte depuis l'origine (plugin jamais installé). À partir de cette
+  release, l'agent vérifie au démarrage s'il y a une nouvelle version sur
+  GitHub releases et l'installe automatiquement (puis restart).
+- **Permission `updater:default`** ajoutée dans `capabilities/default.json`.
+- Check exécuté 5 s après le démarrage (laisse le boot se finir avant de
+  hit le réseau). Fire-and-forget, échec silencieux si offline.
+- Note : les binaires < 0.1.5 (déjà installés) n'ont PAS le plugin et ne se
+  mettront jamais à jour seuls. Le banner browser (côté jamodio.com) est le
+  filet pour ces users.
+
+### Protocole WS — détection version côté browser (BUG A mémoire)
+- `AgentMessage::Status` enrichi avec `version` / `os` / `arch`. Champs
+  optionnels (rétro-compatibilité). Le browser jamodio.com lit ces champs
+  au handshake pour afficher un banner "agent obsolète" sur les binaires
+  ≤ 0.1.4 qui n'envoient pas la version.
+
 ## [0.1.4] — 2026-05-06
 
 ### Audio — corrections audit pipeline (Sprints 1+2+3)
@@ -115,7 +135,8 @@ Première release publique.
   la première ouverture (« Informations complémentaires » → « Exécuter
   quand même ») tant que la signature Authenticode n'est pas en place.
 
-[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.5
 [0.1.4]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.4
 [0.1.3]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.3
 [0.1.0]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.0

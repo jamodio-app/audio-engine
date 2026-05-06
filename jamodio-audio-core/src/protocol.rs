@@ -77,6 +77,18 @@ pub enum AgentMessage {
     },
     Status {
         state: AgentState,
+        /// Version du binaire (CARGO_PKG_VERSION). Utilisée par le browser pour
+        /// détecter si l'agent est obsolète et afficher un banner "Mise à jour
+        /// disponible". Optionnel pour rester rétro-compatible avec d'éventuels
+        /// codes browser anciens qui ignorent les champs inconnus.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        /// `os` / `arch` côté agent — utiles pour debug à distance et pour le
+        /// banner browser (ex : suggérer le bon installer macOS ARM/Intel).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        os: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arch: Option<String>,
     },
     Stats {
         device: Option<String>,

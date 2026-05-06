@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
 
@@ -37,6 +37,10 @@ tauri-plugin-deep-link = "2"
 # Empêche un 2e process agent de démarrer (fix double-launch macOS/Windows).
 # Doit être enregistré AVANT deep-link cf. doc Tauri.
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# Auto-update via GitHub releases (config endpoint dans tauri.conf.json).
+# Sans ce plugin, le bloc `updater` de tauri.conf.json est inerte → les
+# users ne sont jamais notifiés (cf. mémoire agent_release_checklist).
+tauri-plugin-updater = "2"
 
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]

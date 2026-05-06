@@ -11,6 +11,19 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::audio::device;
 use crate::pipeline::PipelineState;
 
+/// Construit un `AgentMessage::Status` avec la version + OS + arch de l'agent.
+/// Centralisé ici pour ne pas dupliquer ces 3 champs à chaque site (init WS,
+/// reset après stop, retour de SelectDevices, etc.). Le browser lit ces champs
+/// pour afficher un banner "agent obsolète" si la version est en retard.
+fn make_status(state: AgentState) -> AgentMessage {
+    AgentMessage::Status {
+        state,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        os: Some(std::env::consts::OS.to_string()),
+        arch: Some(std::env::consts::ARCH.to_string()),
+    }
+}
+
 /// Start the localhost WebSocket server on port 9876.
 pub async fn start(pipeline: Arc<tokio::sync::Mutex<PipelineState>>) {
     let app = Router::new().route(
@@ -38,10 +51,8 @@ pub async fn start(pipeline: Arc<tokio::sync::Mutex<PipelineState>>) {
 async fn handle_connection(socket: WebSocket, pipeline: Arc<tokio::sync::Mutex<PipelineState>>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Send initial status
-    let status = AgentMessage::Status {
-        state: AgentState::Idle,
-    };
+    // Send initial status (avec version/os/arch — détection obsolescence côté browser)
+    let status = make_status(AgentState::Idle);
     let _ = ws_tx
         .send(Message::Text(serde_json::to_string(&status).unwrap()))
         .await;
@@ -119,9 +130,7 @@ async fn handle_message(
 
         BrowserMessage::SelectDevices { input_id, output_id } => {
             pipeline.lock().await.select_devices(input_id, output_id);
-            vec![AgentMessage::Status {
-                state: AgentState::Idle,
-            }]
+            vec![make_status(AgentState::Idle)]
         }
 
         BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, srtp_parameters } => {
@@ -219,9 +228,7 @@ async fn handle_message(
             };
 
             vec![
-                AgentMessage::Status {
-                    state: pl.state.clone(),
-                },
+                make_status(pl.state.clone()),
                 AgentMessage::Stats {
                     device: device_name,
                     capture_latency_ms: if is_capturing { buf_ms + opus_ms } else { 0.0 },
@@ -237,9 +244,7 @@ async fn handle_message(
 
         BrowserMessage::Stop => {
             pipeline.lock().await.stop_all();
-            vec![AgentMessage::Status {
-                state: AgentState::Idle,
-            }]
+            vec![make_status(AgentState::Idle)]
         }
     }
 }
