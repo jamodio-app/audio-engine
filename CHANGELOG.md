@@ -6,6 +6,40 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-05-07
+
+### Qualité audio — fin des clicks numériques sur sortie
+- **`JitterBuffer::push` : drop-oldest au lieu de truncation mid-paquet.**
+  Quand le ring est plein, on jette les samples les plus anciens (côté
+  consumer) pour faire la place au paquet entier. Avant, `push_slice`
+  partial-write coupait le paquet en deux côté producer → discontinuité
+  PCM mid-paquet = click numérique audible (`Max difference 0.336` sur
+  2 samples float détecté par ffmpeg astats sur l'enregistrement MIX du
+  2026-05-07 17h14 — 4500 overflows en 9 minutes, ~4 % de l'audio droppé).
+- **`JitterBuffer::pull` : drift drain pré-emptif.** Si le buffer dépasse
+  3 × `target_samples`, on draine les plus anciens samples pour ramener
+  à target. Sans ça, post-burst SFU ou drift d'horloge producer↔consumer,
+  le buffer pouvait rester à 80-90 ms indéfiniment → latence silencieuse
+  9× la cible + push-overflows en cascade au moindre nouveau jitter.
+- **Capacité ring 100 → 250 ms.** Marge confortable au-dessus du seuil
+  drift drain (3 × MAX_TARGET_MS = 120 ms) pour absorber les bursts SFU
+  sans drop. Coût RAM négligeable (~96 KB / stream). **N'AFFECTE PAS la
+  latence** : la latence est driven par `target_samples` (5-40 ms), pas
+  par `capacity_ms`.
+- **Diagnostic SR mismatch device output.** Warn explicite à `start_playback`
+  si la SR native du device ≠ 48 kHz (ex. casque jack Mac 44.1, BlackHole
+  2ch). CoreAudio fait alors un resampling implicite de qualité variable.
+  Aide le diag en cas de glitches résiduels.
+- Nouveaux compteurs `overflow_drops` / `drift_drops` exposés sur le jitter
+  buffer + warns rate-limited (puissances de 2) côté `mixer.rs`. Plus de
+  spam `full_count=4500` toutes les ms — un événement = un log.
+
+### Latence préservée
+Le budget ear-to-ear < 25 ms n'est pas affecté : `target_ms` (10 ms init,
+5-40 range) inchangé, `opusPtime` 2.5 ms inchangé. Les fixes corrigent la
+qualité audio **sans ajouter** de latence — le drift drain ramène
+activement vers la cible quand un burst l'a fait dériver.
+
 ## [0.1.6] — 2026-05-06
 
 ### Auto-update — vraiment fonctionnel
@@ -162,7 +196,8 @@ Première release publique.
   la première ouverture (« Informations complémentaires » → « Exécuter
   quand même ») tant que la signature Authenticode n'est pas en place.
 
-[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.7
 [0.1.6]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.5
 [0.1.4]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.4

@@ -18,7 +18,13 @@ struct StreamState {
     jitter: JitterBuffer,
     volume: f32,
     rms: f32,
+    /// Snapshot du `overflow_drops` du jitter au précédent push, pour ne
+    /// loguer que sur événement (rate-limited via puissance de 2).
+    last_overflow_drops: u64,
     buffer_full_count: u64,
+    /// Idem pour le drift drain (pull-side).
+    last_drift_drops: u64,
+    drift_drain_count: u64,
 }
 
 impl AudioMixer {
@@ -40,7 +46,10 @@ impl AudioMixer {
             jitter,
             volume: 1.0,
             rms: 0.0,
+            last_overflow_drops: 0,
             buffer_full_count: 0,
+            last_drift_drops: 0,
+            drift_drain_count: 0,
         });
     }
 
@@ -62,6 +71,11 @@ impl AudioMixer {
     }
 
     /// Push decoded samples into a stream's jitter buffer.
+    ///
+    /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).
+    /// Ici on rate-limit le warn sur l'INCRÉMENT de `overflow_drops` pour ne
+    /// pas spammer (1 stream * 400 pkt/s en burst peut générer beaucoup
+    /// d'événements).
     pub fn push_samples(&mut self, producer_id: &str, samples: &[f32]) {
         if let Some(stream) = self.streams.get_mut(producer_id) {
             // Compute RMS of pushed samples
@@ -70,18 +84,21 @@ impl AudioMixer {
                 stream.rms = (sum_sq / samples.len() as f32).sqrt();
             }
 
-            let pushed = stream.jitter.push(samples);
-            if pushed < samples.len() {
+            stream.jitter.push(samples);
+
+            let new_drops = stream.jitter.overflow_drops();
+            if new_drops > stream.last_overflow_drops {
                 stream.buffer_full_count += 1;
-                if stream.buffer_full_count == 1 || stream.buffer_full_count % 100 == 0 {
+                if stream.buffer_full_count == 1 || stream.buffer_full_count.is_power_of_two() {
                     tracing::warn!(
                         target: "jamodio::mixer",
                         producer = &producer_id[..8.min(producer_id.len())],
-                        full_count = stream.buffer_full_count,
-                        dropped = samples.len() - pushed,
-                        "jitter buffer full — samples dropped"
+                        events = stream.buffer_full_count,
+                        oldest_dropped_total = new_drops,
+                        "jitter buffer overflow — oldest samples dropped (burst SFU?)"
                     );
                 }
+                stream.last_overflow_drops = new_drops;
             }
         } else {
             tracing::warn!(
@@ -89,6 +106,29 @@ impl AudioMixer {
                 producer = &producer_id[..8.min(producer_id.len())],
                 "push_samples on unknown stream"
             );
+        }
+    }
+
+    /// Surveille les drift-drains (samples jetés côté pull pour borner la
+    /// latence) après un mix. Appelé depuis `mix_into` à la fin du tour pour
+    /// ne pas faire de logging coûteux dans le hot path callback CPAL.
+    fn report_drift_drops(&mut self) {
+        for (producer_id, stream) in self.streams.iter_mut() {
+            let new_drops = stream.jitter.drift_drops();
+            if new_drops > stream.last_drift_drops {
+                stream.drift_drain_count += 1;
+                if stream.drift_drain_count == 1 || stream.drift_drain_count.is_power_of_two() {
+                    tracing::warn!(
+                        target: "jamodio::mixer",
+                        producer = &producer_id[..8.min(producer_id.len())],
+                        events = stream.drift_drain_count,
+                        drained_total = new_drops,
+                        target_ms = stream.jitter.target_ms(),
+                        "jitter buffer drift drain — latence excessive ramenée à target"
+                    );
+                }
+                stream.last_drift_drops = new_drops;
+            }
         }
     }
 
@@ -125,6 +165,10 @@ impl AudioMixer {
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
+
+        // Report drift drains (rate-limité à puissances de 2). Coût formatage
+        // négligeable hors événement (1 if + un getter atomic-free par stream).
+        self.report_drift_drops();
     }
 
     /// RMS level per stream (for VU meters sent to browser).

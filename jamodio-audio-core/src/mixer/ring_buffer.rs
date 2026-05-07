@@ -12,6 +12,13 @@ pub struct JitterBuffer {
     /// paquet RTP n'arrive) et la rafale d'underruns après un burst de jitter.
     /// Repasse à false sur underrun → ré-attente d'un buffer plein.
     primed: bool,
+    /// Nombre cumulé de samples les plus anciens jetés côté `push` quand le
+    /// ring est plein (burst SFU + drift d'horloge). Reporting via getter.
+    overflow_drops: u64,
+    /// Nombre cumulé de samples drainés côté `pull` quand le buffer s'est
+    /// rempli durablement bien au-dessus de `target_samples` (drift drain
+    /// pré-emptif pour borner la latence post-burst).
+    drift_drops: u64,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -19,7 +26,15 @@ const CHANNELS: usize = 2;
 const MIN_TARGET_MS: usize = 5;
 const MAX_TARGET_MS: usize = 40;
 const INITIAL_TARGET_MS: usize = 10;
-const CAPACITY_MS: usize = 100;
+/// Capacité du ring buffer, en ms d'audio stéréo. Marge confortable au-dessus
+/// de MAX_TARGET_MS (40) ET du seuil de drift-drain (3×target = 120 ms max)
+/// pour absorber les bursts SFU sans truncation. Coût RAM : ~96 KB / stream.
+const CAPACITY_MS: usize = 250;
+/// Seuil hystérèse de drift-drain : si le buffer dépasse `DRIFT_DRAIN_FACTOR
+/// × target_samples`, on draine les plus anciens samples pour ramener à
+/// target. Borne la latence après un burst (sinon le buffer reste à 80-90 ms
+/// indéfiniment sous l'effet de la dérive d'horloge producer↔consumer).
+const DRIFT_DRAIN_FACTOR: usize = 3;
 
 impl JitterBuffer {
     pub fn new() -> Self {
@@ -34,12 +49,32 @@ impl JitterBuffer {
             underruns: 0,
             last_adapt: std::time::Instant::now(),
             primed: false,
+            overflow_drops: 0,
+            drift_drops: 0,
         }
     }
 
     /// Push decoded PCM samples (interleaved stereo f32).
-    pub fn push(&mut self, samples: &[f32]) -> usize {
-        self.producer.push_slice(samples)
+    ///
+    /// Politique d'overflow : si le ring est plein, on jette les samples
+    /// LES PLUS ANCIENS (côté consumer) pour faire de la place — pas de
+    /// truncation mid-paquet. Sans ça, `push_slice` partial-write coupait
+    /// le paquet en deux côté producer → discontinuité PCM mid-paquet =
+    /// click numérique audible (Max difference ~0.3 sur 2 samples f32
+    /// détecté par ffmpeg astats).
+    ///
+    /// Le drop-oldest préserve l'audio le plus récent (=> latence minimale)
+    /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
+    /// audiblement moins violent qu'une coupure mid-paquet.
+    pub fn push(&mut self, samples: &[f32]) {
+        let needed = samples.len();
+        let vacant = self.producer.vacant_len();
+        if vacant < needed {
+            let to_drop = needed - vacant;
+            let dropped = self.consumer.skip(to_drop);
+            self.overflow_drops += dropped as u64;
+        }
+        self.producer.push_slice(samples);
     }
 
     /// Pull samples for playback.
@@ -51,6 +86,14 @@ impl JitterBuffer {
     /// pull retourne du silence → silence permanent au démarrage. Sur
     /// underrun on repasse à false pour ré-attendre un buffer plein avant
     /// de reprendre le playout.
+    ///
+    /// Drift drain : si le buffer s'est rempli durablement bien au-dessus
+    /// de `target_samples` (>= 3× target), on draine les plus anciens
+    /// samples pour ramener à target_samples. Sans ça, post-burst SFU ou
+    /// drift d'horloge producer→consumer, le buffer peut rester à 80-90 ms
+    /// indéfiniment → latence silencieuse 9× la cible + push-overflows
+    /// permanents au moindre nouveau jitter. Une seule discontinuité
+    /// audible vaut mieux qu'un buffer dégradé en permanence.
     pub fn pull(&mut self, output: &mut [f32]) -> usize {
         let available = self.consumer.occupied_len();
 
@@ -62,6 +105,18 @@ impl JitterBuffer {
                 return 0;
             }
         }
+
+        // Drift drain (uniquement quand primed → on n'interfère pas avec
+        // le pre-fill au démarrage).
+        let drain_threshold = DRIFT_DRAIN_FACTOR * self.target_samples;
+        let available = if available > drain_threshold {
+            let to_drop = available - self.target_samples;
+            let dropped = self.consumer.skip(to_drop);
+            self.drift_drops += dropped as u64;
+            self.consumer.occupied_len()
+        } else {
+            available
+        };
 
         let needed = output.len();
         if available >= needed {
@@ -100,6 +155,17 @@ impl JitterBuffer {
 
     pub fn underruns(&self) -> u64 {
         self.underruns
+    }
+
+    /// Cumul des samples plus-anciens jetés à `push` quand le ring était plein.
+    pub fn overflow_drops(&self) -> u64 {
+        self.overflow_drops
+    }
+
+    /// Cumul des samples drainés à `pull` quand le buffer dépassait 3× target
+    /// (correction de drift / post-burst).
+    pub fn drift_drops(&self) -> u64 {
+        self.drift_drops
     }
 
     fn adapt_up(&mut self) {
