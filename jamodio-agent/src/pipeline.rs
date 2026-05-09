@@ -24,6 +24,41 @@ struct SendStream(#[allow(dead_code)] cpal::Stream);
 // We never call methods on it from another thread, only drop it.
 unsafe impl Send for SendStream {}
 
+/// Erreur typée renvoyée par `start_capture`. Permet à `ws_server` de
+/// différencier un device introuvable (= `CaptureError` côté wire) d'une
+/// erreur technique générique (= `Error` côté wire).
+#[derive(Debug)]
+pub enum CaptureStartError {
+    /// Le device demandé (ou le default si aucun id) n'a pas été trouvé.
+    /// Le `requested` est l'id transmis par le browser (None si aucun).
+    InputDeviceNotFound { requested: Option<String> },
+    OutputDeviceNotFound { requested: Option<String> },
+    /// Erreur technique : SFU, UDP, encoder, etc.
+    Other(String),
+}
+
+impl std::fmt::Display for CaptureStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputDeviceNotFound { requested } => {
+                write!(f, "input device introuvable : {:?}", requested)
+            }
+            Self::OutputDeviceNotFound { requested } => {
+                write!(f, "output device introuvable : {:?}", requested)
+            }
+            Self::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Détails d'un device input ouvert avec succès — renvoyés au browser via
+/// `CaptureStarted` pour confirmation explicite.
+pub struct CaptureStartedInfo {
+    pub device_id: String,
+    pub device_name: String,
+    pub channels: u16,
+}
+
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
 pub struct PipelineState {
     pub mixer: Arc<Mutex<AudioMixer>>,
@@ -34,9 +69,11 @@ pub struct PipelineState {
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive tasks.
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
-    /// Selected devices
-    input_device_name: Option<String>,
-    output_device_name: Option<String>,
+    /// Selected devices : ids stricts au format `"{idx}:{name}"` produits par
+    /// `device::list_inputs/outputs`. Le browser stocke et renvoie EXACTEMENT
+    /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
+    input_device_id: Option<String>,
+    output_device_id: Option<String>,
     /// State
     pub state: AgentState,
     /// Buffer size in samples (set when capture starts)
@@ -55,20 +92,19 @@ impl PipelineState {
             playback_stream: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
-            input_device_name: None,
-            output_device_name: None,
+            input_device_id: None,
+            output_device_id: None,
             state: AgentState::Idle,
             buffer_samples: 0,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
-    /// Set ONLY the input device, preserving the current output_device_name.
-    /// Évite le bug où start-capture appelait select_devices(input, None) et
-    /// écrasait à None l'output précédemment configuré (= silent fallback
-    /// sur le device par défaut système au lieu du device choisi par le user).
+    /// Set the input device id (format `"{idx}:{name}"`). `None` = utiliser
+    /// le default système au prochain start_capture (uniquement si le browser
+    /// n'a jamais sélectionné).
     pub fn set_input_device(&mut self, input: Option<String>) {
-        self.input_device_name = input;
+        self.input_device_id = input;
     }
 
     pub fn select_devices(&mut self, input: Option<String>, output: Option<String>) {
@@ -76,9 +112,9 @@ impl PipelineState {
         // Sans ça, modifier la sortie audio dans les settings n'a aucun effet
         // tant qu'on ne quitte/rejoint pas la session (le stream CPAL est
         // démarré une fois dans start_capture et jamais touché ensuite).
-        let output_changed = self.output_device_name != output;
-        self.input_device_name = input;
-        self.output_device_name = output;
+        let output_changed = self.output_device_id != output;
+        self.input_device_id = input;
+        self.output_device_id = output;
         if output_changed && self.playback_stream.is_some() {
             self.restart_playback();
         }
@@ -89,11 +125,19 @@ impl PipelineState {
     /// le ring buffer continue d'accumuler côté décodeur pendant la transition.
     fn restart_playback(&mut self) {
         use cpal::traits::DeviceTrait;
-        let Some(out_device) = crate::audio::device::get_output_device(self.output_device_name.as_deref()) else {
+        // Output : si un id est sélectionné, on l'utilise strictement. Sinon
+        // (browser n'a jamais sélectionné — flow normal vu qu'on délègue à
+        // l'OS) on prend le default système. Pas de hybrid id-then-default :
+        // un id explicite échoué = erreur claire, pas de silent fallback.
+        let out_device_opt = match self.output_device_id.as_deref() {
+            Some(id) => crate::audio::device::get_output_device(id),
+            None => crate::audio::device::default_output_device().map(|(d, _)| d),
+        };
+        let Some(out_device) = out_device_opt else {
             tracing::warn!(
                 target: "jamodio::pipeline",
-                requested = ?self.output_device_name,
-                "output device introuvable, fallback default au prochain frame"
+                requested = ?self.output_device_id,
+                "output device introuvable — playback désactivé jusqu'à nouvelle sélection"
             );
             self.playback_stream.take();
             return;
@@ -117,13 +161,12 @@ impl PipelineState {
         }
     }
 
-    /// Return the currently selected (or default) input device name.
-    pub fn selected_input_name(&self) -> Option<String> {
-        if let Some(ref name) = self.input_device_name {
-            return Some(name.clone());
-        }
-        // Fallback to default device name
-        crate::audio::device::default_input_name()
+    /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
+    /// sinon l'id du default système. Utilisé uniquement pour les Stats UI
+    /// (pas un point de résolution de capture — le start_capture fait sa
+    /// propre résolution stricte).
+    pub fn selected_input_id(&self) -> Option<String> {
+        self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
     }
 
     /// Start the capture pipeline: CPAL → accumulator → Opus → RTP → UDP.
@@ -141,49 +184,69 @@ impl PipelineState {
         payload_type: u8,
         channel_index: Option<u8>,
         sfu_srtp: SrtpParameters,
-    ) -> Result<(u16, SrtpParameters), String> {
-        // Stop any existing capture
+    ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
+        use cpal::traits::DeviceTrait;
+
+        // 1. RÉSOUDRE LE DEVICE D'ABORD — avant de toucher quoi que ce soit
+        // d'autre. Si le device demandé n'existe pas, on échoue tout de suite,
+        // proprement, sans avoir stoppé une capture en cours ni alloué un
+        // socket UDP. Comportement strict : l'id du browser DOIT pointer sur
+        // un device courant. Aucun fallback default.
+        let input_id = self.input_device_id.clone();
+        let input_device = match input_id.as_deref() {
+            Some(id) => crate::audio::device::get_input_device(id),
+            None => {
+                // Premier lancement, browser n'a rien sélectionné : on prend
+                // le default système (uniquement dans ce cas-là).
+                crate::audio::device::default_input_id()
+                    .as_deref()
+                    .and_then(crate::audio::device::get_input_device)
+            }
+        };
+        let Some(device) = input_device else {
+            return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
+        };
+        let in_name = device.name().unwrap_or_default();
+        // L'id qu'on rapporte est celui demandé (si présent) ou celui du
+        // default résolu — toujours au format `{idx}:{name}` pour cohérence.
+        let resolved_input_id = input_id.unwrap_or_else(|| {
+            crate::audio::device::default_input_id().unwrap_or_else(|| in_name.clone())
+        });
+
+        // Stop any existing capture (only after device resolved successfully)
         self.stop_capture();
 
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
-            .map_err(|e| format!("Bad SFU address: {}", e))?;
+            .map_err(|e| CaptureStartError::Other(format!("Bad SFU address: {}", e)))?;
 
-        // 1. Create SRTP context: nos clés (TX, à transmettre au SFU) + clés SFU (RX).
+        // 2. Create SRTP context: nos clés (TX, à transmettre au SFU) + clés SFU (RX).
         let agent_srtp = SrtpParameters::generate_aead_aes_256_gcm();
-        let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp)?);
+        let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp).map_err(CaptureStartError::Other)?);
 
-        // 2. Create UDP sender (chiffre via le contexte SRTP).
+        // 3. Create UDP sender (chiffre via le contexte SRTP).
         let sender = RtpSender::new(sfu_addr, srtp_ctx)
             .await
-            .map_err(|e| format!("UDP bind: {}", e))?;
-        let local_port = sender.local_addr().map_err(|e| format!("{}", e))?.port();
+            .map_err(|e| CaptureStartError::Other(format!("UDP bind: {}", e)))?;
+        let local_port = sender.local_addr().map_err(|e| CaptureStartError::Other(format!("{}", e)))?.port();
 
         // Pas de punch ici : le 1er paquet audio chiffré (sous 10 ms) sert de punch
         // pour comedia. Un punch en clair serait rejeté par le SFU (enableSrtp:true).
 
-        // 2. Channel: CPAL callback → accumulator thread
+        // 4. Channels
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
-
-        // 3. Channel: encoder thread → tokio UDP sender task
         let (rtp_tx, mut rtp_rx) = tokio_mpsc::channel::<Vec<u8>>(64);
-
-        // 4. Input RMS tracking
         let input_rms = self.input_rms.clone();
-
-        // 5. Encoder stop signal
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
-        // 6. Start CPAL input stream (avant le thread encodeur : on doit connaître
-        //    le nombre réel de canaux physiques pour splitter correctement).
-        let device = crate::audio::device::get_input_device(self.input_device_name.as_deref())
-            .ok_or("No input device found")?;
-        use cpal::traits::DeviceTrait;
-        let in_name = device.name().unwrap_or_default();
+        // 5. Start CPAL input stream (le device est déjà résolu, ici on
+        //    ouvre seulement le stream — toute erreur ici est technique
+        //    pure (driver, sample-rate impossible, etc.), pas une erreur
+        //    de sélection user).
         tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
         let (stream, channels_in) = crate::audio::capture::start_capture(&device, sample_tx)
-            .map_err(|e| format!("CPAL input: {}", e))?;
+            .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
         self.capture_stream = Some(SendStream(stream));
         tracing::info!(target: "jamodio::pipeline", channels_in, ?channel_index, "input config");
 
@@ -200,15 +263,15 @@ impl PipelineState {
             }
         });
 
-        // 7. Spawn encoder thread (std thread, not tokio — real-time audio)
+        // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
                 encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel);
             })
-            .map_err(|e| format!("Spawn encoder: {}", e))?;
+            .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 8. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to)
+        // 7. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to)
         let sender = Arc::new(sender);
         tokio::spawn({
             let sender = sender.clone();
@@ -219,15 +282,22 @@ impl PipelineState {
             }
         });
 
-        // 9. Start CPAL output stream (playback) if not already running
+        // 8. Start CPAL output stream (playback) if not already running.
+        //    Output : id explicite si défini, sinon default système (pas de
+        //    fallback hybrid : un id explicite échoué est une erreur claire).
         if self.playback_stream.is_none() {
-            let out_device = crate::audio::device::get_output_device(self.output_device_name.as_deref())
-                .ok_or("No output device found")?;
-            use cpal::traits::DeviceTrait;
+            let out_id = self.output_device_id.clone();
+            let out_device_opt = match out_id.as_deref() {
+                Some(id) => crate::audio::device::get_output_device(id),
+                None => crate::audio::device::default_output_device().map(|(d, _)| d),
+            };
+            let Some(out_device) = out_device_opt else {
+                return Err(CaptureStartError::OutputDeviceNotFound { requested: out_id });
+            };
             let out_name = out_device.name().unwrap_or_default();
             tracing::info!(target: "jamodio::pipeline", device = %out_name, "output device opened");
             let out_stream = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
-                .map_err(|e| format!("CPAL output: {}", e))?;
+                .map_err(|e| CaptureStartError::Other(format!("CPAL output: {}", e)))?;
             self.playback_stream = Some(SendStream(out_stream));
         }
 
@@ -237,9 +307,16 @@ impl PipelineState {
             target: "jamodio::pipeline",
             sfu = format!("{}:{}", sfu_ip, sfu_port),
             local_port,
+            device = %in_name,
+            channels = channels_in,
             "capture started (SRTP)"
         );
-        Ok((local_port, agent_srtp))
+        let info = CaptureStartedInfo {
+            device_id: resolved_input_id,
+            device_name: in_name,
+            channels: channels_in,
+        };
+        Ok((local_port, agent_srtp, info))
     }
 
     /// Add a receive pipeline for one remote stream.
@@ -288,10 +365,15 @@ impl PipelineState {
             recv_decode_task(receiver, sfu_addr, producer_id, mixer, stop_rx).await;
         });
 
-        // Start playback if not running
+        // Start playback if not running. Output : id explicite si défini,
+        // sinon default système. Pas de fallback silencieux sur le default
+        // si un id explicite échoue.
         if self.playback_stream.is_none() {
-            let out_device = crate::audio::device::get_output_device(self.output_device_name.as_deref())
-                .ok_or("No output device found")?;
+            let out_device_opt = match self.output_device_id.as_deref() {
+                Some(id) => crate::audio::device::get_output_device(id),
+                None => crate::audio::device::default_output_device().map(|(d, _)| d),
+            };
+            let out_device = out_device_opt.ok_or("output device introuvable")?;
             let out_stream = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
                 .map_err(|e| format!("CPAL output: {}", e))?;
             self.playback_stream = Some(SendStream(out_stream));

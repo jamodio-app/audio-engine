@@ -392,23 +392,59 @@ async fn handle_message(
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];
             };
-            // Le browser peut passer le device directement dans start-capture
+            // Le browser passe l'id du device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
-            // ⚠ Bug fix : utiliser set_input_device() au lieu de select_devices(_, None)
-            //   qui écrasait à None l'output_device_name précédemment configuré
-            //   → fallback sur device par défaut système (Mac speakers).
+            // L'id est strict ({idx}:{name}) — pas de fuzzy, pas de fallback.
+            // ⚠ Bug fix : set_input_device() (pas select_devices) pour ne pas
+            // écraser l'output_device_id précédemment configuré.
             if input_device.is_some() {
-                pl.set_input_device(input_device);
+                pl.set_input_device(input_device.clone());
             }
             match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
-                Ok((local_port, agent_srtp)) => {
-                    vec![AgentMessage::LocalPort {
-                        producer_id: String::new(),
-                        port: local_port,
-                        srtp_parameters: agent_srtp,
+                Ok((local_port, agent_srtp, info)) => {
+                    // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
+                    // CaptureStarted (confirmation explicite côté browser
+                    // que le device demandé est bien celui ouvert).
+                    vec![
+                        AgentMessage::LocalPort {
+                            producer_id: String::new(),
+                            port: local_port,
+                            srtp_parameters: agent_srtp,
+                        },
+                        AgentMessage::CaptureStarted {
+                            device_id: info.device_id,
+                            device_name: info.device_name,
+                            channels: info.channels,
+                        },
+                    ]
+                }
+                Err(crate::pipeline::CaptureStartError::InputDeviceNotFound { requested }) => {
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        ?requested,
+                        "StartCapture rejected: input device not found"
+                    );
+                    vec![AgentMessage::CaptureError {
+                        reason: "input-device-not-found".into(),
+                        requested_device: requested,
+                        detail: None,
                     }]
                 }
-                Err(e) => vec![AgentMessage::Error { message: e }],
+                Err(crate::pipeline::CaptureStartError::OutputDeviceNotFound { requested }) => {
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        ?requested,
+                        "StartCapture rejected: output device not found"
+                    );
+                    vec![AgentMessage::CaptureError {
+                        reason: "output-device-not-found".into(),
+                        requested_device: requested,
+                        detail: None,
+                    }]
+                }
+                Err(crate::pipeline::CaptureStartError::Other(msg)) => {
+                    vec![AgentMessage::Error { message: msg }]
+                }
             }
         }
 
@@ -466,7 +502,11 @@ async fn handle_message(
             };
             let is_capturing = matches!(pl.state, AgentState::Capturing);
             let stream_count = pl.recv_stops.len();
-            let device_name = pl.selected_input_name();
+            // L'UI agent affiche le nom lisible (pas l'id complet `{idx}:{name}`).
+            // On extrait la part nom de l'id sélectionné.
+            let device_name = pl.selected_input_id().and_then(|id| {
+                id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id))
+            });
 
             // Real latency from CPAL buffer: samples / 48000 * 1000
             let buf_ms = if is_capturing {

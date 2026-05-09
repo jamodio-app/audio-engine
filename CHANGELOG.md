@@ -6,6 +6,57 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-05-07
+
+### Strict device identification — fin des silent fallbacks
+
+Suite session avec un peer (Scarlett 4th Gen, agent connecté mais signal
+absent côté autre peer ; symptôme « son OK avec BlackHole, pas avec
+Scarlett ») : la sélection « Scarlett Solo USB » dans Settings ne tombait
+pas toujours sur le bon device CPAL, et l'agent fallbackait silencieusement
+sur le default système (= mic interne du Mac, qui ne capture rien).
+
+**Fix racine — pas d'approximation possible** :
+
+- **Id stable et unique par device** (`{index}:{name}`).
+  CPAL n'expose pas d'id stable plateforme ; on génère un id composite à
+  l'enumeration. L'index disambigue les noms dupliqués (deux dongles USB
+  génériques étiquetés pareil). Le browser stocke et renvoie EXACTEMENT
+  cet id ; au resolve, l'agent vérifie que l'index pointe toujours sur un
+  device au même nom.
+
+- **`get_input_device(id)` strict** : parse l'id, récupère le device à
+  cet index, vérifie le nom. Si quoi que ce soit ne match pas (index hors
+  borne, hot-plug entre Settings et StartCapture, format d'id inconnu) →
+  `None` propagé en erreur explicite. **Suppression du fuzzy match et du
+  fallback `host.default_input_device()`**. Idem pour l'output.
+
+- **Nouveaux messages protocol** :
+  - `CaptureStarted { deviceId, deviceName, channels }` — confirmation
+    explicite à chaque démarrage capture, le browser peut afficher
+    « Capture active sur : Scarlett Solo USB ».
+  - `CaptureError { reason, requestedDevice, detail }` — si le device
+    demandé est introuvable. Le browser doit afficher un toast bloquant
+    et forcer l'ouverture de Settings (jamais de session muette
+    silencieuse).
+
+- **Erreur typée `CaptureStartError`** côté pipeline.rs (variants
+  InputDeviceNotFound / OutputDeviceNotFound / Other) — le ws_server peut
+  router vers le bon message wire selon la cause.
+
+- **Resolution input avant tout side-effect** : la résolution device se
+  fait AVANT le `stop_capture()` et l'allocation du socket UDP. Si le
+  device est introuvable, on échoue tout de suite, sans perturber l'état
+  pipeline existant.
+
+### Audit des fallbacks restants
+
+- Output : si le browser n'a pas explicitement sélectionné d'id (`None`),
+  on prend le `default_output_device()` système — c'est conforme à la
+  décision audio_output_decision (sortie déléguée à l'OS, pas de picker
+  côté browser). Mais si un id explicite est sélectionné et qu'il échoue,
+  on renvoie `OutputDeviceNotFound` — pas de fallback hybride.
+
 ## [0.2.1] — 2026-05-09
 
 ### Hotfix — UI Tauri webview à nouveau visible

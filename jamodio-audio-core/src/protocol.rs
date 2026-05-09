@@ -171,6 +171,33 @@ pub enum AgentMessage {
     Error {
         message: String,
     },
+    /// Confirmation explicite de la capture démarrée. Permet au browser de
+    /// vérifier que le device ouvert correspond bien à celui demandé.
+    /// Pas de fallback silencieux : si on est ici, le device demandé EST
+    /// celui ouvert (cf. CaptureError pour le cas inverse).
+    CaptureStarted {
+        /// Id complet du device tel que renvoyé par GetDevices (`{idx}:{name}`).
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        /// Nom lisible du device (= la part après `:` de l'id).
+        #[serde(rename = "deviceName")]
+        device_name: String,
+        /// Nombre de canaux physiques effectivement ouverts.
+        channels: u16,
+    },
+    /// Erreur explicite quand la capture ne peut pas démarrer parce que le
+    /// device demandé n'est pas trouvé. Plus de silent fallback to default :
+    /// le browser doit afficher un toast et forcer l'ouverture de Settings.
+    CaptureError {
+        /// "device-not-found" | "io-error" | autre (extensible).
+        reason: String,
+        /// Id ou nom demandé par le browser (pour message UI).
+        #[serde(rename = "requestedDevice")]
+        requested_device: Option<String>,
+        /// Détail technique facultatif (logs/debug).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// Agent reports the local UDP port + SRTP keys.
     /// Le browser doit relayer `srtpParameters` au SFU via `connect-plain-transport`
     /// (clés agent → SFU pour le déchiffrement côté SFU).
@@ -196,7 +223,15 @@ pub struct StreamLevel {
 
 #[derive(Debug, Serialize)]
 pub struct AudioDevice {
+    /// Identifiant stable au sein d'une enumeration : `"{index}:{name}"`.
+    /// L'index disambigue les devices à nom identique (deux cartes USB
+    /// génériques étiquetées pareil). Le browser stocke et renvoie
+    /// EXACTEMENT cet id dans StartCapture / SelectDevices — l'agent
+    /// vérifie au moment du resolve que l'index pointe toujours sur un
+    /// device au même nom (sinon → CaptureError, JAMAIS de fallback
+    /// silencieux sur un autre device).
     pub id: String,
+    /// Nom lisible affiché à l'UI (déduit aussi de l'id si besoin).
     pub name: String,
     #[serde(rename = "isDefault")]
     pub is_default: bool,
