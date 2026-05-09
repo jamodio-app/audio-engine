@@ -26,12 +26,16 @@ const LOCK_TIMEOUT_MS: u64 = 200;
 ///   - https://jamodio.com (prod)
 ///   - https://*.vercel.app (preview branches)
 ///   - http://localhost:* / http://127.0.0.1:* (dev local + browser-side dev)
-///   - file:// (cas Tauri webview embedded — agent peut être appelé depuis sa
-///     propre webview interne)
+///   - tauri://localhost ou http://tauri.localhost (UI WEBVIEW INTERNE
+///     de l'agent — Tauri 2 sert sa webview sous ces schemes selon l'OS).
+///     Cf. is_internal_client() qui bypass la single-client policy pour ces
+///     origins, car la webview interne est un client légitime en plus du
+///     browser jamodio.com (lecture-seule des stats, pas de race possible).
+///   - file:// (cas webview embedded historique)
 ///   - Origin absent (clients "raw" comme tests CLI) — toléré, log warn
 ///
 /// Empêche une page web random sur localhost:1234 de piloter l'agent
-/// silencieusement. Si on veut renforcer plus tard : exiger un token rotatif.
+/// silencieusement.
 fn origin_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else {
         // Origin absent : clients non-browser (tests). On tolère mais on log.
@@ -42,7 +46,20 @@ fn origin_allowed(origin: Option<&str>) -> bool {
         || origin.ends_with(".vercel.app")
         || origin.starts_with("http://localhost:")
         || origin.starts_with("http://127.0.0.1:")
+        || is_internal_client_origin(origin)
         || origin == "file://"
+}
+
+/// Vrai si l'origin correspond à la webview interne de l'agent Tauri.
+/// Ces clients sont en LECTURE SEULE (UI dashboard) et bypass la
+/// single-client policy : la webview reste connectée même si le browser
+/// jamodio.com l'est aussi. Tauri 2 utilise des schemes différents selon
+/// l'OS, on accepte les variantes courantes.
+fn is_internal_client_origin(origin: &str) -> bool {
+    origin == "tauri://localhost"
+        || origin == "http://tauri.localhost"
+        || origin.starts_with("tauri://")
+        || origin.starts_with("http://tauri.localhost")
 }
 
 /// Construit un `AgentMessage::Status` avec la version + OS + arch de l'agent.
@@ -131,7 +148,12 @@ pub async fn start(handle: WsServerHandle) {
                         "WS upgrade with no Origin header (raw client?)"
                     );
                 }
-                ws.on_upgrade(move |socket| handle_connection(socket, handle))
+                // Le flag is_internal détermine si la connexion bypass la
+                // single-client policy (UI Tauri webview = lecture seule).
+                let is_internal = origin
+                    .map(|o| is_internal_client_origin(o))
+                    .unwrap_or(false);
+                ws.on_upgrade(move |socket| handle_connection(socket, handle, is_internal))
                     .into_response()
             }
         }),
@@ -151,32 +173,37 @@ pub async fn start(handle: WsServerHandle) {
     }
 }
 
-async fn handle_connection(socket: WebSocket, handle: WsServerHandle) {
+async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_internal: bool) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Single-client policy : si une WS est déjà active, rejeter celle-ci.
-    // Évite les races sur le shared PipelineState (cf. audit Bloc 1+5).
+    // Single-client policy : si une WS NON-INTERNE est déjà active, rejeter
+    // celle-ci. Évite les races sur le shared PipelineState (2 onglets browser
+    // qui se battent pour StartCapture). Les clients internes (UI Tauri webview)
+    // sont autorisés en parallèle car ils sont lecture-seule (get-stats).
+    //
     // compare_exchange : atomique, pas de race entre 2 connexions concurrentes.
-    if handle
-        .client_active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        tracing::warn!(
-            target: "jamodio::ws",
-            "rejecting concurrent WS connection — another client already active"
-        );
-        let rejected = AgentMessage::Rejected {
-            reason: "another client is already connected to this agent".to_string(),
-        };
-        let _ = ws_tx
-            .send(Message::Text(serde_json::to_string(&rejected).unwrap()))
-            .await;
-        let _ = ws_tx.close().await;
-        return;
+    if !is_internal {
+        if handle
+            .client_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::warn!(
+                target: "jamodio::ws",
+                "rejecting concurrent WS connection — another external client already active"
+            );
+            let rejected = AgentMessage::Rejected {
+                reason: "another client is already connected to this agent".to_string(),
+            };
+            let _ = ws_tx
+                .send(Message::Text(serde_json::to_string(&rejected).unwrap()))
+                .await;
+            let _ = ws_tx.close().await;
+            return;
+        }
     }
 
-    tracing::info!(target: "jamodio::ws", "client connected");
+    tracing::info!(target: "jamodio::ws", is_internal, "client connected");
 
     // Premier message : Hello (annonce le protocole + version).
     // Suivi du Status initial (legacy compat pour browsers v0.1.x qui
@@ -272,29 +299,33 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle) {
         }
     }
 
-    tracing::info!(target: "jamodio::ws", "client disconnected — cleanup");
+    tracing::info!(target: "jamodio::ws", is_internal, "client disconnected — cleanup");
 
     levels_task.abort();
     send_task.abort();
     shutdown_task.abort();
 
-    // Cleanup pipeline avec timeout pour ne pas bloquer indéfiniment si un
-    // task tient le lock (rare mais possible sur shutdown saturé).
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        handle.pipeline.lock(),
-    )
-    .await
-    {
-        Ok(mut pl) => pl.stop_all(),
-        Err(_) => tracing::warn!(
-            target: "jamodio::ws",
-            "pipeline lock timeout during cleanup — stop_all skipped (next client will see stale state)"
-        ),
+    // Cleanup pipeline UNIQUEMENT pour les clients externes (jamodio.com).
+    // Les clients internes (UI Tauri webview) ne pilotent pas le pipeline,
+    // donc leur close ne doit PAS stop_all (sinon le browser actif perd
+    // sa session quand on ferme la fenêtre Tauri par erreur).
+    if !is_internal {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handle.pipeline.lock(),
+        )
+        .await
+        {
+            Ok(mut pl) => pl.stop_all(),
+            Err(_) => tracing::warn!(
+                target: "jamodio::ws",
+                "pipeline lock timeout during cleanup — stop_all skipped (next client will see stale state)"
+            ),
+        }
+        // Libère le single-client slot uniquement si on l'avait pris (pas
+        // pour les clients internes qui n'ont jamais consommé le slot).
+        handle.client_active.store(false, Ordering::SeqCst);
     }
-
-    // Libère le single-client slot pour le prochain client.
-    handle.client_active.store(false, Ordering::SeqCst);
 }
 
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,

@@ -6,6 +6,30 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-09
+
+### Hotfix — UI Tauri webview à nouveau visible
+
+La single-client policy de v0.2.0 rejetait silencieusement la WS de
+l'UI Tauri webview interne (la fenêtre dashboard de l'agent qui affiche
+DEVICE / LATENCE / JITTER / streams en live). Conséquence : l'UI restait
+sur "—" partout et "ws://localhost:9876 — déconnecté" en bas.
+
+**Fix** : whitelist des origins `tauri://localhost` et `http://tauri.localhost`
+comme **clients internes** qui bypass la single-client policy. Ces clients
+sont en LECTURE SEULE (heartbeat get-stats uniquement, ne touchent pas
+le `PipelineState`), donc aucun risque de race avec le client externe
+jamodio.com.
+
+Le cleanup pipeline (stop_all) ne tourne PLUS pour les clients internes
+au disconnect — fermer la fenêtre Tauri n'arrête plus la session studio
+en cours côté browser.
+
+### Aussi dans cette release
+
+- Migration des 2 derniers `console.*` agent-related restants côté
+  groupe.js vers `log.*` structuré (`agent-produce`, `audio`).
+
 ## [0.2.0] — 2026-05-09
 
 ### Robustesse agent — refonte production-grade
@@ -267,7 +291,8 @@ Première release publique.
   la première ouverture (« Informations complémentaires » → « Exécuter
   quand même ») tant que la signature Authenticode n'est pas en place.
 
-[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.2.1
 [0.2.0]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.2.0
 [0.1.7]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.7
 [0.1.6]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.6
