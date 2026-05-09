@@ -1,14 +1,36 @@
 //! JSON protocol types for browser ↔ agent communication via localhost WebSocket.
+//!
+//! ## Versioning
+//!
+//! `PROTOCOL_VERSION` est embarqué dans le `Hello` envoyé à chaque connexion.
+//! Le browser peut comparer pour adapter son comportement (compat ascendante :
+//! le browser tolère une version plus ancienne, mode legacy).
+//!
+//! Historique :
+//!  - v1 (v0.2.0+) : ajout de `Hello`, `HelloAck`, `Shutdown`. Single-client policy.
+//!  - v0 implicite (v0.1.x) : pas de `Hello`. Browser detecte ça via timeout 1.5 s.
+//!
+//! Convention : tout ajout de champ obligatoire = bump majeur. Ajouts optionnels OK.
 
 use crate::net::srtp::SrtpParameters;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Version du protocole. À bumper sur tout breaking change wire-format.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 // ─── Browser → Agent ───────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BrowserMessage {
+    /// Acknowledgement du `Hello` agent. Optionnel (le browser peut ne pas
+    /// répondre, l'agent continue quand même). Sert au futur tracking +
+    /// confirmation que le browser a bien parsé le Hello.
+    HelloAck {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u32,
+    },
     GetDevices,
     SelectDevices {
         #[serde(rename = "inputId")]
@@ -71,6 +93,33 @@ pub enum BrowserMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AgentMessage {
+    /// Premier message envoyé au browser dès l'open WebSocket. Contient la
+    /// version du protocole + métadonnées agent. Le browser utilise ce message
+    /// pour transitionner sa state machine `HANDSHAKING → CONNECTED`.
+    /// Si le browser ne reçoit PAS ce message en 1.5 s, il assume un agent
+    /// legacy (≤ v0.1.7) et passe en mode permissif (legacyMode = true).
+    Hello {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u32,
+        /// Version du binaire (CARGO_PKG_VERSION).
+        #[serde(rename = "agentVersion")]
+        agent_version: String,
+        os: String,
+        arch: String,
+        /// Capabilities optionnelles (futur extensible). Vide en v1.
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
+    /// Notification de shutdown imminent (auto-update, quit user, etc.).
+    /// Le browser doit considérer la WS comme partant et préparer un fallback.
+    Shutdown {
+        reason: String,
+    },
+    /// Notification de rejet d'une connexion (single-client policy).
+    /// Envoyé immédiatement avant fermeture de la 2e WS si une 1re est déjà active.
+    Rejected {
+        reason: String,
+    },
     Devices {
         inputs: Vec<AudioDevice>,
         outputs: Vec<AudioDevice>,

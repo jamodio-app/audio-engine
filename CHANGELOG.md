@@ -6,6 +6,77 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-09
+
+### Robustesse agent — refonte production-grade
+
+Refonte complète du cycle de vie agent + protocole, suite à un bug observé
+en session 2-peers où un peer (avec agent actif) était silencieux pour les
+autres : sa music n'était jamais produite (ni en plain ni en WebRTC).
+Cause racine : double `detectAgent()` créant 2 WebSockets, état `agentConnected`
+divergent entre `setupAudio` et `produceLocalStreams`, callbacks zombies au
+disconnect, `musicStream = null` jamais restauré post-fallback.
+
+#### Protocole — handshake explicite
+
+- **Nouveau message `Hello`** envoyé par l'agent dès l'open WS.
+  Inclut `protocolVersion`, `agentVersion`, `os`, `arch`, `capabilities`.
+  Le browser bascule en `CONNECTED` sur réception (ou après timeout 1.5 s
+  en mode legacy compat pour les agents v0.1.x).
+- **Nouveau message `Shutdown`** broadcasté par l'agent avant `app.restart()`
+  (auto-update). Le browser peut afficher un toast et préparer un fallback
+  gracieux au lieu de subir un TCP close brutal + watchdog 3 s.
+- **Nouveau message `Rejected`** envoyé à un client WS quand un autre client
+  est déjà connecté (single-client policy ci-dessous).
+- **Nouveau message `HelloAck`** browser → agent (optionnel, futur tracking).
+- Constante `PROTOCOL_VERSION = 1` exposée dans `protocol.rs`.
+
+#### Single-client policy
+
+Le serveur WS rejette désormais les connexions concurrentes. Si une 2e
+WebSocket arrive alors qu'une 1re est active, l'agent envoie `Rejected`
+puis ferme la WS. Évite les races sur le shared `PipelineState` (qui
+provoquaient le bug ci-dessus quand le browser ouvrait 2 WS en concurrence).
+
+#### Origin check WS
+
+Le upgrade WebSocket vérifie l'en-tête `Origin`. Whitelist :
+`https://jamodio.com`, `https://*.vercel.app`, `http://localhost:*`,
+`http://127.0.0.1:*`, `file://`. Empêche une page web tierce sur
+localhost de piloter l'agent silencieusement.
+
+#### Lock timeout sur heartbeat
+
+Le handler `GetStats` (heartbeat 1.5 s) acquiert maintenant `pipeline.lock()`
+avec un timeout de 200 ms. Si dépassé (CPU saturé, contention encoder),
+il répond `Error{overloaded}` au lieu de bloquer — évite le faux-positif
+où le watchdog browser tue la session à 3.5 s alors que l'agent est juste
+lent.
+
+#### Deep-link handler implémenté
+
+`jamodio://launch` reçu via `tauri-plugin-deep-link` montre + focus
+maintenant la fenêtre principale (au lieu de l'ignorer silencieusement).
+Le bouton "Lancer" depuis la pill browser fait donc bien remonter l'app
+existante au premier plan.
+
+#### Auto-update broadcast
+
+Avant `app.restart()`, l'agent broadcaste `Shutdown{reason:"update"}` à
+tous les clients WS connectés. Petit délai 500 ms pour leur laisser le
+temps de recevoir + handler. Browser affiche un toast "L'Audio Engine
+se met à jour" + relance la détection auto après 5 s.
+
+### Breaking changes
+
+- **Protocole bumped** : `Hello` est désormais le 1er message envoyé par
+  l'agent. Les browsers v0.1.x ignorent ce message inconnu (compat
+  ascendante OK). Les browsers v0.2.0+ peuvent fonctionner avec un agent
+  v0.1.x via `legacyMode` (timeout handshake 1.5 s).
+- **Single-client policy** : si un browser tente d'ouvrir une 2e WS au
+  même agent (anciennement permis silencieusement), il reçoit `Rejected`.
+  L'utilisateur voit un toast "Audio Engine déjà utilisé par un autre onglet".
+
 ## [0.1.7] — 2026-05-07
 
 ### Qualité audio — fin des clicks numériques sur sortie
@@ -196,7 +267,8 @@ Première release publique.
   la première ouverture (« Informations complémentaires » → « Exécuter
   quand même ») tant que la signature Authenticode n'est pas en place.
 
-[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/jamodio-app/audio-engine/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.2.0
 [0.1.7]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.7
 [0.1.6]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.6
 [0.1.5]: https://github.com/jamodio-app/audio-engine/releases/tag/v0.1.5

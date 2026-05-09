@@ -16,6 +16,7 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
+use ws_server::WsServerHandle;
 
 #[tauri::command]
 fn open_log_dir() -> Result<String, String> {
@@ -39,9 +40,11 @@ fn get_version() -> &'static str {
 
 /// Vérifie une éventuelle update via l'endpoint configuré dans
 /// tauri.conf.json (`updater` bloc), télécharge + installe + restart si
-/// dispo. Tout est silencieux — pas de prompt, pas de friction. Si l'user
-/// quitte avant la fin, l'update reprendra au prochain démarrage.
-async fn check_for_update(app: tauri::AppHandle) {
+/// dispo. Diffuse `Shutdown{reason:"update"}` à tous les clients WS AVANT
+/// `app.restart()` pour que le browser puisse afficher un toast et
+/// préparer un fallback gracieux (au lieu de voir un TCP close brutal
+/// + watchdog timeout 3 s).
+async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerHandle) {
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
@@ -77,7 +80,14 @@ async fn check_for_update(app: tauri::AppHandle) {
 
             match download_result {
                 Ok(_) => {
-                    tracing::info!(target: "jamodio::updater", "update installed — restarting");
+                    tracing::info!(target: "jamodio::updater", "update installed — broadcasting Shutdown then restart");
+                    // Broadcast aux clients WS connectés AVANT restart.
+                    // ws_server::handle_connection sleep 200ms après l'envoi
+                    // pour laisser le browser recevoir + traiter.
+                    ws_handle.broadcast_shutdown("update");
+                    // Petit délai supplémentaire ici aussi pour la marge
+                    // (les broadcasts tokio sont async, le restart aussi).
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     app.restart();
                 }
                 Err(e) => tracing::error!(
@@ -135,9 +145,6 @@ fn main() {
             tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
 
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
-            // Utile pour voir ce que CPAL expose réellement sur le poste :
-            // nom exact, canaux par défaut, device par défaut. Aide à diagnostiquer
-            // les cas où la sélection UI affiche "des chiffres" ou un nom inattendu.
             audio::device::log_devices();
 
             // ─── Attach menu to config-based tray icon ──────
@@ -167,9 +174,24 @@ fn main() {
                 tracing::warn!(target: "jamodio::tray", "no tray icon found");
             }
 
-
             // ─── Deep link handler (jamodio://) ────────────
-            app.deep_link().on_open_url(|_event| {});
+            // Quand l'user clique "Lancer" dans le browser jamodio.com et que
+            // l'agent tourne déjà, l'URL `jamodio://launch` arrive ici.
+            // On focus la fenêtre principale au lieu de l'ignorer.
+            let app_handle_dl = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                let urls: Vec<String> = event.urls().iter().map(|u| u.to_string()).collect();
+                tracing::info!(
+                    target: "jamodio::lifecycle",
+                    urls = ?urls,
+                    "deep-link received — focusing main window"
+                );
+                if let Some(win) = app_handle_dl.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                }
+            });
 
             // ─── Enable auto-start ──────────────────────────
             let autostart = app.autolaunch();
@@ -181,9 +203,11 @@ fn main() {
             // ─── Spawn WS server (audio pipeline) ───────────
             let mixer = Arc::new(Mutex::new(AudioMixer::new()));
             let pipeline = Arc::new(tokio::sync::Mutex::new(PipelineState::new(mixer)));
+            let ws_handle = WsServerHandle::new(pipeline);
+            let ws_handle_for_server = ws_handle.clone();
 
             tauri::async_runtime::spawn(async move {
-                ws_server::start(pipeline).await;
+                ws_server::start(ws_handle_for_server).await;
             });
 
             // ─── Vérification d'update au boot ──────────────
@@ -191,10 +215,12 @@ fn main() {
             // Délai de 5 s pour laisser le démarrage se finir avant de hit
             // GitHub releases. Fire-and-forget : si l'install échoue ou si
             // l'user n'a pas le réseau, on log et on n'embête pas l'utilisateur.
+            // Passe le ws_handle pour pouvoir broadcaster Shutdown avant restart.
             let app_handle = app.handle().clone();
+            let ws_handle_for_update = ws_handle.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                check_for_update(app_handle).await;
+                check_for_update(app_handle, ws_handle_for_update).await;
             });
 
             Ok(())
