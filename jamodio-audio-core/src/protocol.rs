@@ -27,9 +27,15 @@ pub enum BrowserMessage {
     /// Acknowledgement du `Hello` agent. Optionnel (le browser peut ne pas
     /// répondre, l'agent continue quand même). Sert au futur tracking +
     /// confirmation que le browser a bien parsé le Hello.
+    /// `session_id` (UUID v4 généré côté browser, persisté `sessionStorage`)
+    /// est logué côté agent pour permettre au support de croiser les logs
+    /// browser et agent à partir de l'identifiant qui apparaît dans les
+    /// 2 fichiers (header logger.js d'un côté, log line agent de l'autre).
     HelloAck {
         #[serde(rename = "protocolVersion")]
         protocol_version: u32,
+        #[serde(rename = "sessionId", default)]
+        session_id: Option<String>,
     },
     GetDevices,
     SelectDevices {
@@ -86,6 +92,19 @@ pub enum BrowserMessage {
     },
     GetStats,
     Stop,
+    /// Demande à l'agent les N derniers jours de logs concaténés en plain
+    /// text. Utilisé par le module Support browser pour packager un
+    /// bug-report avec les logs des 2 côtés en un seul fichier .txt.
+    /// Les logs sont coupés à `max_bytes` (les plus anciens tronqués en
+    /// premier) pour rester sous la limite d'attachment Resend (25 MB).
+    GetLogsArchive {
+        /// Nombre max de fichiers journaliers à inclure (défaut 3).
+        #[serde(rename = "maxDays")]
+        max_days: Option<u32>,
+        /// Taille max totale en bytes après concaténation (défaut 5_000_000).
+        #[serde(rename = "maxBytes")]
+        max_bytes: Option<u64>,
+    },
 }
 
 // ─── Agent → Browser ───────────────────────────────────
@@ -211,6 +230,20 @@ pub enum AgentMessage {
     /// Per-stream RMS levels for VU meters.
     StreamLevels {
         levels: Vec<StreamLevel>,
+    },
+    /// Réponse à `GetLogsArchive`. Contient les logs agent concaténés en
+    /// plain text (UTF-8), avec entêtes par fichier `====== agent.log.YYYY-MM-DD ======`.
+    /// `truncated = true` indique que le plus ancien fichier a été coupé
+    /// pour respecter `max_bytes`.
+    LogsArchive {
+        content: String,
+        /// Nom des fichiers inclus, du plus ancien au plus récent.
+        files: Vec<String>,
+        truncated: bool,
+        /// Chemin absolu du dossier de logs sur disque (pour aide UI :
+        /// "tu peux aussi ouvrir directement ce dossier").
+        #[serde(rename = "logDir")]
+        log_dir: String,
     },
 }
 

@@ -1,6 +1,6 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    http::HeaderMap,
+    http::{HeaderMap, Uri},
     response::IntoResponse,
     routing::get,
     Router,
@@ -124,7 +124,7 @@ impl WsServerHandle {
 pub async fn start(handle: WsServerHandle) {
     let app = Router::new().route(
         "/",
-        get(move |ws: WebSocketUpgrade, headers: HeaderMap| {
+        get(move |ws: WebSocketUpgrade, headers: HeaderMap, uri: Uri| {
             let handle = handle.clone();
             async move {
                 // Origin check : rejet HTTP 403 si page web non-whitelisée
@@ -153,6 +153,21 @@ pub async fn start(handle: WsServerHandle) {
                 let is_internal = origin
                     .map(is_internal_client_origin)
                     .unwrap_or(false);
+                // Read-only opt-in : `?op=logs` => connexion éphémère qui
+                // sert uniquement GetLogsArchive, ne prend PAS le slot
+                // single-client, ne déclenche PAS de cleanup (stop_all)
+                // à la fermeture. Utilisé par le module Support browser
+                // pour ne pas casser la WS du studio actif quand l'user
+                // génère un bug-report. Cf. `handle_logs_connection`.
+                let is_logs_only = uri
+                    .query()
+                    .map(|q| q.split('&').any(|kv| kv == "op=logs"))
+                    .unwrap_or(false);
+                if is_logs_only {
+                    return ws
+                        .on_upgrade(move |socket| handle_logs_connection(socket, handle))
+                        .into_response();
+                }
                 ws.on_upgrade(move |socket| handle_connection(socket, handle, is_internal))
                     .into_response()
             }
@@ -327,6 +342,91 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     }
 }
 
+/// Handler dédié aux connexions read-only `?op=logs`. Ne prend PAS le
+/// slot single-client, ne pilote PAS le pipeline, ne fait PAS de cleanup
+/// → la WS persistante du studio (s'il y en a une) reste intacte.
+///
+/// Sert uniquement `GetLogsArchive` puis ferme. Toute autre commande est
+/// rejetée explicitement (Error) — pas de surface d'attaque additionnelle.
+/// Timeout de sécurité 10 s pour éviter une connexion qui pendrait.
+async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    tracing::info!(target: "jamodio::ws", "logs-only client connected");
+
+    // Hello envoyé pour cohérence avec le handler principal (le browser
+    // vérifie peut-être qu'il reçoit un Hello avant d'envoyer sa requête).
+    let hello = make_hello();
+    let _ = ws_tx
+        .send(Message::Text(serde_json::to_string(&hello).unwrap()))
+        .await;
+
+    // Une seule itération attendue : GetLogsArchive → réponse → close.
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let Message::Text(text) = msg else { continue };
+            let browser_msg = match serde_json::from_str::<BrowserMessage>(&text) {
+                Ok(m) => m,
+                Err(_) => continue, // ignore HelloAck éventuel + autres bruits
+            };
+            match browser_msg {
+                BrowserMessage::GetLogsArchive { max_days, max_bytes } => {
+                    let days = max_days.unwrap_or(crate::logging::DEFAULT_LOG_ARCHIVE_DAYS);
+                    let bytes = max_bytes.unwrap_or(crate::logging::DEFAULT_LOG_ARCHIVE_BYTES);
+                    let collected = tokio::task::spawn_blocking(move || {
+                        let (content, files, truncated) =
+                            crate::logging::collect_recent_logs(days, bytes);
+                        let log_dir = crate::logging::log_dir().to_string_lossy().into_owned();
+                        (content, files, truncated, log_dir)
+                    })
+                    .await;
+                    let payload = match collected {
+                        Ok((content, files, truncated, log_dir)) => {
+                            tracing::info!(
+                                target: "jamodio::support",
+                                files = files.len(),
+                                bytes = content.len(),
+                                truncated,
+                                conn = "logs-only",
+                                "GetLogsArchive served"
+                            );
+                            AgentMessage::LogsArchive { content, files, truncated, log_dir }
+                        }
+                        Err(e) => AgentMessage::Error {
+                            message: format!("logs archive task failed: {e}"),
+                        },
+                    };
+                    let _ = ws_tx
+                        .send(Message::Text(serde_json::to_string(&payload).unwrap()))
+                        .await;
+                    return;
+                }
+                BrowserMessage::HelloAck { .. } => continue,
+                _ => {
+                    // Tout autre message est refusé : ce canal est read-only.
+                    let err = AgentMessage::Error {
+                        message: "logs-only connection: only get-logs-archive is allowed".into(),
+                    };
+                    let _ = ws_tx
+                        .send(Message::Text(serde_json::to_string(&err).unwrap()))
+                        .await;
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    if res.is_err() {
+        tracing::warn!(target: "jamodio::ws", "logs-only connection timed out (10s)");
+    }
+    // Petite latence pour laisser le frame WS partir avant le close TCP.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = ws_tx.close().await;
+    // Le `_ = handle` empêche le warning unused — on ne touche PAS au pipeline
+    // ni au flag client_active depuis ici, c'est tout l'intérêt.
+    let _ = handle;
+    tracing::info!(target: "jamodio::ws", "logs-only client disconnected (no cleanup)");
+}
+
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,
 /// retourne None et le caller répond Error{overloaded} au lieu de bloquer.
 async fn try_lock_pipeline(
@@ -355,12 +455,16 @@ async fn handle_message(
     pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
 ) -> Vec<AgentMessage> {
     match msg {
-        BrowserMessage::HelloAck { protocol_version } => {
-            tracing::debug!(
+        BrowserMessage::HelloAck { protocol_version, session_id } => {
+            // Log au niveau INFO (pas debug) pour que `session_id` soit toujours
+            // visible dans les logs agent même en niveau de prod par défaut.
+            // C'est l'unique pivot pour croiser browser↔agent côté support.
+            tracing::info!(
                 target: "jamodio::ws",
                 browser_protocol = protocol_version,
                 agent_protocol = PROTOCOL_VERSION,
-                "received HelloAck from browser"
+                session_id = session_id.as_deref().unwrap_or("?"),
+                "browser session linked"
             );
             vec![]
         }
@@ -547,6 +651,39 @@ async fn handle_message(
             };
             pl.stop_all();
             vec![make_status(AgentState::Idle)]
+        }
+
+        BrowserMessage::GetLogsArchive { max_days, max_bytes } => {
+            // I/O disque dans une tâche bloquante pour ne pas geler le runtime
+            // tokio (lecture de plusieurs MB peut prendre 50-200ms sur HDD).
+            let days = max_days.unwrap_or(crate::logging::DEFAULT_LOG_ARCHIVE_DAYS);
+            let bytes = max_bytes.unwrap_or(crate::logging::DEFAULT_LOG_ARCHIVE_BYTES);
+            let res = tokio::task::spawn_blocking(move || {
+                let (content, files, truncated) = crate::logging::collect_recent_logs(days, bytes);
+                let log_dir = crate::logging::log_dir().to_string_lossy().into_owned();
+                (content, files, truncated, log_dir)
+            })
+            .await;
+            match res {
+                Ok((content, files, truncated, log_dir)) => {
+                    tracing::info!(
+                        target: "jamodio::support",
+                        files = files.len(),
+                        bytes = content.len(),
+                        truncated,
+                        "GetLogsArchive served"
+                    );
+                    vec![AgentMessage::LogsArchive {
+                        content,
+                        files,
+                        truncated,
+                        log_dir,
+                    }]
+                }
+                Err(e) => vec![AgentMessage::Error {
+                    message: format!("logs archive task failed: {e}"),
+                }],
+            }
         }
     }
 }
