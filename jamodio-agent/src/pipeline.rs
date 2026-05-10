@@ -149,9 +149,12 @@ impl PipelineState {
         // overflow → crackles au resume).
         match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
             Ok(stream) => {
-                let _old = std::mem::replace(&mut self.playback_stream, Some(SendStream(stream)));
+                // .replace() : crée le nouveau stream AVANT de drop l'ancien
+                // → minimise le gap audio (sinon brève silence → jitter buffer
+                // overflow → crackles au resume). L'Option<> retournée est
+                // droppée en fin de scope = CPAL stoppe l'ancien stream.
+                let _old = self.playback_stream.replace(SendStream(stream));
                 tracing::info!(target: "jamodio::pipeline", device = %resolved_name, "output device switched");
-                // _old drop ici (fin de scope) → CPAL stoppe l'ancien stream
             }
             Err(e) => tracing::error!(
                 target: "jamodio::pipeline",
@@ -452,8 +455,7 @@ fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -
         }
         None => {
             if channels_in == 1 {
-                for f in 0..frames {
-                    let s = src[f];
+                for &s in src.iter().take(frames) {
                     out.push(s);
                     out.push(s);
                 }
@@ -469,6 +471,9 @@ fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -
     out
 }
 
+// Helper RT thread — chaque paramètre est un primitive différent et grouper
+// dans un struct ne ferait qu'ajouter un nom intermédiaire sans clarté.
+#[allow(clippy::too_many_arguments)]
 fn encoder_thread(
     sample_rx: Receiver<Vec<f32>>,
     rtp_tx: tokio_mpsc::Sender<Vec<u8>>,
@@ -646,7 +651,7 @@ async fn recv_decode_task(
                                 bytes = len,
                                 "first RTP packet received"
                             );
-                        } else if pkt_count % 5000 == 0 {
+                        } else if pkt_count.is_multiple_of(5000) {
                             tracing::debug!(
                                 target: "jamodio::recv",
                                 producer = &producer_id[..8.min(producer_id.len())],

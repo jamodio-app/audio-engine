@@ -151,7 +151,7 @@ pub async fn start(handle: WsServerHandle) {
                 // Le flag is_internal détermine si la connexion bypass la
                 // single-client policy (UI Tauri webview = lecture seule).
                 let is_internal = origin
-                    .map(|o| is_internal_client_origin(o))
+                    .map(is_internal_client_origin)
                     .unwrap_or(false);
                 ws.on_upgrade(move |socket| handle_connection(socket, handle, is_internal))
                     .into_response()
@@ -182,25 +182,24 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // sont autorisés en parallèle car ils sont lecture-seule (get-stats).
     //
     // compare_exchange : atomique, pas de race entre 2 connexions concurrentes.
-    if !is_internal {
-        if handle
+    if !is_internal
+        && handle
             .client_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
-        {
-            tracing::warn!(
-                target: "jamodio::ws",
-                "rejecting concurrent WS connection — another external client already active"
-            );
-            let rejected = AgentMessage::Rejected {
-                reason: "another client is already connected to this agent".to_string(),
-            };
-            let _ = ws_tx
-                .send(Message::Text(serde_json::to_string(&rejected).unwrap()))
-                .await;
-            let _ = ws_tx.close().await;
-            return;
-        }
+    {
+        tracing::warn!(
+            target: "jamodio::ws",
+            "rejecting concurrent WS connection — another external client already active"
+        );
+        let rejected = AgentMessage::Rejected {
+            reason: "another client is already connected to this agent".to_string(),
+        };
+        let _ = ws_tx
+            .send(Message::Text(serde_json::to_string(&rejected).unwrap()))
+            .await;
+        let _ = ws_tx.close().await;
+        return;
     }
 
     tracing::info!(target: "jamodio::ws", is_internal, "client connected");
