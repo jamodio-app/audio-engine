@@ -681,6 +681,14 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
+        BrowserMessage::SetInputCut { cut } => {
+            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.set_input_cut(cut);
+            vec![]
+        }
+
         BrowserMessage::StartRecording { stems } => {
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];

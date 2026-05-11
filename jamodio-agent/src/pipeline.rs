@@ -85,6 +85,13 @@ pub struct PipelineState {
     /// d'enregistrement. Le `tx` du handle est aussi posé dans le mixer
     /// via `set_record_tx` pour activer les tap sites.
     recorder: Option<RecorderHandle>,
+    /// Si true, l'encoder_thread remplit les samples capturés avec des zéros
+    /// avant remap/encode → équivalent à un mute hardware côté agent. Permet
+    /// au browser d'implémenter le bouton « ENTRÉE OFF » en mode agent (en
+    /// mode browser c'était `musicStream.getAudioTracks().enabled = false`,
+    /// qui n'a pas d'équivalent ici puisque le flux part en PlainTransport
+    /// piloté par CPAL).
+    pub input_cut: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const CHANNELS: usize = 2;
@@ -103,7 +110,16 @@ impl PipelineState {
             buffer_samples: 0,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             recorder: None,
+            input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF
+    /// browser). Le flag est lu sans lock dans l'encoder_thread à chaque
+    /// frame capturée — coût Relaxed négligeable face à une frame 2.5ms.
+    pub fn set_input_cut(&mut self, cut: bool) {
+        self.input_cut.store(cut, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "jamodio::pipeline", cut, "input_cut updated");
     }
 
     /// REC-3 : démarre un enregistrement multi-stems. Crée un `RecorderHandle`
@@ -314,10 +330,11 @@ impl PipelineState {
         // (silencieux) → le browser ouvre le fader via SetSelfMonitorVolume.
         self.mixer.lock().add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
+        let input_cut_for_encoder = self.input_cut.clone();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
-                encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel, mixer_for_encoder);
+                encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel, mixer_for_encoder, input_cut_for_encoder);
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
@@ -543,6 +560,7 @@ fn encoder_thread(
     channels_in: u16,
     channel_index: Option<u8>,
     mixer: Arc<Mutex<AudioMixer>>,
+    input_cut: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
     // dans ce cas on continue en priorité normale plutôt que de planter.
@@ -580,7 +598,14 @@ fn encoder_thread(
             Ok(samples) => {
                 // RMS calculé sur le canal qui part réellement sur le réseau
                 // (après remap) → le VU-mètre reflète le son transmis, pas la somme brute.
-                let stereo = remap_to_stereo(&samples, channels_in, channel_index);
+                let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
+                // ENTRÉE OFF (= SetInputCut) : remplace les samples capturés
+                // par du silence avant tout traitement (RMS, self-monitor,
+                // record self stem, mix, envoi RTP). Cohérent avec le mode
+                // browser où on faisait `track.enabled = false` côté WebRTC.
+                if input_cut.load(std::sync::atomic::Ordering::Relaxed) {
+                    stereo.fill(0.0);
+                }
                 if !stereo.is_empty() {
                     let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / stereo.len() as f32).sqrt();

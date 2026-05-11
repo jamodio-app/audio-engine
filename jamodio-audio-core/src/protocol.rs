@@ -125,6 +125,14 @@ pub enum BrowserMessage {
         #[serde(rename = "maxBytes")]
         max_bytes: Option<u64>,
     },
+    /// Coupe (true) ou ouvre (false) l'entrée capture côté agent. Quand
+    /// coupée, l'encoder_thread remplit les samples capturés par des zéros
+    /// avant tout traitement (RMS, self-monitor, record self stem, mix,
+    /// envoi RTP). Équivalent du bouton « ENTRÉE OFF » du browser ; en
+    /// mode browser sans agent, c'était `track.enabled = false` côté WebRTC.
+    SetInputCut {
+        cut: bool,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record
