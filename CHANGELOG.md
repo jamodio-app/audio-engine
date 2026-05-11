@@ -6,6 +6,34 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-05-11
+
+### Pan L/R par stream en mode agent (SetPan)
+
+Bug remonté post-v0.2.8 : le pan L/R des tranches instrument
+(self + peers) n'agissait pas en mode agent. Cause double :
+- `selfPanNode` / `p.panNode` (StereoPannerNode Web Audio) silencieux
+  en mode agent (les flux passent par CPAL agent, pas audioCtx).
+- Côté Rust, le mixer n'avait aucune notion de pan par stream —
+  il sommait les samples stéréo sans répartition L/R.
+
+Fix :
+- `StreamState::pan: f32` (default 0.0, range [-1.0, 1.0]).
+- `AudioMixer::set_pan(producer_id, pan)` avec clamp défensif.
+- Constant-power panning dans `mix_into` :
+    angle = (pan+1) · π/4 ∈ [0, π/2]
+    gain_L = cos(angle), gain_R = sin(angle)
+  Puissance totale constante (-3dB au centre), évite le drop de
+  volume perçu au centre des panners linéaires. Fast path si pan≈0
+  (skip cos/sin et boucle simplifiée — cas par défaut majoritaire).
+- Nouveau wire `BrowserMessage::SetPan { producerId, pan }`. Convention
+  producer_id="self" pour le self-monitor (= SELF_MONITOR_ID), sinon
+  producer_id agent du peer (= agentMusicProducerId côté browser).
+
+Le browser envoie set-pan à chaque mouvement de slider PAN ET au
+capture-started (sync initial via applySoloMute) pour qu'une reconnexion
+agent ne reset pas les pans à 0 si l'UI était à L40 / R30 d'avant.
+
 ## [0.2.8] — 2026-05-11
 
 ### Fader MASTER en mode agent (SetMasterVolume)
