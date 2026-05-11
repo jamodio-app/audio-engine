@@ -97,6 +97,19 @@ pub enum BrowserMessage {
     SetSelfMonitorVolume {
         volume: f32,
     },
+    /// Sprint B — delay d'alignement de latence pour un peer remote.
+    /// Le serveur SFU calcule `delay = maxHalfRtt − peerHalfRtt` (cf.
+    /// server/latency-equalizer.js) et le browser le relaie ici. L'agent
+    /// retarde le playout du stream concerné en augmentant la cible du
+    /// jitter buffer de `delay_ms`. En mode browser, la même valeur est
+    /// appliquée via `consumer.rtpReceiver.playoutDelayHint` côté Chrome ;
+    /// en mode agent (ce message), c'est l'agent qui aligne les peers.
+    SetPeerDelay {
+        #[serde(rename = "producerId")]
+        producer_id: String,
+        #[serde(rename = "delayMs")]
+        delay_ms: u32,
+    },
     GetStats,
     Stop,
     /// Demande à l'agent les N derniers jours de logs concaténés en plain

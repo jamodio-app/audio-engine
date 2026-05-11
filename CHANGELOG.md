@@ -6,6 +6,57 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-05-11
+
+### Latency-align en mode agent (sprint B)
+
+Avant : le serveur SFU calculait déjà `delay = maxHalfRtt − peerHalfRtt`
+(EMA α=0.3, broadcast `latency-align` toutes les 2 s, cf.
+`server/latency-equalizer.js`) et le browser appliquait MON delay sur
+chaque `consumer.rtpReceiver.playoutDelayHint`. Mais en **mode agent**,
+le RTP arrive direct SFU → agent CPAL → mixer → playback, et le delay
+n'était **jamais transmis à l'agent**. Donc à 3+ peers ou avec un peer
+distant, on perdait l'alignement automatique qui fonctionne en mode
+browser. Invisible à 2 peers FR-FR fibre (test Ben+Yannick 22 ms reste
+22 ms), critique dès qu'on passe à 3+ peers ou qu'un peer est sur un
+continent différent.
+
+Fix : nouveau message wire + handler agent.
+
+- Nouveau `BrowserMessage::SetPeerDelay { producer_id, delay_ms }` dans
+  [protocol.rs](jamodio-audio-core/src/protocol.rs).
+- Nouvelle méthode `AudioMixer::set_peer_delay()` qui ajuste le
+  `target_samples` du jitter buffer du stream concerné : target final =
+  `REMOTE_BASE_TARGET_MS (10) + delay_ms`, clampé par le ring buffer.
+- **Hystérèse** : sans filtre, chaque broadcast 2 s reseterait le
+  pre-fill gate → micro-coupure audible 2×/s. On ne re-set que si
+  `|new − current| > 5 ms` (PEER_DELAY_HYSTERESIS_MS).
+- Ring buffer élargi côté `set_target_ms` : clamp désormais
+  `[MIN_TARGET_MS, MAX_ALIGN_TARGET_MS=200]` (vs `MAX_TARGET_MS=40`
+  avant). L'adaptation automatique up/down reste bornée à 40 ms — seul
+  le pilotage externe peut monter au-delà pour l'alignement WAN.
+- Capacité ring 250 → 300 ms pour marge confortable au-dessus de
+  MAX_ALIGN_TARGET_MS. Coût RAM : ~115 KB / stream (vs 96 KB avant).
+- Handler `BrowserMessage::SetPeerDelay` dans ws_server appelle
+  `mixer.set_peer_delay()`. Pas de log info ici (broadcast 2 s, on
+  loggue uniquement les changements significatifs côté mixer en debug).
+
+### Côté browser
+
+- Dans `handleLatencyAlign(delays)`, après l'appel `applyReceiverHint`
+  existant, on forward MON delay (`delays[myUserId].delay`) à l'agent
+  pour chaque peer remote en mode agent
+  (`p.agentMusic && p.agentMusicProducerId`). Sémantique cohérente avec
+  Chrome `playoutDelayHint` : on retarde MA sortie sur tous les streams
+  remote pour m'aligner avec le peer le plus lent.
+
+### Précision attendue
+
+±2.5 ms (1 frame Opus). Largement suffisant musicalement. Si la dérive
+adaptative se révèle problématique en pratique (adapt_down sous le
+delay d'alignement), V2 : séparer `align_delay` du target adaptatif
+(~30 lignes en plus).
+
 ## [0.2.4] — 2026-05-11
 
 ### Self-monitor via agent — 25 ms → ≈10 ms ear-to-ear

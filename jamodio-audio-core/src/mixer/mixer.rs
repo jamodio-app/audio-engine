@@ -12,6 +12,18 @@ pub const SELF_MONITOR_ID: &str = "self";
 /// on prend le minimum stable.
 const SELF_MONITOR_TARGET_MS: usize = 5;
 
+/// Sprint B — cible « base » des streams remote (ms) — additionnée au delay
+/// d'alignement reçu de `SetPeerDelay`. Doit rester ≤ INITIAL_TARGET_MS du
+/// ring buffer (10) pour cohérence avec le comportement par défaut quand
+/// aucun alignement n'est appliqué (delay = 0).
+const REMOTE_BASE_TARGET_MS: u32 = 10;
+
+/// Sprint B — seuil d'hystérèse pour `set_peer_delay`. Le serveur broadcast
+/// les alignements toutes les 2 s ; sans ce filtre, chaque update reset le
+/// pre-fill gate du jitter buffer → micro-coupure audible 2×/s. On ne re-set
+/// que si l'écart au target courant dépasse ce seuil (en ms).
+const PEER_DELAY_HYSTERESIS_MS: i32 = 5;
+
 /// Mixes N remote audio streams into a single stereo output.
 /// Each stream has its own jitter buffer and volume control.
 pub struct AudioMixer {
@@ -109,6 +121,39 @@ impl AudioMixer {
     pub fn push_self_samples(&mut self, samples: &[f32]) {
         if self.streams.contains_key(SELF_MONITOR_ID) {
             self.push_samples(SELF_MONITOR_ID, samples);
+        }
+    }
+
+    /// Sprint B — applique un delay d'alignement de latence à un stream remote.
+    ///
+    /// Le serveur SFU calcule `delay = maxHalfRtt − peerHalfRtt` par peer
+    /// (cf. server/latency-equalizer.js) → broadcast `latency-align` toutes
+    /// les 2 s. Le browser relaie ici via `SetPeerDelay`. L'agent ajuste le
+    /// `target_samples` du jitter buffer du stream concerné : target final =
+    /// REMOTE_BASE_TARGET_MS + delay_ms, clampé dans
+    /// [MIN_TARGET_MS, MAX_ALIGN_TARGET_MS] par le ring buffer.
+    ///
+    /// **Hystérèse** : sans filtre, chaque broadcast 2 s déclencherait un
+    /// `set_target_ms` qui reset le pre-fill gate → micro-coupure 2×/s.
+    /// On ne re-set que si |new − current| > PEER_DELAY_HYSTERESIS_MS (5 ms).
+    ///
+    /// No-op si le stream n'existe pas (peer parti, race entre add_stream et
+    /// l'update suivant côté browser).
+    pub fn set_peer_delay(&mut self, producer_id: &str, delay_ms: u32) {
+        if let Some(stream) = self.streams.get_mut(producer_id) {
+            let new_target = (REMOTE_BASE_TARGET_MS + delay_ms) as usize;
+            let current = stream.jitter.target_ms();
+            let delta = (new_target as i32) - (current as i32);
+            if delta.abs() > PEER_DELAY_HYSTERESIS_MS {
+                stream.jitter.set_target_ms(new_target);
+                tracing::debug!(
+                    target: "jamodio::mixer",
+                    producer = &producer_id[..8.min(producer_id.len())],
+                    delay_ms,
+                    target_ms = new_target,
+                    "peer delay updated"
+                );
+            }
         }
     }
 
