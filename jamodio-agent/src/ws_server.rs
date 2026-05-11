@@ -6,9 +6,12 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
+use base64::Engine;
 use jamodio_audio_core::protocol::{
-    AgentMessage, AgentState, BrowserMessage, StreamLevel, PROTOCOL_VERSION,
+    AgentMessage, AgentState, BrowserMessage, RecordStemSpec, RecordedFileWire, StreamLevel,
+    PROTOCOL_VERSION,
 };
+use jamodio_audio_core::record::StemSpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
@@ -401,6 +404,7 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
                     return;
                 }
                 BrowserMessage::HelloAck { .. } => continue,
+                #[allow(unreachable_patterns)]
                 _ => {
                     // Tout autre message est refusé : ce canal est read-only.
                     let err = AgentMessage::Error {
@@ -675,6 +679,75 @@ async fn handle_message(
             };
             pl.stop_all();
             vec![make_status(AgentState::Idle)]
+        }
+
+        BrowserMessage::StartRecording { stems } => {
+            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            };
+            // Convertit le wire StemSpec → record::StemSpec (même contenu,
+            // module différent pour découpler le protocol du core record).
+            let specs: Vec<StemSpec> = stems.iter().map(|s| StemSpec {
+                role: s.role.clone(),
+                peer_id: s.peer_id.clone(),
+                peer_name: s.peer_name.clone(),
+            }).collect();
+            tracing::info!(target: "jamodio::ws", count = specs.len(), "StartRecording");
+            match pl.start_recording(specs) {
+                Ok(armed) => {
+                    let wire: Vec<RecordStemSpec> = armed.iter().map(|s| RecordStemSpec {
+                        role: s.role.clone(),
+                        peer_id: s.peer_id.clone(),
+                        peer_name: s.peer_name.clone(),
+                    }).collect();
+                    vec![AgentMessage::RecordingStarted { stems: wire }]
+                }
+                Err(msg) => {
+                    tracing::error!(target: "jamodio::ws", error = %msg, "start_recording failed");
+                    vec![AgentMessage::RecordingError { message: msg }]
+                }
+            }
+        }
+
+        BrowserMessage::StopRecording => {
+            // stop_recording bloque jusqu'à finalize (timeout 30s côté handle).
+            // On délègue à spawn_blocking pour ne pas bloquer le runtime tokio
+            // pendant l'encodage final + lock pipeline.
+            let pipeline = pipeline.clone();
+            let files_opt = tokio::task::spawn_blocking(move || {
+                // Le blocking thread prend le lock pipeline en sync via
+                // blocking_lock (Tokio Mutex supporte blocking_lock).
+                let mut pl = pipeline.blocking_lock();
+                pl.stop_recording()
+            })
+            .await;
+            let files = match files_opt {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(target: "jamodio::ws", error = %e, "stop_recording join error");
+                    return vec![AgentMessage::RecordingError {
+                        message: format!("stop task failed: {e}"),
+                    }];
+                }
+            };
+            tracing::info!(
+                target: "jamodio::ws",
+                count = files.len(),
+                bytes_total = files.iter().map(|f| f.data.len()).sum::<usize>(),
+                "StopRecording — encoding base64",
+            );
+            // Base64 encode chaque fichier. Un seul message à la fin évite
+            // le chunking côté browser ; WS frame supporte les payloads MB.
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let wire_files: Vec<RecordedFileWire> = files.into_iter().map(|f| RecordedFileWire {
+                role: f.spec.role,
+                peer_id: f.spec.peer_id,
+                peer_name: f.spec.peer_name,
+                mime_type: "audio/ogg".into(),
+                extension: "opus".into(),
+                data_b64: b64.encode(&f.data),
+            }).collect();
+            vec![AgentMessage::RecordingDone { files: wire_files }]
         }
 
         BrowserMessage::GetLogsArchive { max_days, max_bytes } => {

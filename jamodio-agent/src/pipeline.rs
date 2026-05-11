@@ -11,6 +11,7 @@ use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::protocol::AgentState;
+use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -80,6 +81,10 @@ pub struct PipelineState {
     pub buffer_samples: u32,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
+    /// REC-3 : handle vers le thread record actif. `None` quand pas
+    /// d'enregistrement. Le `tx` du handle est aussi posé dans le mixer
+    /// via `set_record_tx` pour activer les tap sites.
+    recorder: Option<RecorderHandle>,
 }
 
 const CHANNELS: usize = 2;
@@ -97,7 +102,41 @@ impl PipelineState {
             state: AgentState::Idle,
             buffer_samples: 0,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            recorder: None,
         }
+    }
+
+    /// REC-3 : démarre un enregistrement multi-stems. Crée un `RecorderHandle`
+    /// (thread record + Recorder), poste son `tx` au mixer pour activer les
+    /// tap sites. Échoue si un enregistrement est déjà en cours OU si l'init
+    /// d'un OpusEncoder échoue.
+    /// Retourne les specs vraiment armés (peut différer des demandés si
+    /// un peer_id n'existe pas — non vérifié ici, juste 1:1 pour l'instant).
+    pub fn start_recording(&mut self, stems: Vec<StemSpec>) -> Result<Vec<StemSpec>, String> {
+        if self.recorder.is_some() {
+            return Err("recording already in progress".into());
+        }
+        let handle = RecorderHandle::start(stems)?;
+        // Active les tap sites côté mixer en clonant le sender.
+        self.mixer.lock().set_record_tx(Some(handle.tx.clone()));
+        let armed = handle.armed_specs.clone();
+        self.recorder = Some(handle);
+        tracing::info!(target: "jamodio::pipeline", stems = armed.len(), "recording started");
+        Ok(armed)
+    }
+
+    /// REC-3 : stop l'enregistrement et retourne les fichiers Ogg/Opus.
+    /// Bloque jusqu'à finalize (timeout 30s côté handle).
+    pub fn stop_recording(&mut self) -> Vec<RecordedFile> {
+        // Détache le tx du mixer d'abord — les tap sites deviennent no-op
+        // immédiatement, plus aucune nouvelle commande n'arrive au thread.
+        self.mixer.lock().set_record_tx(None);
+        let Some(handle) = self.recorder.take() else {
+            return Vec::new();
+        };
+        let files = handle.stop();
+        tracing::info!(target: "jamodio::pipeline", files = files.len(), "recording stopped");
+        files
     }
 
     /// Set the input device id (format `"{idx}:{name}"`). `None` = utiliser
@@ -423,7 +462,15 @@ impl PipelineState {
         // ouvre/ferme une WS toutes les 30 s, ce qui appelait stop_all).
         let was_active = self.capture_stream.is_some()
             || self.playback_stream.is_some()
-            || !self.recv_stops.is_empty();
+            || !self.recv_stops.is_empty()
+            || self.recorder.is_some();
+        // REC-3 : si un recording était en cours, on l'arrête proprement
+        // (les fichiers sont produits mais perdus — l'utilisateur a quitté).
+        // Évite de laisser un thread record orphelin tenir des ressources.
+        if self.recorder.is_some() {
+            tracing::warn!(target: "jamodio::pipeline", "stop_all during recording — files discarded");
+            let _ = self.stop_recording();
+        }
         self.stop_capture();
         let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
         for id in ids {

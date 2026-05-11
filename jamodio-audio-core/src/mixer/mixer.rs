@@ -1,4 +1,6 @@
 use super::ring_buffer::JitterBuffer;
+use crate::record::RecordCmd;
+use crossbeam_channel::Sender;
 use std::collections::HashMap;
 
 /// Id réservé du stream de self-monitor (capture locale rebouclée en sortie
@@ -35,6 +37,10 @@ pub struct AudioMixer {
     /// Si `None`, JitterBuffer utilise sa cible initiale par défaut. Override
     /// via `set_target_ms_all` (handler SetBuffer côté UI).
     default_target_ms: Option<usize>,
+    /// REC-3 : si `Some(tx)`, un enregistrement est en cours et les push_*
+    /// (self, peer) + mix_into envoient leurs samples au thread record via
+    /// `try_send` non-bloquant. Si `None`, les tap sites sont no-op (1 if).
+    record_tx: Option<Sender<RecordCmd>>,
 }
 
 struct StreamState {
@@ -56,6 +62,25 @@ impl AudioMixer {
             streams: HashMap::new(),
             temp_buf: Vec::new(),
             default_target_ms: None,
+            record_tx: None,
+        }
+    }
+
+    /// REC-3 : armer/désarmer l'enregistrement. Quand `Some(tx)`, les tap
+    /// sites (push_self_samples, push_samples remote, mix_into) envoient
+    /// leurs samples au thread record via `try_send` non-bloquant. Quand
+    /// `None`, les taps sont no-op (1 if check). Appelé depuis le pipeline
+    /// au start_recording / stop_recording.
+    pub fn set_record_tx(&mut self, tx: Option<Sender<RecordCmd>>) {
+        self.record_tx = tx;
+    }
+
+    /// Helper interne : try_send vers le record thread sans bloquer.
+    /// Drop silencieux si le channel est plein (thread en retard) — le warn
+    /// est émis côté thread record qui surveille sa queue length.
+    fn record_send(&self, cmd: RecordCmd) {
+        if let Some(tx) = &self.record_tx {
+            let _ = tx.try_send(cmd);
         }
     }
 
@@ -122,6 +147,13 @@ impl AudioMixer {
         if self.streams.contains_key(SELF_MONITOR_ID) {
             self.push_samples(SELF_MONITOR_ID, samples);
         }
+        // REC-3 : tap stem-self. Pré-fader, post channel-split.
+        // Fait APRÈS push_samples pour ne pas dépendre de l'existence du
+        // stream self-monitor : on enregistre l'instrument même si le user
+        // a coupé son monitor browser (mode agent typique selfMuteGain=0).
+        if self.record_tx.is_some() && !samples.is_empty() {
+            self.record_send(RecordCmd::PushSelf(samples.to_vec()));
+        }
     }
 
     /// Sprint B — applique un delay d'alignement de latence à un stream remote.
@@ -176,6 +208,13 @@ impl AudioMixer {
     /// pas spammer (1 stream * 400 pkt/s en burst peut générer beaucoup
     /// d'événements).
     pub fn push_samples(&mut self, producer_id: &str, samples: &[f32]) {
+        // REC-3 : tap stem-peer. Pre-fader (avant `vol *` dans mix_into),
+        // post Opus decode. On filtre SELF_MONITOR_ID car push_self_samples
+        // émet déjà son propre PushSelf (sinon double tap pour self).
+        if self.record_tx.is_some() && producer_id != SELF_MONITOR_ID && !samples.is_empty() {
+            self.record_send(RecordCmd::PushPeer(producer_id.to_string(), samples.to_vec()));
+        }
+
         if let Some(stream) = self.streams.get_mut(producer_id) {
             // Compute RMS of pushed samples
             if !samples.is_empty() {
@@ -263,6 +302,15 @@ impl AudioMixer {
         // Soft clamp to prevent distortion
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
+        }
+
+        // REC-3 : tap MIX. Post-fader (volumes appliqués) et post-clamp.
+        // Note : ce mix inclut self-monitor avec son volume ; pour cohérence
+        // avec le browser (où le MIX inclut self post-fader/post-mute), c'est
+        // attendu. L'utilisateur qui désarme MIX peut toujours désactiver
+        // côté browser.
+        if self.record_tx.is_some() {
+            self.record_send(RecordCmd::PushMix(output.to_vec()));
         }
 
         // Report drift drains (rate-limité à puissances de 2). Coût formatage

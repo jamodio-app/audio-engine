@@ -2330,6 +2330,7 @@ name = "jamodio-agent"
 version = "0.2.5"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "cpal",
  "crossbeam-channel",
  "futures",

@@ -18,6 +18,7 @@ serde_json = "1"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 thread-priority = "0.10"
+base64 = "0.22"            # Encode des fichiers Ogg/Opus du record pour le wire WS (REC-3)
 
 # Logging structuré (PROD-grade) — voir convention dans CLAUDE.md.
 # tracing : façade compatible avec spans + structured fields.

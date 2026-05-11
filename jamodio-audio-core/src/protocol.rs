@@ -125,6 +125,31 @@ pub enum BrowserMessage {
         #[serde(rename = "maxBytes")]
         max_bytes: Option<u64>,
     },
+    /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
+    /// Le browser fournit la liste des stems armés (self + peers + mix).
+    /// L'agent active les tap sites du mixer et démarre un thread record
+    /// avec un OpusOggRecorder par stem.
+    StartRecording {
+        stems: Vec<RecordStemSpec>,
+    },
+    /// REC-2/REC-3 — stop l'enregistrement courant. L'agent répond avec
+    /// `RecordingDone` contenant les fichiers Ogg/Opus en base64.
+    StopRecording,
+}
+
+/// Spec d'un stem à enregistrer, transmise par le browser au start.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RecordStemSpec {
+    /// "stem-self" | "stem-peer" | "mix"
+    pub role: String,
+    /// producer_id du peer (clé du mixer agent). null pour `mix`, myUserId
+    /// pour `stem-self` (informatif côté agent, le tap ne dépend pas de la
+    /// valeur — il route via le role).
+    #[serde(rename = "peerId", default)]
+    pub peer_id: Option<String>,
+    /// Nom lisible (pour fichier final côté browser).
+    #[serde(rename = "peerName", default)]
+    pub peer_name: Option<String>,
 }
 
 // ─── Agent → Browser ───────────────────────────────────
@@ -265,6 +290,38 @@ pub enum AgentMessage {
         #[serde(rename = "logDir")]
         log_dir: String,
     },
+    /// REC-2/REC-3 — Ack du StartRecording. Liste les stems vraiment armés
+    /// (peut différer de la requête : un peer_id inconnu côté mixer est
+    /// silencieusement ignoré).
+    RecordingStarted {
+        stems: Vec<RecordStemSpec>,
+    },
+    /// REC-2/REC-3 — Réponse au StopRecording. Pour chaque stem armé, un
+    /// fichier Ogg/Opus encodé en base64. Le browser décode et stocke en
+    /// IndexedDB avec un sessionTag commun.
+    RecordingDone {
+        files: Vec<RecordedFileWire>,
+    },
+    /// REC-2/REC-3 — Erreur pendant l'enregistrement (init encoder, etc.).
+    RecordingError {
+        message: String,
+    },
+}
+
+/// Fichier enregistré encodé pour le wire (base64 du Ogg/Opus complet).
+#[derive(Debug, Serialize)]
+pub struct RecordedFileWire {
+    pub role: String,
+    #[serde(rename = "peerId", skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
+    #[serde(rename = "peerName", skip_serializing_if = "Option::is_none")]
+    pub peer_name: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub extension: String,
+    /// Contenu Ogg/Opus encodé en base64 standard (RFC 4648).
+    #[serde(rename = "dataB64")]
+    pub data_b64: String,
 }
 
 #[derive(Debug, Serialize)]
