@@ -41,6 +41,12 @@ pub struct AudioMixer {
     /// (self, peer) + mix_into envoient leurs samples au thread record via
     /// `try_send` non-bloquant. Si `None`, les tap sites sont no-op (1 if).
     record_tx: Option<Sender<RecordCmd>>,
+    /// Master gain global appliqué dans `mix_into` après le mix des streams.
+    /// Plage [0.0, 1.5] (cohérent avec les faders peer/self côté UI).
+    /// Le tap REC-3 push_mix reçoit l'output APRÈS application du master
+    /// gain — cohérent avec le browser qui enregistre aussi le mix post
+    /// master fader. Default 1.0 (unity).
+    master_gain: f32,
 }
 
 struct StreamState {
@@ -63,6 +69,7 @@ impl AudioMixer {
             temp_buf: Vec::new(),
             default_target_ms: None,
             record_tx: None,
+            master_gain: 1.0,
         }
     }
 
@@ -73,6 +80,14 @@ impl AudioMixer {
     /// au start_recording / stop_recording.
     pub fn set_record_tx(&mut self, tx: Option<Sender<RecordCmd>>) {
         self.record_tx = tx;
+    }
+
+    /// Master gain global appliqué dans `mix_into`. Clamp défensif dans
+    /// [0.0, 1.5] (NaN devient 1.0 — unity). Le tap record push_mix
+    /// reçoit l'output APRÈS application, donc le fichier MIX reflète
+    /// le réglage master fader courant.
+    pub fn set_master_gain(&mut self, gain: f32) {
+        self.master_gain = if gain.is_finite() { gain.clamp(0.0, 1.5) } else { 1.0 };
     }
 
     /// Helper interne : try_send vers le record thread sans bloquer.
@@ -299,16 +314,26 @@ impl AudioMixer {
             tracing::debug!(target: "jamodio::mixer", streams = self.streams.len(), rms, "mix_into heartbeat");
         }
 
+        // Master gain global (fader MASTER côté UI). Appliqué AVANT le clamp
+        // pour qu'un master à 0.5 atténue proprement un mix qui aurait dépassé
+        // 1.0 (le clamp final ramène quand même dans [-1, 1] pour le DAC).
+        // Skip multiplication si gain == 1.0 (cas par défaut, économise N muls
+        // sur le hot path callback CPAL).
+        if (self.master_gain - 1.0).abs() > f32::EPSILON {
+            let g = self.master_gain;
+            for sample in output.iter_mut() {
+                *sample *= g;
+            }
+        }
+
         // Soft clamp to prevent distortion
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
 
-        // REC-3 : tap MIX. Post-fader (volumes appliqués) et post-clamp.
-        // Note : ce mix inclut self-monitor avec son volume ; pour cohérence
-        // avec le browser (où le MIX inclut self post-fader/post-mute), c'est
-        // attendu. L'utilisateur qui désarme MIX peut toujours désactiver
-        // côté browser.
+        // REC-3 : tap MIX. Post master gain + post clamp = exactement ce
+        // que le user entend dans son casque. Cohérent avec le browser
+        // où le record bus est aussi en sortie de masterGain Web Audio.
         if self.record_tx.is_some() {
             self.record_send(RecordCmd::PushMix(output.to_vec()));
         }

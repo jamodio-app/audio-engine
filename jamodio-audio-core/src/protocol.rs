@@ -133,6 +133,14 @@ pub enum BrowserMessage {
     SetInputCut {
         cut: bool,
     },
+    /// Volume du fader MASTER (sortie globale agent → casque). Appliqué
+    /// dans `AudioMixer::mix_into` après la somme des streams et avant le
+    /// clamp soft. En mode browser sans agent, cette commande est sans
+    /// effet (le master Web Audio est piloté localement via masterGain).
+    /// Clamp défensif côté agent dans [0.0, 1.5].
+    SetMasterVolume {
+        volume: f32,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record

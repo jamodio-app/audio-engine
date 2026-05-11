@@ -689,6 +689,14 @@ async fn handle_message(
             vec![]
         }
 
+        BrowserMessage::SetMasterVolume { volume } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().set_master_gain(volume);
+            vec![]
+        }
+
         BrowserMessage::StartRecording { stems } => {
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];
