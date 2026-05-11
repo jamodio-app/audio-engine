@@ -6,6 +6,31 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.10] — 2026-05-11
+
+### DIM ducking instruments (SetDim) + correction sémantique tap REC
+
+Nouveau bouton DIM sur la tranche Voix côté browser : quand l'utilisateur
+veut entendre la conversation talkback clairement, il active DIM →
+les instruments s'atténuent de -12dB (sans toucher backing/métro/voix
+qui restent à plein volume).
+
+- `AudioMixer::dim_factor: f32` (default 1.0, range [0.0, 1.0]).
+- `set_dim(factor)` avec clamp défensif.
+- Appliqué dans `mix_into` APRÈS la somme des streams et AVANT master_gain.
+- Nouveau wire `BrowserMessage::SetDim { factor }` + handler.
+
+Correction sémantique du tap REC :
+- Avant v0.2.10 : push_mix(output) AVAIT master_gain et clamp (= mix
+  tel qu'écouté, incluant les réglages d'écoute locaux).
+- Maintenant : push_mix(output) AVANT dim_factor + master_gain + clamp.
+
+Sémantique : le fichier MIX enregistré reflète "le mix post-fader des
+instruments seul" (= ce qu'un peer théorique entendrait), indépendant
+de mes réglages d'écoute locaux dim/master. Cohérent avec le tap
+browser sur `instrumentMixBus` qui est aussi pre-dim/pre-master côté
+Web Audio.
+
 ## [0.2.9] — 2026-05-11
 
 ### Pan L/R par stream en mode agent (SetPan)
