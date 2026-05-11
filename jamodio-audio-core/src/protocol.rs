@@ -141,6 +141,15 @@ pub enum BrowserMessage {
     SetMasterVolume {
         volume: f32,
     },
+    /// Balance L/R par stream. `producer_id` = id du flux dans le mixer
+    /// agent ; convention spéciale "self" pour le self-monitor (= la
+    /// tranche "moi" côté browser). Pan range [-1.0, 1.0], constant-power
+    /// applied in `mix_into`. Clamp défensif côté agent.
+    SetPan {
+        #[serde(rename = "producerId")]
+        producer_id: String,
+        pan: f32,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record

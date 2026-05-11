@@ -52,6 +52,11 @@ pub struct AudioMixer {
 struct StreamState {
     jitter: JitterBuffer,
     volume: f32,
+    /// Pan range [-1.0, 1.0]. -1 = full left, 0 = center, +1 = full right.
+    /// Applique constant-power panning dans `mix_into` (gain_L = cos(θ),
+    /// gain_R = sin(θ) avec θ = (pan+1)·π/4). Le DAW classique pour un
+    /// signal stéréo entrant = balance L/R. Default 0.0 (centré).
+    pan: f32,
     rms: f32,
     /// Snapshot du `overflow_drops` du jitter au précédent push, pour ne
     /// loguer que sur événement (rate-limited via puissance de 2).
@@ -108,6 +113,7 @@ impl AudioMixer {
         self.streams.insert(producer_id.to_string(), StreamState {
             jitter,
             volume: 1.0,
+            pan: 0.0,
             rms: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
@@ -136,6 +142,7 @@ impl AudioMixer {
         self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
             jitter,
             volume: 0.0,
+            pan: 0.0,
             rms: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
@@ -214,6 +221,17 @@ impl AudioMixer {
     /// Set per-stream volume by producer_id (alias for set_volume).
     pub fn set_stream_volume(&mut self, producer_id: &str, volume: f32) {
         self.set_volume(producer_id, volume);
+    }
+
+    /// Set per-stream pan, range [-1.0, 1.0]. -1=full left, 0=center, +1=full right.
+    /// Applique constant-power panning dans `mix_into`. Pour SELF_MONITOR_ID,
+    /// fonctionne pareil — le browser envoie producer_id="self".
+    /// No-op si le stream n'existe pas (peer parti, race).
+    pub fn set_pan(&mut self, producer_id: &str, pan: f32) {
+        let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+        if let Some(stream) = self.streams.get_mut(producer_id) {
+            stream.pan = p;
+        }
     }
 
     /// Push decoded samples into a stream's jitter buffer.
@@ -301,8 +319,25 @@ impl AudioMixer {
             stream.jitter.pull(&mut self.temp_buf);
 
             let vol = stream.volume;
-            for (out, &sample) in output.iter_mut().zip(self.temp_buf.iter()) {
-                *out += sample * vol;
+            // Constant-power panning : pour pan ≈ 0, fast path sans cos/sin
+            // (skip un test). Sinon angle = (pan+1) · π/4 ∈ [0, π/2],
+            // gain_L = cos(angle), gain_R = sin(angle) — total power constant.
+            // Le temp_buf est stéréo interleaved (L, R, L, R, ...) ; on
+            // applique gain_L sur les samples pairs et gain_R sur les impairs.
+            if stream.pan.abs() < f32::EPSILON {
+                for (out, &sample) in output.iter_mut().zip(self.temp_buf.iter()) {
+                    *out += sample * vol;
+                }
+            } else {
+                let angle = (stream.pan + 1.0) * std::f32::consts::FRAC_PI_4;
+                let gain_l = vol * angle.cos();
+                let gain_r = vol * angle.sin();
+                let mut i = 0;
+                while i + 1 < self.temp_buf.len() && i + 1 < output.len() {
+                    output[i]   += self.temp_buf[i]   * gain_l;
+                    output[i+1] += self.temp_buf[i+1] * gain_r;
+                    i += 2;
+                }
             }
         }
 
