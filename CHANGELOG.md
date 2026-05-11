@@ -6,6 +6,35 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-05-11
+
+### Fader MASTER en mode agent (SetMasterVolume)
+
+Bug remonté post-v0.2.7 : le fader MASTER du browser n'agissait pas sur
+l'écoute en mode agent. Cause : côté browser le fader pilotait uniquement
+`masterGain` Web Audio, qui est silencieux en mode agent (l'écoute passe
+par CPAL côté agent). Et côté Rust, le mixer n'avait simplement aucun
+master_gain — `mix_into` envoyait l'output au CPAL playback directement
+après le clamp.
+
+Fix : nouveau message wire + champ master_gain dans AudioMixer.
+
+- `BrowserMessage::SetMasterVolume { volume: f32 }` dans protocol.rs.
+- `AudioMixer::master_gain: f32` (default 1.0) + `set_master_gain(gain)`
+  avec clamp défensif dans [0.0, 1.5] et NaN→1.0.
+- Application dans `mix_into` AVANT le clamp final pour qu'un master à
+  0.5 atténue proprement un mix qui aurait dépassé 1.0. Skip la
+  multiplication si gain == 1.0 (cas par défaut, économise N muls sur
+  le hot path callback CPAL).
+- Tap REC-3 push_mix reçoit l'output APRÈS master_gain — cohérent avec
+  le browser qui enregistre aussi le mix post master fader, et le user
+  qui entend le mix final pondéré par son master.
+
+Côté browser : fader master oninput envoie `set-master-volume` à l'agent
+quand connecté, ET applySoloMute() le ré-envoie à chaque sync (notamment
+au capture-started) pour garantir que le mixer Rust connaît la valeur
+courante après une reconnexion agent.
+
 ## [0.2.7] — 2026-05-11
 
 ### ENTRÉE OFF (SetInputCut) en mode agent
