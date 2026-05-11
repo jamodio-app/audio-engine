@@ -6,6 +6,77 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-05-11
+
+### Self-monitor via agent — 25 ms → ≈10 ms ear-to-ear
+
+Yannick puis Ben rapportaient s'entendre « légèrement décalé » dans leur
+casque pendant les sessions, même avec un setup correctement configuré
+(Scarlett bien matchée, agent v0.2.3, DSCP EF en place, ping 22 ms peer).
+Diagnostic : en mode agent, **deux captures simultanées** du même device
+audio cohabitaient — l'agent CPAL pour le flux RTP (parfait, 2.7 ms), et
+le browser via `getUserMedia` pour le monitoring local (≈25 ms à cause du
+buffer Chrome opaque, non désactivable). Si l'utilisateur ouvrait le
+fader « moi » dans la tranche, il s'entendait via la chaîne browser
+≈30 ms, pas via l'agent.
+
+**Fix architectural** : le self-monitor passe maintenant **dans l'agent**.
+
+- Nouveau stream réservé `"self"` dans `AudioMixer` ([mixer.rs](jamodio-audio-core/src/mixer/mixer.rs)),
+  volume initial **0.0** (anti-larsen au démarrage). Jitter target forcé
+  à 5 ms (MIN_TARGET_MS) — pas de gigue réseau, on prend le minimum stable.
+- Encoder thread ([pipeline.rs](jamodio-agent/src/pipeline.rs)) **forke** les samples post-remap :
+  branche 1 → encode Opus → SFU (inchangé), branche 2 → `push_self_samples`
+  dans le mixer local. Lock `parking_lot` contended ≤ µs, négligeable
+  pour un thread RT à frame 2.7 ms.
+- Le stream local est exclu de `stream_count` / `total_underruns` /
+  `mean_target_ms` — l'UI agent continue de refléter la santé des flux
+  remote uniquement.
+- Nouveau message wire `SetSelfMonitorVolume { volume: f32 }` ([protocol.rs](jamodio-audio-core/src/protocol.rs)) →
+  handler côté ws_server qui clampe NaN/négatif et appelle
+  `mixer.set_self_monitor_volume(v)`. Le browser pilote le fader « moi »
+  via ce message.
+- Le stream est créé dans `start_capture()` et supprimé dans
+  `stop_capture()` — symétrique avec le cycle capture.
+
+**Latence ear-to-ear self** :
+
+| Avant (chaîne browser) | Après (chaîne agent) |
+|---|---|
+| getUserMedia 25 ms + audioCtx 5–10 ms ≈ **30 ms** | capture 2.7 + target 5 + playback 2.7 ≈ **10 ms** |
+
+Compatible avec le plan futur d'effets natifs (AMPLITUBE-like) : la
+chaîne d'insertion entre `accumulator` et le fork est un point d'entrée
+unique pour des effets Rust ou des plugins VST3 hostés.
+
+### Côté browser
+
+- En mode agent, suppression de `getUserMedia` instrument du graphe Web
+  Audio. Plus de `selfPanNode` / `localMusicGain` / `localMusicSource`
+  alimentés par la capture local. Le fader « moi » envoie maintenant
+  `set-self-monitor-volume` à l'agent.
+- VU-mètre self alimenté par `input_rms` du Stats agent (déjà exposé
+  depuis v0.2.0, mais inutilisé).
+- `_agentFallbackMusicStream` conservé — si l'agent meurt mid-session,
+  le browser recrée un `getUserMedia` éphémère pour le fallback WebRTC.
+
+## [0.2.3] — 2026-05-10
+
+### Bug-report end-to-end pour la BETA
+
+- Nouveau handler WS `GetLogsArchive { maxDays, maxBytes }` qui retourne
+  les N derniers jours de logs agent concaténés en plain text, plafonnés
+  à `maxBytes` (tronqués anciens-d'abord). Utilisé par le module Support
+  browser pour packager un bug-report avec les logs des 2 côtés en un
+  seul fichier `.txt` sous la limite Resend de 25 MB.
+- `sessionId` (UUID v4 généré côté browser, persisté en `sessionStorage`)
+  désormais logué côté agent au `HelloAck` → permet au support de croiser
+  les logs browser et agent à partir d'un identifiant unique apparaissant
+  dans les deux fichiers.
+- Endpoint WS read-only `ws://localhost:9876/?op=logs` exposé pour
+  l'export hors-studio (UI agent dashboard).
+- Cosmétique : 6 warnings clippy fixés sur `ws_server` et `pipeline` (chore).
+
 ## [0.2.2] — 2026-05-07
 
 ### Strict device identification — fin des silent fallbacks

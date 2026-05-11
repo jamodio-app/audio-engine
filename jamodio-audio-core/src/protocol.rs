@@ -90,6 +90,13 @@ pub enum BrowserMessage {
         #[serde(rename = "targetMs")]
         target_ms: u32,
     },
+    /// Volume du stream de self-monitor (capture locale rebouclée en sortie
+    /// agent → casque). 0.0 = silence par défaut, 1.0 = unity. Sans ce
+    /// message après StartCapture, l'utilisateur ne s'entend pas via l'agent
+    /// (fail-safe anti-larsen au démarrage).
+    SetSelfMonitorVolume {
+        volume: f32,
+    },
     GetStats,
     Stop,
     /// Demande à l'agent les N derniers jours de logs concaténés en plain

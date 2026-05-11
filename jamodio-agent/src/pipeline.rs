@@ -267,10 +267,18 @@ impl PipelineState {
         });
 
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
+        //
+        // SELF-MONITOR : on enregistre un stream local dans le mixer AVANT de
+        // spawn l'encoder. Le thread va y pousser les samples capturés en
+        // parallèle de l'encodage Opus → l'utilisateur s'entend dans son
+        // casque sans passer par la chaîne browser à 25 ms. Volume initial 0
+        // (silencieux) → le browser ouvre le fader via SetSelfMonitorVolume.
+        self.mixer.lock().add_local_stream();
+        let mixer_for_encoder = self.mixer.clone();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
-                encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel);
+                encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel, mixer_for_encoder);
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
@@ -403,6 +411,10 @@ impl PipelineState {
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
+        // Retire le stream self-monitor (créé dans start_capture).
+        // Sans ça, le stream subsisterait dans le mixer avec son volume courant
+        // et continuerait à mixer son ring buffer résiduel jusqu'à underrun.
+        self.mixer.lock().remove_local_stream();
     }
 
     pub fn stop_all(&mut self) {
@@ -483,6 +495,7 @@ fn encoder_thread(
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
     channel_index: Option<u8>,
+    mixer: Arc<Mutex<AudioMixer>>,
 ) {
     // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
     // dans ce cas on continue en priorité normale plutôt que de planter.
@@ -525,6 +538,15 @@ fn encoder_thread(
                     let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / stereo.len() as f32).sqrt();
                     input_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+                    // SELF-MONITOR FORK : push les samples capturés (post-remap)
+                    // dans le mixer local → ils sortent sur le casque via le
+                    // callback CPAL playback. Gated par le volume du stream
+                    // « self » côté mixer (0.0 par défaut = silence). Lock
+                    // parking_lot contended ≤ µs, négligeable pour un RT
+                    // thread à frame 2.7 ms. Le push est no-op si l'id
+                    // n'existe pas (cf. push_self_samples).
+                    mixer.lock().push_self_samples(&stereo);
                 }
 
                 accumulator.extend_from_slice(&stereo);

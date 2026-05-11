@@ -596,6 +596,18 @@ async fn handle_message(
             vec![]
         }
 
+        BrowserMessage::SetSelfMonitorVolume { volume } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            // Clamp défensif côté agent (le mixer clampe déjà dans
+            // [0, 1.5] mais on filtre les NaN ici). 0 = silence (défaut).
+            let v = if volume.is_finite() { volume.max(0.0) } else { 0.0 };
+            pl.mixer.lock().set_self_monitor_volume(v);
+            tracing::info!(target: "jamodio::ws", volume = v, "SetSelfMonitorVolume");
+            vec![]
+        }
+
         BrowserMessage::GetStats => {
             // GetStats est appelé en heartbeat (toutes les 1.5 s). Si on ne peut
             // pas acquérir le lock dans 200 ms, on répond Error pour que le

@@ -1,6 +1,17 @@
 use super::ring_buffer::JitterBuffer;
 use std::collections::HashMap;
 
+/// Id réservé du stream de self-monitor (capture locale rebouclée en sortie
+/// pour que l'utilisateur s'entende dans son casque sans passer par la chaîne
+/// browser à 25 ms). Mixé comme un stream normal mais exclu des stats remote
+/// (stream_count, total_underruns, mean_target_ms) pour ne pas polluer l'UI.
+pub const SELF_MONITOR_ID: &str = "self";
+
+/// Cible jitter buffer du self-monitor (ms). 5 = MIN_TARGET_MS du ring buffer ;
+/// le signal vient du même process que la capture, donc pas de gigue réseau,
+/// on prend le minimum stable.
+const SELF_MONITOR_TARGET_MS: usize = 5;
+
 /// Mixes N remote audio streams into a single stereo output.
 /// Each stream has its own jitter buffer and volume control.
 pub struct AudioMixer {
@@ -56,6 +67,49 @@ impl AudioMixer {
     /// Remove a stream.
     pub fn remove_stream(&mut self, producer_id: &str) {
         self.streams.remove(producer_id);
+    }
+
+    /// Crée le stream de self-monitor (boucle locale capture → mixer → playback).
+    ///
+    /// Volume initial = 0.0 (silencieux) : l'utilisateur doit explicitement
+    /// ouvrir le fader « moi » côté UI via `SetSelfMonitorVolume`. Sans ça,
+    /// risque de larsen au démarrage si micro ouvert près d'un haut-parleur.
+    ///
+    /// Jitter target = `SELF_MONITOR_TARGET_MS` (5 ms) : signal local sans
+    /// gigue réseau, on prend le minimum stable. Latence ear-to-ear self
+    /// résultante ≈ 5.4 ms (capture 2.7 + playback 2.7) + 5 ms target ≈ 10 ms.
+    pub fn add_local_stream(&mut self) {
+        let mut jitter = JitterBuffer::new();
+        jitter.set_target_ms(SELF_MONITOR_TARGET_MS);
+        self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
+            jitter,
+            volume: 0.0,
+            rms: 0.0,
+            last_overflow_drops: 0,
+            buffer_full_count: 0,
+            last_drift_drops: 0,
+            drift_drain_count: 0,
+        });
+    }
+
+    /// Supprime le stream self-monitor (appelé depuis `stop_capture`).
+    pub fn remove_local_stream(&mut self) {
+        self.streams.remove(SELF_MONITOR_ID);
+    }
+
+    /// Override le volume du self-monitor (0.0 = silence, 1.0 = unity, 1.5 = max).
+    /// Appelé par le handler `SetSelfMonitorVolume` côté ws_server.
+    pub fn set_self_monitor_volume(&mut self, volume: f32) {
+        self.set_volume(SELF_MONITOR_ID, volume);
+    }
+
+    /// Push capture samples dans le stream self-monitor (depuis l'encoder
+    /// thread, en parallèle de l'encodage Opus pour les pairs).
+    /// No-op si `add_local_stream()` n'a pas été appelé (capture pas démarrée).
+    pub fn push_self_samples(&mut self, samples: &[f32]) {
+        if self.streams.contains_key(SELF_MONITOR_ID) {
+            self.push_samples(SELF_MONITOR_ID, samples);
+        }
     }
 
     /// Set per-stream volume (0.0 to 1.5).
@@ -178,25 +232,35 @@ impl AudioMixer {
         }).collect()
     }
 
-    /// Number of active streams.
+    /// Number of active REMOTE streams (self-monitor exclu).
     pub fn stream_count(&self) -> usize {
-        self.streams.len()
+        self.streams.keys().filter(|k| k.as_str() != SELF_MONITOR_ID).count()
     }
 
-    /// Total underruns aggregated across all per-stream jitter buffers.
-    /// Used by GetStats to surface jitter-buffer health to the browser dashboard.
+    /// Total underruns aggregated across REMOTE per-stream jitter buffers.
+    /// Self-monitor exclu : son ring est alimenté en local (pas de gigue
+    /// réseau) → ses éventuels underruns refléteraient un overload CPU
+    /// agent, pas un problème côté réseau. À surfacer séparément si besoin.
     pub fn total_underruns(&self) -> u64 {
-        self.streams.values().map(|s| s.jitter.underruns()).sum()
+        self.streams.iter()
+            .filter(|(k, _)| k.as_str() != SELF_MONITOR_ID)
+            .map(|(_, s)| s.jitter.underruns())
+            .sum()
     }
 
-    /// Cible jitter buffer moyenne (ms) sur les streams actifs.
-    /// 0 si pas de stream — utilisé comme indicateur de tuning dans l'UI.
+    /// Cible jitter buffer moyenne (ms) sur les streams REMOTE actifs.
+    /// Self-monitor exclu (target = 5 ms fixe, fausserait la moyenne).
+    /// 0 si pas de stream remote — utilisé comme indicateur de tuning dans l'UI.
     pub fn mean_target_ms(&self) -> f32 {
-        if self.streams.is_empty() {
+        let targets: Vec<usize> = self.streams.iter()
+            .filter(|(k, _)| k.as_str() != SELF_MONITOR_ID)
+            .map(|(_, s)| s.jitter.target_ms())
+            .collect();
+        if targets.is_empty() {
             return 0.0;
         }
-        let sum: usize = self.streams.values().map(|s| s.jitter.target_ms()).sum();
-        sum as f32 / self.streams.len() as f32
+        let sum: usize = targets.iter().sum();
+        sum as f32 / targets.len() as f32
     }
 
     /// Override la target_ms de tous les streams existants ET stocke la valeur
