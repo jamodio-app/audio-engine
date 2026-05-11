@@ -43,10 +43,18 @@ pub struct AudioMixer {
     record_tx: Option<Sender<RecordCmd>>,
     /// Master gain global appliqué dans `mix_into` après le mix des streams.
     /// Plage [0.0, 1.5] (cohérent avec les faders peer/self côté UI).
-    /// Le tap REC-3 push_mix reçoit l'output APRÈS application du master
-    /// gain — cohérent avec le browser qui enregistre aussi le mix post
-    /// master fader. Default 1.0 (unity).
+    /// Default 1.0 (unity).
     master_gain: f32,
+    /// DIM factor — atténuation temporaire des instruments quand l'utilisateur
+    /// active DIM côté UI (pour entendre la conversation talkback clairement).
+    /// Plage [0.0, 1.0], typiquement 0.25 (-12dB) ou 1.0 (off). Appliqué
+    /// dans `mix_into` après la somme des streams et avant le master_gain.
+    /// **Le tap REC-3 push_mix est positionné AVANT dim et master** pour que
+    /// le fichier MIX enregistré soit le mix post-fader des instruments
+    /// SEUL (= ce qui irait à un peer théorique), indépendant des réglages
+    /// d'écoute locaux dim/master. Cohérent avec le tap browser sur
+    /// `instrumentMixBus` qui est aussi pre-dim/pre-master.
+    dim_factor: f32,
 }
 
 struct StreamState {
@@ -75,7 +83,15 @@ impl AudioMixer {
             default_target_ms: None,
             record_tx: None,
             master_gain: 1.0,
+            dim_factor: 1.0,
         }
+    }
+
+    /// DIM factor (= ducking des instruments quand le user veut entendre
+    /// la voix talkback clairement). Plage [0.0, 1.0], typiquement 0.25
+    /// (-12dB) ou 1.0 (off). Clamp défensif côté agent.
+    pub fn set_dim(&mut self, factor: f32) {
+        self.dim_factor = if factor.is_finite() { factor.clamp(0.0, 1.0) } else { 1.0 };
     }
 
     /// REC-3 : armer/désarmer l'enregistrement. Quand `Some(tx)`, les tap
@@ -349,6 +365,24 @@ impl AudioMixer {
             tracing::debug!(target: "jamodio::mixer", streams = self.streams.len(), rms, "mix_into heartbeat");
         }
 
+        // REC-3 : tap MIX positionné ICI = APRÈS la somme des streams post-fader/pan
+        // mais AVANT dim_factor + master_gain + clamp. Sémantique : le fichier MIX
+        // enregistré reflète "le mix post-fader des instruments seul", pas mes
+        // réglages d'écoute locaux (dim/master). Cohérent avec le tap browser sur
+        // `instrumentMixBus` qui est PRE-dim/PRE-master côté Web Audio.
+        if self.record_tx.is_some() {
+            self.record_send(RecordCmd::PushMix(output.to_vec()));
+        }
+
+        // DIM factor — atténue les instruments quand l'user veut entendre le
+        // talkback clairement. Skip si == 1.0 (cas par défaut majoritaire).
+        if (self.dim_factor - 1.0).abs() > f32::EPSILON {
+            let d = self.dim_factor;
+            for sample in output.iter_mut() {
+                *sample *= d;
+            }
+        }
+
         // Master gain global (fader MASTER côté UI). Appliqué AVANT le clamp
         // pour qu'un master à 0.5 atténue proprement un mix qui aurait dépassé
         // 1.0 (le clamp final ramène quand même dans [-1, 1] pour le DAC).
@@ -364,13 +398,6 @@ impl AudioMixer {
         // Soft clamp to prevent distortion
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
-        }
-
-        // REC-3 : tap MIX. Post master gain + post clamp = exactement ce
-        // que le user entend dans son casque. Cohérent avec le browser
-        // où le record bus est aussi en sortie de masterGain Web Audio.
-        if self.record_tx.is_some() {
-            self.record_send(RecordCmd::PushMix(output.to_vec()));
         }
 
         // Report drift drains (rate-limité à puissances de 2). Coût formatage

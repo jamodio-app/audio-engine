@@ -150,6 +150,15 @@ pub enum BrowserMessage {
         producer_id: String,
         pan: f32,
     },
+    /// DIM factor — atténuation temporaire des instruments quand l'utilisateur
+    /// active DIM côté UI (= pour entendre la conversation talkback clairement).
+    /// Plage [0.0, 1.0], typiquement 0.25 (-12dB) ou 1.0 (off). Appliqué dans
+    /// `mix_into` après la somme des streams et AVANT le master_gain. Le tap
+    /// REC est avant dim/master, donc le record n'est pas affecté (= ce qu'un
+    /// peer entendrait, indépendant de mon écoute locale dim/master).
+    SetDim {
+        factor: f32,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record
