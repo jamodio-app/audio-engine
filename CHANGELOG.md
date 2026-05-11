@@ -6,6 +6,44 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-05-11
+
+### Enregistrement multi-stems côté agent (REC-3)
+
+Avant : en mode agent, le bouton REC du browser produisait un fichier
+silencieux ou incomplet sur certaines configurations (notamment Scarlett
+4-canaux), parce que les flux peers transitent par PlainTransport RTP
+côté agent et ne sont jamais visibles depuis audioCtx browser — le
+MediaRecorder local enregistrait alors un mix vide.
+
+Fix : l'agent encode lui-même les stems Ogg/Opus, le browser délègue.
+
+- Nouveau module `jamodio-audio-core/src/record/` :
+  - `ogg.rs` : OggWriter + CRC32 (RFC 3533 / 7845).
+  - `opus_ogg.rs` : OpusOggRecorder (Opus 20ms 128 kbps VBR + Ogg en mémoire).
+  - `mod.rs` : Recorder (multi-stems) + RecorderHandle (thread record
+    dédié + crossbeam channel non-bloquant).
+- AudioMixer : injection record_tx + 3 tap sites (push_self_samples,
+  push_samples remote, mix_into). Quand pas d'enregistrement : 1 if
+  check, zéro alloc.
+- PipelineState : start_recording(stems) / stop_recording() — démarre
+  le thread record, retourne les fichiers Ogg/Opus.
+- Protocole WS étendu : StartRecording / StopRecording côté browser,
+  RecordingStarted / RecordingDone / RecordingError côté agent.
+- Transfert en base64 dans recording-done unique (un seul message au
+  stop ; WS supporte les MB en frame).
+
+Garanties latence :
+- Tap sites RT path : 1 if + 1 to_vec + 1 try_send (~200ns).
+- Encode Opus + écriture Ogg : isolés dans le thread record dédié.
+- Channel bounded à 256 : drop sample-side avec warn rate-limité si
+  record en retard — jamais le jam temps-réel n'est bloqué.
+
+2 unit tests OpusOggRecorder passent (magic OggS, OpusHead/Tags, pages
+audio, finalize empty case).
+
+Le path browser-only (sans agent) reste inchangé pour rétrocompat.
+
 ## [0.2.5] — 2026-05-11
 
 ### Latency-align en mode agent (sprint B)
