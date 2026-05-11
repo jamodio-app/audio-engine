@@ -6,6 +6,25 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-05-11
+
+### ENTRÉE OFF (SetInputCut) en mode agent
+
+Bug post-v0.2.6 : le bouton « ENTRÉE OFF » du browser ne coupait plus
+le flux envoyé aux pairs en mode agent. Implémentation browser-only
+faisait `track.enabled = false` sur le MediaStream WebRTC, mais en
+mode agent ce stream n'existe pas (capture pilotée par CPAL côté agent).
+
+Fix : nouveau message wire `SetInputCut { cut: bool }` + flag atomic
+`input_cut: Arc<AtomicBool>` partagé avec l'encoder_thread. Quand `cut == true`,
+l'encoder remplit le buffer stéréo par des zéros immédiatement après
+`remap_to_stereo`, AVANT tout traitement aval (RMS, self-monitor mixer,
+record self stem, accumulation Opus, envoi RTP/SRTP au SFU).
+
+Coût latence : 1 atomic load Relaxed par chunk capture (~400/s),
+négligeable face à l'encode Opus (30-80μs/frame). Pas de coût quand
+pas coupé.
+
 ## [0.2.6] — 2026-05-11
 
 ### Enregistrement multi-stems côté agent (REC-3)
