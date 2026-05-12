@@ -56,7 +56,6 @@ void fourcc(uint32_t code, char out[5]) {
 struct Entry {
     __strong AUAudioUnit *au;
     __strong NSWindow *editor_window; // nil tant que pas ouvert
-    AudioComponentInstance legacy_inst; // pour AUGenericView (AUv2 path)
     AudioComponentDescription desc;
     AURenderBlock render_block;          // copié hors d'AUAudioUnit pour appel direct
     std::vector<float> in_l, in_r;       // copie de l'input par bloc (pull_block)
@@ -192,7 +191,6 @@ struct Entry {
     auto entry = std::make_unique<Entry>();
     entry->au = au;
     entry->editor_window = nil;
-    entry->legacy_inst = nullptr;
     entry->desc = desc;
     entry->render_block = au.renderBlock;
     entry->in_l.assign(max_frames, 0.0f);
@@ -232,10 +230,6 @@ struct Entry {
         });
     }
     [entry->au deallocateRenderResources];
-    if (entry->legacy_inst) {
-        AudioUnitUninitialize(entry->legacy_inst);
-        AudioComponentInstanceDispose(entry->legacy_inst);
-    }
     return 0;
 }
 
@@ -320,63 +314,69 @@ struct Entry {
         return 0;
     }
 
-    AudioComponentDescription desc = e->desc;
+    // FIX (S1.4 hotfix#2) — utilise UNE seule instance AUAudioUnit pour le
+    // processing audio ET la GUI. Avant on créait une 2e AudioComponentInstance
+    // dédiée à AUGenericView, ce qui faisait :
+    //   • les paramètres bougés dans la GUI n'affectaient pas le son
+    //     (= la GUI parlait à l'instance morte, le renderBlock à l'autre)
+    //   • à la fermeture de la window on disposait l'instance GUI →
+    //     paramètres reset à la prochaine ouverture.
+    // Maintenant on demande au plugin son viewController via
+    // requestViewControllerWithCompletionHandler:, qui retourne :
+    //   • AU v3 : le custom UI du plugin
+    //   • AU v2 (Apple natifs, AmpliTube legacy) : controller générique
+    //     d'Apple qui affiche les params, LIÉ à la même instance audio.
+    // Plus de disposal à la fermeture — l'AUAudioUnit reste vivante tant
+    // que le plugin est chargé, donc params persistent entre ouvertures.
+    __strong AUAudioUnit *au_strong = e->au;
     dispatch_async(dispatch_get_main_queue(), ^{
-        // Instance legacy nécessaire pour AUGenericView (AUv2 path).
-        AudioComponentInstance inst = nullptr;
-        AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
-        if (!comp) return;
-        if (AudioComponentInstanceNew(comp, &inst) != noErr || !inst) return;
-        AudioUnitInitialize(inst);
-        e->legacy_inst = inst;
+        [au_strong requestViewControllerWithCompletionHandler:^(AUViewControllerBase * _Nullable vc) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSView *view = vc ? vc.view : nil;
+                CGSize prefSize = view ? view.frame.size : CGSizeMake(640, 480);
+                if (prefSize.width < 200 || prefSize.height < 100) {
+                    prefSize = CGSizeMake(640, 480);
+                }
 
-        CFStringRef cf_name = nullptr;
-        AudioComponentCopyName(comp, &cf_name);
-        NSString *title = (__bridge_transfer NSString *)cf_name;
-        if (!title) title = @"AU Plugin";
+                NSWindow *win = [[NSWindow alloc]
+                    initWithContentRect:NSMakeRect(120, 120, prefSize.width, prefSize.height)
+                              styleMask:(NSWindowStyleMaskTitled |
+                                         NSWindowStyleMaskClosable |
+                                         NSWindowStyleMaskResizable)
+                                backing:NSBackingStoreBuffered
+                                  defer:NO];
+                NSString *title = au_strong.audioUnitName ?: @"AU Plugin";
+                [win setTitle:title];
+                [win setReleasedWhenClosed:NO];
 
-        NSRect rect = NSMakeRect(120, 120, 640, 480);
-        NSWindow *win = [[NSWindow alloc]
-            initWithContentRect:rect
-                      styleMask:(NSWindowStyleMaskTitled |
-                                 NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskResizable)
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        [win setTitle:title];
-        [win setReleasedWhenClosed:NO];
+                if (view) {
+                    [win setContentView:view];
+                } else {
+                    NSTextField *label = [[NSTextField alloc]
+                        initWithFrame:NSMakeRect(0, 0, prefSize.width, prefSize.height)];
+                    [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
+                    [label setEditable:NO];
+                    [label setBezeled:NO];
+                    [label setDrawsBackground:NO];
+                    [label setAlignment:NSTextAlignmentCenter];
+                    [win setContentView:label];
+                }
 
-        AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
-        if (view) {
-            view.showsExpertParameters = YES;
-            [win setContentView:view];
-        } else {
-            NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
-            [label setStringValue:@"This AU has no Cocoa UI."];
-            [label setEditable:NO];
-            [label setBezeled:NO];
-            [label setDrawsBackground:NO];
-            [win setContentView:label];
-        }
+                [win center];
+                [NSApp activateIgnoringOtherApps:YES];
+                [win makeKeyAndOrderFront:nil];
+                e->editor_window = win;
 
-        [win center];
-        [NSApp activateIgnoringOtherApps:YES];
-        [win makeKeyAndOrderFront:nil];
-
-        e->editor_window = win;
-        // Quand la window est fermée par l'utilisateur, on nettoie l'entrée
-        // côté éditeur sans toucher au plugin lui-même.
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowWillCloseNotification
-                        object:win
-                         queue:nil
-                    usingBlock:^(NSNotification *_Nonnull __unused note) {
-            e->editor_window = nil;
-            if (e->legacy_inst) {
-                AudioUnitUninitialize(e->legacy_inst);
-                AudioComponentInstanceDispose(e->legacy_inst);
-                e->legacy_inst = nullptr;
-            }
+                // À la fermeture par l'utilisateur, on libère juste la window —
+                // PAS le plugin (params préservés pour la prochaine ouverture).
+                [[NSNotificationCenter defaultCenter]
+                    addObserverForName:NSWindowWillCloseNotification
+                                object:win
+                                 queue:nil
+                            usingBlock:^(NSNotification *_Nonnull __unused note) {
+                    e->editor_window = nil;
+                }];
+            });
         }];
     });
     return 0;
