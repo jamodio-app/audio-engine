@@ -11,7 +11,7 @@ use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 #[cfg(target_os = "macos")]
-use jamodio_audio_core::plugin_host::{PluginHandle, PluginHost};
+use jamodio_audio_core::plugin_host::{PluginHandle, PluginHost, PluginInfo, PluginRef};
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
@@ -107,6 +107,25 @@ pub struct PipelineState {
     pub instrument_plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(target_os = "macos")]
     pub instrument_plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    /// INSERT plugin (sprint S1) — cache du scan AU. Le scan complet prend
+    /// ~13s (instancie chaque AU pour mesurer latence/UI), on le fait UNE
+    /// fois en background au démarrage de l'agent et on stocke le résultat
+    /// ici. `ListPlugins` côté WS lit ce cache → réponse instantanée.
+    #[cfg(target_os = "macos")]
+    pub plugin_scan_cache: Arc<Mutex<PluginScanCache>>,
+}
+
+/// État du scan AU en background. Stocké dans `PipelineState`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub enum PluginScanCache {
+    /// Scan en cours — le browser doit repoller dans quelques secondes.
+    Scanning,
+    /// Scan terminé, liste prête.
+    Ready(Vec<PluginInfo>),
+    /// Scan échoué (rarissime — AudioComponentFindNext ne lève pas d'erreur).
+    #[allow(dead_code)]
+    Failed(String),
 }
 
 const CHANNELS: usize = 2;
@@ -132,7 +151,134 @@ impl PipelineState {
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             instrument_plugin_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
         }
+    }
+
+    /// Lance le scan AU en background. Appelé une fois après `new()` par
+    /// `main.rs`. Le thread tourne ~13s puis stocke le résultat dans le cache.
+    /// Méthode no-op sur les autres OS.
+    #[cfg(target_os = "macos")]
+    pub fn spawn_plugin_scan(&self) {
+        let host = self.au_host.clone();
+        let cache = self.plugin_scan_cache.clone();
+        std::thread::Builder::new()
+            .name("au-scan".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                tracing::info!(target: "jamodio::plugin", "AU scan starting in background");
+                let plugins = host.lock().scan();
+                let elapsed_ms = t0.elapsed().as_millis();
+                tracing::info!(
+                    target: "jamodio::plugin",
+                    count = plugins.len(),
+                    elapsed_ms,
+                    "AU scan finished"
+                );
+                *cache.lock() = PluginScanCache::Ready(plugins);
+            })
+            .expect("spawn au-scan thread");
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn spawn_plugin_scan(&self) {
+        // No-op : aucun host plugin sur Windows phase 1 (= Vst3 viendra phase 2).
+    }
+
+    /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
+    /// Chacun renvoie un Result avec message d'erreur lisible pour wire.
+    #[cfg(target_os = "macos")]
+    pub fn list_instrument_plugins(&self) -> (Vec<PluginInfo>, bool) {
+        match &*self.plugin_scan_cache.lock() {
+            PluginScanCache::Scanning => (Vec::new(), true),
+            PluginScanCache::Ready(items) => (items.clone(), false),
+            PluginScanCache::Failed(_) => (Vec::new(), false),
+        }
+    }
+
+    /// Charge un plugin sur l'instrument self. Décharge l'éventuel précédent.
+    /// `max_frames` = 128 (cf. PLUGIN_BLOCK dans encoder_thread). Retourne
+    /// (name, latency_samples, has_editor) pour ack côté browser.
+    #[cfg(target_os = "macos")]
+    pub fn load_instrument_plugin(
+        &self,
+        plugin_ref: &PluginRef,
+    ) -> Result<(String, u32, bool), String> {
+        // Décharger d'abord (single slot MVP).
+        self.unload_instrument_plugin();
+
+        let mut host = self.au_host.lock();
+        let handle = host
+            .load(plugin_ref, 128)
+            .map_err(|e| format!("{e}"))?;
+        let latency = host.latency_samples(handle);
+        drop(host);
+
+        // Retrouver name + has_editor depuis le cache pour l'ack côté browser.
+        // Si le scan tourne encore (cas limite), on retourne des valeurs par
+        // défaut — le browser a de toute façon déjà le name dans sa liste.
+        let (name, has_editor) = {
+            let scan = self.plugin_scan_cache.lock();
+            if let PluginScanCache::Ready(items) = &*scan {
+                items
+                    .iter()
+                    .find(|p| p.plugin_ref == *plugin_ref)
+                    .map(|p| (p.name.clone(), p.has_editor))
+                    .unwrap_or_else(|| ("Unknown plugin".to_string(), false))
+            } else {
+                ("Unknown plugin".to_string(), false)
+            }
+        };
+
+        *self.instrument_plugin_handle.lock() = Some(handle);
+        self.instrument_plugin_bypass
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            target: "jamodio::plugin",
+            name = %name,
+            latency_samples = latency,
+            "instrument plugin loaded"
+        );
+        Ok((name, latency, has_editor))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unload_instrument_plugin(&self) {
+        let mut handle_guard = self.instrument_plugin_handle.lock();
+        if let Some(handle) = handle_guard.take() {
+            let _ = self.au_host.lock().unload(handle);
+            tracing::info!(target: "jamodio::plugin", "instrument plugin unloaded");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_instrument_plugin_bypass(&self, bypass: bool) {
+        self.instrument_plugin_bypass
+            .store(bypass, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn open_instrument_plugin_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.au_host
+            .lock()
+            .open_editor(handle)
+            .map_err(|e| format!("{e}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn close_instrument_plugin_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.au_host
+            .lock()
+            .close_editor(handle)
+            .map_err(|e| format!("{e}"))
     }
 
     /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF

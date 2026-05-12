@@ -13,6 +13,7 @@
 //! Convention : tout ajout de champ obligatoire = bump majeur. Ajouts optionnels OK.
 
 use crate::net::srtp::SrtpParameters;
+use crate::plugin_host::{PluginInfo, PluginRef};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -159,6 +160,32 @@ pub enum BrowserMessage {
     SetDim {
         factor: f32,
     },
+    /// Sprint INSERT (S1) — liste les plugins natifs installés sur la machine.
+    /// L'agent répond avec `PluginList` qui contient le snapshot du cache de
+    /// scan. Si le scan tourne encore (au démarrage de l'agent), `scanning =
+    /// true` et `items` peut être vide → le browser repolle.
+    ListPlugins,
+    /// Sprint INSERT (S1) — charge un plugin sur la tranche instrument self.
+    /// Réponse : `InstrumentPluginLoaded` ou `InstrumentPluginError`.
+    /// Charge UN seul plugin à la fois côté MVP (1 slot) — un appel quand un
+    /// plugin est déjà chargé décharge l'ancien d'abord.
+    LoadInstrumentPlugin {
+        #[serde(rename = "pluginRef")]
+        plugin_ref: PluginRef,
+    },
+    /// Sprint INSERT (S1) — décharge le plugin courant. No-op si rien chargé.
+    UnloadInstrumentPlugin,
+    /// Sprint INSERT (S1) — toggle bypass du plugin actif (= court-circuite
+    /// process_stereo dans l'encoder_thread). Pas de réponse.
+    SetInstrumentPluginBypass {
+        bypass: bool,
+    },
+    /// Sprint INSERT (S1) — ouvre la fenêtre native macOS du plugin (= GUI
+    /// AmpliTube etc.). No-op silencieux si aucun plugin chargé. La fenêtre
+    /// est ouverte par dispatch_async sur le main thread agent.
+    OpenInstrumentPluginEditor,
+    /// Sprint INSERT (S1) — ferme la fenêtre native si ouverte.
+    CloseInstrumentPluginEditor,
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record
@@ -338,6 +365,30 @@ pub enum AgentMessage {
     },
     /// REC-2/REC-3 — Erreur pendant l'enregistrement (init encoder, etc.).
     RecordingError {
+        message: String,
+    },
+    /// Sprint INSERT (S1) — réponse à `ListPlugins`. Snapshot du cache.
+    /// `scanning = true` ⇒ le scan tourne encore (peut être vide). Le browser
+    /// peut repoll quelques secondes plus tard pour avoir la liste finale.
+    PluginList {
+        items: Vec<PluginInfo>,
+        scanning: bool,
+    },
+    /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin`. `latencySamples`
+    /// est la latence intrinsèque rapportée par l'AU ; le browser doit refuser
+    /// d'activer le plugin si > 64 (= au-delà du budget live), même si l'agent
+    /// permet le load techniquement.
+    InstrumentPluginLoaded {
+        name: String,
+        #[serde(rename = "latencySamples")]
+        latency_samples: u32,
+        #[serde(rename = "hasEditor")]
+        has_editor: bool,
+    },
+    /// Sprint INSERT (S1) — ack du UnloadInstrumentPlugin.
+    InstrumentPluginUnloaded,
+    /// Sprint INSERT (S1) — erreur typée (load failed, plugin not found, etc).
+    InstrumentPluginError {
         message: String,
     },
 }

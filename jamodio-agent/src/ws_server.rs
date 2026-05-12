@@ -713,6 +713,122 @@ async fn handle_message(
             vec![]
         }
 
+        // Sprint INSERT (S1.3) — 6 handlers plugin AU. Sur non-macOS, le crate
+        // jamodio-au-host n'existe pas, donc fallback "not supported" pour
+        // satisfaire le match exhaustif et le build cross-platform futur.
+        BrowserMessage::ListPlugins => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                let (items, scanning) = pl.list_instrument_plugins();
+                vec![AgentMessage::PluginList { items, scanning }]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![AgentMessage::PluginList { items: vec![], scanning: false }]
+            }
+        }
+
+        BrowserMessage::LoadInstrumentPlugin { plugin_ref } => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![AgentMessage::InstrumentPluginError {
+                        message: "agent overloaded".into(),
+                    }];
+                };
+                match pl.load_instrument_plugin(&plugin_ref) {
+                    Ok((name, latency_samples, has_editor)) => {
+                        vec![AgentMessage::InstrumentPluginLoaded {
+                            name,
+                            latency_samples,
+                            has_editor,
+                        }]
+                    }
+                    Err(message) => {
+                        tracing::error!(
+                            target: "jamodio::ws",
+                            error = %message,
+                            "LoadInstrumentPlugin failed"
+                        );
+                        vec![AgentMessage::InstrumentPluginError { message }]
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = plugin_ref;
+                vec![AgentMessage::InstrumentPluginError {
+                    message: "AU plugins not supported on this platform".into(),
+                }]
+            }
+        }
+
+        BrowserMessage::UnloadInstrumentPlugin => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                pl.unload_instrument_plugin();
+                vec![AgentMessage::InstrumentPluginUnloaded]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![AgentMessage::InstrumentPluginUnloaded]
+            }
+        }
+
+        BrowserMessage::SetInstrumentPluginBypass { bypass } => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                pl.set_instrument_plugin_bypass(bypass);
+                vec![]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = bypass;
+                vec![]
+            }
+        }
+
+        BrowserMessage::OpenInstrumentPluginEditor => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                if let Err(message) = pl.open_instrument_plugin_editor() {
+                    return vec![AgentMessage::InstrumentPluginError { message }];
+                }
+                vec![]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![]
+            }
+        }
+
+        BrowserMessage::CloseInstrumentPluginEditor => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                let _ = pl.close_instrument_plugin_editor();
+                vec![]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![]
+            }
+        }
+
         BrowserMessage::StartRecording { stems } => {
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];

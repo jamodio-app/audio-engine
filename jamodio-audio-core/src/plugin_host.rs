@@ -20,12 +20,17 @@ impl PluginHandle {
 
 /// Référence persistable d'un plugin (= ce qui permet de le retrouver entre 2 sessions).
 /// Côté AU : type/subtype/manufacturer en 4-CC. Côté VST3 : path .vst3 + UID.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// Sérialisation wire (cohérente avec le reste du protocole — camelCase) :
+/// ```json
+/// { "format": "au", "auType": "aufx", "subtype": "mrev", "manufacturer": "appl" }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "format", rename_all = "lowercase")]
 pub enum PluginRef {
     /// Audio Unit (macOS). type/subtype/manufacturer encodés en 4-CC ASCII.
     Au {
-        #[serde(rename = "type")]
+        #[serde(rename = "auType")]
         au_type: String,
         subtype: String,
         manufacturer: String,
@@ -107,4 +112,43 @@ pub trait PluginHost: Send {
 
     /// Ferme la fenêtre éditeur si ouverte. No-op sinon.
     fn close_editor(&mut self, handle: PluginHandle) -> Result<(), PluginError>;
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_ref_au_serializes_camel_case() {
+        let pr = PluginRef::Au {
+            au_type: "aufx".into(),
+            subtype: "mrev".into(),
+            manufacturer: "appl".into(),
+        };
+        let json = serde_json::to_string(&pr).unwrap();
+        assert!(json.contains(r#""format":"au""#), "json was {json}");
+        assert!(json.contains(r#""auType":"aufx""#), "json was {json}");
+        assert!(json.contains(r#""subtype":"mrev""#), "json was {json}");
+        assert!(json.contains(r#""manufacturer":"appl""#), "json was {json}");
+    }
+
+    #[test]
+    fn plugin_ref_au_round_trip() {
+        let raw = r#"{"format":"au","auType":"aufx","subtype":"mrev","manufacturer":"appl"}"#;
+        let pr: PluginRef = serde_json::from_str(raw).unwrap();
+        match pr {
+            PluginRef::Au { au_type, subtype, manufacturer } => {
+                assert_eq!(au_type, "aufx");
+                assert_eq!(subtype, "mrev");
+                assert_eq!(manufacturer, "appl");
+            }
+            _ => panic!("expected Au variant"),
+        }
+    }
+
+    #[test]
+    fn plugin_handle_zero_is_invalid() {
+        assert!(!PluginHandle::INVALID.is_valid());
+        assert!(PluginHandle(1).is_valid());
+    }
 }
