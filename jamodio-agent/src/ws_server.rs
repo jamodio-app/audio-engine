@@ -948,6 +948,29 @@ async fn handle_message(
             }
         }
 
+        BrowserMessage::PlayMidiNote { status, data1, data2 } => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![];
+                };
+                let handle_opt = *pl.instrument_plugin_handle.lock();
+                if let Some(handle) = handle_opt {
+                    let event = jamodio_audio_core::plugin_host::MidiEvent {
+                        frame_offset: 0,
+                        data: [status, data1, data2],
+                    };
+                    let _ = pl.au_host.lock().dispatch_midi_only(handle, &[event]);
+                }
+                vec![]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (status, data1, data2);
+                vec![]
+            }
+        }
+
         BrowserMessage::StartRecording { stems } => {
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];

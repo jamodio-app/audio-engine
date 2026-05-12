@@ -200,6 +200,17 @@ pub enum BrowserMessage {
         #[serde(rename = "midiDeviceId", default)]
         midi_device_id: Option<String>,
     },
+    /// Sprint S2.9 — Envoie un event MIDI brut (3 bytes) au plugin instrument
+    /// actuellement chargé. Utilisé par le clavier virtuel HTML intégré dans
+    /// la tranche SELF : click sur une touche → NoteOn (0x9N), relâcher → NoteOff
+    /// (0x8N). No-op silencieux si aucun plugin chargé.
+    PlayMidiNote {
+        /// Status byte MIDI : 0x80-0x8F (NoteOff) / 0x90-0x9F (NoteOn) /
+        /// 0xB0-0xBF (CC) / 0xE0-0xEF (PitchBend) / etc.
+        status: u8,
+        data1: u8,
+        data2: u8,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record

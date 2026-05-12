@@ -306,6 +306,37 @@ impl PluginHost for AuHost {
 #[allow(dead_code)]
 fn _midi_event_reserved(_e: &MidiEvent) {}
 
+impl AuHost {
+    /// S2.9 — Dispatche un batch d'events MIDI vers un plugin SANS process_stereo.
+    /// Utilisé par le clavier virtuel HTML (= note ON/OFF déclenchées par click),
+    /// le WS handler `PlayMidiNote` consomme ça. Le plugin scheduleera l'event
+    /// au prochain render block depuis le encoder_thread.
+    pub fn dispatch_midi_only(
+        &mut self,
+        handle: PluginHandle,
+        midi_events: &[MidiEvent],
+    ) -> Result<(), PluginError> {
+        if midi_events.is_empty() {
+            return Ok(());
+        }
+        let mut packed = Vec::with_capacity(midi_events.len() * 3);
+        for ev in midi_events {
+            packed.push(ev.data[0]);
+            packed.push(ev.data[1]);
+            packed.push(ev.data[2]);
+        }
+        unsafe {
+            au_host_dispatch_midi(
+                self.ptr,
+                handle.0,
+                packed.as_ptr(),
+                midi_events.len() as u32,
+            );
+        }
+        Ok(())
+    }
+}
+
 // ---------- Tests ----------
 
 #[cfg(test)]
