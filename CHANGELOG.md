@@ -6,6 +6,186 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.22] — 2026-05-12
+
+### Bug D — Crossfade au drift drain du jitter buffer
+
+Le `JitterBuffer::pull` (`ring_buffer.rs`) ramenait la latence à target en
+droppant brutalement les samples excédentaires quand `available > 3 ×
+target_samples` → discontinuité PCM audible ("clic") sur sessions
+multi-peers. Le drain reste nécessaire pour borner la latence post-burst
+ou post-drift clock skew, mais on lisse maintenant la transition.
+
+- `crossfade_tail: Vec<f32>` conserve les 480 samples interleaved (= 5 ms
+  stéréo à 48 kHz) les plus récents de la zone drainée.
+- Sur les pulls suivants, fade-out de ce tail vs fade-in des samples
+  poppés : `out[i] = tail[i] · (1 − t) + out[i] · t`. Le fade s'étale
+  automatiquement sur plusieurs pulls si la callback CPAL livre des
+  blocs plus courts que 5 ms.
+- **Zéro latence ajoutée** : `target_samples` du jitter buffer inchangé,
+  le crossfade vit uniquement dans le moment du drain.
+- Log : `tracing::warn!` filtré sur `events > 4 && is_power_of_two` →
+  warns à 8, 16, 32… au lieu de 1, 2, 4, 8, 16… (spam log -70 %).
+- 2 tests unitaires : `drift_drain_no_audible_discontinuity` (push
+  échelon ±1, vérifie `max(|step|) < 0.20` — un drain sec donne 2.0)
+  + `drift_drain_counts_all_dropped_samples` (drift_drops compte
+  pre_drop + tail).
+
+## [0.2.21] — 2026-05-12
+
+### Alignement avec les hotfixes browser MIDI (S2.10)
+
+Bump d'alignement de version après les hotfixes côté browser (piano
+flottant + glissando + raccourcis clavier + 4 octaves + VU SELF
+post-plugin en mode MIDI + bouton "Rafraîchir MIDI" pour hot-plug).
+Côté agent, pas de changement de comportement — bump uniquement pour
+garder browser et agent en phase.
+
+## [0.2.20] — 2026-05-12
+
+### Piano flottant + glissando + raccourcis clavier + 4 octaves (S2.10)
+
+Évolutions du clavier virtuel HTML côté agent (port virtuel MIDI
+"Jamodio Virtual MIDI") : fenêtre piano détachable et draggable,
+glissando (clic-drag pour enchaîner les notes), raccourcis clavier
+QWERTY (A W S E D F T G Y H U J → C D E F G A B sur 1 octave + Z X
+pour transposer ±1 octave), extension de 2 à 4 octaves.
+
+## [0.2.19] — 2026-05-12
+
+### Clavier virtuel MIDI HTML 2 octaves + badge MIDI (S2.9 browser)
+
+Côté browser : nouveau clavier virtuel HTML sur 2 octaves intégré à la
+modal Source instrument. Affiche un badge MIDI quand un device MIDI
+externe ou virtuel est actif. Communique avec l'agent via le handler
+WS `PlayMidiNote { note, velocity, on }` côté Rust.
+
+## [0.2.18] — 2026-05-12
+
+### Port virtuel MIDI "Jamodio Virtual MIDI" + UX Audio/MIDI radio (S2.7)
+
+Le port MIDI virtuel `Jamodio Virtual MIDI` est créé automatiquement
+au boot agent (via `coremidi-rs`). Visible dans Logic Pro / Ableton
+Live / GarageBand côté DAW. Permet à un DAW externe de driver les
+plugins instruments hébergés dans Jamodio sans clavier USB physique.
+Côté browser : la modal Source instrument bascule via radio
+Audio / MIDI (au lieu d'un toggle ambigu) pour clarifier le mode.
+
+## [0.2.17] — 2026-05-12
+
+### MIDI input pour les plugins instruments (S2 backend)
+
+Routing MIDI complet côté agent. Nouveau `InputSource { Audio, Midi(device_id) }`
+dans `PipelineState`. En mode MIDI, l'`encoder_thread` force les samples
+audio à zéro mais conserve le tick CPAL 48 kHz / 128 samples. Drain
+max 64 events MIDI par bloc Opus (120 samples) depuis le channel
+`midir` → passe au plugin via `process_stereo(handle, audio_zeros,
+&midi_events)`. Le plugin instrument génère l'audio → Opus → RTP
+peers + self-monitor. Wire `SetMidiInput { device_id }`.
+
+## [0.2.16] — 2026-05-12
+
+### Fenêtre plugin non resizable (S1.11)
+
+Petit hotfix UI : la fenêtre native macOS du plugin (AUGenericView ou
+CocoaUI custom) n'est plus resizable par l'user. La taille est fixée
+par la `requestedSize` reportée par le plugin. Évite de casser des
+layouts custom (AmpliTube notamment) qui ne s'adaptent pas
+correctement aux contraintes de redimensionnement.
+
+## [0.2.15] — 2026-05-12
+
+### `autoresizingMask` sur la view du plugin (S1.10)
+
+Hotfix layout : `autoresizingMask = NSViewWidthSizable |
+NSViewHeightSizable` sur la view racine du plugin → quand la fenêtre
+parente est redimensionnée par le plugin (cas TONEX qui change sa
+taille au load), la view interne s'adapte.
+
+## [0.2.14] — 2026-05-12
+
+### Scan multi-types + détection audio-in au load (S1.9)
+
+Le scan AU couvre maintenant tous les types (`aufx`, `aumu`, `aumi`,
+etc.) au lieu de filtrer aux effects-only. Cas pratique : AmpliTube
+est listé en `aumu` hybride avec audio in → était exclu par le scan
+v0.2.13 strict. Au load, on détecte audio-in via
+`au.inputBusses.count > 0` (v3) ou `kAudioUnitProperty_ElementCount
+scope:Input` (v2). Sans bus input → skip `setFormat input` + render
+callback (plugin instrument MIDI chargeable, silencieux sans MIDI).
+Résout le `setFormat in: -10877 InvalidScope` pour PIANO.
+
+## [0.2.13] — 2026-05-12
+
+### Scan effects-only + CocoaUI v2 custom path (S1.8 hotfix)
+
+Path v2 custom UI : `openEditor:` tente d'abord
+`kAudioUnitProperty_CocoaUI` qui retourne un bundle URL + class
+name. Charge le bundle dynamiquement (`NSBundle bundleWithURL:` +
+`load`), instancie la factory class (conforms à `AUCocoaUIBase`),
+appelle `uiViewForAudioUnit:withSize:`. Fallback `AUGenericView` si
+pas de CocoaUI. Validation utilisateur : UI TONEX et AmpliTube
+fonctionnelles en path v2.
+
+## [0.2.12] — 2026-05-12
+
+### Path hybride AU v2 / v3 pour custom UI plugins v3 (S1.7 hotfix)
+
+AmpliTube 5 affichait un AUGenericView (sliders bruts) au lieu de son
+UI 3D. Cause : AmpliTube 5 = AU v3 dont l'UI custom est uniquement
+accessible via `requestViewControllerWithCompletionHandler:` sur
+`AUAudioUnit`. Détection au load via `componentFlags &
+kAudioComponentFlag_IsV3AudioUnit`. Path v3 → `AUAudioUnit` +
+`scheduleMIDIEventListBlock` + custom UI ; path v2 →
+`AudioComponentInstance` + `AudioUnitRender` + `AUGenericView`.
+Instance partagée GUI ↔ processing dans chaque chemin.
+
+## [0.2.11] — 2026-05-12
+
+### Sprint S1 INSERT plugins natifs AudioUnit (S1.1 à S1.5)
+
+La mixette agent peut maintenant héberger des plugins natifs
+AudioUnit (effets, instruments MIDI) sur la tranche instrument self,
+avec UI custom du plugin ouverte dans une fenêtre native macOS.
+
+- **S1.1 — Trait `PluginHost`** : module
+  `jamodio-audio-core/src/plugin_host.rs` avec types partagés
+  (`PluginInfo`, `PluginRef`, `PluginHandle`, `MidiEvent`).
+  Constante `MAX_PLUGIN_LATENCY_SAMPLES = 64`. Archi cross-platform :
+  impl macOS = `jamodio-au-host`, impl Windows future =
+  `jamodio-vst3-host`.
+- **S1.1 — Nouveau crate `jamodio-au-host`** (~790 LoC) : C API
+  Objective-C++ (`au_host_create/scan/load/unload/process_stereo/
+  dispatch_midi/open_editor/close_editor`) via `build.rs`
+  + `cc::Build::cpp(true)`. Wrapper Rust `AuHost` impl `PluginHost`.
+  Frameworks : AudioToolbox, AudioUnit, CoreAudio, CoreAudioKit,
+  CoreMIDI, AVFoundation, AppKit. 6 tests unitaires.
+- **S1.2 — `process_stereo` dans le capture path** :
+  `encoder_thread` route le signal instrument self à travers le
+  plugin entre `remap_to_stereo` et `accumulator`. Self-monitor
+  entend le WET. Sous-blocs de 128 samples par canal pour respecter
+  `maximumFramesToRender`.
+- **S1.3 — Protocole WS + scan cache background** : 6
+  `BrowserMessage` (`list-plugins`, `load-instrument-plugin`,
+  `unload`, `set-bypass`, `open-editor`, `close-editor`) + 4
+  `AgentMessage`. Scan AU au boot agent, ~122 ms typique.
+- **S1.4 — Hotfixes critiques** : `bus.enabled = NO` par défaut sur
+  AUAudioUnit neuve → fix `[bus setEnabled:YES]` explicite
+  (`-10876 NoConnection`). Window plugin ouverte derrière Chrome →
+  `[NSApp activateIgnoringOtherApps:YES]`. `providesUserInterface`
+  forcé à `true` (AUGenericView fallback). Refactor en API C legacy
+  partout (`AudioComponentInstanceNew` + `AudioUnitRender` +
+  `AURenderCallback` C + `AUGenericView initWithAudioUnit:`) pour
+  partager l'instance entre processing et GUI (l'AUAudioUnit cache
+  son AudioComponentInstance sous-jacente).
+- **S1.5 — Sync state au reconnect WS** : au connect WS, l'agent
+  push automatiquement `InstrumentPluginLoaded` si un plugin est
+  déjà chargé. Browser persiste le dernier plugin dans
+  `localStorage 'jamodio-fx-self'` et tente un re-load auto après
+  800 ms si l'agent ne push pas (cas agent redémarré).
+
+Pièges hosting AudioUnit appris dans la mémoire `au_hosting_pitfalls.md`.
+
 ## [0.2.10] — 2026-05-11
 
 ### DIM ducking instruments (SetDim) + correction sémantique tap REC
