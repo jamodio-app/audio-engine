@@ -18,8 +18,20 @@ Cargo.lock.bak
 # Keys / secrets — ne JAMAIS commit
 *.p8
 *.p12
+*.pfx
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
 *.mobileprovision
 **/tauri.private.key
+.env
+.env.*
+!.env.example
+secrets.*
+credentials.*
 
 # Bac à sable POC INSERT plugins — supprimé une fois jamodio-au-host stable.
 /au-host-poc/
