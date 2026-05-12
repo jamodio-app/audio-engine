@@ -202,11 +202,17 @@ fn main() {
 
             // ─── Spawn WS server (audio pipeline) ───────────
             let mixer = Arc::new(Mutex::new(AudioMixer::new()));
-            let pipeline = PipelineState::new(mixer);
+            let mut pipeline = PipelineState::new(mixer);
             // Sprint INSERT (S1.3) — lance le scan AU en background dès le
             // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
             // pas le menu FX avant plusieurs secondes → cache prêt à temps.
             pipeline.spawn_plugin_scan();
+            // Sprint S2.7 — Crée un port MIDI virtuel "Jamodio Virtual MIDI"
+            // dans CoreMIDI. Apparaît comme destination dans toutes les apps
+            // MIDI macOS (Logic, Ableton, GarageBand…). Évite à l'user
+            // d'avoir à configurer manuellement l'IAC Driver pour utiliser
+            // les plugins instruments sans clavier USB physique.
+            pipeline.spawn_virtual_midi();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
             let ws_handle = WsServerHandle::new(pipeline);
             let ws_handle_for_server = ws_handle.clone();

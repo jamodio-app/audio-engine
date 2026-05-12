@@ -124,14 +124,26 @@ pub struct PipelineState {
     /// MIDI au plugin AU instrument chargé. Le plugin produit alors le son.
     #[cfg(target_os = "macos")]
     pub input_source: Arc<Mutex<InputSource>>,
-    /// S2 — MIDI input ouvert (RAII : le Drop ferme le port). None en mode
-    /// Audio. Le callback midir pousse les events dans `midi_event_rx`.
+    /// S2 — MIDI input physique ouvert (RAII : le Drop ferme le port). None
+    /// si source = Audio OU si l'utilisateur a choisi le port virtuel.
+    /// Le callback midir push dans le channel `midi_event_rx`.
     #[cfg(target_os = "macos")]
     midi_input: Option<crate::audio::midi::MidiInput>,
     /// S2 — Receiver des events MIDI cumulés depuis le dernier bloc audio.
     /// Drainé par l'encoder_thread juste avant `process_stereo`.
     #[cfg(target_os = "macos")]
     midi_event_rx: Option<Receiver<MidiEvent>>,
+    /// S2.7 — Port virtuel "Jamodio Virtual MIDI" créé au boot agent et tenu
+    /// vivant toute la durée d'exécution. Apparaît dans CoreMIDI = destination
+    /// visible dans toutes les apps MIDI macOS (Logic, Ableton, GarageBand…).
+    /// Permet à l'user d'utiliser Jamodio comme cible MIDI sans IAC Driver.
+    #[cfg(target_os = "macos")]
+    virtual_midi_keepalive: Option<crate::audio::midi::MidiInput>,
+    /// S2.7 — Receiver du port virtuel, persistant et clonable. Quand l'user
+    /// sélectionne "Jamodio Virtual MIDI", `set_input_source` retourne ce rx
+    /// au lieu d'ouvrir un nouveau MidiInput (= une seule instance virtuelle).
+    #[cfg(target_os = "macos")]
+    virtual_midi_rx: Option<Receiver<MidiEvent>>,
 }
 
 /// Source d'entrée de l'instrument self (sprint S2). Mutuellement exclusif :
@@ -202,8 +214,36 @@ impl PipelineState {
             midi_input: None,
             #[cfg(target_os = "macos")]
             midi_event_rx: None,
+            #[cfg(target_os = "macos")]
+            virtual_midi_keepalive: None,
+            #[cfg(target_os = "macos")]
+            virtual_midi_rx: None,
         }
     }
+
+    /// S2.7 — Crée le port virtuel "Jamodio Virtual MIDI" au boot agent.
+    /// Best-effort : si la création échoue (rare — droits CoreMIDI), on
+    /// continue sans virtual port. Les ports physiques restent utilisables.
+    /// Appelée une fois après `new()` par `main.rs`.
+    #[cfg(target_os = "macos")]
+    pub fn spawn_virtual_midi(&mut self) {
+        let (tx, rx) = bounded::<MidiEvent>(512);
+        match crate::audio::midi::create_virtual_input(tx) {
+            Ok(mi) => {
+                self.virtual_midi_keepalive = Some(mi);
+                self.virtual_midi_rx = Some(rx);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::midi",
+                    error = %e,
+                    "virtual MIDI port creation failed — physical ports only"
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn spawn_virtual_midi(&mut self) {}
 
     /// S2 — change la source d'entrée. Appelé par le WS handler quand le
     /// browser bascule entre Audio et MIDI. En mode MIDI, ouvre un MidiInput
@@ -214,15 +254,27 @@ impl PipelineState {
     pub fn set_input_source(&mut self, source: InputSource) -> Result<(), String> {
         match &source {
             InputSource::Audio => {
-                // Ferme le MIDI input s'il y en avait un.
+                // Ferme le MIDI input physique s'il y en avait un. Le port
+                // virtuel reste vivant (= virtual_midi_keepalive intact).
                 self.midi_input = None;
                 self.midi_event_rx = None;
             }
             InputSource::Midi(device_id) => {
-                let (tx, rx) = bounded::<MidiEvent>(256);
-                let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
-                self.midi_input = Some(midi);
-                self.midi_event_rx = Some(rx);
+                if device_id.starts_with(crate::audio::midi::VIRTUAL_PORT_ID_PREFIX) {
+                    // Port virtuel : on réutilise le receiver persistant créé
+                    // au boot. Pas d'ouverture nouvelle. Si le virtual a échoué
+                    // au boot (rare), on retourne une erreur claire.
+                    let rx = self.virtual_midi_rx.clone().ok_or_else(|| {
+                        "virtual MIDI port not available (creation failed at boot)".to_string()
+                    })?;
+                    self.midi_input = None;
+                    self.midi_event_rx = Some(rx);
+                } else {
+                    let (tx, rx) = bounded::<MidiEvent>(256);
+                    let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
+                    self.midi_input = Some(midi);
+                    self.midi_event_rx = Some(rx);
+                }
             }
         }
         *self.input_source.lock() = source;
