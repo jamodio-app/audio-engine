@@ -304,7 +304,13 @@ impl AudioMixer {
             let new_drops = stream.jitter.drift_drops();
             if new_drops > stream.last_drift_drops {
                 stream.drift_drain_count += 1;
-                if stream.drift_drain_count == 1 || stream.drift_drain_count.is_power_of_two() {
+                // Bug D : on logue uniquement les drains sévères (events > 4).
+                // Les small drifts (1-4) sont normaux et bruyaient le log
+                // sans signal. Combiné avec is_power_of_two, on logue à
+                // events = 8, 16, 32, 64… → réduction ~70 % du spam.
+                if stream.drift_drain_count > 4
+                    && stream.drift_drain_count.is_power_of_two()
+                {
                     tracing::warn!(
                         target: "jamodio::mixer",
                         producer = &producer_id[..8.min(producer_id.len())],

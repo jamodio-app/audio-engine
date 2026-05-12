@@ -19,6 +19,15 @@ pub struct JitterBuffer {
     /// rempli durablement bien au-dessus de `target_samples` (drift drain
     /// pré-emptif pour borner la latence post-burst).
     drift_drops: u64,
+    /// Tail conservé au moment d'un drift drain : les `CROSSFADE_SAMPLES`
+    /// derniers samples drainés (= ce qui aurait été joué juste avant le
+    /// saut). Sur les pulls suivants, on fait un crossfade entre ce tail et
+    /// les premiers samples poppés → la discontinuité brutale du drain
+    /// devient une rampe douce sur 5 ms (inaudible). Vide hors drain.
+    crossfade_tail: Vec<f32>,
+    /// Position courante (en samples interleaved) dans `crossfade_tail`.
+    /// `crossfade_pos < crossfade_tail.len()` ⇒ un crossfade est en cours.
+    crossfade_pos: usize,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -42,6 +51,14 @@ const CAPACITY_MS: usize = 300;
 /// target. Borne la latence après un burst (sinon le buffer reste à 80-90 ms
 /// indéfiniment sous l'effet de la dérive d'horloge producer↔consumer).
 const DRIFT_DRAIN_FACTOR: usize = 3;
+/// Durée du crossfade appliqué au moment d'un drift drain. 5 ms à 48 kHz
+/// stéréo interleaved = 240 frames × 2 canaux = 480 samples. Suffisant pour
+/// masquer la discontinuité du drain sans introduire de smear audible sur
+/// transients (standard DAW splice point). N'ajoute AUCUNE latence : le
+/// crossfade s'applique sur les samples qu'on poppait déjà — la cible du
+/// buffer reste `target_samples`.
+const CROSSFADE_MS: usize = 5;
+const CROSSFADE_SAMPLES: usize = CROSSFADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 
 impl JitterBuffer {
     pub fn new() -> Self {
@@ -58,6 +75,8 @@ impl JitterBuffer {
             primed: false,
             overflow_drops: 0,
             drift_drops: 0,
+            crossfade_tail: Vec::with_capacity(CROSSFADE_SAMPLES),
+            crossfade_pos: 0,
         }
     }
 
@@ -115,18 +134,30 @@ impl JitterBuffer {
 
         // Drift drain (uniquement quand primed → on n'interfère pas avec
         // le pre-fill au démarrage).
+        //
+        // Crossfade ~5 ms : au lieu de drop sec tous les samples excédentaires
+        // (= clic audible), on garde les CROSSFADE_SAMPLES derniers dans
+        // `crossfade_tail` et on les fade-out contre le fade-in des nouveaux
+        // samples poppés ci-dessous. Pas de latence ajoutée — la cible du
+        // buffer reste target_samples après l'opération.
         let drain_threshold = DRIFT_DRAIN_FACTOR * self.target_samples;
         let available = if available > drain_threshold {
             let to_drop = available - self.target_samples;
-            let dropped = self.consumer.skip(to_drop);
-            self.drift_drops += dropped as u64;
+            let tail_len = CROSSFADE_SAMPLES.min(to_drop);
+            let pre_drop = to_drop - tail_len;
+            let dropped_pre = self.consumer.skip(pre_drop);
+            self.crossfade_tail.resize(tail_len, 0.0);
+            let popped_tail = self.consumer.pop_slice(&mut self.crossfade_tail[..]);
+            self.crossfade_tail.truncate(popped_tail);
+            self.crossfade_pos = 0;
+            self.drift_drops += (dropped_pre + popped_tail) as u64;
             self.consumer.occupied_len()
         } else {
             available
         };
 
         let needed = output.len();
-        if available >= needed {
+        let pulled = if available >= needed {
             self.consumer.pop_slice(&mut output[..needed]);
             self.adapt_down();
             needed
@@ -139,7 +170,32 @@ impl JitterBuffer {
             self.adapt_up();
             self.primed = false;
             available
+        };
+
+        // Applique le crossfade en cours sur les premiers samples poppés.
+        // Le fade s'étale sur plusieurs pulls si output.len() < tail_len.
+        if self.crossfade_pos < self.crossfade_tail.len() {
+            let fade_len = self.crossfade_tail.len();
+            let remaining = fade_len - self.crossfade_pos;
+            let n = remaining.min(output.len());
+            let start = self.crossfade_pos;
+            let inv_fade = 1.0 / fade_len as f32;
+            for (i, (out, &tail)) in output[..n]
+                .iter_mut()
+                .zip(&self.crossfade_tail[start..start + n])
+                .enumerate()
+            {
+                let t = (start + i) as f32 * inv_fade;
+                *out = tail * (1.0 - t) + *out * t;
+            }
+            self.crossfade_pos += n;
+            if self.crossfade_pos >= fade_len {
+                self.crossfade_tail.clear();
+                self.crossfade_pos = 0;
+            }
         }
+
+        pulled
     }
 
     pub fn buffered(&self) -> usize {
@@ -194,5 +250,111 @@ impl JitterBuffer {
             self.target_samples = self.target_samples.saturating_sub(shrink).max(min);
             self.last_adapt = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plus grand écart entre 2 samples interleaved consécutifs d'un même
+    /// canal (= dérivée discrète par canal). Sur un signal continu cette
+    /// valeur est bornée par la slope du signal ; une discontinuité brutale
+    /// la fait exploser. Mesure aussi le saut entre `prev_tail` (dernier
+    /// sample joué juste avant `buf`) et le 1er sample de `buf` pour
+    /// détecter une coupure au bord du pull.
+    fn max_step_per_channel(buf: &[f32], prev_tail: Option<&[f32]>) -> f32 {
+        let mut m = 0.0_f32;
+        for ch in 0..CHANNELS {
+            let mut prev = if let Some(t) = prev_tail {
+                t[t.len() - CHANNELS + ch]
+            } else {
+                buf[ch]
+            };
+            let start_frame = if prev_tail.is_some() { 0 } else { 1 };
+            for frame_idx in start_frame..(buf.len() / CHANNELS) {
+                let s = buf[frame_idx * CHANNELS + ch];
+                m = m.max((s - prev).abs());
+                prev = s;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn drift_drain_no_audible_discontinuity() {
+        // Pour qu'un drain SEC produise une discontinuité observable, on
+        // push un échelon : grand segment à +1.0 puis segment à -1.0. Le
+        // drain va jeter une partie du +1.0 → sans crossfade le pull
+        // suivant verra une marche directe +1.0 → −1.0 (step = 2.0). Avec
+        // crossfade sur 480 samples interleaved, la transition est lissée
+        // (~2.0 / 240 ≈ 0.008 par frame).
+        let target_ms = 10;
+        let target_samples_local = target_ms * SAMPLE_RATE * CHANNELS / 1000;
+
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(target_ms);
+
+        // Pré-fill amorce : 1 chunk de +1.0 → primed sur +1.0.
+        jb.push(&vec![1.0_f32; target_samples_local]);
+
+        // 1er pull : consomme tout le chunk. Pas de drain (occupied = target).
+        let mut warmup = vec![0.0_f32; target_samples_local];
+        jb.pull(&mut warmup);
+        assert!(warmup.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert_eq!(jb.drift_drops(), 0, "pas de drain au pré-pull");
+
+        // Construit un buffer dont la frontière +1/−1 tombe pile entre le
+        // tail conservé pour le crossfade et le new_head poppé après :
+        //   • pre_drop = 4320 samples skipped dans la zone +1.0
+        //   • tail (480 samples) = fin de la zone +1.0
+        //   • new_head poppé = début de la zone −1.0 (≥ target)
+        // Calcul : pour avoir pre_drop = (5×target − tail_len) avec tail_len
+        // = CROSSFADE_SAMPLES = 480, il faut occupied = 5×target + target
+        // = 6×target. La zone +1.0 doit faire 5×target pour que tail
+        // s'arrête exactement à la frontière.
+        jb.push(&vec![1.0_f32; 5 * target_samples_local]);
+        jb.push(&vec![-1.0_f32; target_samples_local]);
+
+        // Pull de la taille exacte du crossfade pour rester dans la zone
+        // alimentée (target = 960 samples post-drain — un pull plus grand
+        // déclencherait un underrun et faussserait la mesure).
+        let mut out = vec![0.0_f32; CROSSFADE_SAMPLES];
+        jb.pull(&mut out);
+        assert!(jb.drift_drops() > 0, "drift drain attendu");
+
+        // Step max entre la fin du warmup et le 2e pull. Sans crossfade
+        // ≈ 2.0 (saut +1.0 → −1.0). Avec crossfade ≈ 0.008.
+        let max_step = max_step_per_channel(&out, Some(&warmup));
+        assert!(
+            max_step < 0.20,
+            "discontinuité résiduelle trop forte: max_step={max_step}"
+        );
+    }
+
+    #[test]
+    fn drift_drain_counts_all_dropped_samples() {
+        // Le crossfade ne doit pas perdre la trace des samples consommés :
+        // drift_drops doit refléter exactement (occupied_initial − target),
+        // tail conservé pour le fade inclus (consumé pour de bon, pas joué
+        // tel quel — mixé en fade-out avec le new_head).
+        let target_ms = 10;
+        let target_samples_local = target_ms * SAMPLE_RATE * CHANNELS / 1000;
+
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(target_ms);
+
+        let burst_len = 5 * target_samples_local; // > 3× target ⇒ déclenche
+        jb.push(&vec![0.5_f32; burst_len]);
+
+        let mut out = vec![0.0_f32; 256];
+        jb.pull(&mut out);
+
+        let expected_drained = burst_len - target_samples_local;
+        assert_eq!(
+            jb.drift_drops(),
+            expected_drained as u64,
+            "drift_drops doit compter pre_drop + tail conservé pour le crossfade"
+        );
     }
 }
