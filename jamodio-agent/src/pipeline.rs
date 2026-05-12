@@ -113,6 +113,11 @@ pub struct PipelineState {
     /// ici. `ListPlugins` côté WS lit ce cache → réponse instantanée.
     #[cfg(target_os = "macos")]
     pub plugin_scan_cache: Arc<Mutex<PluginScanCache>>,
+    /// S1.5 — snapshot du plugin actuellement chargé (None si aucun). Lu au
+    /// connect WS pour push l'état au browser → l'UI se resynchronise même
+    /// après reload de page (le plugin reste actif côté agent).
+    #[cfg(target_os = "macos")]
+    pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
 }
 
 /// État du scan AU en background. Stocké dans `PipelineState`.
@@ -126,6 +131,18 @@ pub enum PluginScanCache {
     /// Scan échoué (rarissime — AudioComponentFindNext ne lève pas d'erreur).
     #[allow(dead_code)]
     Failed(String),
+}
+
+/// Snapshot complet du plugin chargé sur l'instrument self (S1.5). Utilisé
+/// pour push l'état au browser au reconnect WS — sans ça, après reload de
+/// la page browser, l'UI ignorait qu'un plugin tournait encore côté agent.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct LoadedPluginInfo {
+    pub plugin_ref: PluginRef,
+    pub name: String,
+    pub latency_samples: u32,
+    pub has_editor: bool,
 }
 
 const CHANNELS: usize = 2;
@@ -153,6 +170,8 @@ impl PipelineState {
             instrument_plugin_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "macos")]
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
+            #[cfg(target_os = "macos")]
+            instrument_plugin_info: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -233,6 +252,13 @@ impl PipelineState {
         *self.instrument_plugin_handle.lock() = Some(handle);
         self.instrument_plugin_bypass
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // S1.5 — snapshot complet pour resync au reconnect.
+        *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
+            plugin_ref: plugin_ref.clone(),
+            name: name.clone(),
+            latency_samples: latency,
+            has_editor,
+        });
         tracing::info!(
             target: "jamodio::plugin",
             name = %name,
@@ -247,8 +273,23 @@ impl PipelineState {
         let mut handle_guard = self.instrument_plugin_handle.lock();
         if let Some(handle) = handle_guard.take() {
             let _ = self.au_host.lock().unload(handle);
+            // S1.5 — clear le snapshot AVEC le handle pour cohérence.
+            *self.instrument_plugin_info.lock() = None;
+            self.instrument_plugin_bypass
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(target: "jamodio::plugin", "instrument plugin unloaded");
         }
+    }
+
+    /// S1.5 — Snapshot pour resync au reconnect WS. Retourne None si aucun
+    /// plugin actuellement chargé. Le bypass est dans le AtomicBool dédié.
+    #[cfg(target_os = "macos")]
+    pub fn get_instrument_plugin_snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
+        let info = self.instrument_plugin_info.lock().clone()?;
+        let bypass = self
+            .instrument_plugin_bypass
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some((info, bypass))
     }
 
     #[cfg(target_os = "macos")]

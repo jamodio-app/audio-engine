@@ -234,6 +234,30 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         .send(Message::Text(serde_json::to_string(&status).unwrap()))
         .await;
 
+    // S1.5 — Sync state au reconnect : si un plugin INSERT est déjà chargé
+    // côté agent (= browser a fait reload de page mais l'agent vivait), on
+    // push l'état pour que l'UI affiche directement [● bypass][nom][✕] au
+    // lieu de "+ FX" trompeur. Le browser reçoit le même message que pour
+    // un load fresh, plus rien à modifier côté handler.
+    #[cfg(target_os = "macos")]
+    {
+        let pl = handle.pipeline.lock().await;
+        if let Some((info, bypass)) = pl.get_instrument_plugin_snapshot() {
+            drop(pl);
+            let resync = AgentMessage::InstrumentPluginLoaded {
+                name: info.name,
+                plugin_ref: info.plugin_ref,
+                latency_samples: info.latency_samples,
+                has_editor: info.has_editor,
+                bypass,
+            };
+            let _ = ws_tx
+                .send(Message::Text(serde_json::to_string(&resync).unwrap()))
+                .await;
+            tracing::info!(target: "jamodio::ws", "pushed instrument plugin state on connect");
+        }
+    }
+
     // Channel for outgoing messages (from message handler + periodic tasks)
     let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(64);
 
@@ -743,8 +767,12 @@ async fn handle_message(
                     Ok((name, latency_samples, has_editor)) => {
                         vec![AgentMessage::InstrumentPluginLoaded {
                             name,
+                            plugin_ref: plugin_ref.clone(),
                             latency_samples,
                             has_editor,
+                            // Reset au load — l'agent met bypass à false dans
+                            // load_instrument_plugin, on miroite pour le wire.
+                            bypass: false,
                         }]
                     }
                     Err(message) => {

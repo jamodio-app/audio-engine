@@ -374,16 +374,22 @@ pub enum AgentMessage {
         items: Vec<PluginInfo>,
         scanning: bool,
     },
-    /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin`. `latencySamples`
-    /// est la latence intrinsèque rapportée par l'AU ; le browser doit refuser
-    /// d'activer le plugin si > 64 (= au-delà du budget live), même si l'agent
-    /// permet le load techniquement.
+    /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin` ET push
+    /// automatique au connect WS si un plugin est déjà chargé (sync state
+    /// au reconnect, S1.5). `latencySamples` est la latence intrinsèque
+    /// rapportée par l'AU ; le browser doit refuser d'activer le plugin si
+    /// > 64 (= au-delà du budget live). `pluginRef` permet au browser de
+    /// matcher avec son localStorage. `bypass` reflète l'état courant
+    /// (utile au reconnect pour resynchroniser le bouton bypass UI).
     InstrumentPluginLoaded {
         name: String,
+        #[serde(rename = "pluginRef")]
+        plugin_ref: PluginRef,
         #[serde(rename = "latencySamples")]
         latency_samples: u32,
         #[serde(rename = "hasEditor")]
         has_editor: bool,
+        bypass: bool,
     },
     /// Sprint INSERT (S1) — ack du UnloadInstrumentPlugin.
     InstrumentPluginUnloaded,
