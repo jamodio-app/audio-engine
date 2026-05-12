@@ -43,6 +43,8 @@ pub enum PluginRef {
 /// Métadonnées d'un plugin tel que présenté au browser.
 /// `incompatible: true` = latence intrinsèque trop haute (>64 samples) pour live.
 /// L'UI affiche ces plugins en grisé avec tooltip explicatif (cf. mémoire vision).
+/// `has_input_bus = false` (= synthé MIDI pur) signale au browser qu'il faut
+/// auto-switcher la source d'entrée en MIDI à l'activation (S2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: String,
@@ -51,6 +53,15 @@ pub struct PluginInfo {
     pub latency_samples: u32,
     pub has_editor: bool,
     pub incompatible: bool,
+    /// True si le plugin a au moins un bus audio in (= effets aufx + aumu
+    /// hybrides type AmpliTube). False = pur instrument MIDI, nécessite une
+    /// source d'entrée MIDI pour produire du son.
+    #[serde(default = "default_true")]
+    pub has_input_bus: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Évènement MIDI pour les plugins instruments (S2). Pas utilisé en S1 mais réservé.
@@ -95,12 +106,16 @@ pub trait PluginHost: Send {
 
     /// Process un bloc audio stéréo non-interleaved IN-PLACE.
     /// `left`/`right` contiennent les samples d'entrée à l'appel, samples de sortie au retour.
+    /// `midi_events` est passé au plugin AVANT le render (S2 : utilisé par les AU instrument
+    /// pour générer leur son à partir du MIDI). Passer `&[]` pour les AU effects qui ne
+    /// consomment pas de MIDI.
     /// Appelé depuis le thread audio RT — DOIT être lock-free et alloc-free.
     fn process_stereo(
         &mut self,
         handle: PluginHandle,
         left: &mut [f32],
         right: &mut [f32],
+        midi_events: &[MidiEvent],
     ) -> Result<(), PluginError>;
 
     /// Latence intrinsèque rapportée par le plugin. Stable après load.

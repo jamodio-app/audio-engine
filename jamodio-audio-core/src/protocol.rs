@@ -186,6 +186,20 @@ pub enum BrowserMessage {
     OpenInstrumentPluginEditor,
     /// Sprint INSERT (S1) — ferme la fenêtre native si ouverte.
     CloseInstrumentPluginEditor,
+    /// Sprint INSERT instruments (S2) — liste les MIDI devices détectés sur
+    /// la machine (claviers USB, virtual MIDI ports). L'agent répond avec
+    /// `MidiDeviceList`. Pas de cache : les devices USB peuvent être hot-plug.
+    ListMidiDevices,
+    /// Sprint INSERT instruments (S2) — change la source d'entrée de la
+    /// tranche instrument self. `source` = "audio" (= CPAL classique) ou
+    /// "midi" (clavier MIDI). `midiDeviceId` est requis si source=midi
+    /// (format `"{idx}:{name}"` retourné par MidiDeviceList).
+    SetInputSource {
+        /// "audio" | "midi"
+        source: String,
+        #[serde(rename = "midiDeviceId", default)]
+        midi_device_id: Option<String>,
+    },
     /// REC-2/REC-3 — démarre l'enregistrement multi-stems côté agent.
     /// Le browser fournit la liste des stems armés (self + peers + mix).
     /// L'agent active les tap sites du mixer et démarre un thread record
@@ -397,6 +411,33 @@ pub enum AgentMessage {
     InstrumentPluginError {
         message: String,
     },
+    /// Sprint INSERT instruments (S2) — réponse à `ListMidiDevices`.
+    MidiDeviceList {
+        devices: Vec<MidiDeviceWire>,
+    },
+    /// Sprint INSERT instruments (S2) — ack du SetInputSource (ou erreur si
+    /// le MIDI device demandé est introuvable). Le browser miroite cette info
+    /// dans son UI (badge "MIDI" sur la tranche, retour Audio si erreur).
+    InputSourceChanged {
+        /// "audio" | "midi"
+        source: String,
+        #[serde(rename = "midiDeviceId", skip_serializing_if = "Option::is_none")]
+        midi_device_id: Option<String>,
+        #[serde(rename = "midiDeviceName", skip_serializing_if = "Option::is_none")]
+        midi_device_name: Option<String>,
+    },
+    InputSourceError {
+        message: String,
+    },
+}
+
+/// Wire format pour un MIDI device (cf. `audio::midi::MidiDeviceInfo` côté agent).
+#[derive(Debug, Serialize)]
+pub struct MidiDeviceWire {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "isDefault")]
+    pub is_default: bool,
 }
 
 /// Fichier enregistré encodé pour le wire (base64 du Ogg/Opus complet).

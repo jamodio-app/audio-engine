@@ -857,6 +857,97 @@ async fn handle_message(
             }
         }
 
+        // Sprint INSERT instruments (S2) — discovery + selection MIDI input.
+        BrowserMessage::ListMidiDevices => {
+            #[cfg(target_os = "macos")]
+            {
+                let devices = crate::audio::midi::list_devices()
+                    .into_iter()
+                    .map(|d| jamodio_audio_core::protocol::MidiDeviceWire {
+                        id: d.id,
+                        name: d.name,
+                        is_default: d.is_default,
+                    })
+                    .collect();
+                vec![AgentMessage::MidiDeviceList { devices }]
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                vec![AgentMessage::MidiDeviceList { devices: vec![] }]
+            }
+        }
+
+        BrowserMessage::SetInputSource { source, midi_device_id } => {
+            #[cfg(target_os = "macos")]
+            {
+                let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![AgentMessage::InputSourceError {
+                        message: "agent overloaded".into(),
+                    }];
+                };
+                let new_source = match source.as_str() {
+                    "audio" => crate::pipeline::InputSource::Audio,
+                    "midi" => match midi_device_id {
+                        Some(id) => crate::pipeline::InputSource::Midi(id),
+                        None => {
+                            return vec![AgentMessage::InputSourceError {
+                                message: "midiDeviceId required when source=midi".into(),
+                            }];
+                        }
+                    },
+                    _ => {
+                        return vec![AgentMessage::InputSourceError {
+                            message: format!("unknown source: {source}"),
+                        }];
+                    }
+                };
+
+                match pl.set_input_source(new_source.clone()) {
+                    Ok(()) => {
+                        let (src_str, dev_id, dev_name) = match &new_source {
+                            crate::pipeline::InputSource::Audio => {
+                                ("audio".to_string(), None, None)
+                            }
+                            crate::pipeline::InputSource::Midi(id) => {
+                                // Cherche le nom human-friendly dans la liste.
+                                let name = crate::audio::midi::list_devices()
+                                    .into_iter()
+                                    .find(|d| &d.id == id)
+                                    .map(|d| d.name);
+                                ("midi".to_string(), Some(id.clone()), name)
+                            }
+                        };
+                        tracing::info!(
+                            target: "jamodio::midi",
+                            source = %src_str,
+                            device_id = ?dev_id,
+                            "input source changed"
+                        );
+                        vec![AgentMessage::InputSourceChanged {
+                            source: src_str,
+                            midi_device_id: dev_id,
+                            midi_device_name: dev_name,
+                        }]
+                    }
+                    Err(message) => {
+                        tracing::error!(
+                            target: "jamodio::midi",
+                            error = %message,
+                            "set_input_source failed"
+                        );
+                        vec![AgentMessage::InputSourceError { message }]
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (source, midi_device_id);
+                vec![AgentMessage::InputSourceError {
+                    message: "MIDI input not supported on this platform".into(),
+                }]
+            }
+        }
+
         BrowserMessage::StartRecording { stems } => {
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];

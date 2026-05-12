@@ -23,6 +23,7 @@ fn main() {
         "AudioUnit",
         "CoreAudio",
         "CoreAudioKit",
+        "CoreMIDI",          // S2 — MIDIEventListInit/Add pour les AU v3
         "AVFoundation",
         "AppKit",
         "Foundation",

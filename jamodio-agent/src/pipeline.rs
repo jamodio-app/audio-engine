@@ -11,7 +11,7 @@ use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 #[cfg(target_os = "macos")]
-use jamodio_audio_core::plugin_host::{PluginHandle, PluginHost, PluginInfo, PluginRef};
+use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
@@ -118,6 +118,30 @@ pub struct PipelineState {
     /// après reload de page (le plugin reste actif côté agent).
     #[cfg(target_os = "macos")]
     pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
+    /// S2 — source d'entrée actuelle. Audio = CPAL classique. Midi(device_id)
+    /// = ouvre un MIDI input via midir, encode silence en audio (samples zéros
+    /// capturés depuis CPAL pour garder le tick d'horloge) et passe les events
+    /// MIDI au plugin AU instrument chargé. Le plugin produit alors le son.
+    #[cfg(target_os = "macos")]
+    pub input_source: Arc<Mutex<InputSource>>,
+    /// S2 — MIDI input ouvert (RAII : le Drop ferme le port). None en mode
+    /// Audio. Le callback midir pousse les events dans `midi_event_rx`.
+    #[cfg(target_os = "macos")]
+    midi_input: Option<crate::audio::midi::MidiInput>,
+    /// S2 — Receiver des events MIDI cumulés depuis le dernier bloc audio.
+    /// Drainé par l'encoder_thread juste avant `process_stereo`.
+    #[cfg(target_os = "macos")]
+    midi_event_rx: Option<Receiver<MidiEvent>>,
+}
+
+/// Source d'entrée de l'instrument self (sprint S2). Mutuellement exclusif :
+/// l'utilisateur choisit Audio OU MIDI, pas les deux. Audio+MIDI simultané
+/// = sprint futur sur demande (cf. mémoire vision INSERT plugins).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub enum InputSource {
+    Audio,
+    Midi(String), // device id format `"{idx}:{name}"` (cf. midi::list_devices)
 }
 
 /// État du scan AU en background. Stocké dans `PipelineState`.
@@ -172,7 +196,42 @@ impl PipelineState {
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
             #[cfg(target_os = "macos")]
             instrument_plugin_info: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            input_source: Arc::new(Mutex::new(InputSource::Audio)),
+            #[cfg(target_os = "macos")]
+            midi_input: None,
+            #[cfg(target_os = "macos")]
+            midi_event_rx: None,
         }
+    }
+
+    /// S2 — change la source d'entrée. Appelé par le WS handler quand le
+    /// browser bascule entre Audio et MIDI. En mode MIDI, ouvre un MidiInput
+    /// via midir et stocke son receiver pour drainage dans encoder_thread.
+    /// L'ouverture du device peut échouer si introuvable → on revient en
+    /// Audio et l'erreur est retournée au caller (qui fait un toast browser).
+    #[cfg(target_os = "macos")]
+    pub fn set_input_source(&mut self, source: InputSource) -> Result<(), String> {
+        match &source {
+            InputSource::Audio => {
+                // Ferme le MIDI input s'il y en avait un.
+                self.midi_input = None;
+                self.midi_event_rx = None;
+            }
+            InputSource::Midi(device_id) => {
+                let (tx, rx) = bounded::<MidiEvent>(256);
+                let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
+                self.midi_input = Some(midi);
+                self.midi_event_rx = Some(rx);
+            }
+        }
+        *self.input_source.lock() = source;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn current_input_source(&self) -> InputSource {
+        self.input_source.lock().clone()
     }
 
     /// Lance le scan AU en background. Appelé une fois après `new()` par
@@ -545,6 +604,13 @@ impl PipelineState {
         let plugin_handle_for_encoder = self.instrument_plugin_handle.clone();
         #[cfg(target_os = "macos")]
         let plugin_bypass_for_encoder = self.instrument_plugin_bypass.clone();
+        // S2 — receiver MIDI cloné si on est en mode MIDI au moment du
+        // start_capture. Si l'utilisateur switch en cours de session, on
+        // gérera ça dans un sprint robustesse (= restart capture).
+        #[cfg(target_os = "macos")]
+        let midi_event_rx_for_encoder = self.midi_event_rx.clone();
+        #[cfg(target_os = "macos")]
+        let input_source_for_encoder = self.input_source.clone();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
@@ -554,6 +620,8 @@ impl PipelineState {
                     #[cfg(target_os = "macos")] au_host_for_encoder,
                     #[cfg(target_os = "macos")] plugin_handle_for_encoder,
                     #[cfg(target_os = "macos")] plugin_bypass_for_encoder,
+                    #[cfg(target_os = "macos")] midi_event_rx_for_encoder,
+                    #[cfg(target_os = "macos")] input_source_for_encoder,
                 );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
@@ -784,6 +852,8 @@ fn encoder_thread(
     #[cfg(target_os = "macos")] au_host: Arc<Mutex<AuHost>>,
     #[cfg(target_os = "macos")] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(target_os = "macos")] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_os = "macos")] midi_event_rx: Option<Receiver<MidiEvent>>,
+    #[cfg(target_os = "macos")] input_source: Arc<Mutex<InputSource>>,
 ) {
     // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
     // dans ce cas on continue en priorité normale plutôt que de planter.
@@ -841,6 +911,19 @@ fn encoder_thread(
                     stereo.fill(0.0);
                 }
 
+                // S2 — Si source = MIDI, on FORCE les samples audio à zéro.
+                // Le micro/carte audio continue d'être ouverte (= elle nous
+                // donne le tick d'horloge 48k/128) mais on ignore son contenu.
+                // Le plugin AU instrument recevra silence + les events MIDI
+                // accumulés, et produira l'audio depuis les notes jouées.
+                #[cfg(target_os = "macos")]
+                {
+                    let src = input_source.lock().clone();
+                    if matches!(src, InputSource::Midi(_)) {
+                        stereo.fill(0.0);
+                    }
+                }
+
                 // INSERT plugin (S1.2) — applique le plugin AU chargé sur la
                 // tranche instrument self entre remap et self-monitor/encode.
                 // Le self-monitor entend donc le son WET (cohérent avec
@@ -851,8 +934,30 @@ fn encoder_thread(
                     let handle_opt = *plugin_handle.lock();
                     if let Some(handle) = handle_opt {
                         let mut host = au_host.lock();
+
+                        // S2 — Drain les events MIDI accumulés depuis le
+                        // dernier bloc. Le receiver est non-blocking : on
+                        // collecte ce qui est dispo MAX BATCH events
+                        // (limite défensive pour ne pas spinner sur un
+                        // device qui flood).
+                        let midi_events: Vec<MidiEvent> = if let Some(rx) = &midi_event_rx {
+                            let mut batch = Vec::new();
+                            while let Ok(ev) = rx.try_recv() {
+                                batch.push(ev);
+                                if batch.len() >= 64 { break; }
+                            }
+                            batch
+                        } else {
+                            Vec::new()
+                        };
+
                         let n_pairs = stereo.len() / 2;
                         let mut idx = 0;
+                        // Important : on dispatche TOUS les MIDI events au 1er
+                        // sous-bloc seulement (le plugin AU recevra des notes
+                        // ON/OFF au début du bloc). Pour les sous-blocs
+                        // suivants, MIDI vide (le plugin tient l'état).
+                        let mut first_subblock = true;
                         while idx < n_pairs {
                             let end = (idx + PLUGIN_BLOCK).min(n_pairs);
                             plugin_left.clear();
@@ -861,7 +966,13 @@ fn encoder_thread(
                                 plugin_left.push(stereo[i * 2]);
                                 plugin_right.push(stereo[i * 2 + 1]);
                             }
-                            match host.process_stereo(handle, &mut plugin_left, &mut plugin_right) {
+                            let midi_for_block: &[MidiEvent] = if first_subblock {
+                                &midi_events
+                            } else {
+                                &[]
+                            };
+                            first_subblock = false;
+                            match host.process_stereo(handle, &mut plugin_left, &mut plugin_right, midi_for_block) {
                                 Ok(()) => {
                                     for (k, j) in (idx..end).enumerate() {
                                         stereo[j * 2] = plugin_left[k];

@@ -28,6 +28,7 @@ type AuScanCb = unsafe extern "C" fn(
     name: *const c_char,
     latency_samples: u32,
     has_editor: c_int,
+    has_input_bus: c_int,
 );
 
 extern "C" {
@@ -51,6 +52,12 @@ extern "C" {
         right: *mut f32,
         n_frames: u32,
     ) -> c_int;
+    fn au_host_dispatch_midi(
+        p: *mut c_void,
+        handle_id: u32,
+        midi_data: *const u8,
+        midi_count: u32,
+    );
     fn au_host_latency_samples(p: *mut c_void, handle_id: u32) -> u32;
     fn au_host_open_editor(p: *mut c_void, handle_id: u32) -> c_int;
     fn au_host_close_editor(p: *mut c_void, handle_id: u32) -> c_int;
@@ -130,6 +137,7 @@ unsafe extern "C" fn scan_thunk(
     name: *const c_char,
     latency_samples: u32,
     has_editor: c_int,
+    has_input_bus: c_int,
 ) {
     let ctx = &mut *(ctx as *mut ScanCtx);
     let raw = match CStr::from_ptr(name).to_str() {
@@ -153,6 +161,7 @@ unsafe extern "C" fn scan_thunk(
         latency_samples,
         has_editor: has_editor != 0,
         incompatible: latency_samples > MAX_PLUGIN_LATENCY_SAMPLES,
+        has_input_bus: has_input_bus != 0,
     });
 }
 
@@ -227,9 +236,32 @@ impl PluginHost for AuHost {
         handle: PluginHandle,
         left: &mut [f32],
         right: &mut [f32],
+        midi_events: &[MidiEvent],
     ) -> Result<(), PluginError> {
         if left.len() != right.len() {
             return Err(PluginError::Process("L/R length mismatch".into()));
+        }
+        // S2 — Dispatche les events MIDI AVANT le render. `MidiEvent` est
+        // `repr(Rust)` mais ses 3 bytes data sont contigus → on transmet
+        // un buffer flat de N×3 bytes au C. Si pas d'events, no-op.
+        if !midi_events.is_empty() {
+            // Pré-allouer un Vec<u8> est OK ici (alloc dans le hot path mais
+            // rare : ~10 events typiques par bloc, capacité 30 bytes). En
+            // optim future on peut buffer-recycle.
+            let mut packed = Vec::with_capacity(midi_events.len() * 3);
+            for ev in midi_events {
+                packed.push(ev.data[0]);
+                packed.push(ev.data[1]);
+                packed.push(ev.data[2]);
+            }
+            unsafe {
+                au_host_dispatch_midi(
+                    self.ptr,
+                    handle.0,
+                    packed.as_ptr(),
+                    midi_events.len() as u32,
+                );
+            }
         }
         let rc = unsafe {
             au_host_process_stereo(
@@ -356,7 +388,7 @@ mod tests {
         let mut right = left.clone();
         let in_energy: f32 = left.iter().map(|s| s.abs()).sum();
 
-        h.process_stereo(handle, &mut left, &mut right).expect("process");
+        h.process_stereo(handle, &mut left, &mut right, &[]).expect("process");
 
         let out_energy: f32 = left.iter().chain(right.iter()).map(|s| s.abs()).sum();
         assert!(
@@ -384,7 +416,7 @@ mod tests {
         let mut left = vec![0.1f32; 64];
         let mut right = vec![0.1f32; 64];
         for _ in 0..100 {
-            h.process_stereo(handle, &mut left, &mut right).expect("process");
+            h.process_stereo(handle, &mut left, &mut right, &[]).expect("process");
         }
         h.unload(handle).ok();
     }

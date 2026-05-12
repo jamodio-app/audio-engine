@@ -15,8 +15,10 @@
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioToolbox/AUCocoaUIView.h>
+#import <AudioToolbox/MusicDevice.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudioKit/CoreAudioKit.h>
+#import <CoreMIDI/CoreMIDI.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,7 +37,8 @@ typedef void (*au_scan_cb)(void *ctx,
                            uint32_t au_manuf,
                            const char *name,
                            uint32_t latency_samples,
-                           int has_editor);
+                           int has_editor,
+                           int has_input_bus);  // S2 : 1 si bus audio in, 0 sinon
 
 struct AuHostOpaque; // handle opaque pour Rust
 
@@ -86,6 +89,65 @@ struct Entry {
     const float *cur_in_r;
     uint32_t cur_n_frames;
 };
+
+// S2 — Dispatch des events MIDI vers le plugin AVANT le render. Le format
+// d'entrée (`data`) est un tableau de N*3 bytes ASCII MIDI : pour chaque
+// event, status/data1/data2. Les events sont émis avec offset 0 (= début
+// du bloc) — sample-precise timing = future S2+.
+
+static void jmo_dispatch_midi_v2(AudioComponentInstance au_inst,
+                                 const uint8_t *data,
+                                 uint32_t count) {
+    if (!au_inst || !data) return;
+    for (uint32_t i = 0; i < count; i++) {
+        UInt32 status = data[i * 3 + 0];
+        UInt32 d1     = data[i * 3 + 1];
+        UInt32 d2     = data[i * 3 + 2];
+        // MusicDeviceMIDIEvent : route un voice channel message au plugin.
+        // offsetSampleFrame=0 → traité au début du prochain AudioUnitRender.
+        MusicDeviceMIDIEvent(au_inst, status, d1, d2, 0);
+    }
+}
+
+static void jmo_dispatch_midi_v3(AUAudioUnit *au_v3,
+                                 const uint8_t *data,
+                                 uint32_t count) {
+    if (!au_v3 || !data || count == 0) return;
+    AUMIDIEventListBlock block = au_v3.scheduleMIDIEventListBlock;
+    if (!block) return;
+
+    // Build un MIDIEventList avec les N events au format UMP MIDI 1.0
+    // (1 word de 32 bits par event voice). MIDIEventListAdd alloue dans
+    // notre buffer (= taille = sizeof(list) + N * sizeof(packet)).
+    size_t list_size = sizeof(MIDIEventList) + count * sizeof(MIDIEventPacket);
+    void *buf = std::malloc(list_size);
+    if (!buf) return;
+    MIDIEventList *list = (MIDIEventList *)buf;
+    MIDIEventPacket *packet = MIDIEventListInit(list, kMIDIProtocol_1_0);
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t status = data[i * 3 + 0];
+        uint8_t d1     = data[i * 3 + 1];
+        uint8_t d2     = data[i * 3 + 2];
+        // UMP MIDI 1.0 voice message : 1 word de 32 bits.
+        //   bit 31-28 : MT (Message Type) = 0x2 (MIDI 1.0)
+        //   bit 27-24 : group (0..15, on prend 0)
+        //   bit 23-16 : status byte (incluant channel)
+        //   bit 15-8  : data1
+        //   bit 7-0   : data2
+        UInt32 word = ((UInt32)0x2 << 28)
+                    | ((UInt32)0 << 24)
+                    | ((UInt32)status << 16)
+                    | ((UInt32)d1 << 8)
+                    | ((UInt32)d2);
+        packet = MIDIEventListAdd(list, (ByteCount)list_size, packet, 0, 1, &word);
+        if (!packet) break;
+    }
+
+    // AUEventSampleTimeImmediate = délivrer ASAP (= dans le prochain render).
+    block((AUEventSampleTime)0xFFFFFFFF00000000LL, 0, list);
+    std::free(buf);
+}
 
 // Callback C statique invoqué par AudioUnitRender pour fournir l'input.
 // Le `refCon` pointe vers l'Entry concerné. Le callback reçoit un
@@ -164,12 +226,16 @@ static OSStatus jmo_render_callback(void *refCon,
             // Coût observé en prod : ~5ms par plugin (caché par macOS après
             // un premier scan). Cache disque persistant à ajouter en S1.5.
             uint32_t latency_samples = 0;
+            int has_input_bus = 1;
             NSError *err = nil;
             AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:d
                                                                             options:0
                                                                               error:&err];
             if (probe && !err) {
                 latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
+                // S2 — has_input_bus permet au browser de savoir s'il faut
+                // auto-switcher en source MIDI (= pur instrument) au load.
+                has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
                 probe = nil; // ARC release
             }
             // `providesUserInterface` retourne YES uniquement pour les AU v3
@@ -182,7 +248,7 @@ static OSStatus jmo_render_callback(void *refCon,
             int has_editor = 1;
 
             cb(ctx, d.componentType, d.componentSubType, d.componentManufacturer,
-               name_buf, latency_samples, has_editor);
+               name_buf, latency_samples, has_editor, has_input_bus);
         }
     }
 }
@@ -473,6 +539,23 @@ static OSStatus jmo_render_callback(void *refCon,
     return (it == entries.end()) ? 0 : it->second->latency_samples;
 }
 
+// S2 — Dispatche des events MIDI vers le plugin. Appelé depuis le thread
+// audio RT (encoder_thread) JUSTE AVANT processHandle:. Sans lock (cf.
+// invariant : pas d'unload concurrent sur le même handle).
+- (void)dispatchMidi:(const uint8_t *)data
+               count:(uint32_t)count
+            toHandle:(uint32_t)handle_id {
+    if (count == 0 || !data) return;
+    auto it = entries.find(handle_id);
+    if (it == entries.end()) return;
+    Entry *e = it->second.get();
+    if (e->is_v3) {
+        jmo_dispatch_midi_v3(e->au_v3, data, count);
+    } else {
+        jmo_dispatch_midi_v2(e->au_inst, data, count);
+    }
+}
+
 - (int)openEditor:(uint32_t)handle_id {
     auto it = entries.find(handle_id);
     if (it == entries.end()) return -1;
@@ -713,6 +796,17 @@ int au_host_process_stereo(void *p, uint32_t handle_id,
     if (!p) return -1;
     JmoAuHost *h = (__bridge JmoAuHost *)p;
     return [h processHandle:handle_id left:left right:right frames:n_frames];
+}
+
+// S2 — Dispatche un batch d'events MIDI au plugin AVANT le prochain
+// process_stereo. `midi_data` = N * 3 bytes (status, data1, data2). No-op
+// si count=0. Doit être appelé sur le thread RT, juste avant
+// au_host_process_stereo dans la boucle encoder.
+void au_host_dispatch_midi(void *p, uint32_t handle_id,
+                            const uint8_t *midi_data, uint32_t midi_count) {
+    if (!p) return;
+    JmoAuHost *h = (__bridge JmoAuHost *)p;
+    [h dispatchMidi:midi_data count:midi_count toHandle:handle_id];
 }
 
 uint32_t au_host_latency_samples(void *p, uint32_t handle_id) {
