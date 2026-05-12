@@ -517,6 +517,7 @@ static OSStatus jmo_render_callback(void *refCon,
                     [win setTitle:(au_v3.audioUnitName ?: @"AU Plugin")];
                     [win setReleasedWhenClosed:NO];
                     if (view) {
+                        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
                         [win setContentView:view];
                     } else {
                         NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
@@ -525,6 +526,7 @@ static OSStatus jmo_render_callback(void *refCon,
                         [label setBezeled:NO];
                         [label setDrawsBackground:NO];
                         [label setAlignment:NSTextAlignmentCenter];
+                        label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
                         [win setContentView:label];
                     }
                     [win center];
@@ -618,11 +620,13 @@ static OSStatus jmo_render_callback(void *refCon,
         [win setReleasedWhenClosed:NO];
 
         if (customView) {
+            customView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
             [win setContentView:customView];
         } else {
             AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
             if (view) {
                 view.showsExpertParameters = YES;
+                view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
                 [win setContentView:view];
             } else {
                 NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
@@ -631,6 +635,7 @@ static OSStatus jmo_render_callback(void *refCon,
                 [label setBezeled:NO];
                 [label setDrawsBackground:NO];
                 [label setAlignment:NSTextAlignmentCenter];
+                label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
                 [win setContentView:label];
             }
         }
