@@ -2334,6 +2334,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "futures",
+ "jamodio-au-host",
  "jamodio-audio-core",
  "opener",
  "parking_lot",

@@ -10,9 +10,13 @@ use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
+#[cfg(target_os = "macos")]
+use jamodio_audio_core::plugin_host::{PluginHandle, PluginHost};
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
+#[cfg(target_os = "macos")]
+use jamodio_au_host::AuHost;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -92,6 +96,17 @@ pub struct PipelineState {
     /// qui n'a pas d'équivalent ici puisque le flux part en PlainTransport
     /// piloté par CPAL).
     pub input_cut: Arc<std::sync::atomic::AtomicBool>,
+    /// INSERT plugin (sprint S1) — hôte AU + handle du plugin actif sur la
+    /// tranche instrument self. `handle = None` ⇒ chain bypass total
+    /// (no-op dans l'encoder_thread). `bypass = true` ⇒ plugin chargé mais
+    /// court-circuité (toggle UI A/B). Sur Windows, ces champs n'existent
+    /// pas — Sprint Phase 2 ajoutera `Vst3Host`.
+    #[cfg(target_os = "macos")]
+    pub au_host: Arc<Mutex<AuHost>>,
+    #[cfg(target_os = "macos")]
+    pub instrument_plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
+    #[cfg(target_os = "macos")]
+    pub instrument_plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const CHANNELS: usize = 2;
@@ -111,6 +126,12 @@ impl PipelineState {
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             recorder: None,
             input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            au_host: Arc::new(Mutex::new(AuHost::new())),
+            #[cfg(target_os = "macos")]
+            instrument_plugin_handle: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            instrument_plugin_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -331,10 +352,22 @@ impl PipelineState {
         self.mixer.lock().add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
         let input_cut_for_encoder = self.input_cut.clone();
+        #[cfg(target_os = "macos")]
+        let au_host_for_encoder = self.au_host.clone();
+        #[cfg(target_os = "macos")]
+        let plugin_handle_for_encoder = self.instrument_plugin_handle.clone();
+        #[cfg(target_os = "macos")]
+        let plugin_bypass_for_encoder = self.instrument_plugin_bypass.clone();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
-                encoder_thread(sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms, channels_in, effective_channel, mixer_for_encoder, input_cut_for_encoder);
+                encoder_thread(
+                    sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
+                    channels_in, effective_channel, mixer_for_encoder, input_cut_for_encoder,
+                    #[cfg(target_os = "macos")] au_host_for_encoder,
+                    #[cfg(target_os = "macos")] plugin_handle_for_encoder,
+                    #[cfg(target_os = "macos")] plugin_bypass_for_encoder,
+                );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
@@ -561,6 +594,9 @@ fn encoder_thread(
     channel_index: Option<u8>,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_os = "macos")] au_host: Arc<Mutex<AuHost>>,
+    #[cfg(target_os = "macos")] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
+    #[cfg(target_os = "macos")] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
     // dans ce cas on continue en priorité normale plutôt que de planter.
@@ -587,6 +623,17 @@ fn encoder_thread(
     let mut sequence: u16 = 0;
     let mut timestamp: u32 = 0;
 
+    // SPRINT INSERT (S1.2) — buffers L/R préalloués pour le passage à
+    // travers le plugin AU. Désentrelacer/ré-entrelacer par sous-blocs
+    // de PLUGIN_BLOCK samples par canal. Capacité fixée à 128 (la frame
+    // Opus fait 120 stéréo, et les buffers CPAL typiques < 128 par canal).
+    #[cfg(target_os = "macos")]
+    const PLUGIN_BLOCK: usize = 128;
+    #[cfg(target_os = "macos")]
+    let mut plugin_left: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
+    #[cfg(target_os = "macos")]
+    let mut plugin_right: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
+
     loop {
         // Check stop signal (non-blocking)
         if stop_rx.try_recv().is_ok() {
@@ -606,6 +653,41 @@ fn encoder_thread(
                 if input_cut.load(std::sync::atomic::Ordering::Relaxed) {
                     stereo.fill(0.0);
                 }
+
+                // INSERT plugin (S1.2) — applique le plugin AU chargé sur la
+                // tranche instrument self entre remap et self-monitor/encode.
+                // Le self-monitor entend donc le son WET (cohérent avec
+                // l'expérience DAW : jouer dans un ampli simulé en s'écoutant
+                // traité).
+                #[cfg(target_os = "macos")]
+                if !stereo.is_empty() && !plugin_bypass.load(std::sync::atomic::Ordering::Relaxed) {
+                    let handle_opt = *plugin_handle.lock();
+                    if let Some(handle) = handle_opt {
+                        let mut host = au_host.lock();
+                        let n_pairs = stereo.len() / 2;
+                        let mut idx = 0;
+                        while idx < n_pairs {
+                            let end = (idx + PLUGIN_BLOCK).min(n_pairs);
+                            plugin_left.clear();
+                            plugin_right.clear();
+                            for i in idx..end {
+                                plugin_left.push(stereo[i * 2]);
+                                plugin_right.push(stereo[i * 2 + 1]);
+                            }
+                            if host
+                                .process_stereo(handle, &mut plugin_left, &mut plugin_right)
+                                .is_ok()
+                            {
+                                for (k, j) in (idx..end).enumerate() {
+                                    stereo[j * 2] = plugin_left[k];
+                                    stereo[j * 2 + 1] = plugin_right[k];
+                                }
+                            }
+                            idx = end;
+                        }
+                    }
+                }
+
                 if !stereo.is_empty() {
                     let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / stereo.len() as f32).sqrt();

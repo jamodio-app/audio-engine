@@ -46,3 +46,7 @@ tauri-plugin-updater = "2"
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.15", features = ["asio"] }
+
+# Hôte AU plugins — macOS uniquement (phase 2 = jamodio-vst3-host pour Windows).
+[target.'cfg(target_os = "macos")'.dependencies]
+jamodio-au-host = { path = "../jamodio-au-host" }
