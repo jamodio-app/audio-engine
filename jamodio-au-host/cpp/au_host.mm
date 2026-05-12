@@ -110,18 +110,25 @@ struct Entry {
             CFRelease(cf_name);
 
             // Latence rapportée AVANT instantiation : on doit instancier brièvement.
-            // Coût : ~quelques ms par plugin. Cache TODO en S1.5.
+            // Coût observé en prod : ~5ms par plugin (caché par macOS après
+            // un premier scan). Cache disque persistant à ajouter en S1.5.
             uint32_t latency_samples = 0;
-            int has_editor = 0;
             NSError *err = nil;
             AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:d
                                                                             options:0
                                                                               error:&err];
             if (probe && !err) {
                 latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
-                has_editor = probe.providesUserInterface ? 1 : 0;
                 probe = nil; // ARC release
             }
+            // `providesUserInterface` retourne YES uniquement pour les AU v3
+            // qui exposent un custom view controller. Les AU v2 (= la totalité
+            // des AU Apple natifs, AmpliTube legacy, etc.) retournent NO mais
+            // sont parfaitement affichables via AUGenericView. Comme on utilise
+            // AUGenericView en fallback dans openEditor:, on annonce un editor
+            // pour TOUS les AU. Quand on switchera vers requestViewController
+            // pour les AU v3 modernes (S2), on raffinera.
+            int has_editor = 1;
 
             cb(ctx, d.componentType, d.componentSubType, d.componentManufacturer,
                name_buf, latency_samples, has_editor);
@@ -303,9 +310,11 @@ struct Entry {
     if (it == entries.end()) return -1;
     Entry *e = it->second.get();
     if (e->editor_window) {
-        // Déjà ouverte → bring to front.
+        // Déjà ouverte → bring to front + activate l'app sinon la window
+        // reste derrière Chrome/Tauri/etc. (bug observé en test E2E).
         NSWindow *w = e->editor_window;
         dispatch_async(dispatch_get_main_queue(), ^{
+            [NSApp activateIgnoringOtherApps:YES];
             [w makeKeyAndOrderFront:nil];
         });
         return 0;
@@ -351,6 +360,7 @@ struct Entry {
         }
 
         [win center];
+        [NSApp activateIgnoringOtherApps:YES];
         [win makeKeyAndOrderFront:nil];
 
         e->editor_window = win;
