@@ -2353,6 +2353,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jamodio-au-host"
+version = "0.2.10"
+dependencies = [
+ "cc",
+ "jamodio-audio-core",
+ "tracing",
+]
+
+[[package]]
 name = "jamodio-audio-core"
 version = "0.2.10"
 dependencies = [
@@ -2365,6 +2374,7 @@ dependencies = [
  "serde_json",
  "socket2 0.5.10",
  "srtp",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

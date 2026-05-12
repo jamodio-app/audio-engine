@@ -3,4 +3,7 @@ resolver = "2"
 members = [
   "jamodio-audio-core",
   "jamodio-agent",
+  "jamodio-au-host",
 ]
+# au-host-poc/ reste hors workspace (bac à sable, supprimé une fois jamodio-au-host stable).
+exclude = ["au-host-poc"]

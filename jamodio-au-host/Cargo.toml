@@ -1,0 +1,15 @@
+[package]
+name = "jamodio-au-host"
+version = "0.2.10"
+edition = "2021"
+description = "Jamodio AudioUnit (AU) plugin host — macOS uniquement, impl du trait PluginHost de jamodio-audio-core"
+
+# Phase 2 Windows : ce crate restera macOS-only (frameworks Apple obligatoires).
+# Un crate frère `jamodio-vst3-host` couvrira Windows. Trait commun = jamodio-audio-core::plugin_host.
+
+[dependencies]
+jamodio-audio-core = { path = "../jamodio-audio-core" }
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1.0"

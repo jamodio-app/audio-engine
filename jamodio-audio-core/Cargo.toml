@@ -15,6 +15,7 @@ socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
 base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
 getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres
 tracing = "0.1"            # Logging structuré (façade) — init côté binaire jamodio-agent
+thiserror = "1"            # Dérive Error proprement (utilisé par plugin_host)
 
 # SRTP — chiffrement+auth du flux RTP agent ↔ SFU (AEAD AES-256-GCM).
 # Stratégie par plateforme :

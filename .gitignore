@@ -21,3 +21,6 @@ Cargo.lock.bak
 *.mobileprovision
 **/tauri.private.key
 
+# Bac à sable POC INSERT plugins — supprimé une fois jamodio-au-host stable.
+/au-host-poc/
+
