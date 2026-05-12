@@ -507,11 +507,14 @@ static OSStatus jmo_render_callback(void *refCon,
                         prefSize = CGSizeMake(800, 600);
                     }
                     NSRect rect = NSMakeRect(120, 120, prefSize.width, prefSize.height);
+                    // S1.11 — Window NON resizable (convention DAW Logic/Ableton/Reaper).
+                    // Les UI plugins ont une taille fixe imposée par le plugin (AmpliTube,
+                    // TONEX et 95% des plugins commerciaux). Laisser le user resize la
+                    // window créait une zone vide trompeuse autour de l'UI fixe.
                     NSWindow *win = [[NSWindow alloc]
                         initWithContentRect:rect
                                   styleMask:(NSWindowStyleMaskTitled |
-                                             NSWindowStyleMaskClosable |
-                                             NSWindowStyleMaskResizable)
+                                             NSWindowStyleMaskClosable)
                                     backing:NSBackingStoreBuffered
                                       defer:NO];
                     [win setTitle:(au_v3.audioUnitName ?: @"AU Plugin")];
@@ -609,11 +612,11 @@ static OSStatus jmo_render_callback(void *refCon,
             prefSize = NSMakeSize(640, 480);
         }
         NSRect rect = NSMakeRect(120, 120, prefSize.width, prefSize.height);
+        // S1.11 — Window NON resizable (convention DAW). Cf. path v3 ci-dessus.
         NSWindow *win = [[NSWindow alloc]
             initWithContentRect:rect
                       styleMask:(NSWindowStyleMaskTitled |
-                                 NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskResizable)
+                                 NSWindowStyleMaskClosable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
         [win setTitle:title];
