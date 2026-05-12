@@ -14,6 +14,7 @@
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AudioToolbox/AUCocoaUIView.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudioKit/CoreAudioKit.h>
 #include <cstdint>
@@ -131,10 +132,16 @@ static OSStatus jmo_render_callback(void *refCon,
 }
 
 - (void)scanAndCallback:(au_scan_cb)cb context:(void *)ctx {
+    // S1.8 — MVP scope limité aux EFFETS uniquement. Les instruments (= AU
+    // type `aumu` MusicDevice : AUMIDISynth, AUSampler, pianos virtuels)
+    // n'ont pas de bus audio in (= ils prennent du MIDI et sortent de
+    // l'audio) → setProperty(StreamFormat, scope:Input) retourne -10877
+    // (InvalidScope) au load. Bug observé en prod sur un plugin PIANO.
+    // Ces plugins seront réactivés en S2 quand on aura le MIDI routing
+    // côté capture agent. Les `MusicEffect` (aumf) sont des effets
+    // MIDI-aware aussi exclus pour la même raison.
     static const uint32_t kTypes[] = {
         kAudioUnitType_Effect,
-        kAudioUnitType_MusicDevice,
-        kAudioUnitType_MusicEffect,
     };
     for (uint32_t type : kTypes) {
         AudioComponentDescription desc = {0, 0, 0, 0, 0};
@@ -503,7 +510,11 @@ static OSStatus jmo_render_callback(void *refCon,
         return 0;
     }
 
-    // Path v2 — AUGenericView legacy.
+    // Path v2 — essayer d'abord le custom Cocoa UI exposé par le plugin via
+    // `kAudioUnitProperty_CocoaUI`. C'est l'API officielle des hôtes pro pour
+    // les AU v2 modernes (AmpliTube 5, plein de plugins commerciaux récents
+    // restés en v2 legacy malgré leur modernité). Fallback sur AUGenericView
+    // (sliders bruts) si le plugin ne fournit pas de Cocoa UI.
     AudioComponentInstance inst = e->au_inst;
     dispatch_async(dispatch_get_main_queue(), ^{
         CFStringRef cf_name = nullptr;
@@ -512,7 +523,56 @@ static OSStatus jmo_render_callback(void *refCon,
         NSString *title = (__bridge_transfer NSString *)cf_name;
         if (!title) title = @"AU Plugin";
 
-        NSRect rect = NSMakeRect(120, 120, 640, 480);
+        // Tentative Cocoa UI custom (v2).
+        NSView *customView = nil;
+        UInt32 dataSize = 0;
+        Boolean isWritable = NO;
+        OSStatus st = AudioUnitGetPropertyInfo(inst, kAudioUnitProperty_CocoaUI,
+                                               kAudioUnitScope_Global, 0,
+                                               &dataSize, &isWritable);
+        if (st == noErr && dataSize >= sizeof(AudioUnitCocoaViewInfo)) {
+            AudioUnitCocoaViewInfo *cocoaUI =
+                (AudioUnitCocoaViewInfo *)std::malloc(dataSize);
+            if (cocoaUI) {
+                OSStatus st2 = AudioUnitGetProperty(inst, kAudioUnitProperty_CocoaUI,
+                                                    kAudioUnitScope_Global, 0,
+                                                    cocoaUI, &dataSize);
+                if (st2 == noErr) {
+                    NSURL *bundleURL = (__bridge NSURL *)cocoaUI->mCocoaAUViewBundleLocation;
+                    NSString *className = (__bridge NSString *)cocoaUI->mCocoaAUViewClass[0];
+                    if (bundleURL && className) {
+                        NSBundle *viewBundle = [NSBundle bundleWithURL:bundleURL];
+                        if ([viewBundle load]) {
+                            Class viewFactoryClass = [viewBundle classNamed:className];
+                            if (viewFactoryClass &&
+                                [viewFactoryClass conformsToProtocol:@protocol(AUCocoaUIBase)]) {
+                                id<AUCocoaUIBase> factory = [[viewFactoryClass alloc] init];
+                                customView = [factory uiViewForAudioUnit:inst
+                                                                withSize:NSMakeSize(800, 600)];
+                            }
+                        }
+                    }
+                }
+                // Cleanup CF refs créées par AudioUnitGetProperty.
+                if (cocoaUI->mCocoaAUViewBundleLocation) {
+                    CFRelease(cocoaUI->mCocoaAUViewBundleLocation);
+                }
+                UInt32 count = (dataSize - sizeof(CFURLRef)) / sizeof(CFStringRef);
+                for (UInt32 i = 0; i < count; i++) {
+                    if (cocoaUI->mCocoaAUViewClass[i]) {
+                        CFRelease(cocoaUI->mCocoaAUViewClass[i]);
+                    }
+                }
+                std::free(cocoaUI);
+            }
+        }
+
+        // Taille window adaptée à la view fournie (sinon 640x480).
+        NSSize prefSize = customView ? customView.frame.size : NSMakeSize(640, 480);
+        if (prefSize.width < 200 || prefSize.height < 100) {
+            prefSize = NSMakeSize(640, 480);
+        }
+        NSRect rect = NSMakeRect(120, 120, prefSize.width, prefSize.height);
         NSWindow *win = [[NSWindow alloc]
             initWithContentRect:rect
                       styleMask:(NSWindowStyleMaskTitled |
@@ -523,18 +583,22 @@ static OSStatus jmo_render_callback(void *refCon,
         [win setTitle:title];
         [win setReleasedWhenClosed:NO];
 
-        AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
-        if (view) {
-            view.showsExpertParameters = YES;
-            [win setContentView:view];
+        if (customView) {
+            [win setContentView:customView];
         } else {
-            NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
-            [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
-            [label setEditable:NO];
-            [label setBezeled:NO];
-            [label setDrawsBackground:NO];
-            [label setAlignment:NSTextAlignmentCenter];
-            [win setContentView:label];
+            AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
+            if (view) {
+                view.showsExpertParameters = YES;
+                [win setContentView:view];
+            } else {
+                NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
+                [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
+                [label setEditable:NO];
+                [label setBezeled:NO];
+                [label setDrawsBackground:NO];
+                [label setAlignment:NSTextAlignmentCenter];
+                [win setContentView:label];
+            }
         }
 
         [win center];
