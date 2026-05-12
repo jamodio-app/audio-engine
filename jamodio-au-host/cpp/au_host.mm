@@ -68,6 +68,7 @@ void fourcc(uint32_t code, char out[5]) {
 // Détection au load via `componentFlags & kAudioComponentFlag_IsV3AudioUnit`.
 struct Entry {
     bool is_v3;
+    bool has_input_bus;                 // false pour les synthés MIDI purs
     // v2 path
     AudioComponentInstance au_inst;     // nullptr en v3
     // v3 path
@@ -132,16 +133,18 @@ static OSStatus jmo_render_callback(void *refCon,
 }
 
 - (void)scanAndCallback:(au_scan_cb)cb context:(void *)ctx {
-    // S1.8 — MVP scope limité aux EFFETS uniquement. Les instruments (= AU
-    // type `aumu` MusicDevice : AUMIDISynth, AUSampler, pianos virtuels)
-    // n'ont pas de bus audio in (= ils prennent du MIDI et sortent de
-    // l'audio) → setProperty(StreamFormat, scope:Input) retourne -10877
-    // (InvalidScope) au load. Bug observé en prod sur un plugin PIANO.
-    // Ces plugins seront réactivés en S2 quand on aura le MIDI routing
-    // côté capture agent. Les `MusicEffect` (aumf) sont des effets
-    // MIDI-aware aussi exclus pour la même raison.
+    // S1.9 — Scan multi-types : effets (`aufx`) + instruments (`aumu`) +
+    // music-effects (`aumf`). On laisse le load filtrer plus finement selon
+    // la présence d'un bus audio in (cf. loadType:). Raison : certains
+    // plugins listés en `aumu` ont quand même un bus audio in (cas
+    // AmpliTube 5 chez IK Multimedia) → exclure tout `aumu` cachait
+    // AmpliTube de la liste alors qu'il marchait avant. Les vrais
+    // synthés MIDI purs (AUMIDISynth, AUSampler) restent chargeables
+    // au MVP mais produiront silence sans MIDI → MIDI routing arrive en S2.
     static const uint32_t kTypes[] = {
         kAudioUnitType_Effect,
+        kAudioUnitType_MusicDevice,
+        kAudioUnitType_MusicEffect,
     };
     for (uint32_t type : kTypes) {
         AudioComponentDescription desc = {0, 0, 0, 0, 0};
@@ -211,6 +214,7 @@ static OSStatus jmo_render_callback(void *refCon,
 
     auto entry = std::make_unique<Entry>();
     entry->is_v3 = is_v3;
+    entry->has_input_bus = false;       // sera mis à true plus bas si l'AU a un input bus
     entry->au_inst = nullptr;
     entry->au_v3 = nil;
     entry->render_block_v3 = nullptr;
@@ -239,12 +243,19 @@ static OSStatus jmo_render_callback(void *refCon,
 
         AVAudioFormat *fmt = [[AVAudioFormat alloc]
             initStandardFormatWithSampleRate:kSampleRate channels:2];
-        for (AUAudioUnitBus *bus in au.inputBusses) {
-            bus.enabled = YES;
-            if (![bus setFormat:fmt error:&err]) {
-                if (err_buf) std::snprintf(err_buf, err_size, "v3 setFormat in: %s",
-                                            err.localizedDescription.UTF8String);
-                return 0;
+        // S1.9 — n'ouvrir le bus input que s'il existe. Les synthés MIDI purs
+        // (AUMIDISynth, AUSampler) ont 0 bus input → on les charge quand même
+        // pour permettre l'ouverture de leur éditeur (UI custom, params),
+        // mais ils produiront silence tant qu'on n'a pas de routing MIDI in.
+        entry->has_input_bus = (au.inputBusses.count > 0);
+        if (entry->has_input_bus) {
+            for (AUAudioUnitBus *bus in au.inputBusses) {
+                bus.enabled = YES;
+                if (![bus setFormat:fmt error:&err]) {
+                    if (err_buf) std::snprintf(err_buf, err_size, "v3 setFormat in: %s",
+                                                err.localizedDescription.UTF8String);
+                    return 0;
+                }
             }
         }
         for (AUAudioUnitBus *bus in au.outputBusses) {
@@ -286,13 +297,18 @@ static OSStatus jmo_render_callback(void *refCon,
         fmt.mChannelsPerFrame = 2;
         fmt.mBitsPerChannel = 32;
 
-        st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
-                                  kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
-        if (st != noErr) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v2 setFormat in: %d", (int)st);
-            AudioComponentInstanceDispose(inst);
-            return 0;
-        }
+        // S1.9 — détection du nombre de bus input via kAudioUnitProperty_ElementCount.
+        // Les synthés MIDI purs en v2 (AUMIDISynth, AUSampler) ont 0 bus input
+        // → on doit skip setFormat/setRenderCallback sur scope:Input (sinon
+        // -10877 InvalidScope). Plugins type aufx ou aumu-avec-audio-in
+        // (AmpliTube 5, Guitar Rig variants…) ont au moins 1 bus input.
+        UInt32 n_in_bus = 0;
+        UInt32 sz = sizeof(n_in_bus);
+        AudioUnitGetProperty(inst, kAudioUnitProperty_ElementCount,
+                             kAudioUnitScope_Input, 0, &n_in_bus, &sz);
+        entry->has_input_bus = (n_in_bus > 0);
+
+        // Output bus toujours requis.
         st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
                                   kAudioUnitScope_Output, 0, &fmt, sizeof(fmt));
         if (st != noErr) {
@@ -301,19 +317,31 @@ static OSStatus jmo_render_callback(void *refCon,
             return 0;
         }
 
+        if (entry->has_input_bus) {
+            st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
+                                      kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+            if (st != noErr) {
+                if (err_buf) std::snprintf(err_buf, err_size, "v2 setFormat in: %d", (int)st);
+                AudioComponentInstanceDispose(inst);
+                return 0;
+            }
+        }
+
         UInt32 maxF = max_frames;
         AudioUnitSetProperty(inst, kAudioUnitProperty_MaximumFramesPerSlice,
                              kAudioUnitScope_Global, 0, &maxF, sizeof(maxF));
 
-        AURenderCallbackStruct cb = {0};
-        cb.inputProc = jmo_render_callback;
-        cb.inputProcRefCon = entry.get();
-        st = AudioUnitSetProperty(inst, kAudioUnitProperty_SetRenderCallback,
-                                  kAudioUnitScope_Input, 0, &cb, sizeof(cb));
-        if (st != noErr) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v2 setRenderCallback: %d", (int)st);
-            AudioComponentInstanceDispose(inst);
-            return 0;
+        if (entry->has_input_bus) {
+            AURenderCallbackStruct cb = {0};
+            cb.inputProc = jmo_render_callback;
+            cb.inputProcRefCon = entry.get();
+            st = AudioUnitSetProperty(inst, kAudioUnitProperty_SetRenderCallback,
+                                      kAudioUnitScope_Input, 0, &cb, sizeof(cb));
+            if (st != noErr) {
+                if (err_buf) std::snprintf(err_buf, err_size, "v2 setRenderCallback: %d", (int)st);
+                AudioComponentInstanceDispose(inst);
+                return 0;
+            }
         }
 
         st = AudioUnitInitialize(inst);
@@ -405,27 +433,33 @@ static OSStatus jmo_render_callback(void *refCon,
     OSStatus st;
     if (e->is_v3) {
         // Path v3 : renderBlock + AURenderPullInputBlock fournit l'input.
-        AURenderPullInputBlock pull = ^OSStatus(AudioUnitRenderActionFlags *,
-                                                const AudioTimeStamp *,
-                                                AUAudioFrameCount frame_count,
-                                                NSInteger /*bus*/,
-                                                AudioBufferList *in_data) {
-            if (in_data->mNumberBuffers < 2) return -1;
-            if (frame_count > e->cur_n_frames) return -1;
-            if (in_data->mBuffers[0].mData == nullptr) {
-                in_data->mBuffers[0].mData = (void *)e->cur_in_l;
-                in_data->mBuffers[0].mDataByteSize = frame_count * sizeof(float);
-                in_data->mBuffers[1].mData = (void *)e->cur_in_r;
-                in_data->mBuffers[1].mDataByteSize = frame_count * sizeof(float);
-            } else {
-                std::memcpy(in_data->mBuffers[0].mData, e->cur_in_l, frame_count * sizeof(float));
-                std::memcpy(in_data->mBuffers[1].mData, e->cur_in_r, frame_count * sizeof(float));
-            }
-            return noErr;
-        };
+        // Si pas de bus input (synthé MIDI pur), pull = nil → renderBlock
+        // produit son output naturel (silence sans MIDI au MVP).
+        AURenderPullInputBlock pull = nil;
+        if (e->has_input_bus) {
+            pull = ^OSStatus(AudioUnitRenderActionFlags *,
+                             const AudioTimeStamp *,
+                             AUAudioFrameCount frame_count,
+                             NSInteger /*bus*/,
+                             AudioBufferList *in_data) {
+                if (in_data->mNumberBuffers < 2) return -1;
+                if (frame_count > e->cur_n_frames) return -1;
+                if (in_data->mBuffers[0].mData == nullptr) {
+                    in_data->mBuffers[0].mData = (void *)e->cur_in_l;
+                    in_data->mBuffers[0].mDataByteSize = frame_count * sizeof(float);
+                    in_data->mBuffers[1].mData = (void *)e->cur_in_r;
+                    in_data->mBuffers[1].mDataByteSize = frame_count * sizeof(float);
+                } else {
+                    std::memcpy(in_data->mBuffers[0].mData, e->cur_in_l, frame_count * sizeof(float));
+                    std::memcpy(in_data->mBuffers[1].mData, e->cur_in_r, frame_count * sizeof(float));
+                }
+                return noErr;
+            };
+        }
         st = e->render_block_v3(&flags, &ts, n_frames, 0, abl, pull);
     } else {
-        // Path v2 : AudioUnitRender + render_callback C (set au load).
+        // Path v2 : AudioUnitRender. Si pas de bus input, le callback C n'a
+        // pas été set au load, AudioUnitRender produira l'output naturel.
         st = AudioUnitRender(e->au_inst, &flags, &ts, 0, n_frames, abl);
     }
     if (st != noErr) return -2;

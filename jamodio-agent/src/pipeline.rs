@@ -861,13 +861,28 @@ fn encoder_thread(
                                 plugin_left.push(stereo[i * 2]);
                                 plugin_right.push(stereo[i * 2 + 1]);
                             }
-                            if host
-                                .process_stereo(handle, &mut plugin_left, &mut plugin_right)
-                                .is_ok()
-                            {
-                                for (k, j) in (idx..end).enumerate() {
-                                    stereo[j * 2] = plugin_left[k];
-                                    stereo[j * 2 + 1] = plugin_right[k];
+                            match host.process_stereo(handle, &mut plugin_left, &mut plugin_right) {
+                                Ok(()) => {
+                                    for (k, j) in (idx..end).enumerate() {
+                                        stereo[j * 2] = plugin_left[k];
+                                        stereo[j * 2 + 1] = plugin_right[k];
+                                    }
+                                }
+                                Err(e) => {
+                                    // Bug 1 diagnostic (S1.9) — log throttled
+                                    // pour ne pas spam (2.7ms par bloc).
+                                    static FAILS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n == 0 || n.is_power_of_two() {
+                                        tracing::warn!(
+                                            target: "jamodio::plugin",
+                                            handle = ?handle,
+                                            count = n + 1,
+                                            error = %e,
+                                            "process_stereo failed in encoder_thread (signal passe DRY)"
+                                        );
+                                    }
                                 }
                             }
                             idx = end;
