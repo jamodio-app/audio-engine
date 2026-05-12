@@ -53,20 +53,55 @@ void fourcc(uint32_t code, char out[5]) {
 }
 
 // État par plugin chargé.
+//
+// On utilise l'API C legacy `AudioComponentInstance` (= `AudioUnit`) plutôt
+// que l'API moderne `AUAudioUnit`. Raison : `AUGenericView` (qui affiche
+// l'UI générique des AU v2 = Apple natifs + AmpliTube legacy + 95% des
+// plugins macOS) prend une `AudioComponentInstance` en paramètre. Pour que
+// les paramètres bougés dans la GUI affectent le son, il FAUT que les deux
+// (processing + GUI) parlent à la MÊME instance. `AUAudioUnit` cache son
+// instance sous-jacente sans API publique → on doit donc tout faire en
+// legacy. Pour les AU v3 modernes (AmpliTube récent, Battery), macOS wrappe
+// transparemment la legacy AudioUnit, et `requestViewController` pourra
+// être utilisé en S2 quand on raffine pour récupérer le custom UI.
 struct Entry {
-    __strong AUAudioUnit *au;
-    __strong NSWindow *editor_window; // nil tant que pas ouvert
+    AudioComponentInstance au_inst;     // instance partagée processing + GUI
+    __strong NSWindow *editor_window;   // nil tant que pas ouvert
     AudioComponentDescription desc;
-    AURenderBlock render_block;          // copié hors d'AUAudioUnit pour appel direct
-    std::vector<float> in_l, in_r;       // copie de l'input par bloc (pull_block)
+    std::vector<float> in_l, in_r;      // copie de l'input par bloc (callback)
     uint32_t max_frames;
     uint32_t latency_samples;
-    double sample_time;                  // monotonic pour timestamp render
-    // État courant utilisé par pull_block (set juste avant renderBlock)
+    double sample_time;                 // monotonic pour timestamp render
+    // État courant lu par render_callback (set avant AudioUnitRender)
     const float *cur_in_l;
     const float *cur_in_r;
     uint32_t cur_n_frames;
 };
+
+// Callback C statique invoqué par AudioUnitRender pour fournir l'input.
+// Le `refCon` pointe vers l'Entry concerné. Le callback reçoit un
+// AudioBufferList que l'AU veut remplir avec les samples d'entrée.
+static OSStatus jmo_render_callback(void *refCon,
+                                    AudioUnitRenderActionFlags *,
+                                    const AudioTimeStamp *,
+                                    UInt32 /*bus*/,
+                                    UInt32 frame_count,
+                                    AudioBufferList *io_data) {
+    Entry *e = static_cast<Entry *>(refCon);
+    if (!e || !io_data || io_data->mNumberBuffers < 2) return -1;
+    if (frame_count > e->cur_n_frames) return -1;
+    if (!io_data->mBuffers[0].mData || !io_data->mBuffers[1].mData) {
+        // Si l'AU ne nous a pas alloué de buffers, on lui passe nos pointeurs.
+        io_data->mBuffers[0].mData = (void *)e->cur_in_l;
+        io_data->mBuffers[0].mDataByteSize = frame_count * sizeof(float);
+        io_data->mBuffers[1].mData = (void *)e->cur_in_r;
+        io_data->mBuffers[1].mDataByteSize = frame_count * sizeof(float);
+    } else {
+        std::memcpy(io_data->mBuffers[0].mData, e->cur_in_l, frame_count * sizeof(float));
+        std::memcpy(io_data->mBuffers[1].mData, e->cur_in_r, frame_count * sizeof(float));
+    }
+    return noErr;
+}
 
 } // anonymous namespace
 
@@ -152,55 +187,82 @@ struct Entry {
         return 0;
     }
 
-    NSError *err = nil;
-    AUAudioUnit *au = [[AUAudioUnit alloc] initWithComponentDescription:desc
-                                                                 options:0
-                                                                   error:&err];
-    if (!au || err) {
-        if (err_buf) std::snprintf(err_buf, err_size, "init: %s",
-                                    err.localizedDescription.UTF8String);
+    AudioComponentInstance inst = nullptr;
+    OSStatus st = AudioComponentInstanceNew(comp, &inst);
+    if (st != noErr || !inst) {
+        if (err_buf) std::snprintf(err_buf, err_size, "AudioComponentInstanceNew failed: %d", (int)st);
         return 0;
     }
 
-    AVAudioFormat *fmt = [[AVAudioFormat alloc]
-        initStandardFormatWithSampleRate:kSampleRate channels:2];
-    for (AUAudioUnitBus *bus in au.inputBusses) {
-        bus.enabled = YES;
-        if (![bus setFormat:fmt error:&err]) {
-            if (err_buf) std::snprintf(err_buf, err_size, "setFormat in: %s",
-                                        err.localizedDescription.UTF8String);
-            return 0;
-        }
-    }
-    for (AUAudioUnitBus *bus in au.outputBusses) {
-        bus.enabled = YES;
-        if (![bus setFormat:fmt error:&err]) {
-            if (err_buf) std::snprintf(err_buf, err_size, "setFormat out: %s",
-                                        err.localizedDescription.UTF8String);
-            return 0;
-        }
-    }
-    au.maximumFramesToRender = max_frames;
+    // Format I/O : 48k stéréo float32 non-interleaved (= 2 buffers, 1 ch chacun).
+    AudioStreamBasicDescription fmt = {0};
+    fmt.mSampleRate = kSampleRate;
+    fmt.mFormatID = kAudioFormatLinearPCM;
+    fmt.mFormatFlags = kAudioFormatFlagIsFloat
+                      | kAudioFormatFlagIsPacked
+                      | kAudioFormatFlagIsNonInterleaved;
+    fmt.mBytesPerPacket = sizeof(float);
+    fmt.mFramesPerPacket = 1;
+    fmt.mBytesPerFrame = sizeof(float);
+    fmt.mChannelsPerFrame = 2;
+    fmt.mBitsPerChannel = 32;
 
-    if (![au allocateRenderResourcesAndReturnError:&err]) {
-        if (err_buf) std::snprintf(err_buf, err_size, "allocRenderResources: %s",
-                                    err.localizedDescription.UTF8String);
+    st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
+                              kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+    if (st != noErr) {
+        if (err_buf) std::snprintf(err_buf, err_size, "setFormat in: %d", (int)st);
+        AudioComponentInstanceDispose(inst);
+        return 0;
+    }
+    st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
+                              kAudioUnitScope_Output, 0, &fmt, sizeof(fmt));
+    if (st != noErr) {
+        if (err_buf) std::snprintf(err_buf, err_size, "setFormat out: %d", (int)st);
+        AudioComponentInstanceDispose(inst);
         return 0;
     }
 
+    UInt32 maxF = max_frames;
+    AudioUnitSetProperty(inst, kAudioUnitProperty_MaximumFramesPerSlice,
+                         kAudioUnitScope_Global, 0, &maxF, sizeof(maxF));
+
+    // Pré-allouer l'Entry pour avoir un pointeur stable AVANT set du callback
+    // (le callback C reçoit ce pointeur en refCon).
     auto entry = std::make_unique<Entry>();
-    entry->au = au;
+    entry->au_inst = inst;
     entry->editor_window = nil;
     entry->desc = desc;
-    entry->render_block = au.renderBlock;
     entry->in_l.assign(max_frames, 0.0f);
     entry->in_r.assign(max_frames, 0.0f);
     entry->max_frames = max_frames;
-    entry->latency_samples = (uint32_t)lround(au.latency * kSampleRate);
     entry->sample_time = 0.0;
     entry->cur_in_l = nullptr;
     entry->cur_in_r = nullptr;
     entry->cur_n_frames = 0;
+
+    AURenderCallbackStruct cb = {0};
+    cb.inputProc = jmo_render_callback;
+    cb.inputProcRefCon = entry.get();
+    st = AudioUnitSetProperty(inst, kAudioUnitProperty_SetRenderCallback,
+                              kAudioUnitScope_Input, 0, &cb, sizeof(cb));
+    if (st != noErr) {
+        if (err_buf) std::snprintf(err_buf, err_size, "setRenderCallback: %d", (int)st);
+        AudioComponentInstanceDispose(inst);
+        return 0;
+    }
+
+    st = AudioUnitInitialize(inst);
+    if (st != noErr) {
+        if (err_buf) std::snprintf(err_buf, err_size, "AudioUnitInitialize: %d", (int)st);
+        AudioComponentInstanceDispose(inst);
+        return 0;
+    }
+
+    Float64 latency_sec = 0;
+    UInt32 latency_size = sizeof(latency_sec);
+    AudioUnitGetProperty(inst, kAudioUnitProperty_Latency,
+                         kAudioUnitScope_Global, 0, &latency_sec, &latency_size);
+    entry->latency_samples = (uint32_t)lround(latency_sec * kSampleRate);
 
     os_unfair_lock_lock(&lock);
     uint32_t id_ = next_id++;
@@ -221,15 +283,17 @@ struct Entry {
     os_unfair_lock_unlock(&lock);
 
     // Cleanup AU & window — hors lock pour éviter de tenir le lock pendant
-    // dealloc lourd. ARC s'occupe des objets ObjC.
+    // dealloc lourd.
     if (entry->editor_window) {
-        // Fermeture window sur main thread.
         NSWindow *w = entry->editor_window;
         dispatch_async(dispatch_get_main_queue(), ^{
             [w close];
         });
     }
-    [entry->au deallocateRenderResources];
+    if (entry->au_inst) {
+        AudioUnitUninitialize(entry->au_inst);
+        AudioComponentInstanceDispose(entry->au_inst);
+    }
     return 0;
 }
 
@@ -244,7 +308,7 @@ struct Entry {
     Entry *e = it->second.get();
     if (n_frames > e->max_frames) return -2;
 
-    // Snapshot input pour le pull_block (qui sera invoqué par renderBlock).
+    // Snapshot input — sera lu par jmo_render_callback via refCon.
     std::memcpy(e->in_l.data(), left,  n_frames * sizeof(float));
     std::memcpy(e->in_r.data(), right, n_frames * sizeof(float));
     e->cur_in_l = e->in_l.data();
@@ -266,28 +330,8 @@ struct Entry {
     ts.mFlags = kAudioTimeStampSampleTimeValid;
     ts.mSampleTime = e->sample_time;
 
-    AURenderPullInputBlock pull = ^OSStatus(AudioUnitRenderActionFlags *flags,
-                                            const AudioTimeStamp *t,
-                                            AUAudioFrameCount frame_count,
-                                            NSInteger bus_number,
-                                            AudioBufferList *in_data) {
-        if (in_data->mNumberBuffers < 2) return -1;
-        const uint32_t want = (uint32_t)frame_count;
-        if (want > e->cur_n_frames) return -1;
-        if (in_data->mBuffers[0].mData == nullptr) {
-            in_data->mBuffers[0].mData = (void *)e->cur_in_l;
-            in_data->mBuffers[0].mDataByteSize = want * sizeof(float);
-            in_data->mBuffers[1].mData = (void *)e->cur_in_r;
-            in_data->mBuffers[1].mDataByteSize = want * sizeof(float);
-        } else {
-            std::memcpy(in_data->mBuffers[0].mData, e->cur_in_l, want * sizeof(float));
-            std::memcpy(in_data->mBuffers[1].mData, e->cur_in_r, want * sizeof(float));
-        }
-        return noErr;
-    };
-
     AudioUnitRenderActionFlags flags = 0;
-    OSStatus st = e->render_block(&flags, &ts, n_frames, 0, abl, pull);
+    OSStatus st = AudioUnitRender(e->au_inst, &flags, &ts, 0, n_frames, abl);
     if (st != noErr) return -2;
 
     e->sample_time += n_frames;
@@ -314,69 +358,59 @@ struct Entry {
         return 0;
     }
 
-    // FIX (S1.4 hotfix#2) — utilise UNE seule instance AUAudioUnit pour le
-    // processing audio ET la GUI. Avant on créait une 2e AudioComponentInstance
-    // dédiée à AUGenericView, ce qui faisait :
-    //   • les paramètres bougés dans la GUI n'affectaient pas le son
-    //     (= la GUI parlait à l'instance morte, le renderBlock à l'autre)
-    //   • à la fermeture de la window on disposait l'instance GUI →
-    //     paramètres reset à la prochaine ouverture.
-    // Maintenant on demande au plugin son viewController via
-    // requestViewControllerWithCompletionHandler:, qui retourne :
-    //   • AU v3 : le custom UI du plugin
-    //   • AU v2 (Apple natifs, AmpliTube legacy) : controller générique
-    //     d'Apple qui affiche les params, LIÉ à la même instance audio.
-    // Plus de disposal à la fermeture — l'AUAudioUnit reste vivante tant
-    // que le plugin est chargé, donc params persistent entre ouvertures.
-    __strong AUAudioUnit *au_strong = e->au;
+    // FIX (S1.4 hotfix#3) — on utilise AUGenericView pointée sur la MÊME
+    // AudioComponentInstance que celle utilisée par AudioUnitRender pour le
+    // processing audio. Plus de duplication d'instance → les sliders bougent
+    // bien le son, et fermer/réouvrir la window préserve les paramètres
+    // (l'instance reste vivante jusqu'à unload). Pour les AU v3 modernes,
+    // S2 raffinera avec requestViewController pour récupérer le custom UI.
+    AudioComponentInstance inst = e->au_inst;
+    AudioComponentDescription desc = e->desc;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [au_strong requestViewControllerWithCompletionHandler:^(AUViewControllerBase * _Nullable vc) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSView *view = vc ? vc.view : nil;
-                CGSize prefSize = view ? view.frame.size : CGSizeMake(640, 480);
-                if (prefSize.width < 200 || prefSize.height < 100) {
-                    prefSize = CGSizeMake(640, 480);
-                }
+        CFStringRef cf_name = nullptr;
+        AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
+        if (comp) AudioComponentCopyName(comp, &cf_name);
+        NSString *title = (__bridge_transfer NSString *)cf_name;
+        if (!title) title = @"AU Plugin";
 
-                NSWindow *win = [[NSWindow alloc]
-                    initWithContentRect:NSMakeRect(120, 120, prefSize.width, prefSize.height)
-                              styleMask:(NSWindowStyleMaskTitled |
-                                         NSWindowStyleMaskClosable |
-                                         NSWindowStyleMaskResizable)
-                                backing:NSBackingStoreBuffered
-                                  defer:NO];
-                NSString *title = au_strong.audioUnitName ?: @"AU Plugin";
-                [win setTitle:title];
-                [win setReleasedWhenClosed:NO];
+        NSRect rect = NSMakeRect(120, 120, 640, 480);
+        NSWindow *win = [[NSWindow alloc]
+            initWithContentRect:rect
+                      styleMask:(NSWindowStyleMaskTitled |
+                                 NSWindowStyleMaskClosable |
+                                 NSWindowStyleMaskResizable)
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        [win setTitle:title];
+        [win setReleasedWhenClosed:NO];
 
-                if (view) {
-                    [win setContentView:view];
-                } else {
-                    NSTextField *label = [[NSTextField alloc]
-                        initWithFrame:NSMakeRect(0, 0, prefSize.width, prefSize.height)];
-                    [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
-                    [label setEditable:NO];
-                    [label setBezeled:NO];
-                    [label setDrawsBackground:NO];
-                    [label setAlignment:NSTextAlignmentCenter];
-                    [win setContentView:label];
-                }
+        AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
+        if (view) {
+            view.showsExpertParameters = YES;
+            [win setContentView:view];
+        } else {
+            NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
+            [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
+            [label setEditable:NO];
+            [label setBezeled:NO];
+            [label setDrawsBackground:NO];
+            [label setAlignment:NSTextAlignmentCenter];
+            [win setContentView:label];
+        }
 
-                [win center];
-                [NSApp activateIgnoringOtherApps:YES];
-                [win makeKeyAndOrderFront:nil];
-                e->editor_window = win;
+        [win center];
+        [NSApp activateIgnoringOtherApps:YES];
+        [win makeKeyAndOrderFront:nil];
+        e->editor_window = win;
 
-                // À la fermeture par l'utilisateur, on libère juste la window —
-                // PAS le plugin (params préservés pour la prochaine ouverture).
-                [[NSNotificationCenter defaultCenter]
-                    addObserverForName:NSWindowWillCloseNotification
-                                object:win
-                                 queue:nil
-                            usingBlock:^(NSNotification *_Nonnull __unused note) {
-                    e->editor_window = nil;
-                }];
-            });
+        // À la fermeture par l'utilisateur, on libère juste la window —
+        // PAS le plugin (params préservés pour la prochaine ouverture).
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSWindowWillCloseNotification
+                        object:win
+                         queue:nil
+                    usingBlock:^(NSNotification *_Nonnull __unused note) {
+            e->editor_window = nil;
         }];
     });
     return 0;
