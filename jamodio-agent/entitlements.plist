@@ -8,5 +8,47 @@
   <true/>
   <key>com.apple.security.network.server</key>
   <true/>
+
+  <!--
+    v0.2.24 — Entitlements pour héberger des AudioUnits 3rd party.
+
+    Sans ces entitlements, macOS Sequoia (hardened runtime) refuse de
+    charger les plugins AU signés par un autre team ID que le nôtre →
+    AudioComponentInstanceNew et AUAudioUnit alloc retournent OSStatus -1.
+    Apple natives (AUSampler, AUMatrixReverb, etc.) sont chargés in-process
+    et bypassent cette validation, c'est pourquoi ils fonctionnaient avant.
+
+    Cas observé en prod 2026-05-13 (Yannick, M-series, macOS 15.7.5) :
+    BFD Player, AmpliTube 5, Cherry GX-80, UJAM VIP, Splice Instrument,
+    et autres plugins pro échouaient TOUS avec -1. Apple AUMIDISynth /
+    AUMatrixReverb chargeaient OK.
+
+    C'est le pattern standard pour tout host AU (Logic Pro, Ableton Live,
+    Bitwig, Reaper, MainStage utilisent tous des entitlements similaires).
+  -->
+
+  <!-- LA clé critique : permet de charger des dylibs/bundles signés par
+       un autre team ID. Sans elle, hardened runtime rejette tous les
+       plugins 3rd party au moment du dlopen() interne du composant. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- Plugins modernes (Native Instruments, UAD, Waves récents) utilisent
+       du JIT pour leur moteur DSP. Sans cette entitlement, le JIT compiler
+       du plugin crashe au démarrage. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Permet aux pages mémoire d'être marquées exécutables sans signature
+       (= JIT compilers embarqués). Va de pair avec allow-jit. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- Permet aux plugins de lire les variables d'environnement DYLD_*
+       que leurs propres installers ont posées (BFD, Kontakt, EastWest
+       utilisent ce mécanisme pour pointer vers leurs librairies de
+       samples installées hors du bundle). -->
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
 </dict>
 </plist>

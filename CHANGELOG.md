@@ -6,6 +6,45 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.24] — 2026-05-13
+
+### Entitlements AU host — vraie cause du bug Yannick (v0.2.23 ne suffisait pas)
+
+Bug toujours présent en v0.2.23 malgré le main-thread dispatch + fallback
+v3↔v2 : sur Mac M-series macOS 15.7.5, **TOUS** les plugins 3rd party
+(BFD Player, AmpliTube 5, Cherry GX-80, UJAM, Splice…) échouaient avec
+`OSStatus -1` sur les DEUX chemins. Apple natives marchaient.
+
+Grâce au logging 4-CC ajouté en v0.2.23, on a pu confirmer le pattern :
+le -1 vient du **hardened runtime + library validation** de Sequoia. Sans
+les bonnes entitlements, macOS refuse de charger des dylibs/bundles AU
+signés par un autre team ID que le nôtre → AudioComponentInstanceNew et
+`[AUAudioUnit alloc init…]` retournent -1 sur tout plugin 3rd party.
+Apple natives (AUSampler, AUMatrixReverb…) sont chargés in-process et
+bypass la validation, c'est pourquoi ils fonctionnaient.
+
+### Changements
+
+`entitlements.plist` : ajout des 4 clés requises pour héberger des AU
+3rd party sous hardened runtime macOS 15+ :
+
+- `com.apple.security.cs.disable-library-validation` — **LA clé**.
+  Permet de charger des libs signées par un autre team ID.
+- `com.apple.security.cs.allow-jit` — pour les plugins NI/UAD/Waves
+  modernes qui utilisent du JIT pour leur DSP.
+- `com.apple.security.cs.allow-unsigned-executable-memory` — pour les
+  pages mémoire JIT marquées exécutables.
+- `com.apple.security.cs.allow-dyld-environment-variables` — pour BFD,
+  Kontakt, EastWest qui utilisent DYLD_* pour pointer vers leurs samples.
+
+C'est le pattern standard pour tout host AU (Logic Pro, Ableton Live,
+Bitwig, Reaper, MainStage utilisent tous ces entitlements).
+
+### Tests
+
+Pas de nouveau test unitaire (entitlements ne s'appliquent qu'au binaire
+signé). Validation manuelle Yannick au déploiement v0.2.24.
+
 ## [0.2.23] — 2026-05-13
 
 ### Sprint robustesse plugin AU — fix bug Yannick (BFD + AmpliTube `-1`)
