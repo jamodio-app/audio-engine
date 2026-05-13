@@ -6,6 +6,41 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.25] — 2026-05-13
+
+### Hotfix — Crash agent au boot avec entitlements v0.2.24
+
+v0.2.24 a introduit les entitlements `disable-library-validation` +
+`allow-jit` qui permettent de charger les plugins AU 3rd party. Effet de
+bord : ces plugins se chargent maintenant **in-process** dans notre agent,
+au lieu d'être rejetés. Et certains plugins (FIN-NEO d'UJAM observé chez
+Yannick) ont des destructeurs C++ buggés qui throw une exception
+(`std::thread::~thread()` quand le thread n'a pas été join), ce qui
+déclenche `std::terminate()` → crash de l'agent.
+
+Le crash se produisait pendant le SCAN au boot, parce qu'on probe chaque
+plugin pour récupérer sa latence et son nombre de bus input (via
+`[[AUAudioUnit alloc] initWithComponentDescription:options:error:]`).
+L'allocation transitoire pour la mesure suffisait à instancier puis
+détruire le plugin → trigger le destructeur foireux.
+
+### Fix
+
+Dans `au_host.mm::scanAndCallback:`, ne probe désormais que les plugins
+**Apple natifs** (manufacturer == `'appl'` = 0x6170706c). Pour les 3rd
+party, valeurs par défaut sûres :
+- `latency_samples = 0` (pas filtré comme incompatible)
+- `has_input_bus = 1` (traité comme effet par défaut)
+
+Trade-off : on perd le filtrage automatique des plugins 3rd party à
+latence intrinsèque > 64 samples, et l'auto-switch MIDI ne se déclenche
+qu'au load réel (pas au scan). Mais l'agent boot toujours, même avec un
+plugin défectueux installé sur la machine.
+
+Le user paye encore le prix au LOAD réel d'un plugin défectueux (qui
+peut crasher l'agent — comme dans Logic Pro), mais le scan est fiable
+et la majorité des plugins fonctionneront.
+
 ## [0.2.24] — 2026-05-13
 
 ### Entitlements AU host — vraie cause du bug Yannick (v0.2.23 ne suffisait pas)

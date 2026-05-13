@@ -299,21 +299,42 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
             CFRelease(cf_name);
 
             // Latence rapportée AVANT instantiation : on doit instancier brièvement.
-            // Coût observé en prod : ~5ms par plugin (caché par macOS après
-            // un premier scan). Cache disque persistant à ajouter en S1.5.
+            //
+            // v0.2.25 — Crash isolation au scan.
+            // Depuis qu'on a ajouté disable-library-validation + allow-jit en
+            // v0.2.24, les plugins 3rd party se chargent IN-PROCESS dans notre
+            // agent. Si un de leurs constructeurs/destructeurs C++ crashe ou
+            // throw une exception dans un destructeur (cas FIN-NEO d'UJAM,
+            // std::thread::~thread() qui throw → std::terminate), notre agent
+            // crashe au démarrage pendant ce scan.
+            //
+            // Mitigation : on ne probe que les Apple natives (manufacturer
+            // == 'appl' = 0x6170706c) pour récupérer latence/has_input_bus.
+            // Pour les 3rd party, valeurs par défaut sûres :
+            //   - latency_samples = 0   (= ne pas filtrer comme incompatible)
+            //   - has_input_bus = 1     (= traiter comme effet par défaut ;
+            //     l'auto-switch MIDI se fera au load réel si le plugin se
+            //     révèle être un instrument pur)
+            // Le user paye le prix au LOAD réel d'un plugin défectueux (qui
+            // peut crasher l'agent), mais le SCAN reste fiable et l'agent
+            // boot toujours.
+            const uint32_t kAppleManuf = 0x6170706c; // 'appl' big-endian
             uint32_t latency_samples = 0;
             int has_input_bus = 1;
-            NSError *err = nil;
-            AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:d
-                                                                            options:0
-                                                                              error:&err];
-            if (probe && !err) {
-                latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
-                // S2 — has_input_bus permet au browser de savoir s'il faut
-                // auto-switcher en source MIDI (= pur instrument) au load.
-                has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
-                probe = nil; // ARC release
+            if (d.componentManufacturer == kAppleManuf) {
+                NSError *err = nil;
+                AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:d
+                                                                                options:0
+                                                                                  error:&err];
+                if (probe && !err) {
+                    latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
+                    // S2 — has_input_bus permet au browser de savoir s'il faut
+                    // auto-switcher en source MIDI (= pur instrument) au load.
+                    has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
+                    probe = nil; // ARC release
+                }
             }
+            // else : 3rd party plugin → on ne probe pas, défauts sûrs.
             // `providesUserInterface` retourne YES uniquement pour les AU v3
             // qui exposent un custom view controller. Les AU v2 (= la totalité
             // des AU Apple natifs, AmpliTube legacy, etc.) retournent NO mais
