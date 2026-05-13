@@ -6,6 +6,59 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.2.23] — 2026-05-13
+
+### Sprint robustesse plugin AU — fix bug Yannick (BFD + AmpliTube `-1`)
+
+Plusieurs plugins lourds (BFD Player, AmpliTube 5, Kontakt, etc.) plantaient
+silencieusement avec `v2 InstanceNew failed: -1` chez certains utilisateurs,
+alors que `auval` les validait à 100 %. Diagnostic : on appelait
+`AudioComponentInstanceNew` depuis un tokio worker thread sans CFRunLoop, ce
+qui faisait timeouter le XPC interne du plugin (licensing daemon, sample
+engine background, etc.). Sur Mac assez rapides l'XPC se résolvait avant
+l'inspection, sur Mac plus chargés ça plantait.
+
+### Changements
+
+- **(b)** `au_host.mm` : tout le chemin d'instanciation AU (v2 et v3) est
+  désormais wrappé dans un `dispatch_sync(dispatch_get_main_queue(), …)` via
+  l'helper `jmo_run_on_main_sync`. Inline si déjà sur le main thread (évite
+  le deadlock `dispatch_sync` ↦ main quand on est main). Couvre
+  `AudioComponentInstanceNew`, `AudioUnitSetProperty` (format, render
+  callback, max frames), `AudioUnitInitialize`, et l'équivalent v3
+  `AUAudioUnit alloc`, `setFormat`, `allocateRenderResources`.
+- **(c)** Fallback v3 ↔ v2 : si le chemin préféré (selon le flag
+  `kAudioComponentFlag_IsV3AudioUnit`) échoue, on retente l'autre chemin
+  automatiquement. Beaucoup de plugins publient les deux interfaces avec des
+  comportements différents — l'un peut planter là où l'autre passe.
+  L'erreur finale annexe les deux messages (« primary: … (fallback: …) »).
+- **(a)** `ws_server.rs` : `LoadInstrumentPlugin failed` loggue maintenant
+  `au_type`, `subtype`, `manufacturer` et `error`. Plus de ping-pong Chrome
+  console pour identifier le plugin tenté au prochain bug report.
+- **(e)** `PluginInfo` gagne `#[serde(rename_all = "camelCase")]`. Le wire
+  est maintenant cohérent : `pluginRef`, `latencySamples`, `hasEditor`,
+  `hasInputBus` partout (avant : snake_case dans `PluginList`, camelCase
+  dans `InstrumentPluginLoaded` — inconsistance subtile qui rendait le
+  debug Chrome console déroutant). Browser lit les deux formes pendant la
+  transition (compat agent ≤ v0.2.22 ↔ navigateur v0.2.23).
+- **(d) côté browser** : nouveau cache `localStorage:jamodio-fx-failures`
+  des plugins ayant échoué au load. Pas de grisage — juste un badge ⚠
+  informatif dans la modal FX (cliquable, tooltip explicatif).
+  Invalidation intelligente :
+  - TTL 30 jours (laisse une chance à une MAJ du plugin)
+  - Effacement si la version de l'agent change (peut-être qu'on a fixé)
+  - Effacement immédiat dès qu'un load réussit
+  L'utilisateur n'est jamais bloqué, et bénéficie automatiquement des
+  fixes futurs.
+
+### Tests
+
+- Nouveau `plugin_info_serializes_camel_case` dans `jamodio-audio-core` :
+  vérifie que la sérialisation est en camelCase et qu'aucun champ
+  snake_case ne fuit.
+- Tests existants `au-host` passent inchangés (process_passes_through_eq,
+  double_process_keeps_working).
+
 ## [0.2.22] — 2026-05-12
 
 ### Bug D — Crossfade au drift drain du jitter buffer

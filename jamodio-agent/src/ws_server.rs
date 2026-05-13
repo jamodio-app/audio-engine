@@ -776,8 +776,20 @@ async fn handle_message(
                         }]
                     }
                     Err(message) => {
+                        // v0.2.23 — Log enrichi avec les 4-CC du plugin tenté
+                        // pour permettre le diag à distance sans Chrome console
+                        // (cf. bug Yannick 2026-05-13).
+                        let (au_type, subtype, manuf) = match &plugin_ref {
+                            jamodio_audio_core::plugin_host::PluginRef::Au {
+                                au_type, subtype, manufacturer,
+                            } => (au_type.as_str(), subtype.as_str(), manufacturer.as_str()),
+                            _ => ("?", "?", "?"),
+                        };
                         tracing::error!(
                             target: "jamodio::ws",
+                            au_type = au_type,
+                            subtype = subtype,
+                            manufacturer = manuf,
                             error = %message,
                             "LoadInstrumentPlugin failed"
                         );

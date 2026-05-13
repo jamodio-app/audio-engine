@@ -46,6 +46,7 @@ pub enum PluginRef {
 /// `has_input_bus = false` (= synthé MIDI pur) signale au browser qu'il faut
 /// auto-switcher la source d'entrée en MIDI à l'activation (S2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PluginInfo {
     pub name: String,
     pub manufacturer: String,
@@ -165,5 +166,36 @@ mod serde_tests {
     fn plugin_handle_zero_is_invalid() {
         assert!(!PluginHandle::INVALID.is_valid());
         assert!(PluginHandle(1).is_valid());
+    }
+
+    /// v0.2.23 — Vérifie que PluginInfo sérialise en camelCase (cohérent avec
+    /// le reste du protocole wire). Avant v0.2.23, on avait l'inconsistance
+    /// snake_case dans PluginList vs camelCase dans InstrumentPluginLoaded
+    /// → bug Yannick avec `p.pluginRef` undefined côté Chrome console.
+    #[test]
+    fn plugin_info_serializes_camel_case() {
+        let info = PluginInfo {
+            name: "AUMatrixReverb".into(),
+            manufacturer: "Apple".into(),
+            plugin_ref: PluginRef::Au {
+                au_type: "aufx".into(),
+                subtype: "mrev".into(),
+                manufacturer: "appl".into(),
+            },
+            latency_samples: 0,
+            has_editor: true,
+            incompatible: false,
+            has_input_bus: true,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(r#""pluginRef":"#), "json was {json}");
+        assert!(json.contains(r#""latencySamples":0"#), "json was {json}");
+        assert!(json.contains(r#""hasEditor":true"#), "json was {json}");
+        assert!(json.contains(r#""hasInputBus":true"#), "json was {json}");
+        // Sanity : aucun champ snake_case ne doit fuir.
+        assert!(!json.contains("plugin_ref"), "snake_case leaked: {json}");
+        assert!(!json.contains("latency_samples"), "snake_case leaked: {json}");
+        assert!(!json.contains("has_editor"), "snake_case leaked: {json}");
+        assert!(!json.contains("has_input_bus"), "snake_case leaked: {json}");
     }
 }

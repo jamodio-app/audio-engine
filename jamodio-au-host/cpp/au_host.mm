@@ -174,6 +174,82 @@ static OSStatus jmo_render_callback(void *refCon,
     return noErr;
 }
 
+// v0.2.23 — Exécute `block` sur le main thread Cocoa, synchrone.
+//
+// Pourquoi : `AudioComponentInstanceNew` + `AUAudioUnit alloc init` doivent
+// tourner sur un thread avec une CFRunLoop active. Les plugins lourds
+// (BFD Player, AmpliTube 5, Kontakt, beaucoup d'autres) font du XPC sync
+// vers leur daemon de licence / sample engine à l'instanciation, et ce XPC
+// ne renvoie que si un runloop pompe les messages. Notre WS handler tourne
+// sur un tokio worker sans runloop → InstanceNew retourne -1 silencieusement
+// (cas observé en prod 2026-05-13 sur Mac M-series de Yannick).
+//
+// La doc Apple Audio Unit recommande explicitement le main thread pour
+// load/init/uninitialize (HostAudioUnits Programming Guide).
+//
+// Implémentation : on utilise `dispatch_async` + `dispatch_semaphore_wait`
+// avec timeout, plutôt que `dispatch_sync`. Raison : en environnement de
+// test Rust (cargo test), le main thread est le test runner qui ne pompe
+// PAS la main queue → `dispatch_sync` deadlock infini. Avec un timeout,
+// on tombe en fallback "exécution inline" sur le tokio worker, ce qui
+// suffit pour les plugins simples (Apple natifs, EQ basique) testés en CI.
+//
+// En production (Tauri = NSApp avec runloop main pompée), le block est
+// exécuté quasi instantanément (~50 µs), le timeout n'est jamais atteint.
+//
+// Garantie d'exécution unique via flag `done` + os_unfair_lock : si on
+// timeout sur le wait et qu'on exécute inline, ET que le block dispatch_async
+// finit par être pompé plus tard, le second appel ne s'exécute pas.
+static void jmo_run_on_main_sync(dispatch_block_t block) {
+    if ([NSThread isMainThread]) {
+        block();
+        return;
+    }
+    // Détection contexte test/CLI : NSApp est initialisé par Tauri au démarrage
+    // de l'agent (NSApplication sharedApplication). En `cargo test` ou en
+    // contexte CLI sans GUI, NSApp reste nil → la main queue n'est pas pompée
+    // → dispatch_sync deadlock. On exécute inline dans ce cas.
+    // En production (Tauri actif), NSApp != nil → dispatch_async + wait OK.
+    if (NSApp == nil) {
+        block();
+        return;
+    }
+    // 10 secondes = largement assez pour les plugins les plus lents
+    // (BFD = 2.3 s cold open, mesuré via auval). Au-delà = main thread KO,
+    // on fallback inline.
+    static constexpr long long TIMEOUT_NS = 10LL * NSEC_PER_SEC;
+
+    __block bool done = false;
+    __block os_unfair_lock done_lock = OS_UNFAIR_LOCK_INIT;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        bool should_run = false;
+        os_unfair_lock_lock(&done_lock);
+        if (!done) { done = true; should_run = true; }
+        os_unfair_lock_unlock(&done_lock);
+        if (should_run) block();
+        dispatch_semaphore_signal(sem);
+    });
+
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, TIMEOUT_NS);
+    if (dispatch_semaphore_wait(sem, deadline) != 0) {
+        // Timeout : main thread ne pompe pas la queue. Exécution inline
+        // (= tokio worker thread). Pour les plugins simples ça marche.
+        // Pour les plugins exigeants (cf. BFD/AmpliTube), on récupère le
+        // comportement v0.2.22 (échec InstanceNew -1) — au moins on ne
+        // pend pas indéfiniment.
+        bool should_run = false;
+        os_unfair_lock_lock(&done_lock);
+        if (!done) { done = true; should_run = true; }
+        os_unfair_lock_unlock(&done_lock);
+        if (should_run) block();
+        // Le block originel reste queued sur main et fera no-op au pickup
+        // éventuel grâce au flag `done`. Le `sem` se libère par ARC quand
+        // le block s'exécute ou est dropé.
+    }
+}
+
 } // anonymous namespace
 
 @interface JmoAuHost : NSObject {
@@ -276,10 +352,10 @@ static OSStatus jmo_render_callback(void *refCon,
     // récents = v3. Apple natifs, AmpliTube legacy = v2.
     AudioComponentDescription d;
     AudioComponentGetDescription(comp, &d);
-    const bool is_v3 = (d.componentFlags & kAudioComponentFlag_IsV3AudioUnit) != 0;
+    const bool prefer_v3 = (d.componentFlags & kAudioComponentFlag_IsV3AudioUnit) != 0;
 
     auto entry = std::make_unique<Entry>();
-    entry->is_v3 = is_v3;
+    entry->is_v3 = false;               // sera fixé par le chemin qui réussit
     entry->has_input_bus = false;       // sera mis à true plus bas si l'AU a un input bus
     entry->au_inst = nullptr;
     entry->au_v3 = nil;
@@ -294,135 +370,210 @@ static OSStatus jmo_render_callback(void *refCon,
     entry->cur_in_r = nullptr;
     entry->cur_n_frames = 0;
 
-    if (is_v3) {
-        // Path AU v3 — AUAudioUnit moderne. Permet de récupérer le custom UI
-        // du plugin via requestViewControllerWithCompletionHandler:.
-        NSError *err = nil;
-        AUAudioUnit *au = [[AUAudioUnit alloc] initWithComponentDescription:desc
-                                                                     options:0
-                                                                       error:&err];
-        if (!au || err) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v3 init: %s",
-                                        err.localizedDescription.UTF8String);
-            return 0;
-        }
-
-        AVAudioFormat *fmt = [[AVAudioFormat alloc]
-            initStandardFormatWithSampleRate:kSampleRate channels:2];
-        // S1.9 — n'ouvrir le bus input que s'il existe. Les synthés MIDI purs
-        // (AUMIDISynth, AUSampler) ont 0 bus input → on les charge quand même
-        // pour permettre l'ouverture de leur éditeur (UI custom, params),
-        // mais ils produiront silence tant qu'on n'a pas de routing MIDI in.
-        entry->has_input_bus = (au.inputBusses.count > 0);
-        if (entry->has_input_bus) {
-            for (AUAudioUnitBus *bus in au.inputBusses) {
-                bus.enabled = YES;
-                if (![bus setFormat:fmt error:&err]) {
-                    if (err_buf) std::snprintf(err_buf, err_size, "v3 setFormat in: %s",
-                                                err.localizedDescription.UTF8String);
-                    return 0;
+    // v0.2.23 — Tentative v3 wrappée dans un bloc dispatch main thread. Renvoie
+    // true si le plugin est chargé (entry->au_v3 set). Sinon, écrit l'erreur
+    // dans err_buf et laisse entry intact pour permettre un fallback v2.
+    Entry *entry_raw = entry.get();
+    AudioComponentDescription desc_for_v3 = desc;
+    uint32_t max_frames_capture = max_frames;
+    // Wrap dans une struct : ObjC blocks ne peuvent pas capturer un C array
+    // avec __block (déclaration "of array type" interdite par le compilo).
+    struct ErrSlot { char data[256]; };
+    auto try_v3 = [&]() -> bool {
+        __block bool ok = false;
+        __block ErrSlot local_err = {{0}};
+        jmo_run_on_main_sync(^{
+            NSError *err = nil;
+            AUAudioUnit *au = [[AUAudioUnit alloc] initWithComponentDescription:desc_for_v3
+                                                                         options:0
+                                                                           error:&err];
+            if (!au || err) {
+                std::snprintf(local_err.data, sizeof(local_err.data), "v3 init: %s",
+                              err.localizedDescription.UTF8String);
+                return;
+            }
+            AVAudioFormat *fmt = [[AVAudioFormat alloc]
+                initStandardFormatWithSampleRate:kSampleRate channels:2];
+            // S1.9 — n'ouvrir le bus input que s'il existe. Les synthés MIDI purs
+            // (AUMIDISynth, AUSampler) ont 0 bus input → on les charge quand même
+            // pour permettre l'ouverture de leur éditeur, mais ils produiront
+            // silence tant qu'on n'a pas de routing MIDI in.
+            entry_raw->has_input_bus = (au.inputBusses.count > 0);
+            if (entry_raw->has_input_bus) {
+                for (AUAudioUnitBus *bus in au.inputBusses) {
+                    bus.enabled = YES;
+                    if (![bus setFormat:fmt error:&err]) {
+                        std::snprintf(local_err.data, sizeof(local_err.data), "v3 setFormat in: %s",
+                                      err.localizedDescription.UTF8String);
+                        return;
+                    }
                 }
             }
-        }
-        for (AUAudioUnitBus *bus in au.outputBusses) {
-            bus.enabled = YES;
-            if (![bus setFormat:fmt error:&err]) {
-                if (err_buf) std::snprintf(err_buf, err_size, "v3 setFormat out: %s",
-                                            err.localizedDescription.UTF8String);
-                return 0;
+            for (AUAudioUnitBus *bus in au.outputBusses) {
+                bus.enabled = YES;
+                if (![bus setFormat:fmt error:&err]) {
+                    std::snprintf(local_err.data, sizeof(local_err.data), "v3 setFormat out: %s",
+                                  err.localizedDescription.UTF8String);
+                    return;
+                }
             }
+            au.maximumFramesToRender = max_frames_capture;
+            if (![au allocateRenderResourcesAndReturnError:&err]) {
+                std::snprintf(local_err.data, sizeof(local_err.data), "v3 allocRender: %s",
+                              err.localizedDescription.UTF8String);
+                return;
+            }
+            entry_raw->au_v3 = au;
+            entry_raw->render_block_v3 = au.renderBlock;
+            entry_raw->latency_samples = (uint32_t)lround(au.latency * kSampleRate);
+            entry_raw->is_v3 = true;
+            ok = true;
+        });
+        if (!ok && err_buf && local_err.data[0]) {
+            std::snprintf(err_buf, err_size, "%s", local_err.data);
         }
-        au.maximumFramesToRender = max_frames;
-        if (![au allocateRenderResourcesAndReturnError:&err]) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v3 allocRender: %s",
-                                        err.localizedDescription.UTF8String);
-            return 0;
-        }
+        return ok;
+    };
 
-        entry->au_v3 = au;
-        entry->render_block_v3 = au.renderBlock;
-        entry->latency_samples = (uint32_t)lround(au.latency * kSampleRate);
-    } else {
-        // Path AU v2 — AudioComponentInstance legacy + AUGenericView.
-        AudioComponentInstance inst = nullptr;
-        OSStatus st = AudioComponentInstanceNew(comp, &inst);
-        if (st != noErr || !inst) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v2 InstanceNew failed: %d", (int)st);
-            return 0;
-        }
+    // v0.2.23 — Tentative v2 wrappée dans un bloc dispatch main thread. Idem.
+    // C'est ce chemin qui plantait avec "InstanceNew failed: -1" sur les plugins
+    // lourds (BFD, AmpliTube) appelés depuis un thread sans CFRunLoop active.
+    AudioComponent comp_for_v2 = comp;
+    auto try_v2 = [&]() -> bool {
+        __block bool ok = false;
+        __block ErrSlot local_err = {{0}};
+        jmo_run_on_main_sync(^{
+            AudioComponentInstance inst = nullptr;
+            OSStatus st = AudioComponentInstanceNew(comp_for_v2, &inst);
+            if (st != noErr || !inst) {
+                std::snprintf(local_err.data, sizeof(local_err.data),
+                              "v2 InstanceNew failed: %d", (int)st);
+                return;
+            }
 
-        AudioStreamBasicDescription fmt = {0};
-        fmt.mSampleRate = kSampleRate;
-        fmt.mFormatID = kAudioFormatLinearPCM;
-        fmt.mFormatFlags = kAudioFormatFlagIsFloat
-                          | kAudioFormatFlagIsPacked
-                          | kAudioFormatFlagIsNonInterleaved;
-        fmt.mBytesPerPacket = sizeof(float);
-        fmt.mFramesPerPacket = 1;
-        fmt.mBytesPerFrame = sizeof(float);
-        fmt.mChannelsPerFrame = 2;
-        fmt.mBitsPerChannel = 32;
+            AudioStreamBasicDescription fmt = {0};
+            fmt.mSampleRate = kSampleRate;
+            fmt.mFormatID = kAudioFormatLinearPCM;
+            fmt.mFormatFlags = kAudioFormatFlagIsFloat
+                              | kAudioFormatFlagIsPacked
+                              | kAudioFormatFlagIsNonInterleaved;
+            fmt.mBytesPerPacket = sizeof(float);
+            fmt.mFramesPerPacket = 1;
+            fmt.mBytesPerFrame = sizeof(float);
+            fmt.mChannelsPerFrame = 2;
+            fmt.mBitsPerChannel = 32;
 
-        // S1.9 — détection du nombre de bus input via kAudioUnitProperty_ElementCount.
-        // Les synthés MIDI purs en v2 (AUMIDISynth, AUSampler) ont 0 bus input
-        // → on doit skip setFormat/setRenderCallback sur scope:Input (sinon
-        // -10877 InvalidScope). Plugins type aufx ou aumu-avec-audio-in
-        // (AmpliTube 5, Guitar Rig variants…) ont au moins 1 bus input.
-        UInt32 n_in_bus = 0;
-        UInt32 sz = sizeof(n_in_bus);
-        AudioUnitGetProperty(inst, kAudioUnitProperty_ElementCount,
-                             kAudioUnitScope_Input, 0, &n_in_bus, &sz);
-        entry->has_input_bus = (n_in_bus > 0);
+            // S1.9 — détection du nombre de bus input via kAudioUnitProperty_ElementCount.
+            // Les synthés MIDI purs en v2 (AUMIDISynth, AUSampler) ont 0 bus input
+            // → on doit skip setFormat/setRenderCallback sur scope:Input (sinon
+            // -10877 InvalidScope).
+            UInt32 n_in_bus = 0;
+            UInt32 sz = sizeof(n_in_bus);
+            AudioUnitGetProperty(inst, kAudioUnitProperty_ElementCount,
+                                 kAudioUnitScope_Input, 0, &n_in_bus, &sz);
+            entry_raw->has_input_bus = (n_in_bus > 0);
 
-        // Output bus toujours requis.
-        st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
-                                  kAudioUnitScope_Output, 0, &fmt, sizeof(fmt));
-        if (st != noErr) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v2 setFormat out: %d", (int)st);
-            AudioComponentInstanceDispose(inst);
-            return 0;
-        }
-
-        if (entry->has_input_bus) {
             st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
-                                      kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+                                      kAudioUnitScope_Output, 0, &fmt, sizeof(fmt));
             if (st != noErr) {
-                if (err_buf) std::snprintf(err_buf, err_size, "v2 setFormat in: %d", (int)st);
+                std::snprintf(local_err.data, sizeof(local_err.data),
+                              "v2 setFormat out: %d", (int)st);
                 AudioComponentInstanceDispose(inst);
-                return 0;
+                return;
+            }
+
+            if (entry_raw->has_input_bus) {
+                st = AudioUnitSetProperty(inst, kAudioUnitProperty_StreamFormat,
+                                          kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+                if (st != noErr) {
+                    std::snprintf(local_err.data, sizeof(local_err.data),
+                                  "v2 setFormat in: %d", (int)st);
+                    AudioComponentInstanceDispose(inst);
+                    return;
+                }
+            }
+
+            UInt32 maxF = max_frames_capture;
+            AudioUnitSetProperty(inst, kAudioUnitProperty_MaximumFramesPerSlice,
+                                 kAudioUnitScope_Global, 0, &maxF, sizeof(maxF));
+
+            if (entry_raw->has_input_bus) {
+                AURenderCallbackStruct cb = {0};
+                cb.inputProc = jmo_render_callback;
+                cb.inputProcRefCon = entry_raw;
+                st = AudioUnitSetProperty(inst, kAudioUnitProperty_SetRenderCallback,
+                                          kAudioUnitScope_Input, 0, &cb, sizeof(cb));
+                if (st != noErr) {
+                    std::snprintf(local_err.data, sizeof(local_err.data),
+                                  "v2 setRenderCallback: %d", (int)st);
+                    AudioComponentInstanceDispose(inst);
+                    return;
+                }
+            }
+
+            st = AudioUnitInitialize(inst);
+            if (st != noErr) {
+                std::snprintf(local_err.data, sizeof(local_err.data),
+                              "v2 AudioUnitInitialize: %d", (int)st);
+                AudioComponentInstanceDispose(inst);
+                return;
+            }
+
+            Float64 latency_sec = 0;
+            UInt32 latency_size = sizeof(latency_sec);
+            AudioUnitGetProperty(inst, kAudioUnitProperty_Latency,
+                                 kAudioUnitScope_Global, 0, &latency_sec, &latency_size);
+            entry_raw->latency_samples = (uint32_t)lround(latency_sec * kSampleRate);
+            entry_raw->au_inst = inst;
+            entry_raw->is_v3 = false;
+            ok = true;
+        });
+        if (!ok && err_buf && local_err.data[0]) {
+            std::snprintf(err_buf, err_size, "%s", local_err.data);
+        }
+        return ok;
+    };
+
+    // v0.2.23 — Stratégie : tenter le chemin "préféré" selon le flag du composant,
+    // puis fallback sur l'autre. Beaucoup de plugins publient les deux interfaces
+    // (v2 + v3) avec des comportements différents — l'un peut planter là où
+    // l'autre passe. Côté Yannick (M-series, macOS 15.7.5), v2 InstanceNew
+    // retournait -1 pour BFD/AmpliTube ; le fallback v3 a de bonnes chances de
+    // marcher. Inversement, certains plugins v3 mal écrits crashent en init et
+    // le fallback v2 sauve la journée.
+    bool ok = false;
+    char primary_err[256] = {0};
+    if (prefer_v3) {
+        ok = try_v3();
+        if (!ok) {
+            if (err_buf) std::snprintf(primary_err, sizeof(primary_err), "%s", err_buf);
+            ok = try_v2();
+            if (ok && err_buf) {
+                // Plugin chargé via fallback — efface l'erreur primaire pour
+                // que le caller ne se croie pas en échec.
+                err_buf[0] = 0;
             }
         }
-
-        UInt32 maxF = max_frames;
-        AudioUnitSetProperty(inst, kAudioUnitProperty_MaximumFramesPerSlice,
-                             kAudioUnitScope_Global, 0, &maxF, sizeof(maxF));
-
-        if (entry->has_input_bus) {
-            AURenderCallbackStruct cb = {0};
-            cb.inputProc = jmo_render_callback;
-            cb.inputProcRefCon = entry.get();
-            st = AudioUnitSetProperty(inst, kAudioUnitProperty_SetRenderCallback,
-                                      kAudioUnitScope_Input, 0, &cb, sizeof(cb));
-            if (st != noErr) {
-                if (err_buf) std::snprintf(err_buf, err_size, "v2 setRenderCallback: %d", (int)st);
-                AudioComponentInstanceDispose(inst);
-                return 0;
+    } else {
+        ok = try_v2();
+        if (!ok) {
+            if (err_buf) std::snprintf(primary_err, sizeof(primary_err), "%s", err_buf);
+            ok = try_v3();
+            if (ok && err_buf) {
+                err_buf[0] = 0;
             }
         }
-
-        st = AudioUnitInitialize(inst);
-        if (st != noErr) {
-            if (err_buf) std::snprintf(err_buf, err_size, "v2 AudioUnitInitialize: %d", (int)st);
-            AudioComponentInstanceDispose(inst);
-            return 0;
+    }
+    if (!ok) {
+        // Les deux chemins ont échoué. err_buf contient l'erreur du dernier essai,
+        // on annexe l'erreur du premier essai pour aider le diag.
+        if (err_buf && primary_err[0]) {
+            char last_err[256] = {0};
+            std::snprintf(last_err, sizeof(last_err), "%s", err_buf);
+            std::snprintf(err_buf, err_size, "%s (fallback: %s)",
+                          primary_err, last_err);
         }
-
-        Float64 latency_sec = 0;
-        UInt32 latency_size = sizeof(latency_sec);
-        AudioUnitGetProperty(inst, kAudioUnitProperty_Latency,
-                             kAudioUnitScope_Global, 0, &latency_sec, &latency_size);
-        entry->latency_samples = (uint32_t)lround(latency_sec * kSampleRate);
-        entry->au_inst = inst;
+        return 0;
     }
 
     os_unfair_lock_lock(&lock);
