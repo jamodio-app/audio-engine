@@ -31,8 +31,9 @@ use vst3::{
         int32, kResultOk, tresult, FUnknown, IBStream, IBStreamTrait,
         IBStream_::IStreamSeekMode_, IPluginBaseTrait, IPluginFactoryTrait, TUID,
         Vst::{
-            IComponentHandler, IComponentHandlerTrait, IComponentTrait, IEditController,
-            IEditControllerTrait, IEditController_iid, IHostApplication, ParamID, ParamValue,
+            IComponentHandler, IComponentHandlerTrait, IComponentTrait, IConnectionPoint,
+            IConnectionPointTrait, IEditController, IEditControllerTrait, IEditController_iid,
+            IHostApplication, ParamID, ParamValue,
         },
         IPlugView, IPlugViewTrait, ViewRect,
     },
@@ -133,9 +134,17 @@ impl EditorWindow {
 
         let controller = resolve_controller(instance, &module, &host_app)?;
 
-        // State sync component → controller : indispensable pour les plugins
-        // en architecture "separate component+controller" (Valhalla, FabFilter,
-        // NI…). Tolérant à l'échec (certains plugins retournent E_NOTIMPL).
+        // IConnectionPoint bidirectionnel component ↔ controller : utilisé par
+        // les plugins separate-class pour sync state runtime (param changes,
+        // automation, etc.). Beaucoup de plugins (Valhalla) refusent createView
+        // si la connexion n'est pas faite. Cast → None = plugin n'implémente
+        // pas IConnectionPoint (= single-component ou état partagé in-memory),
+        // skip silencieusement.
+        connect_component_to_controller(instance, &controller);
+
+        // State sync via stream : pour les plugins qui supportent le pattern
+        // getState/setComponentState. Tolérant à l'échec (E_NOTIMPL pour ceux
+        // qui n'implémentent pas, comme Valhalla).
         sync_component_state(instance, &controller);
 
         // Set le component handler avant tout createView (sinon plugins pros
@@ -191,6 +200,60 @@ impl EditorWindow {
 impl Drop for EditorWindow {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Connecte le composant et le controller via `IConnectionPoint` bidirectionnel.
+///
+/// Pattern VST3 "distributed plug-in" : quand component et controller vivent
+/// dans des classes COM séparées (cas Valhalla, FabFilter, etc.), ils
+/// communiquent via `IConnectionPoint::notify(IMessage)`. Pour que cette
+/// communication soit possible, le host doit faire un `connect()` croisé :
+///   - `comp_cp.connect(ctrl_cp)`
+///   - `ctrl_cp.connect(comp_cp)`
+///
+/// Beaucoup de plugins commerciaux refusent leur `createView` si cette
+/// connexion n'a pas été établie (le controller ne peut pas demander au
+/// composant les valeurs courantes de ses params via message).
+///
+/// Tolérant à tout : si l'un ou l'autre n'expose pas `IConnectionPoint`
+/// (= cast = None), on skip silencieusement — c'est ce que font les plugins
+/// single-component ou ceux qui partagent leur state en mémoire directement.
+fn connect_component_to_controller(instance: &Instance, controller: &ComPtr<IEditController>) {
+    let comp_cp = match instance.component.cast::<IConnectionPoint>() {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                target: "jamodio::vst3::editor",
+                "component n'expose pas IConnectionPoint — connect skipped"
+            );
+            return;
+        }
+    };
+    let ctrl_cp = match controller.cast::<IConnectionPoint>() {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                target: "jamodio::vst3::editor",
+                "controller n'expose pas IConnectionPoint — connect skipped"
+            );
+            return;
+        }
+    };
+    let r1 = unsafe { comp_cp.connect(ctrl_cp.as_ptr()) };
+    let r2 = unsafe { ctrl_cp.connect(comp_cp.as_ptr()) };
+    if r1 == kResultOk && r2 == kResultOk {
+        tracing::info!(
+            target: "jamodio::vst3::editor",
+            "IConnectionPoint connect component↔controller ok"
+        );
+    } else {
+        tracing::warn!(
+            target: "jamodio::vst3::editor",
+            r1 = r1,
+            r2 = r2,
+            "IConnectionPoint connect partiel — le plugin peut quand même fonctionner"
+        );
     }
 }
 
