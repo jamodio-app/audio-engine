@@ -6,6 +6,28 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-15
+
+### Changed — Polish Windows beta
+- **Latence capture smart** : `capture.rs` pré-check via
+  `device.supported_input_configs()` si le device expose `BufferSize::Range`
+  qui contient 128. Si oui (ASIO Windows + CoreAudio mac + parfois WASAPI
+  exclusive Win 11) → `Fixed(128)` = ~2.7 ms latence. Sinon (mic onboard
+  Realtek WASAPI shared) → fallback `Default` = ~10 ms. Donne la latence
+  pro aux users avec carte audio externe sans casser les users sans.
+- **Format d'install Windows recommandé = MSI** : nouvel asset stable
+  `Jamodio-Audio-Engine-Windows.msi` publié sur chaque release. Site web
+  jamodio.com pointe désormais sur ce MSI au lieu du `.exe` NSIS. Le MSI
+  utilise le Restart Manager Windows = pas de "Error opening file for
+  writing" lors de l'auto-update (bug observé en v0.3.0/0.3.1).
+  Le `.exe` NSIS reste publié pour rétro-compat des installs existantes.
+
+### Notes
+- **Beta testers Windows v0.3.0/0.3.1** : votre installation NSIS continuera
+  de s'auto-updater (le NSIS reste dans le bundle). Pour bénéficier des
+  updates lisses sans Retry, désinstaller l'agent actuel et réinstaller via
+  le nouveau `Jamodio-Audio-Engine-Windows.msi` depuis jamodio.com (1 fois).
+
 ## [0.3.1] — 2026-05-15
 
 ### Fixed — Beta Windows critical

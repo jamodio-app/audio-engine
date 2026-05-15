@@ -166,7 +166,8 @@ jobs:
             **Téléchargements** (liens permanents, toujours la dernière version) :
             - macOS Apple Silicon : [Jamodio-Audio-Engine-macOS-AppleSilicon.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg)
             - macOS Intel : [Jamodio-Audio-Engine-macOS-Intel.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-Intel.dmg)
-            - Windows : [Jamodio-Audio-Engine-Windows.exe](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.exe)
+            - Windows (recommandé, MSI) : [Jamodio-Audio-Engine-Windows.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.msi)
+            - Windows (legacy NSIS) : [Jamodio-Audio-Engine-Windows.exe](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.exe)
           releaseDraft: true      # chaque matrix complète le draft
           prerelease: false
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
@@ -204,7 +205,16 @@ jobs:
                 cp -v "$f" 'Jamodio-Audio-Engine-macOS-Intel.dmg'
                 ;;
               *setup.exe)
+                # NSIS — gardé pour rétro-compat avec les agents installés en
+                # v0.3.0/0.3.1. Les nouveaux installs passent désormais par
+                # le MSI (cf. ci-dessous) qui supporte le Restart Manager
+                # Windows = pas de "Error opening file for writing" au update.
                 cp -v "$f" 'Jamodio-Audio-Engine-Windows.exe'
+                ;;
+              *.msi)
+                # MSI = format d'install recommandé sur Windows depuis v0.3.2.
+                # Site web jamodio.com pointe sur ce nom stable.
+                cp -v "$f" 'Jamodio-Audio-Engine-Windows.msi'
                 ;;
             esac
           done
@@ -213,7 +223,8 @@ jobs:
           for stable in \
             'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg' \
             'Jamodio-Audio-Engine-macOS-Intel.dmg' \
-            'Jamodio-Audio-Engine-Windows.exe'; do
+            'Jamodio-Audio-Engine-Windows.exe' \
+            'Jamodio-Audio-Engine-Windows.msi'; do
             if [ -f "$stable" ]; then
               gh release upload "$TAG" "$stable" -R "$REPO" --clobber
               echo "  ✓ $stable"

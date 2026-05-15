@@ -1,6 +1,40 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, SampleRate, StreamConfig, BufferSize};
+use cpal::{Device, SampleRate, StreamConfig, BufferSize, SupportedBufferSize};
 use crossbeam_channel::{Sender, TrySendError};
+
+/// Vérifie si le device input expose une `BufferSize::Range` qui contient
+/// `target_buf` pour le couple `(channels, sr)` demandé. Permet de choisir
+/// `Fixed(target_buf)` (low-latency) si supporté, sinon de tomber sur
+/// `Default` (= laisse le backend choisir, ~10ms WASAPI shared typique).
+///
+/// Sur Windows :
+/// - ASIO expose typiquement `Range { min: 16, max: 4096 }` → Fixed(128) OK.
+/// - WASAPI shared mode expose `Range { min: 480, max: 480 }` (10ms à 48k)
+///   ou `BufferSize::Unknown` → Fixed(128) refusé.
+/// - WASAPI exclusive expose un range plus large mais nécessite un device pas
+///   utilisé par d'autres apps.
+///
+/// Sur macOS CoreAudio expose presque toujours un range qui contient 128.
+fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_buf: u32) -> bool {
+    let Ok(supported) = device.supported_input_configs() else {
+        return false;
+    };
+    let target_sr = SampleRate(sr);
+    for cfg in supported {
+        if cfg.channels() != channels {
+            continue;
+        }
+        if cfg.min_sample_rate() > target_sr || cfg.max_sample_rate() < target_sr {
+            continue;
+        }
+        if let SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
+            if target_buf >= *min && target_buf <= *max {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Start capturing audio from the given device.
 /// Returns `(stream, channels_captured, native_sample_rate)`. Le SR natif est
@@ -31,16 +65,20 @@ pub fn start_capture(
     let channels = default_cfg.channels().max(1);
     let native_sr = default_cfg.sample_rate().0;
 
-    // Buffer size : Fixed(128) sur mac (CoreAudio + ASIO Windows acceptent
-    // les petits buffers = ~2.7ms latence). Default sur Windows WASAPI shared
-    // mode qui impose 10-20ms minimum (refus silencieux sinon = même symptôme
-    // que le SR forcé). Sur Windows ASIO le code passera quand même par cette
-    // branche Default mais ASIO ignorera et utilisera son propre buffer
-    // configurable côté ASIO control panel.
-    let buffer_size = if cfg!(windows) {
-        BufferSize::Default
-    } else {
+    // Buffer size : on essaye Fixed(128) (= ~2.7ms low-latency, accepté par
+    // CoreAudio mac + ASIO Windows + parfois WASAPI exclusive Win 11) et on
+    // fallback sur Default si le device n'expose pas ce range (= WASAPI
+    // shared sur mic onboard typique, qui impose ~10ms min). Le fallback
+    // évite l'erreur `StreamConfigNotSupported` qui bloquait v0.3.0 sur PC.
+    let buffer_size = if device_supports_fixed_buffer(device, channels, native_sr, 128) {
         BufferSize::Fixed(128)
+    } else {
+        tracing::info!(
+            target: "jamodio::capture",
+            channels, native_sr,
+            "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
+        );
+        BufferSize::Default
     };
 
     let config = StreamConfig {
