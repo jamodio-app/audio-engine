@@ -14,6 +14,7 @@ mod discovery;
 mod editor;
 mod host;
 mod loader;
+mod state;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -28,7 +28,8 @@ use std::thread::JoinHandle;
 use vst3::{
     Class, ComPtr, ComWrapper,
     Steinberg::{
-        int32, kResultOk, tresult, FUnknown, IPluginBaseTrait, IPluginFactoryTrait, TUID,
+        int32, kResultOk, tresult, FUnknown, IBStream, IBStreamTrait,
+        IBStream_::IStreamSeekMode_, IPluginBaseTrait, IPluginFactoryTrait, TUID,
         Vst::{
             IComponentHandler, IComponentHandlerTrait, IComponentTrait, IEditController,
             IEditControllerTrait, IEditController_iid, ParamID, ParamValue,
@@ -47,6 +48,7 @@ use windows_sys::Win32::{
 
 use crate::host::Instance;
 use crate::loader::LoadedModule;
+use crate::state::MemoryStream;
 
 const HOST_NAMESPACE: &str = "JAMOEDITOR";
 const PLATFORM_HWND: &[u8] = b"HWND\0";
@@ -116,6 +118,14 @@ impl EditorWindow {
     ) -> Result<Self, String> {
         let controller = resolve_controller(instance, &module)?;
 
+        // State sync component → controller : INDISPENSABLE pour les plugins
+        // en architecture "separate component+controller" (Valhalla, FabFilter,
+        // NI…). Sans ça, le controller ne sait pas quels params le composant
+        // expose et refuse silencieusement `createView`. Sur les plugins
+        // "single-component" (= cast IComponent → IEditController = même
+        // instance COM), c'est un no-op fonctionnel (self → self).
+        sync_component_state(instance, &controller);
+
         // Set le component handler avant tout createView (sinon plugins pros
         // refusent de créer leur UI).
         let handler_wrapper = ComWrapper::new(MinimalHandler);
@@ -169,6 +179,66 @@ impl Drop for EditorWindow {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Synchronise l'état du `IComponent` vers le `IEditController` via un
+/// `IBStream` mémoire éphémère.
+///
+/// Pattern VST3 standard pour activer la view d'un plugin "separate
+/// component+controller" :
+/// 1. `component.getState(stream)` — le composant audio écrit ses params
+/// 2. `stream.seek(0, kIBSeekSet)` — rewind avant lecture
+/// 3. `controller.setComponentState(stream)` — le controller charge
+///
+/// Tolérant à l'échec : si une étape rate, on log warn et on continue. Pour
+/// les plugins simples ça suffit ; les plus pointilleux refuseront createView
+/// derrière (= prochaine étape de diag).
+fn sync_component_state(instance: &Instance, controller: &ComPtr<IEditController>) {
+    let stream_wrapper = ComWrapper::new(MemoryStream::new());
+    let stream: ComPtr<IBStream> = match stream_wrapper.to_com_ptr::<IBStream>() {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                target: "jamodio::vst3::editor",
+                "MemoryStream::to_com_ptr<IBStream> a échoué — state sync skipped"
+            );
+            return;
+        }
+    };
+
+    let get_ok = unsafe { instance.component.getState(stream.as_ptr()) };
+    if get_ok != kResultOk {
+        tracing::warn!(
+            target: "jamodio::vst3::editor",
+            tresult = get_ok,
+            "component.getState a échoué — state sync skipped"
+        );
+        return;
+    }
+
+    let mut dummy: i64 = 0;
+    let seek_ok = unsafe {
+        stream.seek(0, IStreamSeekMode_::kIBSeekSet as i32, &mut dummy)
+    };
+    if seek_ok != kResultOk {
+        tracing::warn!(
+            target: "jamodio::vst3::editor",
+            tresult = seek_ok,
+            "stream.seek(0) a échoué — state sync skipped"
+        );
+        return;
+    }
+
+    let set_ok = unsafe { controller.setComponentState(stream.as_ptr()) };
+    if set_ok != kResultOk {
+        tracing::warn!(
+            target: "jamodio::vst3::editor",
+            tresult = set_ok,
+            "controller.setComponentState a échoué (le plugin tolère peut-être, on continue)"
+        );
+        return;
+    }
+    tracing::info!(target: "jamodio::vst3::editor", "state sync component→controller ok");
 }
 
 /// Récupère un `IEditController` pour l'instance.
