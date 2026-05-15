@@ -439,7 +439,8 @@ fn editor_thread_main(data: EditorThreadData) {
     // MFC framework, etc.) qui exigent un thread STA. Sans CoInitializeEx,
     // ces appels deadlock silencieusement ou la window reste blanche +
     // "NOT RESPONDING".
-    let com_init = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED) };
+    let com_init =
+        unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
     tracing::info!(
         target: "jamodio::vst3::editor",
         hresult = format!("0x{com_init:08X}"),
