@@ -13,6 +13,7 @@
 mod discovery;
 mod editor;
 mod host;
+mod host_app;
 mod loader;
 mod state;
 

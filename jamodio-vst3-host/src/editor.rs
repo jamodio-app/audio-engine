@@ -32,7 +32,7 @@ use vst3::{
         IBStream_::IStreamSeekMode_, IPluginBaseTrait, IPluginFactoryTrait, TUID,
         Vst::{
             IComponentHandler, IComponentHandlerTrait, IComponentTrait, IEditController,
-            IEditControllerTrait, IEditController_iid, ParamID, ParamValue,
+            IEditControllerTrait, IEditController_iid, IHostApplication, ParamID, ParamValue,
         },
         IPlugView, IPlugViewTrait, ViewRect,
     },
@@ -47,6 +47,7 @@ use windows_sys::Win32::{
 };
 
 use crate::host::Instance;
+use crate::host_app::MinimalHost;
 use crate::loader::LoadedModule;
 use crate::state::MemoryStream;
 
@@ -96,6 +97,11 @@ struct EditorThreadData {
     /// à 0 et le plugin crashera dès qu'il essaiera de notifier un edit.
     #[allow(dead_code)]
     handler: ComPtr<IComponentHandler>,
+    /// Host context passé à `controller.initialize`. Le plugin garde son
+    /// pointeur en cache et peut appeler `getName` à tout moment — donc on
+    /// le garde vivant aussi longtemps que le controller.
+    #[allow(dead_code)]
+    host_app: ComPtr<IHostApplication>,
     #[allow(dead_code)]
     component_keepalive: ComPtr<vst3::Steinberg::Vst::IComponent>,
     #[allow(dead_code)]
@@ -116,14 +122,20 @@ impl EditorWindow {
         module: Arc<LoadedModule>,
         title: &str,
     ) -> Result<Self, String> {
-        let controller = resolve_controller(instance, &module)?;
+        // 1. IHostApplication minimal — passé en context à controller.initialize.
+        //    Indispensable pour les plugins commerciaux (Valhalla, FabFilter…)
+        //    qui refusent leur UI si le hostContext est null. On garde le
+        //    pointeur vivant en stockant le `ComPtr` dans `EditorThreadData`.
+        let host_app_wrapper = ComWrapper::new(MinimalHost);
+        let host_app: ComPtr<IHostApplication> = host_app_wrapper
+            .to_com_ptr::<IHostApplication>()
+            .ok_or_else(|| "ComWrapper::to_com_ptr::<IHostApplication> a échoué".to_string())?;
 
-        // State sync component → controller : INDISPENSABLE pour les plugins
+        let controller = resolve_controller(instance, &module, &host_app)?;
+
+        // State sync component → controller : indispensable pour les plugins
         // en architecture "separate component+controller" (Valhalla, FabFilter,
-        // NI…). Sans ça, le controller ne sait pas quels params le composant
-        // expose et refuse silencieusement `createView`. Sur les plugins
-        // "single-component" (= cast IComponent → IEditController = même
-        // instance COM), c'est un no-op fonctionnel (self → self).
+        // NI…). Tolérant à l'échec (certains plugins retournent E_NOTIMPL).
         sync_component_state(instance, &controller);
 
         // Set le component handler avant tout createView (sinon plugins pros
@@ -146,6 +158,7 @@ impl EditorWindow {
             title: title.to_string(),
             controller,
             handler,
+            host_app,
             component_keepalive: instance.component.clone(),
             module_keepalive: module,
             hwnd_slot: hwnd_slot.clone(),
@@ -250,6 +263,7 @@ fn sync_component_state(instance: &Instance, controller: &ComPtr<IEditController
 fn resolve_controller(
     instance: &Instance,
     module: &LoadedModule,
+    host_app: &ComPtr<IHostApplication>,
 ) -> Result<ComPtr<IEditController>, String> {
     if let Some(c) = instance.component.cast::<IEditController>() {
         tracing::info!(
@@ -279,13 +293,19 @@ fn resolve_controller(
     }
     let controller = unsafe { ComPtr::<IEditController>::from_raw(raw as *mut IEditController) }
         .ok_or_else(|| "createInstance retourne null".to_string())?;
-    let init_ok = unsafe { controller.initialize(std::ptr::null_mut() as *mut FUnknown) };
+
+    // hostContext = ptr sur notre MinimalHost (cast IHostApplication → FUnknown
+    // via le layout vtable : IHostApplication inherits FUnknown).
+    let host_ctx = host_app.as_ptr() as *mut FUnknown;
+    let init_ok = unsafe { controller.initialize(host_ctx) };
     if init_ok != 0 {
-        return Err(format!("controller.initialize tresult={init_ok}"));
+        return Err(format!(
+            "controller.initialize(IHostApplication) tresult={init_ok}"
+        ));
     }
     tracing::info!(
         target: "jamodio::vst3::editor",
-        "controller = separate class instance"
+        "controller = separate class instance, initialized with IHostApplication"
     );
     Ok(controller)
 }
