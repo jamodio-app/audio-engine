@@ -21,6 +21,11 @@
 use crossbeam_channel::Sender;
 use jamodio_audio_core::plugin_host::MidiEvent;
 use midir::{MidiInput as MidirInput, MidiInputConnection, MidiInputPort};
+// Port virtuel MIDI = Unix-only (CoreMIDI macOS, ALSA Linux). Windows MIDI
+// (winmm) ne supporte pas nativement la création de ports virtuels — pas de
+// `midir::os::windows::VirtualInput`. Sur Windows, l'utilisateur passe
+// directement par un clavier MIDI USB physique (toujours supporté).
+#[cfg(unix)]
 use midir::os::unix::VirtualInput;
 use serde::Serialize;
 
@@ -65,7 +70,9 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
     // Port virtuel toujours en tête de liste (= default UI). Son id
     // commence par "virtual:" → `set_input_source` détecte ce préfixe
     // pour réutiliser le receiver persistant au lieu d'ouvrir un physique.
+    // Unix-only — Windows ne sait pas créer de port MIDI virtuel.
     let mut out = Vec::with_capacity(ports.len() + 1);
+    #[cfg(unix)]
     out.push(MidiDeviceInfo {
         id: format!("{VIRTUAL_PORT_ID_PREFIX}{VIRTUAL_PORT_NAME}"),
         name: VIRTUAL_PORT_NAME.to_string(),
@@ -76,13 +83,14 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
         let name = input.port_name(port).unwrap_or_else(|_| "Unknown".into());
         // Le port virtuel apparaît parfois dans midir.ports() (CoreMIDI
         // se voit lui-même). On dédoublonne par nom.
+        #[cfg(unix)]
         if name == VIRTUAL_PORT_NAME {
             continue;
         }
         out.push(MidiDeviceInfo {
             id: format!("{idx}:{name}"),
             name,
-            is_default: false,
+            is_default: idx == 0 && cfg!(not(unix)),
         });
     }
     out
@@ -91,7 +99,11 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
 /// Crée le port virtuel "Jamodio Virtual MIDI" et le tient ouvert tant que
 /// le `MidiInput` retourné n'est pas dropped. Apparaît dans CoreMIDI = visible
 /// dans toutes les apps MIDI macOS comme destination. Appelée UNE fois au
-/// boot agent par `PipelineState::spawn_virtual_midi()`.
+/// boot agent par `PipelineState::spawn_virtual_midi()` — qui est lui-même
+/// gardé `cfg(target_os = "macos")`, donc cette fonction n'est appelée que
+/// sur mac. Le `cfg(unix)` ici garde la définition cohérente avec l'API
+/// `midir::os::unix::VirtualInput` qui n'existe que sur Unix.
+#[cfg(unix)]
 pub fn create_virtual_input(tx: Sender<MidiEvent>) -> Result<MidiInput, String> {
     let input = MidirInput::new("Jamodio Agent")
         .map_err(|e| format!("MidirInput virtual init: {e}"))?;
