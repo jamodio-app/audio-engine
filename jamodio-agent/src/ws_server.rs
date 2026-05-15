@@ -239,7 +239,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // push l'état pour que l'UI affiche directement [● bypass][nom][✕] au
     // lieu de "+ FX" trompeur. Le browser reçoit le même message que pour
     // un load fresh, plus rien à modifier côté handler.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         let pl = handle.pipeline.lock().await;
         if let Some((info, bypass)) = pl.get_instrument_plugin_snapshot() {
@@ -737,11 +737,10 @@ async fn handle_message(
             vec![]
         }
 
-        // Sprint INSERT (S1.3) — 6 handlers plugin AU. Sur non-macOS, le crate
-        // jamodio-au-host n'existe pas, donc fallback "not supported" pour
-        // satisfaire le match exhaustif et le build cross-platform futur.
+        // Sprint INSERT — 6 handlers plugin (AU sur macOS, VST3 sur Windows).
+        // Sur les OS sans host plugin (linux test), fallback "not supported".
         BrowserMessage::ListPlugins => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -749,14 +748,14 @@ async fn handle_message(
                 let (items, scanning) = pl.list_instrument_plugins();
                 vec![AgentMessage::PluginList { items, scanning }]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 vec![AgentMessage::PluginList { items: vec![], scanning: false }]
             }
         }
 
         BrowserMessage::LoadInstrumentPlugin { plugin_ref } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![AgentMessage::InstrumentPluginError {
@@ -776,20 +775,20 @@ async fn handle_message(
                         }]
                     }
                     Err(message) => {
-                        // v0.2.23 — Log enrichi avec les 4-CC du plugin tenté
-                        // pour permettre le diag à distance sans Chrome console
-                        // (cf. bug Yannick 2026-05-13).
-                        let (au_type, subtype, manuf) = match &plugin_ref {
+                        // v0.2.23 — Log enrichi avec l'identifiant plugin pour
+                        // permettre le diag à distance sans Chrome console
+                        // (cf. bug Yannick 2026-05-13). Format diffère AU/VST3.
+                        let ident: String = match &plugin_ref {
                             jamodio_audio_core::plugin_host::PluginRef::Au {
                                 au_type, subtype, manufacturer,
-                            } => (au_type.as_str(), subtype.as_str(), manufacturer.as_str()),
-                            _ => ("?", "?", "?"),
+                            } => format!("AU {au_type}/{subtype}/{manufacturer}"),
+                            jamodio_audio_core::plugin_host::PluginRef::Vst3 {
+                                path, uid,
+                            } => format!("VST3 {path} (uid={uid})"),
                         };
                         tracing::error!(
                             target: "jamodio::ws",
-                            au_type = au_type,
-                            subtype = subtype,
-                            manufacturer = manuf,
+                            plugin = %ident,
                             error = %message,
                             "LoadInstrumentPlugin failed"
                         );
@@ -797,17 +796,17 @@ async fn handle_message(
                     }
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 let _ = plugin_ref;
                 vec![AgentMessage::InstrumentPluginError {
-                    message: "AU plugins not supported on this platform".into(),
+                    message: "INSERT plugins not supported on this platform".into(),
                 }]
             }
         }
 
         BrowserMessage::UnloadInstrumentPlugin => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -815,14 +814,14 @@ async fn handle_message(
                 pl.unload_instrument_plugin();
                 vec![AgentMessage::InstrumentPluginUnloaded]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 vec![AgentMessage::InstrumentPluginUnloaded]
             }
         }
 
         BrowserMessage::SetInstrumentPluginBypass { bypass } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -830,7 +829,7 @@ async fn handle_message(
                 pl.set_instrument_plugin_bypass(bypass);
                 vec![]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 let _ = bypass;
                 vec![]
@@ -838,7 +837,7 @@ async fn handle_message(
         }
 
         BrowserMessage::OpenInstrumentPluginEditor => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -848,14 +847,14 @@ async fn handle_message(
                 }
                 vec![]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 vec![]
             }
         }
 
         BrowserMessage::CloseInstrumentPluginEditor => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -863,7 +862,7 @@ async fn handle_message(
                 let _ = pl.close_instrument_plugin_editor();
                 vec![]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 vec![]
             }
@@ -972,7 +971,10 @@ async fn handle_message(
                         frame_offset: 0,
                         data: [status, data1, data2],
                     };
-                    let _ = pl.au_host.lock().dispatch_midi_only(handle, &[event]);
+                    // `dispatch_midi_only` est spécifique à AuHost — Windows
+                    // n'implémente pas encore le dispatch MIDI clavier virtuel
+                    // (= sprint S2 pour la parité MIDI Windows).
+                    let _ = pl.plugin_host.lock().dispatch_midi_only(handle, &[event]);
                 }
                 vec![]
             }

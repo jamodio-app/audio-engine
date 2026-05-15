@@ -4,6 +4,8 @@ members = [
   "jamodio-audio-core",
   "jamodio-agent",
   "jamodio-au-host",
+  "jamodio-vst3-host",
 ]
-# au-host-poc/ reste hors workspace (bac à sable, supprimé une fois jamodio-au-host stable).
-exclude = ["au-host-poc"]
+# au-host-poc/ et vst3-host-poc/ restent hors workspace (bacs à sable, supprimés
+# une fois les crates in-workspace stables).
+exclude = ["au-host-poc", "vst3-host-poc"]

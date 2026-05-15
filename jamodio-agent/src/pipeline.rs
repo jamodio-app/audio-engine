@@ -10,13 +10,23 @@ use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 #[cfg(target_os = "macos")]
 use jamodio_au_host::AuHost;
+#[cfg(target_os = "windows")]
+use jamodio_vst3_host::Vst3Host;
+
+/// Type alias for the active plugin host implementation. Macos = AuHost,
+/// Windows = Vst3Host. Both implement `jamodio_audio_core::PluginHost`.
+/// Mode autres OS (linux test) : aucun host plugin défini (`cfg`).
+#[cfg(target_os = "macos")]
+pub type PluginHostImpl = AuHost;
+#[cfg(target_os = "windows")]
+pub type PluginHostImpl = Vst3Host;
 use parking_lot::Mutex;
 // Trait `Resampler` requis pour appeler output_frames_max() / process_into_buffer()
 // sur le `SincFixedIn<f32>` du resampler 44.1k → 48k Windows.
@@ -99,27 +109,26 @@ pub struct PipelineState {
     /// qui n'a pas d'équivalent ici puisque le flux part en PlainTransport
     /// piloté par CPAL).
     pub input_cut: Arc<std::sync::atomic::AtomicBool>,
-    /// INSERT plugin (sprint S1) — hôte AU + handle du plugin actif sur la
-    /// tranche instrument self. `handle = None` ⇒ chain bypass total
-    /// (no-op dans l'encoder_thread). `bypass = true` ⇒ plugin chargé mais
-    /// court-circuité (toggle UI A/B). Sur Windows, ces champs n'existent
-    /// pas — Sprint Phase 2 ajoutera `Vst3Host`.
-    #[cfg(target_os = "macos")]
-    pub au_host: Arc<Mutex<AuHost>>,
-    #[cfg(target_os = "macos")]
+    /// INSERT plugin — hôte commun (AU sur macOS, VST3 sur Windows) + handle
+    /// du plugin actif sur la tranche instrument self. `handle = None` ⇒
+    /// chain bypass total (no-op dans l'encoder_thread). `bypass = true` ⇒
+    /// plugin chargé mais court-circuité (toggle UI A/B).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub plugin_host: Arc<Mutex<PluginHostImpl>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    /// INSERT plugin (sprint S1) — cache du scan AU. Le scan complet prend
-    /// ~13s (instancie chaque AU pour mesurer latence/UI), on le fait UNE
-    /// fois en background au démarrage de l'agent et on stocke le résultat
-    /// ici. `ListPlugins` côté WS lit ce cache → réponse instantanée.
-    #[cfg(target_os = "macos")]
+    /// Cache du scan plugin. Le scan complet (mac : AU ~122ms-13s ; win :
+    /// VST3 instancie chaque plugin pour lire latence/bus, ~5-15s) tourne UNE
+    /// fois en background au boot et stocke le résultat ici. `ListPlugins`
+    /// côté WS lit ce cache → réponse instantanée.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub plugin_scan_cache: Arc<Mutex<PluginScanCache>>,
     /// S1.5 — snapshot du plugin actuellement chargé (None si aucun). Lu au
     /// connect WS pour push l'état au browser → l'UI se resynchronise même
     /// après reload de page (le plugin reste actif côté agent).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
     /// S2 — source d'entrée actuelle. Audio = CPAL classique. Midi(device_id)
     /// = ouvre un MIDI input via midir, encode silence en audio (samples zéros
@@ -159,15 +168,15 @@ pub enum InputSource {
     Midi(String), // device id format `"{idx}:{name}"` (cf. midi::list_devices)
 }
 
-/// État du scan AU en background. Stocké dans `PipelineState`.
-#[cfg(target_os = "macos")]
+/// État du scan plugin en background. Stocké dans `PipelineState`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub enum PluginScanCache {
     /// Scan en cours — le browser doit repoller dans quelques secondes.
     Scanning,
     /// Scan terminé, liste prête.
     Ready(Vec<PluginInfo>),
-    /// Scan échoué (rarissime — AudioComponentFindNext ne lève pas d'erreur).
+    /// Scan échoué (rarissime).
     #[allow(dead_code)]
     Failed(String),
 }
@@ -175,7 +184,7 @@ pub enum PluginScanCache {
 /// Snapshot complet du plugin chargé sur l'instrument self (S1.5). Utilisé
 /// pour push l'état au browser au reconnect WS — sans ça, après reload de
 /// la page browser, l'UI ignorait qu'un plugin tournait encore côté agent.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub struct LoadedPluginInfo {
     pub plugin_ref: PluginRef,
@@ -202,14 +211,16 @@ impl PipelineState {
             recorder: None,
             input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "macos")]
-            au_host: Arc::new(Mutex::new(AuHost::new())),
-            #[cfg(target_os = "macos")]
+            plugin_host: Arc::new(Mutex::new(AuHost::new())),
+            #[cfg(target_os = "windows")]
+            plugin_host: Arc::new(Mutex::new(Vst3Host::new())),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             input_source: Arc::new(Mutex::new(InputSource::Audio)),
@@ -289,38 +300,40 @@ impl PipelineState {
         self.input_source.lock().clone()
     }
 
-    /// Lance le scan AU en background. Appelé une fois après `new()` par
-    /// `main.rs`. Le thread tourne ~13s puis stocke le résultat dans le cache.
-    /// Méthode no-op sur les autres OS.
-    #[cfg(target_os = "macos")]
+    /// Lance le scan plugin en background. Appelé une fois après `new()` par
+    /// `main.rs`. Le thread tourne typiquement 100ms à 15s puis stocke le
+    /// résultat dans le cache. Méthode no-op sur les OS sans host plugin.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn spawn_plugin_scan(&self) {
-        let host = self.au_host.clone();
+        let host = self.plugin_host.clone();
         let cache = self.plugin_scan_cache.clone();
+        let kind = if cfg!(target_os = "macos") { "AU" } else { "VST3" };
         std::thread::Builder::new()
-            .name("au-scan".into())
+            .name("plugin-scan".into())
             .spawn(move || {
                 let t0 = std::time::Instant::now();
-                tracing::info!(target: "jamodio::plugin", "AU scan starting in background");
+                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting in background");
                 let plugins = host.lock().scan();
                 let elapsed_ms = t0.elapsed().as_millis();
                 tracing::info!(
                     target: "jamodio::plugin",
+                    kind,
                     count = plugins.len(),
                     elapsed_ms,
-                    "AU scan finished"
+                    "plugin scan finished"
                 );
                 *cache.lock() = PluginScanCache::Ready(plugins);
             })
-            .expect("spawn au-scan thread");
+            .expect("spawn plugin-scan thread");
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn spawn_plugin_scan(&self) {
-        // No-op : aucun host plugin sur Windows phase 1 (= Vst3 viendra phase 2).
+        // No-op : pas d'host plugin Linux pour l'instant.
     }
 
     /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
     /// Chacun renvoie un Result avec message d'erreur lisible pour wire.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn list_instrument_plugins(&self) -> (Vec<PluginInfo>, bool) {
         match &*self.plugin_scan_cache.lock() {
             PluginScanCache::Scanning => (Vec::new(), true),
@@ -332,7 +345,7 @@ impl PipelineState {
     /// Charge un plugin sur l'instrument self. Décharge l'éventuel précédent.
     /// `max_frames` = 128 (cf. PLUGIN_BLOCK dans encoder_thread). Retourne
     /// (name, latency_samples, has_editor) pour ack côté browser.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn load_instrument_plugin(
         &self,
         plugin_ref: &PluginRef,
@@ -340,7 +353,7 @@ impl PipelineState {
         // Décharger d'abord (single slot MVP).
         self.unload_instrument_plugin();
 
-        let mut host = self.au_host.lock();
+        let mut host = self.plugin_host.lock();
         let handle = host
             .load(plugin_ref, 128)
             .map_err(|e| format!("{e}"))?;
@@ -382,11 +395,11 @@ impl PipelineState {
         Ok((name, latency, has_editor))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn unload_instrument_plugin(&self) {
         let mut handle_guard = self.instrument_plugin_handle.lock();
         if let Some(handle) = handle_guard.take() {
-            let _ = self.au_host.lock().unload(handle);
+            let _ = self.plugin_host.lock().unload(handle);
             // S1.5 — clear le snapshot AVEC le handle pour cohérence.
             *self.instrument_plugin_info.lock() = None;
             self.instrument_plugin_bypass
@@ -397,7 +410,7 @@ impl PipelineState {
 
     /// S1.5 — Snapshot pour resync au reconnect WS. Retourne None si aucun
     /// plugin actuellement chargé. Le bypass est dans le AtomicBool dédié.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn get_instrument_plugin_snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
         let info = self.instrument_plugin_info.lock().clone()?;
         let bypass = self
@@ -406,31 +419,31 @@ impl PipelineState {
         Some((info, bypass))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_instrument_plugin_bypass(&self, bypass: bool) {
         self.instrument_plugin_bypass
             .store(bypass, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn open_instrument_plugin_editor(&self) -> Result<(), String> {
         let handle = self
             .instrument_plugin_handle
             .lock()
             .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.au_host
+        self.plugin_host
             .lock()
             .open_editor(handle)
             .map_err(|e| format!("{e}"))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn close_instrument_plugin_editor(&self) -> Result<(), String> {
         let handle = self
             .instrument_plugin_handle
             .lock()
             .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.au_host
+        self.plugin_host
             .lock()
             .close_editor(handle)
             .map_err(|e| format!("{e}"))
@@ -658,15 +671,14 @@ impl PipelineState {
         self.mixer.lock().add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
         let input_cut_for_encoder = self.input_cut.clone();
-        #[cfg(target_os = "macos")]
-        let au_host_for_encoder = self.au_host.clone();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let plugin_host_for_encoder = self.plugin_host.clone();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_handle_for_encoder = self.instrument_plugin_handle.clone();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_bypass_for_encoder = self.instrument_plugin_bypass.clone();
         // S2 — receiver MIDI cloné si on est en mode MIDI au moment du
-        // start_capture. Si l'utilisateur switch en cours de session, on
-        // gérera ça dans un sprint robustesse (= restart capture).
+        // start_capture. macOS uniquement pour l'instant (Windows MIDI = S2).
         #[cfg(target_os = "macos")]
         let midi_event_rx_for_encoder = self.midi_event_rx.clone();
         #[cfg(target_os = "macos")]
@@ -677,9 +689,9 @@ impl PipelineState {
                 encoder_thread(
                     sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
-                    #[cfg(target_os = "macos")] au_host_for_encoder,
-                    #[cfg(target_os = "macos")] plugin_handle_for_encoder,
-                    #[cfg(target_os = "macos")] plugin_bypass_for_encoder,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
                     #[cfg(target_os = "macos")] midi_event_rx_for_encoder,
                     #[cfg(target_os = "macos")] input_source_for_encoder,
                 );
@@ -910,9 +922,9 @@ fn encoder_thread(
     channel_index: Option<u8>,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(target_os = "macos")] au_host: Arc<Mutex<AuHost>>,
-    #[cfg(target_os = "macos")] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
-    #[cfg(target_os = "macos")] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "macos")] midi_event_rx: Option<Receiver<MidiEvent>>,
     #[cfg(target_os = "macos")] input_source: Arc<Mutex<InputSource>>,
 ) {
@@ -991,14 +1003,14 @@ fn encoder_thread(
     let mut timestamp: u32 = 0;
 
     // SPRINT INSERT (S1.2) — buffers L/R préalloués pour le passage à
-    // travers le plugin AU. Désentrelacer/ré-entrelacer par sous-blocs
-    // de PLUGIN_BLOCK samples par canal. Capacité fixée à 128 (la frame
-    // Opus fait 120 stéréo, et les buffers CPAL typiques < 128 par canal).
-    #[cfg(target_os = "macos")]
+    // travers le plugin (AU sur mac, VST3 sur win). Désentrelacer/ré-entrelacer
+    // par sous-blocs de PLUGIN_BLOCK samples par canal. Capacité fixée à 128
+    // (la frame Opus fait 120 stéréo, et les buffers CPAL typiques < 128 par canal).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     const PLUGIN_BLOCK: usize = 128;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut plugin_left: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut plugin_right: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
 
     loop {
@@ -1091,22 +1103,21 @@ fn encoder_thread(
                     }
                 }
 
-                // INSERT plugin (S1.2) — applique le plugin AU chargé sur la
-                // tranche instrument self entre remap et self-monitor/encode.
-                // Le self-monitor entend donc le son WET (cohérent avec
-                // l'expérience DAW : jouer dans un ampli simulé en s'écoutant
-                // traité).
-                #[cfg(target_os = "macos")]
+                // INSERT plugin (S1.2) — applique le plugin chargé (AU sur
+                // mac, VST3 sur win) sur la tranche instrument self entre
+                // remap et self-monitor/encode. Le self-monitor entend donc
+                // le son WET (cohérent avec l'expérience DAW : jouer dans
+                // un ampli simulé en s'écoutant traité).
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if !stereo.is_empty() && !plugin_bypass.load(std::sync::atomic::Ordering::Relaxed) {
                     let handle_opt = *plugin_handle.lock();
                     if let Some(handle) = handle_opt {
-                        let mut host = au_host.lock();
+                        let mut host = plugin_host.lock();
 
                         // S2 — Drain les events MIDI accumulés depuis le
-                        // dernier bloc. Le receiver est non-blocking : on
-                        // collecte ce qui est dispo MAX BATCH events
-                        // (limite défensive pour ne pas spinner sur un
-                        // device qui flood).
+                        // dernier bloc. macOS uniquement pour l'instant
+                        // (Windows MIDI = S2). Sur Windows on passe `&[]`.
+                        #[cfg(target_os = "macos")]
                         let midi_events: Vec<MidiEvent> = if let Some(rx) = &midi_event_rx {
                             let mut batch = Vec::new();
                             while let Ok(ev) = rx.try_recv() {
@@ -1117,6 +1128,8 @@ fn encoder_thread(
                         } else {
                             Vec::new()
                         };
+                        #[cfg(target_os = "windows")]
+                        let midi_events: Vec<MidiEvent> = Vec::new();
 
                         let n_pairs = stereo.len() / 2;
                         let mut idx = 0;

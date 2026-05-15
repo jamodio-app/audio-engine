@@ -1,0 +1,24 @@
+[package]
+name = "jamodio-vst3-host"
+version = "0.4.0"
+edition = "2021"
+description = "Jamodio VST3 plugin host — Windows uniquement, impl du trait PluginHost de jamodio-audio-core"
+
+# Crate frère de `jamodio-au-host` (macOS). Compile à vide sur les autres OS.
+# Bindings raw VST 3 SDK Steinberg via la crate `vst3` (coupler-rs).
+# Chargement dynamique des .vst3 (DLL Windows ou bundle Mac legacy) via `libloading`.
+
+[dependencies]
+jamodio-audio-core = { path = "../jamodio-audio-core" }
+tracing = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+vst3 = "0.3"
+libloading = "0.8"
+parking_lot = "0.12"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
