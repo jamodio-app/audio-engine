@@ -40,10 +40,12 @@ use vst3::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
-        RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, MSG, SW_SHOW, WM_CLOSE,
-        WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PeekMessageW,
+        PostMessageW, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, MSG,
+        PM_REMOVE, SW_SHOW, WM_CLOSE, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     },
 };
 
@@ -409,12 +411,41 @@ fn ensure_window_class() {
     });
 }
 
+/// Pump tous les messages Win32 en attente dans la queue du thread courant,
+/// SANS bloquer. Utilisé entre la création de la HWND et `attached()` pour
+/// laisser le système traiter WM_CREATE/WM_SHOWWINDOW/WM_PAINT initiaux —
+/// certains plugins postent leurs propres messages durant `attached()` et
+/// se figent si la queue n'est jamais drainée.
+fn pump_pending_messages() {
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 fn editor_thread_main(data: EditorThreadData) {
     tracing::info!(
         target: "jamodio::vst3::editor",
         title = %data.title,
         "editor thread starting"
     );
+
+    // COM apartment STA OBLIGATOIRE pour le thread UI VST3. Les plugins
+    // commerciaux (Valhalla, NI, FabFilter…) font des appels COM internes
+    // pendant `attached()` (WIC pour les bitmaps, GDI+ pour les vectors,
+    // MFC framework, etc.) qui exigent un thread STA. Sans CoInitializeEx,
+    // ces appels deadlock silencieusement ou la window reste blanche +
+    // "NOT RESPONDING".
+    let com_init = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED) };
+    tracing::info!(
+        target: "jamodio::vst3::editor",
+        hresult = format!("0x{com_init:08X}"),
+        "CoInitializeEx STA"
+    );
+
     ensure_window_class();
     let title_w = wide(&data.title);
     let class_w = wide(HOST_NAMESPACE);
@@ -503,6 +534,11 @@ fn editor_thread_main(data: EditorThreadData) {
     data.hwnd_slot.store(hwnd, Ordering::SeqCst);
     tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée");
 
+    // Drain les messages WM_CREATE / WM_SHOWWINDOW / WM_PAINT initiaux avant
+    // d'appeler `attached()`. Sans ça, des plugins postent leurs propres
+    // messages durant l'attach et hang en attendant qu'ils soient dispatchés.
+    pump_pending_messages();
+
     // 5. IPlugView::attached(hwnd, "HWND")
     let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
     if att_ok != kResultOk {
@@ -542,5 +578,9 @@ fn editor_thread_main(data: EditorThreadData) {
     // 7. Cleanup côté plugin.
     let _ = unsafe { view.removed() };
     data.hwnd_slot.store(std::ptr::null_mut(), Ordering::SeqCst);
+
+    unsafe {
+        CoUninitialize();
+    }
     tracing::info!(target: "jamodio::vst3::editor", "editor thread exiting");
 }
