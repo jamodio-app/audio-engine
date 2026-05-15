@@ -35,7 +35,7 @@ use vst3::{
             IConnectionPointTrait, IEditController, IEditControllerTrait, IEditController_iid,
             IHostApplication, ParamID, ParamValue,
         },
-        IPlugView, IPlugViewTrait, ViewRect,
+        IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait, ViewRect,
     },
 };
 use windows_sys::Win32::{
@@ -90,6 +90,30 @@ impl IComponentHandlerTrait for MinimalHandler {
     }
 }
 
+// ---------- IPlugFrame minimal ----------
+//
+// Le host doit fournir un IPlugFrame que le plugin attache au view via
+// `IPlugView::setFrame()`. Le plugin appelle ensuite `resizeView()` quand sa
+// taille interne change (ex: bouton "agrandir" dans l'UI Valhalla). Pour le
+// MVP on accepte sans rien faire — la HWND parent reste à la taille initiale.
+// `keep alive` aussi long que le view (cf. EditorThreadData.frame).
+
+struct PlugFrame;
+
+impl Class for PlugFrame {
+    type Interfaces = (IPlugFrame,);
+}
+
+impl IPlugFrameTrait for PlugFrame {
+    unsafe fn resizeView(&self, _view: *mut IPlugView, _new_size: *mut ViewRect) -> tresult {
+        // MVP : on accepte la new size mais on ne resize pas la HWND parent.
+        // Pour Valhalla c'est OK, la window est fixe 1020x435 et ne demande
+        // jamais de resize. Pour un futur plugin qui veut s'agrandir/réduire,
+        // on rajoutera un SetWindowPos sur la HWND parent ici (= sprint UI/UX).
+        kResultOk
+    }
+}
+
 // ---------- Données thread + struct publique ----------
 
 struct EditorThreadData {
@@ -100,6 +124,11 @@ struct EditorThreadData {
     /// à 0 et le plugin crashera dès qu'il essaiera de notifier un edit.
     #[allow(dead_code)]
     handler: ComPtr<IComponentHandler>,
+    /// Frame injectée dans le view via `setFrame`. Le plugin l'appelle via
+    /// `resizeView`. Spec : host doit la maintenir vivante tant que le view
+    /// est utilisé. On la garde dans le thread data (= dropped à la fermeture).
+    #[allow(dead_code)]
+    frame: ComPtr<IPlugFrame>,
     /// Host context passé à `controller.initialize`. Le plugin garde son
     /// pointeur en cache et peut appeler `getName` à tout moment — donc on
     /// le garde vivant aussi longtemps que le controller.
@@ -164,11 +193,20 @@ impl EditorWindow {
             );
         }
 
+        // IPlugFrame minimal — le plugin l'appelle via resizeView. Tenu en vie
+        // dans EditorThreadData. Setté sur le view DANS le thread éditeur
+        // pour respecter l'invariant "même thread que createView/attached".
+        let frame_wrapper = ComWrapper::new(PlugFrame);
+        let frame: ComPtr<IPlugFrame> = frame_wrapper
+            .to_com_ptr::<IPlugFrame>()
+            .ok_or_else(|| "ComWrapper::to_com_ptr::<IPlugFrame> a échoué".to_string())?;
+
         let hwnd_slot: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let data = EditorThreadData {
             title: title.to_string(),
             controller,
             handler,
+            frame,
             host_app,
             component_keepalive: instance.component.clone(),
             module_keepalive: module,
@@ -504,7 +542,9 @@ fn editor_thread_main(data: EditorThreadData) {
         "size demandée par le plugin"
     );
 
-    // 4. Créer la HWND parent.
+    // 4. Créer la HWND parent — SANS WS_VISIBLE pour l'instant. On la show
+    //    après attached pour que le plugin crée ses widgets enfants pendant
+    //    qu'on est encore caché (= évite le flash blanc).
     let hinst = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
     };
@@ -513,7 +553,7 @@ fn editor_thread_main(data: EditorThreadData) {
             WS_EX_DLGMODALFRAME,
             class_w.as_ptr(),
             title_w.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            WS_OVERLAPPEDWINDOW,
             -2_147_483_648, // CW_USEDEFAULT
             -2_147_483_648,
             width + 16,
@@ -530,17 +570,24 @@ fn editor_thread_main(data: EditorThreadData) {
     }
     unsafe {
         SetWindowTextW(hwnd, title_w.as_ptr());
-        ShowWindow(hwnd, SW_SHOW);
     }
     data.hwnd_slot.store(hwnd, Ordering::SeqCst);
-    tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée");
+    tracing::info!(target: "jamodio::vst3::editor", "HWND créée (cachée)");
 
-    // Drain les messages WM_CREATE / WM_SHOWWINDOW / WM_PAINT initiaux avant
-    // d'appeler `attached()`. Sans ça, des plugins postent leurs propres
-    // messages durant l'attach et hang en attendant qu'ils soient dispatchés.
+    // 5. setFrame avant attached. Le plugin garde le ptr et peut appeler
+    //    resizeView depuis attached pour proposer sa taille préférée.
+    let set_frame_ok = unsafe { view.setFrame(data.frame.as_ptr()) };
+    tracing::info!(
+        target: "jamodio::vst3::editor",
+        tresult = set_frame_ok,
+        "setFrame"
+    );
+
+    // 6. Drain les messages WM_CREATE initiaux pour ne pas que `attached()`
+    //    bloque en attendant que la queue soit traitée.
     pump_pending_messages();
 
-    // 5. IPlugView::attached(hwnd, "HWND")
+    // 7. IPlugView::attached(hwnd, "HWND")
     let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
     if att_ok != kResultOk {
         tracing::error!(
@@ -548,17 +595,24 @@ fn editor_thread_main(data: EditorThreadData) {
             tresult = att_ok,
             "IPlugView::attached failed"
         );
-    } else {
-        tracing::info!(target: "jamodio::vst3::editor", "IPlugView::attached ok");
-        let _ = unsafe {
-            view.onSize(&ViewRect {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            } as *const _ as *mut ViewRect)
-        };
+        return;
     }
+    tracing::info!(target: "jamodio::vst3::editor", "IPlugView::attached ok");
+    let _ = unsafe {
+        view.onSize(&ViewRect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        } as *const _ as *mut ViewRect)
+    };
+
+    // 8. Maintenant on peut montrer la fenêtre — le plugin a créé ses widgets
+    //    enfants pendant qu'on était caché, le 1er paint sera complet.
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    tracing::info!(target: "jamodio::vst3::editor", "ShowWindow SW_SHOW");
 
     // 6. Msg pump jusqu'à WM_DESTROY.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
