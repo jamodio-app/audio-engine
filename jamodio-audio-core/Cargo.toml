@@ -23,14 +23,20 @@ thiserror = "1"            # Dérive Error proprement (utilisé par plugin_host)
 #   macOS / Linux : libsrtp2 + OpenSSL VENDORÉS (compilés depuis sources).
 #                   → binaire 100 % autonome, aucune dep système chez l'utilisateur.
 #                   Coût : 1er build long (~5 min pour OpenSSL), ensuite caché.
-#                   Note CI : le `./configure` de libsrtp2 ne sait pas cross-compiler
-#                   macOS arm64 → x86_64 ; le runner CI Intel (macos-13) build natif.
+#                   Wrapper : net/srtp_libsrtp.rs (cfg(not(windows))).
 #
-#   Windows       : libsrtp + OpenSSL via VCPKG (pas de cross-compile from-source
-#                   supporté par srtp2-sys sur MSVC). Requiert un step CI
-#                   `vcpkg install libsrtp openssl` avant le build.
+#   Windows       : webrtc-srtp (pure Rust, écosystème pion/webrtc-rs).
+#                   → 0 dep système (vire vcpkg+OpenSSL+libsrtp du CI).
+#                   Le crate `srtp 0.7` (libsrtp2 wrapper) a un bug ABI
+#                   irréparable en amont sur MSVC (LLP64 vs LP64), repo
+#                   upstream HyeonuPark/srtp mort depuis 2020-12.
+#                   Wrapper : net/srtp_webrtc.rs (cfg(windows)).
+#
+# Les deux wrappers exposent EXACTEMENT la même API publique (SrtpParameters,
+# SrtpContext::new/protect/unprotect) → udp.rs ne voit aucune différence.
 [target.'cfg(not(windows))'.dependencies]
 srtp = { version = "0.7", default-features = false, features = ["bytes", "log", "build-libsrtp", "build-openssl"] }
 
 [target.'cfg(windows)'.dependencies]
-srtp = { version = "0.7", default-features = false, features = ["bytes", "log", "enable-openssl"] }
+webrtc-srtp = "0.17"
+bytes = "1"

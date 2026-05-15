@@ -57,30 +57,16 @@ jobs:
           # - runner: macos-13
           #   target: x86_64-apple-darwin
           # ─────────────────────────────────────────────────────────────────
-          # Windows : DÉSACTIVÉ depuis v0.1.2 (Phase 1 SRTP).
+          # Windows : RÉACTIVÉ en v0.3.0 (2026-05-15).
           #
-          # Bloqueur : la crate `srtp 0.7` (dernière version sur crates.io) a
-          # un bug de portabilité Windows. À session.rs:333 :
-          #     policy.window_size = self.window_size;   // u32 := u64 → error[E0308]
-          # `policy.window_size` provient de bindgen sur `srtp_policy_t.window_size`
-          # (typé `unsigned long` en C). Sur Linux/macOS LP64 = u64 → match.
-          # Sur Windows MSVC LLP64 = u32 → mismatch avec u64 hardcodé côté Rust.
-          # Le fix amont serait `as _` ou `try_into()`. Pas de 0.7.1 publié.
-          #
-          # Solutions futures (à explorer pour v0.1.3+) :
-          #   1. Maintenir un fork de HyeonuPark/srtp avec le fix 1-ligne,
-          #      référencé via [patch.crates-io] dans Cargo.toml.
-          #   2. Migrer vers webrtc-srtp (pure Rust, no system deps), au prix
-          #      d'~25 crates webrtc-rs supplémentaires.
-          #   3. Implémenter SRTP custom sur aes-gcm + hmac (risqué, KDF
-          #      AES-CM + nonce ROC|SEQ + replay protection à coder à la main).
-          #
-          # Impact utilisateurs Windows v0.1.1 quand SFU passe en SRTP :
-          #   - Mode agent ne marchera plus → fallback mode browser (~60 ms).
-          #   - Mode browser inchangé (DTLS-SRTP WebRTC, indépendant de Phase 1).
-          #
-          # - runner: windows-2022
-          #   target: x86_64-pc-windows-msvc
+          # Le bloqueur ABI `srtp 0.7` (LP64 vs LLP64 sur unsigned long, repo
+          # upstream HyeonuPark/srtp mort depuis 2020-12) est contourné en
+          # utilisant `webrtc-srtp` (pure Rust) sur Windows uniquement, via
+          # `[target.'cfg(windows)'.dependencies]` dans jamodio-audio-core.
+          # macOS reste sur libsrtp2/OpenSSL inchangé. Voir mémoire
+          # `srtp_strategy.md` pour le détail.
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
     steps:
@@ -108,37 +94,37 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
 
-      # Windows : libsrtp + OpenSSL via vcpkg (build from-source de libsrtp2
-      # non supporté sur MSVC). libopus aussi.
-      #
-      # `libsrtp[openssl]` : feature flag pour activer le backend OpenSSL =
-      # support AEAD-GCM (notre crypto suite). Sans cette feature, libsrtp
-      # ne compile que AES-CM → notre code link échoue avec "undefined symbol
-      # srtp_crypto_policy_set_aes_gcm_256_16_auth".
+      # Windows : libopus via vcpkg (audiopus_sys). SRTP = pure Rust
+      # (webrtc-srtp), donc plus besoin d'OpenSSL/libsrtp côté système depuis
+      # v0.3.0 — voir [target.'cfg(windows)'.dependencies] dans
+      # jamodio-audio-core/Cargo.toml.
       #
       # Triplet `x64-windows-static-md` = lib statique + MSVCRT dynamique
       # (compatible Tauri).
-      #
-      # Variables env exportées vers les steps suivants :
-      #   VCPKG_ROOT       → vcpkg-rs (utilisé par srtp2-sys::build.rs)
-      #   VCPKGRS_TRIPLET  → force le triplet pour vcpkg-rs
-      #   OPENSSL_DIR      → openssl-sys (court-circuit la détection automatique)
-      #   OPENSSL_STATIC   → static link OpenSSL
-      #   PKG_CONFIG_PATH  → audiopus_sys → libopus via pkg-config
-      #   LIBOPUS_STATIC   → idem
-      - name: Install libopus + libsrtp + OpenSSL (Windows via vcpkg)
+      - name: Install libopus (Windows via vcpkg)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           vcpkg install opus:x64-windows-static-md
-          vcpkg install openssl:x64-windows-static-md
-          vcpkg install "libsrtp[openssl]:x64-windows-static-md"
-          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKGRS_TRIPLET=x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
           "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ASIO SDK Steinberg : nécessaire pour la feature `asio` de cpal côté
+      # Windows (low-latency 3-5 ms vs WASAPI shared 10-30 ms). cpal-asio-sys
+      # utilise bindgen, qui requiert LLVM/clang.
+      #
+      # ASIO SDK est gratuit (Steinberg Inc., licence ASIO SDK 2.3.3) — URL
+      # stable depuis 2019. Si Steinberg change l'URL, fallback : bundler le
+      # ZIP dans le repo (autorisé pour usage privé / dev).
+      - name: Install ASIO SDK + LLVM (Windows, cpal asio feature)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          Invoke-WebRequest -Uri "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip" -OutFile asiosdk.zip
+          Expand-Archive asiosdk.zip -DestinationPath C:\
+          "CPAL_ASIO_DIR=C:\asiosdk_2.3.3_2019-06-14" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH
       # relatif vers deps/opus-arm64/ (workaround local pour le dev sur Mac M*
