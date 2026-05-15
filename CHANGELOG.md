@@ -6,6 +6,32 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-15
+
+### Added
+- **Support Windows x64** (ASIO + WASAPI via cpal). Première release
+  multi-plateforme depuis v0.1.1. Le runner `windows-2022` est réactivé
+  dans le matrix CI, l'EXE NSIS est publié sous le nom stable
+  `Jamodio-Audio-Engine-Windows.exe` aux côtés du DMG mac.
+
+### Changed
+- **SRTP backend split par plateforme** :
+  - macOS / Linux : libsrtp2 + OpenSSL vendorés (inchangé, code wrapper
+    renommé en `srtp_libsrtp.rs` sans modification fonctionnelle).
+  - Windows : `webrtc-srtp` pure Rust (nouveau wrapper `srtp_webrtc.rs`,
+    même API publique). Contournement du bug ABI `unsigned long` LP64/LLP64
+    du crate `srtp 0.7` (repo upstream HyeonuPark/srtp mort depuis
+    2020-12). Aucun changement côté binaire mac.
+- CI Windows allégé : plus besoin de `vcpkg install openssl libsrtp` (pure
+  Rust). Conserve `vcpkg install opus` + ajout step `choco install llvm`
+  + téléchargement ASIO SDK Steinberg pour la feature `cpal asio`.
+
+### Notes
+- Plugins INSERT (AU host) restent macOS-only — phase 2 = host VST3 pour
+  Windows, post-beta.
+- macOS Intel reste désactivé (cross-compile libsrtp2 cassé, runner
+  macos-13 saturé). À traiter séparément.
+
 ## [0.2.25] — 2026-05-13
 
 ### Hotfix — Crash agent au boot avec entitlements v0.2.24
