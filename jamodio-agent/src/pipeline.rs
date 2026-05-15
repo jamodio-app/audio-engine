@@ -18,6 +18,9 @@ use jamodio_audio_core::sync::drift::DriftEstimator;
 #[cfg(target_os = "macos")]
 use jamodio_au_host::AuHost;
 use parking_lot::Mutex;
+// Trait `Resampler` requis pour appeler output_frames_max() / process_into_buffer()
+// sur le `SincFixedIn<f32>` du resampler 44.1k → 48k Windows.
+use rubato::Resampler as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -622,10 +625,15 @@ impl PipelineState {
         //    pure (driver, sample-rate impossible, etc.), pas une erreur
         //    de sélection user).
         tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        let (stream, channels_in) = crate::audio::capture::start_capture(&device, sample_tx)
+        let (stream, channels_in, native_sr) = crate::audio::capture::start_capture(&device, sample_tx)
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
         self.capture_stream = Some(SendStream(stream));
-        tracing::info!(target: "jamodio::pipeline", channels_in, ?channel_index, "input config");
+        tracing::info!(
+            target: "jamodio::pipeline",
+            channels_in, native_sr, ?channel_index,
+            needs_resample = native_sr != 48000,
+            "input config"
+        );
 
         // Valider que le canal mono demandé existe bien sur le device
         let effective_channel = channel_index.and_then(|idx| {
@@ -668,7 +676,7 @@ impl PipelineState {
             .spawn(move || {
                 encoder_thread(
                     sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
-                    channels_in, effective_channel, mixer_for_encoder, input_cut_for_encoder,
+                    channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
                     #[cfg(target_os = "macos")] au_host_for_encoder,
                     #[cfg(target_os = "macos")] plugin_handle_for_encoder,
                     #[cfg(target_os = "macos")] plugin_bypass_for_encoder,
@@ -898,6 +906,7 @@ fn encoder_thread(
     payload_type: u8,
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
+    native_sr: u32,
     channel_index: Option<u8>,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
@@ -928,6 +937,55 @@ fn encoder_thread(
     let frame_len = frame_size * CHANNELS; // 240 f32s (stereo interleaved, 2.5ms @ 48kHz)
     let channels_in = channels_in as usize;
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_len * 2);
+
+    // Resampler natif → 48 kHz (mic Windows onboard typique = 44.1 kHz, mac
+    // CoreAudio est généralement 48 kHz natif → bypass total). Rubato Sinc
+    // est sync, ~50-150 µs par bloc 128 samples sur M1. Latence introduite
+    // ≈ sinc_len / native_sr = 256 / 44100 ≈ 5.8 ms (acceptable, dominé par
+    // le buffer WASAPI shared 10ms de toute façon sur ce path).
+    let mut resampler: Option<rubato::SincFixedIn<f32>> = if native_sr != 48000 {
+        let ratio = 48000.0 / native_sr as f64;
+        let params = rubato::SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: rubato::SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: rubato::WindowFunction::BlackmanHarris2,
+        };
+        // chunk_size 1024 = absorbe les buffers WASAPI shared (~480 samples
+        // @44.1k) sans réinit ; padding interne géré par Rubato.
+        match rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, 1024, CHANNELS) {
+            Ok(r) => {
+                tracing::info!(
+                    target: "jamodio::encoder",
+                    native_sr, target_sr = 48000u32, ratio,
+                    "resampler enabled (native_sr ≠ 48k)"
+                );
+                Some(r)
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "jamodio::encoder",
+                    error = %e,
+                    "rubato init failed — capture continuera SANS resampling (audio sera désynchronisé)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Buffers de sortie Rubato réutilisés entre les itérations pour éviter alloc
+    // dans le hot path. Resize au besoin (output_frames_max).
+    let mut resample_out_l: Vec<f32> = Vec::with_capacity(2048);
+    let mut resample_out_r: Vec<f32> = Vec::with_capacity(2048);
+    // Accumulateur PRE-resample : Rubato impose un chunk_size FIXE en input
+    // (1024). Les buffers CPAL arrivent à des tailles variables (128 sur
+    // CoreAudio, ~480 sur WASAPI shared). On accumule jusqu'à atteindre
+    // 1024 par canal avant de resampler.
+    let mut pre_resample_l: Vec<f32> = Vec::with_capacity(2048);
+    let mut pre_resample_r: Vec<f32> = Vec::with_capacity(2048);
+    const RESAMPLE_CHUNK: usize = 1024;
     let mut opus_buf = vec![0u8; 4000];
     let mut sequence: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -955,6 +1013,63 @@ fn encoder_thread(
                 // RMS calculé sur le canal qui part réellement sur le réseau
                 // (après remap) → le VU-mètre reflète le son transmis, pas la somme brute.
                 let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
+
+                // RESAMPLE (Windows mic onboard 44.1k → 48k Opus). Bypass total
+                // si native_sr == 48000 (mac CoreAudio + cartes pro). Rubato
+                // SincFixedIn impose un chunk_size FIXE en input → on accumule
+                // les buffers CPAL (taille variable selon WASAPI/ASIO/CoreAudio)
+                // jusqu'à RESAMPLE_CHUNK puis on process. Output = variable
+                // (~RESAMPLE_CHUNK * 48000/native_sr).
+                if let Some(rs) = resampler.as_mut() {
+                    // Désentrelace stereo entrelacé → 2 canaux séparés.
+                    for chunk in stereo.chunks_exact(2) {
+                        pre_resample_l.push(chunk[0]);
+                        pre_resample_r.push(chunk[1]);
+                    }
+                    stereo.clear();
+                    let out_max = rs.output_frames_max();
+                    if resample_out_l.len() < out_max { resample_out_l.resize(out_max, 0.0); }
+                    if resample_out_r.len() < out_max { resample_out_r.resize(out_max, 0.0); }
+                    while pre_resample_l.len() >= RESAMPLE_CHUNK {
+                        // Slices d'entrée sans alloc.
+                        let waves_in: [&[f32]; 2] = [
+                            &pre_resample_l[..RESAMPLE_CHUNK],
+                            &pre_resample_r[..RESAMPLE_CHUNK],
+                        ];
+                        let mut waves_out: [&mut [f32]; 2] = [
+                            &mut resample_out_l[..],
+                            &mut resample_out_r[..],
+                        ];
+                        match rs.process_into_buffer(&waves_in, &mut waves_out, None) {
+                            Ok((_in_used, out_frames)) => {
+                                // Re-entrelace dans `stereo` (= ce que le reste du
+                                // pipeline attend, comme avant).
+                                for i in 0..out_frames {
+                                    stereo.push(resample_out_l[i]);
+                                    stereo.push(resample_out_r[i]);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "jamodio::encoder",
+                                    error = %e,
+                                    "rubato process_into_buffer failed"
+                                );
+                            }
+                        }
+                        // Drain le chunk consommé. SincFixedIn consomme TOUJOURS
+                        // chunk_size en input (contrat FixedIn).
+                        pre_resample_l.drain(..RESAMPLE_CHUNK);
+                        pre_resample_r.drain(..RESAMPLE_CHUNK);
+                    }
+                    // Si pas encore assez de samples accumulés, `stereo` reste
+                    // vide ce tour-ci → l'accumulator Opus n'avance pas, on
+                    // attend le prochain buffer CPAL. Comportement attendu.
+                    if stereo.is_empty() {
+                        continue;
+                    }
+                }
+
                 // ENTRÉE OFF (= SetInputCut) : remplace les samples capturés
                 // par du silence avant tout traitement (RMS, self-monitor,
                 // record self stem, mix, envoi RTP). Cohérent avec le mode

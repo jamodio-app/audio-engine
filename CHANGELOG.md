@@ -6,6 +6,32 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-15
+
+### Fixed — Beta Windows critical
+- **Capture micro Windows onboard** : remplacé le `SampleRate(48000)` forcé
+  par le SR natif du device + resampling Rust via `rubato 0.16` vers 48 kHz
+  avant Opus encode. Sur Windows WASAPI shared mode, le mix format Realtek
+  onboard impose 44100 Hz et refusait l'ouverture CPAL en 48 kHz (erreur
+  `The requested stream configuration is not supported by the device`).
+  Mac CoreAudio masquait le problème via resampling implicite. Désormais
+  fonctionne sur tout device, indépendamment du SR natif.
+- **Buffer CPAL Windows** : `BufferSize::Default` sur Windows (WASAPI
+  shared mode impose ~10 ms minimum) au lieu de `Fixed(128)`. Mac garde
+  `Fixed(128)` (~2.7 ms latence). Sur Windows ASIO le buffer est de toute
+  façon piloté par le control panel ASIO.
+
+### Fixed — Polish
+- **Plus de console CMD au démarrage Windows** : ajout
+  `windows_subsystem = "windows"` en release (préservé en dev pour le diag).
+
+### Notes
+- Latence resampler Rubato Sinc : ~5.8 ms (sinc_len=256 / 44.1 kHz). Dominé
+  par le buffer WASAPI shared 10 ms de toute façon. Bypass total quand
+  `native_sr == 48000` (mac, cartes pro Windows).
+- Aucun changement comportemental côté binaire mac (resampler bypass +
+  buffer Fixed(128) inchangé).
+
 ## [0.3.0] — 2026-05-15
 
 ### Added

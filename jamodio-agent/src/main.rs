@@ -1,5 +1,9 @@
 //! Jamodio Desktop Audio Agent
 
+// Pas de console CMD au démarrage en release Windows. En dev (debug_assertions),
+// la console reste pour faciliter le diag (eprintln, panics visibles).
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 mod audio;
 mod logging;
 mod pipeline;

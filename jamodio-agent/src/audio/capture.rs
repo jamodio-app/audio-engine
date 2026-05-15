@@ -3,25 +3,50 @@ use cpal::{Device, SampleRate, StreamConfig, BufferSize};
 use crossbeam_channel::{Sender, TrySendError};
 
 /// Start capturing audio from the given device.
-/// Returns (stream, channels_captured). The number of channels is the hardware's
-/// native value (pas forcément 2) pour permettre l'extraction d'un canal mono
-/// précis sur les interfaces multi-canaux (Scarlett, Motu, etc.).
-/// Les samples envoyés sont en f32 entrelacés sur `channels_captured` canaux.
+/// Returns `(stream, channels_captured, native_sample_rate)`. Le SR natif est
+/// **respecté tel quel** (pas forcé à 48000) pour rester compatible avec les
+/// devices Windows WASAPI shared mode (qui imposent le mix format Windows :
+/// souvent 44100 sur les chipsets Realtek onboard) — l'`encoder_thread`
+/// resample ensuite vers 48000 via `rubato` avant Opus encode.
+///
+/// Sur macOS CoreAudio fait un resampling implicite si on demande 48000 sur
+/// un device 44100 → ça marchait silencieusement. Sur Windows WASAPI shared
+/// le device REFUSE toute config qui diffère du mix format → erreur explicite
+/// `StreamConfigNotSupported`. D'où la stratégie "ouvrir au natif puis
+/// resampler côté Rust".
+///
+/// Le nombre de canaux retourné est la valeur hardware native (pas forcément 2)
+/// pour permettre l'extraction d'un canal mono précis sur les interfaces
+/// multi-canaux (Scarlett, Motu, etc.). Les samples envoyés sont en f32
+/// entrelacés sur `channels_captured` canaux, au sample rate natif.
 pub fn start_capture(
     device: &Device,
     sample_tx: Sender<Vec<f32>>,
-) -> Result<(cpal::Stream, u16), cpal::BuildStreamError> {
+) -> Result<(cpal::Stream, u16, u32), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
-    // physiques exposés. Sur une Scarlett Solo = 2, une 4i4 = 4, un built-in = 1.
+    // physiques + le sample rate natif (cf. doc fonction).
     let default_cfg = device
         .default_input_config()
         .map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
     let channels = default_cfg.channels().max(1);
+    let native_sr = default_cfg.sample_rate().0;
+
+    // Buffer size : Fixed(128) sur mac (CoreAudio + ASIO Windows acceptent
+    // les petits buffers = ~2.7ms latence). Default sur Windows WASAPI shared
+    // mode qui impose 10-20ms minimum (refus silencieux sinon = même symptôme
+    // que le SR forcé). Sur Windows ASIO le code passera quand même par cette
+    // branche Default mais ASIO ignorera et utilisera son propre buffer
+    // configurable côté ASIO control panel.
+    let buffer_size = if cfg!(windows) {
+        BufferSize::Default
+    } else {
+        BufferSize::Fixed(128)
+    };
 
     let config = StreamConfig {
         channels,
-        sample_rate: SampleRate(48000),
-        buffer_size: BufferSize::Fixed(128), // ~2.7ms at 48kHz
+        sample_rate: SampleRate(native_sr),
+        buffer_size,
     };
 
     let stream = device.build_input_stream(
@@ -69,5 +94,5 @@ pub fn start_capture(
     )?;
 
     stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
-    Ok((stream, channels))
+    Ok((stream, channels, native_sr))
 }

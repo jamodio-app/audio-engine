@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
 
@@ -20,6 +20,7 @@ parking_lot = "0.12"
 thread-priority = "0.10"
 base64 = "0.22"            # Encode des fichiers Ogg/Opus du record pour le wire WS (REC-3)
 midir = "0.10"             # Discovery + ouverture des MIDI devices (S2 INSERT plugins instruments)
+rubato = "0.16"            # Resampler haute qualité (mic onboard Windows 44.1 → 48 kHz Opus)
 
 # Logging structuré (PROD-grade) — voir convention dans CLAUDE.md.
 # tracing : façade compatible avec spans + structured fields.
