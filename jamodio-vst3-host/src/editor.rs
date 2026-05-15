@@ -5,8 +5,12 @@
 //! - `EditorWindow::open()` spawn un thread "ui-vst3-{title}" qui :
 //!   1. crée une `HWND` Win32 via `CreateWindowExW`
 //!   2. récupère un `IEditController` (cast IComponent → fallback createInstance)
-//!   3. appelle `IPlugView::attached(hwnd, "HWND")`
-//!   4. lance un msg pump `GetMessageW` → `DispatchMessageW`
+//!   3. lui attache un `IComponentHandler` minimal (= no-op qui retourne kResultOk
+//!      sur beginEdit/performEdit/endEdit/restartComponent). **Indispensable** :
+//!      les plugins pro (Valhalla, AmpliTube…) refusent silencieusement de
+//!      créer leur view si le handler n'est pas set.
+//!   4. appelle `IPlugView::attached(hwnd, "HWND")`
+//!   5. lance un msg pump `GetMessageW` → `DispatchMessageW`
 //! - `EditorWindow::close()` poste un `WM_CLOSE` sur la HWND → le thread sort.
 //!
 //! Threading : VST3 demande que `IEditController` + `IPlugView` soient appelés
@@ -22,10 +26,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use vst3::{
-    ComPtr,
+    Class, ComPtr, ComWrapper,
     Steinberg::{
-        IPluginBaseTrait, IPluginFactoryTrait, TUID,
-        Vst::{IComponentTrait, IEditController, IEditControllerTrait, IEditController_iid},
+        int32, kResultOk, tresult, FUnknown, IPluginBaseTrait, IPluginFactoryTrait, TUID,
+        Vst::{
+            IComponentHandler, IComponentHandlerTrait, IComponentTrait, IEditController,
+            IEditControllerTrait, IEditController_iid, ParamID, ParamValue,
+        },
         IPlugView, IPlugViewTrait, ViewRect,
     },
 };
@@ -49,24 +56,48 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Données passées au thread éditeur.
-///
-/// `hwnd_slot` est un `AtomicPtr<c_void>` (= équivalent `AtomicPtr<HWND>`)
-/// pour rester `Send` sans Mutex. `HWND = *mut c_void` dans windows-sys 0.59,
-/// les pointeurs raw ne sont pas Send par défaut.
+// ---------- IComponentHandler minimal ----------
+//
+// Implémenté en Rust via `Class` (= la facilité de coupler-rs pour exposer une
+// classe COM Rust côté plugin). Les 4 méthodes retournent `kResultOk` sans
+// rien faire : on n'enregistre pas l'automation des params, ce qui est OK
+// pour du live (l'user joue avec les knobs en direct, pas besoin de sync).
+
+struct MinimalHandler;
+
+impl Class for MinimalHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for MinimalHandler {
+    unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+    unsafe fn performEdit(&self, _id: ParamID, _value_normalized: ParamValue) -> tresult {
+        kResultOk
+    }
+    unsafe fn endEdit(&self, _id: ParamID) -> tresult {
+        kResultOk
+    }
+    unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+        kResultOk
+    }
+}
+
+// ---------- Données thread + struct publique ----------
+
 struct EditorThreadData {
     title: String,
     controller: ComPtr<IEditController>,
-    /// Tenu vivant pendant que la window existe — ComPtr.Clone() pour ne pas
-    /// invalider l'`IComponent` du Vst3Host quand le thread sort.
+    /// Handler injecté dans le controller via `setComponentHandler`. Maintenu
+    /// en vie pendant toute la durée du thread éditeur — sinon refcount tombe
+    /// à 0 et le plugin crashera dès qu'il essaiera de notifier un edit.
+    #[allow(dead_code)]
+    handler: ComPtr<IComponentHandler>,
     #[allow(dead_code)]
     component_keepalive: ComPtr<vst3::Steinberg::Vst::IComponent>,
-    /// Idem pour le module — la DLL doit rester chargée tant que la window
-    /// référence ses callbacks.
     #[allow(dead_code)]
     module_keepalive: Arc<LoadedModule>,
-    /// Shared HWND raw pointer : main thread peut PostMessage(WM_CLOSE).
-    /// Null = window pas encore créée OU déjà fermée.
     hwnd_slot: Arc<AtomicPtr<c_void>>,
 }
 
@@ -78,8 +109,6 @@ pub struct EditorWindow {
 }
 
 impl EditorWindow {
-    /// Ouvre l'éditeur du plugin. Retourne une erreur si le plugin n'expose
-    /// pas d'`IEditController` accessible.
     pub fn open(
         instance: &Instance,
         module: Arc<LoadedModule>,
@@ -87,10 +116,26 @@ impl EditorWindow {
     ) -> Result<Self, String> {
         let controller = resolve_controller(instance, &module)?;
 
+        // Set le component handler avant tout createView (sinon plugins pros
+        // refusent de créer leur UI).
+        let handler_wrapper = ComWrapper::new(MinimalHandler);
+        let handler: ComPtr<IComponentHandler> = handler_wrapper
+            .to_com_ptr::<IComponentHandler>()
+            .ok_or_else(|| "ComWrapper::to_com_ptr::<IComponentHandler> a échoué".to_string())?;
+        let set_ok = unsafe { controller.setComponentHandler(handler.as_ptr()) };
+        if set_ok != kResultOk {
+            tracing::warn!(
+                target: "jamodio::vst3::editor",
+                tresult = set_ok,
+                "setComponentHandler refusé — la view risque d'être non fonctionnelle"
+            );
+        }
+
         let hwnd_slot: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
         let data = EditorThreadData {
             title: title.to_string(),
             controller,
+            handler,
             component_keepalive: instance.component.clone(),
             module_keepalive: module,
             hwnd_slot: hwnd_slot.clone(),
@@ -107,7 +152,6 @@ impl EditorWindow {
         })
     }
 
-    /// Ferme la fenêtre (poste WM_CLOSE) et attend la fin du thread.
     pub fn close(&mut self) {
         let hwnd = self.hwnd_slot.load(Ordering::SeqCst);
         if !hwnd.is_null() {
@@ -133,14 +177,15 @@ impl Drop for EditorWindow {
 /// 1. Tentative cast : beaucoup de plugins "single component" exposent
 ///    `IComponent` + `IEditController` sur la même instance COM.
 /// 2. Sinon : `getControllerClassId()` → `factory.createInstance(cid, IEditController_iid)`.
-///
-/// Pas d'`IConnectionPoint` pour le MVP — fonctionne tant que le plugin n'a
-/// pas besoin de sync state component↔controller (= la majorité des effets).
 fn resolve_controller(
     instance: &Instance,
     module: &LoadedModule,
 ) -> Result<ComPtr<IEditController>, String> {
     if let Some(c) = instance.component.cast::<IEditController>() {
+        tracing::info!(
+            target: "jamodio::vst3::editor",
+            "controller = same instance as component (single-component plugin)"
+        );
         return Ok(c);
     }
 
@@ -164,10 +209,14 @@ fn resolve_controller(
     }
     let controller = unsafe { ComPtr::<IEditController>::from_raw(raw as *mut IEditController) }
         .ok_or_else(|| "createInstance retourne null".to_string())?;
-    let init_ok = unsafe { controller.initialize(std::ptr::null_mut()) };
+    let init_ok = unsafe { controller.initialize(std::ptr::null_mut() as *mut FUnknown) };
     if init_ok != 0 {
         return Err(format!("controller.initialize tresult={init_ok}"));
     }
+    tracing::info!(
+        target: "jamodio::vst3::editor",
+        "controller = separate class instance"
+    );
     Ok(controller)
 }
 
@@ -202,13 +251,17 @@ fn ensure_window_class() {
             hIconSm: std::ptr::null_mut(),
         };
         unsafe {
-            // Idempotent : si déjà registered (relance après drop), pas d'erreur fatale.
             let _ = RegisterClassExW(&wc);
         }
     });
 }
 
 fn editor_thread_main(data: EditorThreadData) {
+    tracing::info!(
+        target: "jamodio::vst3::editor",
+        title = %data.title,
+        "editor thread starting"
+    );
     ensure_window_class();
     let title_w = wide(&data.title);
     let class_w = wide(HOST_NAMESPACE);
@@ -218,21 +271,36 @@ fn editor_thread_main(data: EditorThreadData) {
         let cstr = b"editor\0";
         data.controller.createView(cstr.as_ptr() as *const i8)
     };
-    let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) }) else {
-        tracing::warn!(target: "jamodio::vst3::editor", "createView('editor') retourne null");
+    if view_ptr.is_null() {
+        tracing::error!(
+            target: "jamodio::vst3::editor",
+            "createView('editor') retourne null — le plugin refuse de fournir une UI"
+        );
         return;
+    }
+    let view = match unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) } {
+        Some(v) => v,
+        None => {
+            tracing::error!(
+                target: "jamodio::vst3::editor",
+                "ComPtr::from_raw(view) a refusé un pointeur non-null (improbable)"
+            );
+            return;
+        }
     };
+    tracing::info!(target: "jamodio::vst3::editor", "createView ok");
 
     // 2. Vérifier que le platform "HWND" est supporté.
     let plat_ok = unsafe { view.isPlatformTypeSupported(PLATFORM_HWND.as_ptr() as *const i8) };
-    if plat_ok != 0 {
-        tracing::warn!(
+    if plat_ok != kResultOk {
+        tracing::error!(
             target: "jamodio::vst3::editor",
             tresult = plat_ok,
             "plugin ne supporte pas la plateforme HWND"
         );
         return;
     }
+    tracing::info!(target: "jamodio::vst3::editor", "platform HWND supporté");
 
     // 3. Récupérer la taille préférée de la view (avant attach).
     let mut size = ViewRect {
@@ -244,6 +312,12 @@ fn editor_thread_main(data: EditorThreadData) {
     let _ = unsafe { view.getSize(&mut size) };
     let width = (size.right - size.left).max(100);
     let height = (size.bottom - size.top).max(100);
+    tracing::info!(
+        target: "jamodio::vst3::editor",
+        width,
+        height,
+        "size demandée par le plugin"
+    );
 
     // 4. Créer la HWND parent.
     let hinst = unsafe {
@@ -255,10 +329,9 @@ fn editor_thread_main(data: EditorThreadData) {
             class_w.as_ptr(),
             title_w.as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            // x, y = use default placement
             -2_147_483_648, // CW_USEDEFAULT
             -2_147_483_648,
-            width + 16, // add some chrome budget
+            width + 16,
             height + 40,
             std::ptr::null_mut(), // parent
             std::ptr::null_mut(), // menu
@@ -275,17 +348,18 @@ fn editor_thread_main(data: EditorThreadData) {
         ShowWindow(hwnd, SW_SHOW);
     }
     data.hwnd_slot.store(hwnd, Ordering::SeqCst);
+    tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée");
 
     // 5. IPlugView::attached(hwnd, "HWND")
     let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
-    if att_ok != 0 {
-        tracing::warn!(
+    if att_ok != kResultOk {
+        tracing::error!(
             target: "jamodio::vst3::editor",
             tresult = att_ok,
             "IPlugView::attached failed"
         );
     } else {
-        // Ajuste la HWND à la taille demandée par le plugin.
+        tracing::info!(target: "jamodio::vst3::editor", "IPlugView::attached ok");
         let _ = unsafe {
             view.onSize(&ViewRect {
                 left: 0,
@@ -315,4 +389,5 @@ fn editor_thread_main(data: EditorThreadData) {
     // 7. Cleanup côté plugin.
     let _ = unsafe { view.removed() };
     data.hwnd_slot.store(std::ptr::null_mut(), Ordering::SeqCst);
+    tracing::info!(target: "jamodio::vst3::editor", "editor thread exiting");
 }
