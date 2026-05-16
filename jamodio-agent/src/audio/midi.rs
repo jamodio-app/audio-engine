@@ -68,11 +68,16 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
     let ports = input.ports();
 
     // Port virtuel toujours en tête de liste (= default UI). Son id
-    // commence par "virtual:" → `set_input_source` détecte ce préfixe
-    // pour réutiliser le receiver persistant au lieu d'ouvrir un physique.
-    // Unix-only — Windows ne sait pas créer de port MIDI virtuel.
+    // commence par "virtual:" → `set_input_source` détecte ce préfixe.
+    //
+    // - macOS (unix) : vrai port CoreMIDI créé au boot par `spawn_virtual_midi`.
+    //   Visible OS-wide depuis Logic/Ableton/etc. Lit son receiver persistant.
+    // - Windows : pseudo-entrée (pas de vrai port — S2.5 avec teVirtualMIDI
+    //   pour rendre le port OS-wide). En attendant, sélectionner cette entrée
+    //   permet de basculer source=MIDI et d'utiliser le clavier HTML Jamodio
+    //   intégré (dispatch direct via WS PlayMidiNote → Vst3Host::dispatch_midi_only).
     let mut out = Vec::with_capacity(ports.len() + 1);
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     out.push(MidiDeviceInfo {
         id: format!("{VIRTUAL_PORT_ID_PREFIX}{VIRTUAL_PORT_NAME}"),
         name: VIRTUAL_PORT_NAME.to_string(),
@@ -83,14 +88,13 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
         let name = input.port_name(port).unwrap_or_else(|_| "Unknown".into());
         // Le port virtuel apparaît parfois dans midir.ports() (CoreMIDI
         // se voit lui-même). On dédoublonne par nom.
-        #[cfg(unix)]
         if name == VIRTUAL_PORT_NAME {
             continue;
         }
         out.push(MidiDeviceInfo {
             id: format!("{idx}:{name}"),
             name,
-            is_default: idx == 0 && cfg!(not(unix)),
+            is_default: false,
         });
     }
     out

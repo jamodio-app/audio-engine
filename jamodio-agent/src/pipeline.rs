@@ -288,15 +288,18 @@ impl PipelineState {
                 }
                 #[cfg(target_os = "windows")]
                 if is_virtual {
-                    // Sur Windows, pas encore de port virtuel (= S2.5 avec
-                    // teVirtualMIDI, en attente de la license). On signale
-                    // explicitement plutôt qu'un fallback silencieux.
-                    return Err(
-                        "Le port virtuel 'Jamodio Virtual MIDI' n'est pas encore \
-                         disponible sur Windows — choisis un clavier MIDI USB \
-                         physique ou utilise le clavier HTML intégré."
-                            .to_string(),
-                    );
+                    // Sur Windows, le pseudo "Jamodio Virtual MIDI" n'a pas
+                    // (encore) de vrai port CoreMIDI-équivalent (= S2.5 via
+                    // teVirtualMIDI). En attendant, accepter la sélection
+                    // permet de basculer source=MIDI et d'utiliser le
+                    // clavier HTML intégré qui dispatch directement au
+                    // plugin via PlayMidiNote → Vst3Host::dispatch_midi_only.
+                    // Pas d'ouverture midir (= pas de réception physique
+                    // depuis d'autres apps OS pour l'instant).
+                    self.midi_input = None;
+                    self.midi_event_rx = None;
+                    *self.input_source.lock() = source;
+                    return Ok(());
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 let _ = is_virtual;
