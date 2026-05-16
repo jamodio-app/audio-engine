@@ -268,27 +268,39 @@ impl Instance {
             );
         }
 
-        // activateBus sur chaque bus audio (analogue du piège AU
+        // activateBus sur chaque bus audio ET event (analogue du piège AU
         // `bus.enabled=NO`). Sans ça, process() retourne erreur immédiate
-        // pour certains plugins.
-        for dir in [BusDirections_::kInput, BusDirections_::kOutput] {
-            let n = unsafe {
-                self.component
-                    .getBusCount(MediaTypes_::kAudio as i32, dir as i32)
-            };
-            for idx in 0..n {
-                let act_ok = unsafe {
-                    self.component
-                        .activateBus(MediaTypes_::kAudio as i32, dir as i32, idx, 1)
+        // pour les effets, ET — découverte 16/05 — les synthés VST3 ne
+        // reçoivent PAS l'IEventList si leur bus MIDI input n'est pas
+        // activé. Symptôme silencieux : Surge XT charge, accepte notre
+        // process() sans erreur, mais ignore les notes du clavier HTML.
+        for media in [MediaTypes_::kAudio, MediaTypes_::kEvent] {
+            for dir in [BusDirections_::kInput, BusDirections_::kOutput] {
+                let n = unsafe {
+                    self.component.getBusCount(media as i32, dir as i32)
                 };
-                if act_ok != 0 {
-                    tracing::warn!(
-                        target: "jamodio::vst3",
-                        dir = ?dir,
-                        idx,
-                        tresult = act_ok,
-                        "activateBus failed"
-                    );
+                for idx in 0..n {
+                    let act_ok = unsafe {
+                        self.component.activateBus(media as i32, dir as i32, idx, 1)
+                    };
+                    if act_ok != 0 {
+                        tracing::warn!(
+                            target: "jamodio::vst3",
+                            media = ?media,
+                            dir = ?dir,
+                            idx,
+                            tresult = act_ok,
+                            "activateBus failed"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "jamodio::vst3",
+                            media = ?media,
+                            dir = ?dir,
+                            idx,
+                            "activateBus ok"
+                        );
+                    }
                 }
             }
         }
