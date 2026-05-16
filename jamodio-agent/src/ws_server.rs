@@ -870,7 +870,7 @@ async fn handle_message(
 
         // Sprint INSERT instruments (S2) — discovery + selection MIDI input.
         BrowserMessage::ListMidiDevices => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let devices = crate::audio::midi::list_devices()
                     .into_iter()
@@ -882,14 +882,14 @@ async fn handle_message(
                     .collect();
                 vec![AgentMessage::MidiDeviceList { devices }]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 vec![AgentMessage::MidiDeviceList { devices: vec![] }]
             }
         }
 
         BrowserMessage::SetInputSource { source, midi_device_id } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                     return vec![AgentMessage::InputSourceError {
@@ -920,7 +920,6 @@ async fn handle_message(
                                 ("audio".to_string(), None, None)
                             }
                             crate::pipeline::InputSource::Midi(id) => {
-                                // Cherche le nom human-friendly dans la liste.
                                 let name = crate::audio::midi::list_devices()
                                     .into_iter()
                                     .find(|d| &d.id == id)
@@ -950,7 +949,7 @@ async fn handle_message(
                     }
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 let _ = (source, midi_device_id);
                 vec![AgentMessage::InputSourceError {
@@ -960,7 +959,7 @@ async fn handle_message(
         }
 
         BrowserMessage::PlayMidiNote { status, data1, data2 } => {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 let Some(pl) = try_lock_pipeline(pipeline).await else {
                     return vec![];
@@ -971,14 +970,14 @@ async fn handle_message(
                         frame_offset: 0,
                         data: [status, data1, data2],
                     };
-                    // `dispatch_midi_only` est spécifique à AuHost — Windows
-                    // n'implémente pas encore le dispatch MIDI clavier virtuel
-                    // (= sprint S2 pour la parité MIDI Windows).
+                    // Mac (AuHost) ET Win (Vst3Host) implémentent tous deux
+                    // `dispatch_midi_only` avec la même signature → call
+                    // OS-agnostic via le champ `plugin_host` aliasé.
                     let _ = pl.plugin_host.lock().dispatch_midi_only(handle, &[event]);
                 }
                 vec![]
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
                 let _ = (status, data1, data2);
                 vec![]

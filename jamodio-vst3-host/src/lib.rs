@@ -12,6 +12,7 @@
 
 mod discovery;
 mod editor;
+mod events;
 mod host;
 mod host_app;
 mod loader;
@@ -58,6 +59,11 @@ struct Entry {
     plugin_ref: PluginRef,
     latency: u32,
     editor: Option<EditorWindow>,
+    /// Queue d'events MIDI poussés par `dispatch_midi_only` (= clavier HTML
+    /// via WS PlayMidiNote). Drainée au prochain `process_stereo`.
+    /// Concurrence : push depuis le thread WS, drain depuis l'encoder thread.
+    /// `parking_lot::Mutex` pour acquire ~25ns négligeable vs budget bloc.
+    pending_midi: parking_lot::Mutex<Vec<MidiEvent>>,
 }
 
 impl Vst3Host {
@@ -212,7 +218,7 @@ impl PluginHost for Vst3Host {
         let mut left = vec![0.0f32; block];
         let mut right = vec![0.0f32; block];
         for i in 0..PRE_WARM_BLOCKS {
-            if let Err(e) = instance.process_stereo(&mut left, &mut right) {
+            if let Err(e) = instance.process_stereo(&mut left, &mut right, &[]) {
                 tracing::warn!(
                     target: "jamodio::vst3",
                     block = i,
@@ -232,6 +238,7 @@ impl PluginHost for Vst3Host {
                 plugin_ref: plugin_ref.clone(),
                 latency,
                 editor: None,
+                pending_midi: parking_lot::Mutex::new(Vec::with_capacity(32)),
             },
         );
         Ok(PluginHandle(handle_id))
@@ -249,19 +256,26 @@ impl PluginHost for Vst3Host {
         handle: PluginHandle,
         left: &mut [f32],
         right: &mut [f32],
-        _midi_events: &[MidiEvent],
+        midi_events: &[MidiEvent],
     ) -> Result<(), PluginError> {
-        // S2 : `_midi_events` sera transmis au plugin via IEventList avant
-        // process(). Pas implémenté en S1 — les plugins d'effets purs n'en
-        // consomment pas, et le MIDI Windows arrive en S2.
         let entry = self
             .entries
             .get_mut(&handle.0)
             .ok_or(PluginError::InvalidHandle)?;
-        entry
-            .instance
-            .process_stereo(left, right)
-            .map_err(PluginError::Process)
+
+        // Drain les events MIDI accumulés via dispatch_midi_only (= clavier
+        // HTML). Combine avec les events du param (= drain physique MIDI USB
+        // fait par l'encoder_thread). Les 2 sources arrivent en même temps
+        // au plugin via une seule IEventList → cohérent avec le sample offset.
+        let pending: Vec<MidiEvent> = std::mem::take(&mut *entry.pending_midi.lock());
+        let result = if pending.is_empty() && midi_events.is_empty() {
+            entry.instance.process_stereo(left, right, &[])
+        } else {
+            let mut all = pending;
+            all.extend_from_slice(midi_events);
+            entry.instance.process_stereo(left, right, &all)
+        };
+        result.map_err(PluginError::Process)
     }
 
     fn latency_samples(&self, handle: PluginHandle) -> u32 {
@@ -290,6 +304,33 @@ impl PluginHost for Vst3Host {
             .get_mut(&handle.0)
             .ok_or(PluginError::InvalidHandle)?;
         entry.editor = None; // Drop → close()
+        Ok(())
+    }
+}
+
+impl Vst3Host {
+    /// Dispatche un batch d'events MIDI au plugin actif SANS appeler process.
+    ///
+    /// Utilisé par le clavier HTML virtuel (= note ON/OFF déclenchée par clic
+    /// browser, WS handler `PlayMidiNote`). Les events sont stockés dans la
+    /// queue `pending_midi` de l'entry et seront consommés au prochain
+    /// `process_stereo` appelé par l'encoder_thread.
+    ///
+    /// Miroir API de `AuHost::dispatch_midi_only` pour que le call-site WS
+    /// soit OS-agnostic : `pl.plugin_host.lock().dispatch_midi_only(handle, &[ev])`.
+    pub fn dispatch_midi_only(
+        &mut self,
+        handle: PluginHandle,
+        midi_events: &[MidiEvent],
+    ) -> Result<(), PluginError> {
+        if midi_events.is_empty() {
+            return Ok(());
+        }
+        let entry = self
+            .entries
+            .get_mut(&handle.0)
+            .ok_or(PluginError::InvalidHandle)?;
+        entry.pending_midi.lock().extend_from_slice(midi_events);
         Ok(())
     }
 }

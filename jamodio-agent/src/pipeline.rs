@@ -131,29 +131,27 @@ pub struct PipelineState {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
     /// S2 — source d'entrée actuelle. Audio = CPAL classique. Midi(device_id)
-    /// = ouvre un MIDI input via midir, encode silence en audio (samples zéros
-    /// capturés depuis CPAL pour garder le tick d'horloge) et passe les events
-    /// MIDI au plugin AU instrument chargé. Le plugin produit alors le son.
-    #[cfg(target_os = "macos")]
+    /// = ouvre un MIDI input via midir, force le signal audio à zéro (le mic
+    /// reste ouvert pour la cadence d'horloge 48k/128) et passe les events
+    /// MIDI au plugin instrument chargé. Le plugin produit alors le son.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub input_source: Arc<Mutex<InputSource>>,
     /// S2 — MIDI input physique ouvert (RAII : le Drop ferme le port). None
-    /// si source = Audio OU si l'utilisateur a choisi le port virtuel.
+    /// si source = Audio OU si l'utilisateur a choisi le port virtuel (mac).
     /// Le callback midir push dans le channel `midi_event_rx`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     midi_input: Option<crate::audio::midi::MidiInput>,
     /// S2 — Receiver des events MIDI cumulés depuis le dernier bloc audio.
     /// Drainé par l'encoder_thread juste avant `process_stereo`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     midi_event_rx: Option<Receiver<MidiEvent>>,
     /// S2.7 — Port virtuel "Jamodio Virtual MIDI" créé au boot agent et tenu
     /// vivant toute la durée d'exécution. Apparaît dans CoreMIDI = destination
     /// visible dans toutes les apps MIDI macOS (Logic, Ableton, GarageBand…).
-    /// Permet à l'user d'utiliser Jamodio comme cible MIDI sans IAC Driver.
+    /// macOS only — Windows aura son équivalent en S2.5 via teVirtualMIDI.
     #[cfg(target_os = "macos")]
     virtual_midi_keepalive: Option<crate::audio::midi::MidiInput>,
-    /// S2.7 — Receiver du port virtuel, persistant et clonable. Quand l'user
-    /// sélectionne "Jamodio Virtual MIDI", `set_input_source` retourne ce rx
-    /// au lieu d'ouvrir un nouveau MidiInput (= une seule instance virtuelle).
+    /// S2.7 — Receiver du port virtuel macOS, persistant et clonable.
     #[cfg(target_os = "macos")]
     virtual_midi_rx: Option<Receiver<MidiEvent>>,
 }
@@ -161,7 +159,7 @@ pub struct PipelineState {
 /// Source d'entrée de l'instrument self (sprint S2). Mutuellement exclusif :
 /// l'utilisateur choisit Audio OU MIDI, pas les deux. Audio+MIDI simultané
 /// = sprint futur sur demande (cf. mémoire vision INSERT plugins).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub enum InputSource {
     Audio,
@@ -222,11 +220,11 @@ impl PipelineState {
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_info: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             input_source: Arc::new(Mutex::new(InputSource::Audio)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             midi_input: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             midi_event_rx: None,
             #[cfg(target_os = "macos")]
             virtual_midi_keepalive: None,
@@ -262,40 +260,58 @@ impl PipelineState {
     /// S2 — change la source d'entrée. Appelé par le WS handler quand le
     /// browser bascule entre Audio et MIDI. En mode MIDI, ouvre un MidiInput
     /// via midir et stocke son receiver pour drainage dans encoder_thread.
-    /// L'ouverture du device peut échouer si introuvable → on revient en
-    /// Audio et l'erreur est retournée au caller (qui fait un toast browser).
-    #[cfg(target_os = "macos")]
+    /// L'ouverture du device peut échouer si introuvable → erreur retournée
+    /// au caller (qui fait un toast browser).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_input_source(&mut self, source: InputSource) -> Result<(), String> {
         match &source {
             InputSource::Audio => {
                 // Ferme le MIDI input physique s'il y en avait un. Le port
-                // virtuel reste vivant (= virtual_midi_keepalive intact).
+                // virtuel macOS reste vivant (= virtual_midi_keepalive intact).
                 self.midi_input = None;
                 self.midi_event_rx = None;
             }
             InputSource::Midi(device_id) => {
-                if device_id.starts_with(crate::audio::midi::VIRTUAL_PORT_ID_PREFIX) {
-                    // Port virtuel : on réutilise le receiver persistant créé
-                    // au boot. Pas d'ouverture nouvelle. Si le virtual a échoué
-                    // au boot (rare), on retourne une erreur claire.
+                let is_virtual = device_id
+                    .starts_with(crate::audio::midi::VIRTUAL_PORT_ID_PREFIX);
+                #[cfg(target_os = "macos")]
+                if is_virtual {
+                    // Port virtuel macOS : on réutilise le receiver persistant
+                    // créé au boot. Pas d'ouverture nouvelle.
                     let rx = self.virtual_midi_rx.clone().ok_or_else(|| {
                         "virtual MIDI port not available (creation failed at boot)".to_string()
                     })?;
                     self.midi_input = None;
                     self.midi_event_rx = Some(rx);
-                } else {
-                    let (tx, rx) = bounded::<MidiEvent>(256);
-                    let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
-                    self.midi_input = Some(midi);
-                    self.midi_event_rx = Some(rx);
+                    *self.input_source.lock() = source;
+                    return Ok(());
                 }
+                #[cfg(target_os = "windows")]
+                if is_virtual {
+                    // Sur Windows, pas encore de port virtuel (= S2.5 avec
+                    // teVirtualMIDI, en attente de la license). On signale
+                    // explicitement plutôt qu'un fallback silencieux.
+                    return Err(
+                        "Le port virtuel 'Jamodio Virtual MIDI' n'est pas encore \
+                         disponible sur Windows — choisis un clavier MIDI USB \
+                         physique ou utilise le clavier HTML intégré."
+                            .to_string(),
+                    );
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                let _ = is_virtual;
+
+                let (tx, rx) = bounded::<MidiEvent>(256);
+                let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
+                self.midi_input = Some(midi);
+                self.midi_event_rx = Some(rx);
             }
         }
         *self.input_source.lock() = source;
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn current_input_source(&self) -> InputSource {
         self.input_source.lock().clone()
     }
@@ -678,10 +694,11 @@ impl PipelineState {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_bypass_for_encoder = self.instrument_plugin_bypass.clone();
         // S2 — receiver MIDI cloné si on est en mode MIDI au moment du
-        // start_capture. macOS uniquement pour l'instant (Windows MIDI = S2).
-        #[cfg(target_os = "macos")]
+        // start_capture. Si l'user switch en cours de session, restart
+        // capture = sprint robustesse (= prochain).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let midi_event_rx_for_encoder = self.midi_event_rx.clone();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let input_source_for_encoder = self.input_source.clone();
         std::thread::Builder::new()
             .name("encoder".into())
@@ -692,8 +709,8 @@ impl PipelineState {
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
-                    #[cfg(target_os = "macos")] midi_event_rx_for_encoder,
-                    #[cfg(target_os = "macos")] input_source_for_encoder,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx_for_encoder,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source_for_encoder,
                 );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
@@ -925,8 +942,8 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(target_os = "macos")] midi_event_rx: Option<Receiver<MidiEvent>>,
-    #[cfg(target_os = "macos")] input_source: Arc<Mutex<InputSource>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
     // dans ce cas on continue en priorité normale plutôt que de planter.
@@ -1093,9 +1110,9 @@ fn encoder_thread(
                 // S2 — Si source = MIDI, on FORCE les samples audio à zéro.
                 // Le micro/carte audio continue d'être ouverte (= elle nous
                 // donne le tick d'horloge 48k/128) mais on ignore son contenu.
-                // Le plugin AU instrument recevra silence + les events MIDI
+                // Le plugin instrument recevra silence + les events MIDI
                 // accumulés, et produira l'audio depuis les notes jouées.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     let src = input_source.lock().clone();
                     if matches!(src, InputSource::Midi(_)) {
@@ -1115,9 +1132,10 @@ fn encoder_thread(
                         let mut host = plugin_host.lock();
 
                         // S2 — Drain les events MIDI accumulés depuis le
-                        // dernier bloc. macOS uniquement pour l'instant
-                        // (Windows MIDI = S2). Sur Windows on passe `&[]`.
-                        #[cfg(target_os = "macos")]
+                        // dernier bloc. Le receiver est non-blocking : on
+                        // collecte ce qui est dispo MAX BATCH events
+                        // (limite défensive pour ne pas spinner sur un
+                        // device qui flood).
                         let midi_events: Vec<MidiEvent> = if let Some(rx) = &midi_event_rx {
                             let mut batch = Vec::new();
                             while let Ok(ev) = rx.try_recv() {
@@ -1128,8 +1146,6 @@ fn encoder_thread(
                         } else {
                             Vec::new()
                         };
-                        #[cfg(target_os = "windows")]
-                        let midi_events: Vec<MidiEvent> = Vec::new();
 
                         let n_pairs = stereo.len() / 2;
                         let mut idx = 0;

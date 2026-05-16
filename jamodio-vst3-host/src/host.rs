@@ -4,19 +4,21 @@
 
 use std::ffi::c_void;
 
+use jamodio_audio_core::plugin_host::MidiEvent;
 use vst3::{
-    ComPtr,
+    ComPtr, ComWrapper,
     Steinberg::{
         IPluginBaseTrait, IPluginFactoryTrait, PClassInfo, PFactoryInfo, TUID,
         Vst::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, IAudioProcessor,
-            IAudioProcessorTrait, IComponent, IComponentTrait, IComponent_iid, MediaTypes_,
-            ProcessData, ProcessModes_, ProcessSetup, SpeakerArr, SpeakerArrangement,
+            IAudioProcessorTrait, IComponent, IComponentTrait, IComponent_iid, IEventList,
+            MediaTypes_, ProcessData, ProcessModes_, ProcessSetup, SpeakerArr, SpeakerArrangement,
             SymbolicSampleSizes_,
         },
     },
 };
 
+use crate::events::MidiEventList;
 use crate::loader::LoadedModule;
 
 /// Catégorie standard VST3 pour les plugins audio (synthés + effets).
@@ -129,6 +131,13 @@ pub struct Instance {
     pub setup_done: bool,
     pub active: bool,
     pub processing: bool,
+    /// Liste d'events VST3 partagée entre nous (push via `set_batch`) et le
+    /// plugin (lit via `IEventList` pendant `process()`). Allouée une fois
+    /// au load, ré-utilisée à chaque bloc audio (= alloc-free dans le hot path).
+    event_list: ComWrapper<MidiEventList>,
+    /// Cache du `ComPtr<IEventList>` pour ne pas refaire `to_com_ptr` à chaque
+    /// bloc audio (= éviterait un refcount inc/dec inutile sur le hot path).
+    event_list_ptr: ComPtr<IEventList>,
 }
 
 impl Instance {
@@ -182,6 +191,13 @@ impl Instance {
             .cast::<IAudioProcessor>()
             .ok_or_else(|| "plugin n'expose pas IAudioProcessor".to_string())?;
 
+        // IEventList partagé pour MIDI dispatch (HTML keyboard + USB MIDI).
+        // Alloué une fois ici, reset à chaque bloc dans process_stereo.
+        let event_list = ComWrapper::new(MidiEventList::new());
+        let event_list_ptr = event_list
+            .to_com_ptr::<IEventList>()
+            .ok_or_else(|| "MidiEventList::to_com_ptr<IEventList> a échoué".to_string())?;
+
         Ok(Self {
             class,
             component,
@@ -189,6 +205,8 @@ impl Instance {
             setup_done: false,
             active: false,
             processing: false,
+            event_list,
+            event_list_ptr,
         })
     }
 
@@ -318,11 +336,19 @@ impl Instance {
         n > 0
     }
 
-    /// Process un bloc stéréo float32 IN-PLACE.
+    /// Process un bloc stéréo float32 IN-PLACE, avec dispatch optionnel d'events MIDI.
     ///
     /// `left` et `right` contiennent l'entrée à l'appel, la sortie au retour.
-    /// Appelé depuis l'encoder_thread (RT) — alloc-free.
-    pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32]) -> Result<(), String> {
+    /// `midi_events` est forwardé au plugin via l'`IEventList` partagé — pour
+    /// les plugins instrument qui génèrent leur audio depuis des notes MIDI.
+    /// Appelé depuis l'encoder_thread (RT) — alloc-free (set_batch fait juste
+    /// un clear+push dans un Vec préalloué à 64 events).
+    pub fn process_stereo(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        midi_events: &[MidiEvent],
+    ) -> Result<(), String> {
         if !self.active {
             return Err("instance not active".into());
         }
@@ -330,6 +356,10 @@ impl Instance {
             return Err("L/R len mismatch".into());
         }
         let n = left.len() as i32;
+
+        // Remplit l'IEventList avec les events MIDI du bloc courant (NoteOn/Off).
+        // Le plugin les lit pendant `process` via `IEventList::getEvent`.
+        self.event_list.set_batch(midi_events);
 
         let has_input = self.has_input_bus();
 
@@ -356,6 +386,11 @@ impl Instance {
         };
 
         let num_inputs = if has_input { 1 } else { 0 };
+        let input_events_ptr = if midi_events.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.event_list_ptr.as_ptr()
+        };
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
@@ -370,7 +405,7 @@ impl Instance {
             outputs: &mut out_bus,
             inputParameterChanges: std::ptr::null_mut(),
             outputParameterChanges: std::ptr::null_mut(),
-            inputEvents: std::ptr::null_mut(),
+            inputEvents: input_events_ptr,
             outputEvents: std::ptr::null_mut(),
             processContext: std::ptr::null_mut(),
         };
