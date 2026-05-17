@@ -6,6 +6,87 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-17
+
+### Added — VST3 host Windows + parité MIDI
+
+Sprint majeur : Windows passe de "audio + SRTP" à **parité fonctionnelle 95 %
+avec macOS** sur les plugins INSERT + MIDI. Les musiciens Windows peuvent
+maintenant utiliser des effets/synthés VST3 dans Jamodio comme leurs
+collègues sur Mac avec leurs AU.
+
+- **Nouveau crate `jamodio-vst3-host`** (Windows uniquement) implémentant le
+  trait `PluginHost` partagé avec `jamodio-au-host`. Stack 100 % Rust pur
+  via `vst3 = "0.3"` (bindings coupler-rs du SDK Steinberg) + `libloading`
+  pour le chargement dynamique des `.vst3`. ~1500 LoC, 6 modules :
+  `discovery` (paths VST3 système Win), `loader` (LoadedModule + ComPtr),
+  `host` (Instance + setup_stereo/process_stereo lifecycle complet),
+  `events` (MidiEventList impl IEventList VST3 + conversion MIDI 3 bytes
+  → Event NoteOn/NoteOff), `state` (MemoryStream impl IBStream pour sync
+  component↔controller), `host_app` (IHostApplication minimal pour les
+  plugins commerciaux), `editor` (HWND attached + thread STA dédié).
+- **Scan VST3 background au boot** sur Windows (= analogue du scan AU mac).
+  Instancie chaque plugin pour lire latence / bus / has_editor. Cache
+  partagé avec l'UI. Typique ~1-2 s pour 5-10 plugins installés.
+- **Load / unload / bypass / process audio** validés en runtime sur
+  Valhalla FutureVerb (effet, 0 sample latence intrinsèque, ~75 µs avg
+  wall-clock @ 48k/64). Pre-warm 8 blocs au load pour absorber le warmup
+  du 1er process (~3000 µs → 75 µs en steady-state).
+- **MIDI input Windows** : `ListMidiDevices` + `SetInputSource` +
+  `PlayMidiNote` (clavier HTML virtuel) activés. midir/winmm pour les
+  ports physiques USB. Pseudo-entrée "Jamodio Virtual MIDI" en tête de
+  liste (= permet de basculer source=MIDI et débloque le clavier HTML
+  même sans clavier USB physique).
+- **Plugin instrument (synthé) → audio** : `MidiEventList` injectée dans
+  `ProcessData.inputEvents`, plugin reçoit NoteOn/NoteOff, génère audio
+  sur bus 0 → mixé dans la pipeline → SRTP. Surge XT validé en runtime
+  17/05.
+- **`PluginHostImpl` type alias** (`AuHost` mac / `Vst3Host` win) dans
+  `pipeline.rs` : champ unique `plugin_host` aux méthodes OS-agnostic
+  via le trait. Zero divergence Mac dans la pipeline.
+- **UI** : retrait du guard `agentOs !== 'macos'` dans `groupe.js
+  renderFxSlot`. Slot FX visible sur les 2 OSes. Click handler du picker
+  refactor format-agnostic (data-plugin-ref JSON) pour gérer AU + VST3
+  sans cas particulier. MIDI device picker OS-aware avec hints
+  Windows-spécifiques mentionnant le port virtuel OS-wide à venir.
+
+### Pièges VST3 documentés (capitalisés pour les futurs sprints)
+
+- **`activateBus` requis sur les bus events** (= `MediaTypes_::kEvent`),
+  pas que les bus audio. Sans ça les synthés ignorent silencieusement
+  l'IEventList qu'on leur passe.
+- **N'activer que le bus 0** (= main I/O). Activer les bus aux (= aux
+  sends Surge XT) sans fournir leurs buffers dans `ProcessData` cause un
+  silence inexplicable (le plugin écrit "ailleurs"). Multi-bus support
+  reporté post-beta.
+- **COM apartment STA + msg pump pre-attached** + IPlugFrame + state sync
+  + IHostApplication + IConnectionPoint::connect + setComponentHandler :
+  tous nécessaires pour `IPlugView::attached()` sur les plugins
+  commerciaux. Code complet en place.
+
+### Known limitations Windows v0.4.0
+
+- **Éditeur GUI VST3** : `IPlugView::attached()` hang sur Windows 11 ARM
+  sous émulation x64 (VMware Fusion). Reproduit sur Valhalla FutureVerb
+  ET Surge XT (= pas un quirk plugin spécifique, plutôt émulation
+  graphique ARM problématique). À valider sur vrai Windows x64 natif
+  avant tirer conclusion — le code COM/HWND/msg-pump est complet et
+  conforme à la spec Steinberg.
+- **Port virtuel "Jamodio Virtual MIDI" OS-wide** : sur Mac, CoreMIDI
+  fournit nativement un port visible depuis Logic/Ableton/etc. Windows
+  n'a pas d'équivalent built-in. En attente de license commerciale
+  teVirtualMIDI (Tobias Erichsen) pour S2.5. Le clavier HTML Jamodio
+  intégré fonctionne déjà sans le port virtuel.
+
+### Refactor / cleanup
+
+- Type alias `PluginHostImpl` dans pipeline.rs (au lieu de cfg-gating
+  séparé `au_host` mac / `vst3_host` win). Méthodes plugin passent toutes
+  par le trait → code body identique sur les 2 OSes.
+- `InputSource`, `input_source`, `midi_input`, `midi_event_rx` étendus
+  `cfg(any(macos, windows))`. Le port virtuel keepalive Mac (CoreMIDI)
+  reste `cfg(target_os = "macos")`.
+
 ## [0.3.2] — 2026-05-15
 
 ### Changed — Polish Windows beta
