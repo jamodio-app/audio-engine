@@ -268,20 +268,29 @@ impl Instance {
             );
         }
 
-        // activateBus sur chaque bus audio ET event (analogue du piège AU
-        // `bus.enabled=NO`). Sans ça, process() retourne erreur immédiate
-        // pour les effets, ET — découverte 16/05 — les synthés VST3 ne
-        // reçoivent PAS l'IEventList si leur bus MIDI input n'est pas
-        // activé. Symptôme silencieux : Surge XT charge, accepte notre
-        // process() sans erreur, mais ignore les notes du clavier HTML.
+        // activateBus : on N'ACTIVE QUE le bus 0 (= main) pour chaque media×dir.
+        //
+        // Le piège VST3 (analogue de AU `bus.enabled=NO`) demande d'activer
+        // explicitement les bus, mais la spec dit que `numInputs/numOutputs`
+        // dans `ProcessData` doit ÉGALER le nombre de bus actifs et que
+        // `inputs[]`/`outputs[]` correspond exactement. Si on active 3 bus de
+        // sortie (= cas Surge XT main + aux1 + aux2) mais qu'on déclare
+        // `numOutputs=1`, le plugin peut écrire silencieusement dans des bus
+        // non couverts par notre buffer → audio perdu, VU à zéro.
+        //
+        // MVP : on désactive explicitement les bus aux pour rester sur le
+        // pattern simple "1 bus main I/O + 1 bus event in". Le multi-bus
+        // (sidechain, aux sends pour mixing in-plugin) sera un sprint dédié
+        // post-beta.
         for media in [MediaTypes_::kAudio, MediaTypes_::kEvent] {
             for dir in [BusDirections_::kInput, BusDirections_::kOutput] {
                 let n = unsafe {
                     self.component.getBusCount(media as i32, dir as i32)
                 };
                 for idx in 0..n {
+                    let state: i16 = if idx == 0 { 1 } else { 0 };
                     let act_ok = unsafe {
-                        self.component.activateBus(media as i32, dir as i32, idx, 1)
+                        self.component.activateBus(media as i32, dir as i32, idx, state)
                     };
                     if act_ok != 0 {
                         tracing::warn!(
@@ -289,6 +298,7 @@ impl Instance {
                             media = ?media,
                             dir = ?dir,
                             idx,
+                            state,
                             tresult = act_ok,
                             "activateBus failed"
                         );
@@ -298,7 +308,8 @@ impl Instance {
                             media = ?media,
                             dir = ?dir,
                             idx,
-                            "activateBus ok"
+                            state,
+                            "activateBus"
                         );
                     }
                 }
