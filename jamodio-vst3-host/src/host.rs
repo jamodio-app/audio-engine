@@ -288,7 +288,7 @@ impl Instance {
                     self.component.getBusCount(media as i32, dir as i32)
                 };
                 for idx in 0..n {
-                    let state: i16 = if idx == 0 { 1 } else { 0 };
+                    let state: u8 = if idx == 0 { 1 } else { 0 };
                     let act_ok = unsafe {
                         self.component.activateBus(media as i32, dir as i32, idx, state)
                     };
