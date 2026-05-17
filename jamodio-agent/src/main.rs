@@ -22,6 +22,19 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 use ws_server::WsServerHandle;
 
+/// Détection minimale de la langue d'interface (FR/EN) sans dépendance externe.
+/// Lit LC_ALL → LC_MESSAGES → LANG (POSIX, Linux/macOS). Sur Windows, ces vars
+/// ne sont pas posées par défaut → on retombe sur 'en'. Suffisant pour les 2
+/// labels du menu Tray ; pas besoin d'un système i18n complet ici.
+fn detect_lang() -> &'static str {
+    let raw = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LC_MESSAGES"))
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default();
+    let prefix = raw.split(['_', '.', '@', '-']).next().unwrap_or("").to_lowercase();
+    if prefix == "fr" { "fr" } else { "en" }
+}
+
 #[tauri::command]
 fn open_log_dir() -> Result<String, String> {
     let dir = logging::log_dir();
@@ -152,8 +165,15 @@ fn main() {
             audio::device::log_devices();
 
             // ─── Attach menu to config-based tray icon ──────
-            let show = MenuItem::with_id(app, "show", "Afficher la fenêtre", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
+            // i18n minimal : libellés FR si la locale OS est FR, EN sinon
+            // (couvre la première impression utilisateur EN — cf. ToDo audit 17/05).
+            let (show_label, quit_label) = if detect_lang() == "fr" {
+                ("Afficher la fenêtre", "Quitter")
+            } else {
+                ("Show window", "Quit")
+            };
+            let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
 
             // ─── Activate app so first tray click works ─────
