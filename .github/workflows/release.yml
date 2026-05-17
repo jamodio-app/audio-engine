@@ -173,11 +173,10 @@ jobs:
           ls -lh
 
           echo "▸ Duplication en noms stables (les originaux restent pour l'updater)"
-          # Cibles supportées Jamodio depuis v0.3.3 :
+          # Cibles supportées Jamodio depuis v0.4.0 :
           #   - macOS Apple Silicon (M1+)
-          #   - Windows x64 (MSI uniquement, NSIS reste dans le bundle pour
-          #     l'updater des installs existantes mais sans nom stable)
-          # macOS Intel et Windows NSIS legacy : abandonnés (cf. mémoire
+          #   - Windows x64 MSI (NSIS retiré du bundle, plus aucun binaire NSIS produit)
+          # macOS Intel + Windows NSIS legacy : abandonnés (cf. mémoires
           # agent_windows_blocker.md + beta_launch_strategy.md).
           for f in *.dmg *.msi; do
             [ -f "$f" ] || continue

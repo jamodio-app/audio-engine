@@ -137,15 +137,13 @@ Les artefacts :
 Toute release est **déclenchée par un tag Git** `vX.Y.Z`. Le workflow
 [`release.yml`](.github/workflows/release.yml) tourne sur GitHub Actions :
 
-1. **3 runners en parallèle** compilent l'agent :
+1. **2 runners en parallèle** compilent l'agent :
    - `macos-14` → cible `aarch64-apple-darwin` (Apple Silicon)
-   - `macos-13` → cible `x86_64-apple-darwin` (Intel)
    - `windows-2022` → cible `x86_64-pc-windows-msvc`
 2. Chaque build signe l'updater Tauri (avec `TAURI_SIGNING_PRIVATE_KEY`).
 3. Le job `publish` renomme les artefacts en noms stables :
    - `Jamodio-Audio-Engine-macOS-AppleSilicon.dmg`
-   - `Jamodio-Audio-Engine-macOS-Intel.dmg`
-   - `Jamodio-Audio-Engine-Windows.exe`
+   - `Jamodio-Audio-Engine-Windows.msi`
 4. Le draft devient une release publiée.
 
 **Tu n'as besoin que de ta machine de dev** — GitHub fournit les 3 runners.
@@ -258,12 +256,11 @@ Supprime l'écran SmartScreen au 1er lancement.
 
 ## Intégration côté web
 
-Le frontend jamodio.com (app + landing) pointe sur les 3 URLs stables :
+Le frontend jamodio.com (app + landing) pointe sur les 2 URLs stables :
 
 ```
 /releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg
-/releases/latest/download/Jamodio-Audio-Engine-macOS-Intel.dmg
-/releases/latest/download/Jamodio-Audio-Engine-Windows.exe
+/releases/latest/download/Jamodio-Audio-Engine-Windows.msi
 ```
 
 La détection ARM/Intel côté browser utilise :

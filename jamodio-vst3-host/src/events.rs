@@ -63,11 +63,6 @@ impl MidiEventList {
         }
     }
 
-    pub fn clear(&self) {
-        if let Ok(mut g) = self.events.lock() {
-            g.clear();
-        }
-    }
 }
 
 impl Default for MidiEventList {

@@ -218,6 +218,9 @@ impl MidiInput {
         })
     }
 
+    /// Lecteur diag — l'id du device courant. Pas utilisé en prod aujourd'hui
+    /// (le wire renvoie déjà l'id), gardé pour le debug log éventuel.
+    #[allow(dead_code)]
     pub fn device_id(&self) -> &str {
         &self.device_id
     }

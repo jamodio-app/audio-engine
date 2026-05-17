@@ -36,12 +36,18 @@ pub fn decode_cstr_i8(buf: &[i8]) -> String {
 #[derive(Clone, Debug)]
 pub struct FactoryInfo {
     pub vendor: String,
+    /// Affiché par le POC en mode `info`, gardé pour diag/log futur.
+    #[allow(dead_code)]
     pub url: String,
+    /// Affiché par le POC en mode `info`, gardé pour diag/log futur.
+    #[allow(dead_code)]
     pub email: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClassInfo {
+    /// Index dans la factory — utile pour diag (= "la classe n°3 a échoué").
+    #[allow(dead_code)]
     pub index: i32,
     pub cid: TUID,
     pub category: String,
@@ -149,16 +155,6 @@ impl Instance {
             .into_iter()
             .find(|c| &c.cid == cid && c.is_audio_effect())
             .ok_or_else(|| "UID inconnu ou pas Audio Module Class".to_string())?;
-        Self::create_class(module, class)
-    }
-
-    /// Crée la 1re classe Audio Module Class trouvée. Pratique en test
-    /// unitaire — en prod on passe par `create_by_uid` (sélection user).
-    pub fn create_first_audio_effect(module: &LoadedModule) -> Result<Self, String> {
-        let class = enumerate_classes(module)
-            .into_iter()
-            .find(|c| c.is_audio_effect())
-            .ok_or_else(|| "plugin sans Audio Module Class".to_string())?;
         Self::create_class(module, class)
     }
 

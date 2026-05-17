@@ -51,7 +51,11 @@ pub fn resolve_binary(plugin_path: &Path) -> Result<PathBuf, String> {
 /// chargée, sinon use-after-unload garanti (l'impl COM de la factory vit
 /// dans la DLL).
 pub struct LoadedModule {
+    /// Chemin original (= `.vst3` choisi par l'user). Gardé pour le diag log.
+    #[allow(dead_code)]
     pub plugin_path: PathBuf,
+    /// Chemin binaire interne au bundle / DLL flat. Gardé pour le diag log.
+    #[allow(dead_code)]
     pub binary_path: PathBuf,
     factory: ComPtr<IPluginFactory>,
     #[allow(dead_code)] // kept alive for the lifetime of the factory

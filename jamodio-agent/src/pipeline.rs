@@ -314,6 +314,10 @@ impl PipelineState {
         Ok(())
     }
 
+    /// Symétrique de `set_input_source`. Pas utilisé en prod (le browser
+    /// pousse l'état via `InputSourceChanged`), gardé pour le diag log et
+    /// la cohérence d'API.
+    #[allow(dead_code)]
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn current_input_source(&self) -> InputSource {
         self.input_source.lock().clone()
