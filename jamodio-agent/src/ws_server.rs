@@ -564,10 +564,21 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         break;
                     }
                     Ok(Some(Ok(msg))) => {
-                        // PROMOTION : premier BrowserMessage reçu d'un client
-                        // externe ⇒ c'est une vraie session, on prend le slot
-                        // et on kick le précédent.
-                        if !slot_taken && !is_internal {
+                        // v0.4.4 — PROMOTION uniquement sur Message::Text
+                        // qui se parse en BrowserMessage. Les Close/Ping/Pong/
+                        // Binary ne déclenchent PAS promotion : c'est ce qui
+                        // créait le log spam observé en v0.4.3 (probes
+                        // agent-status.js qui ferment leur WS génèrent un
+                        // Close frame, traité à tort comme "1er message").
+                        let is_real_browser_msg = match &msg {
+                            Message::Text(text) => serde_json::from_str::<
+                                BrowserMessage,
+                            >(text)
+                            .is_ok(),
+                            _ => false,
+                        };
+
+                        if is_real_browser_msg && !slot_taken && !is_internal {
                             slot_taken = true;
                             let (new_killer_tx, new_killer_rx) =
                                 tokio::sync::oneshot::channel();
@@ -576,17 +587,30 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                                 .lock()
                                 .replace(new_killer_tx);
                             if let Some(prev) = previous {
-                                tracing::warn!(
-                                    target: "jamodio::ws",
-                                    "displacing previous external client (stale slot — likely half-open WS or rapid reconnect)"
-                                );
-                                // Best-effort : Err si receiver déjà drop.
-                                let _ = prev.send("displaced-by-new-client");
-                                // Pause courte pour laisser cleanup ancien
-                                // (stop_all peut prendre quelques ms).
-                                tokio::time::sleep(
-                                    std::time::Duration::from_millis(50),
-                                ).await;
+                                // v0.4.4 — log "displacing" UNIQUEMENT si on
+                                // a réellement kické quelqu'un. send() retourne
+                                // Err si le receiver a déjà été drop (= ancien
+                                // client déjà cleanup, Sender stale dans le
+                                // Mutex). Dans ce cas, no-op silencieux : pas
+                                // de kick effectif, pas de log spam.
+                                match prev.send("displaced-by-new-client") {
+                                    Ok(()) => {
+                                        tracing::warn!(
+                                            target: "jamodio::ws",
+                                            "displacing previous external client (stale slot — likely half-open WS or rapid reconnect)"
+                                        );
+                                        // Pause courte pour laisser le cleanup
+                                        // ancien finir (stop_all peut prendre
+                                        // quelques ms).
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(50),
+                                        ).await;
+                                    }
+                                    Err(_) => {
+                                        // Sender stale — ancien client déjà parti.
+                                        // Pas de kick effectif, pas de pause.
+                                    }
+                                }
                             }
                             handle.client_active.store(true, Ordering::SeqCst);
                             killer_rx = Some(new_killer_rx);

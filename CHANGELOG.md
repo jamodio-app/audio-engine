@@ -6,6 +6,40 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-05-27
+
+### Fixed — Log spam : promotion sur Close frame (cosmétique)
+
+Détecté sur la session test v0.4.3 du 27/05 : 74 "external client promoted"
++ 73 "displacing previous external client" sur 15 min, alors que seulement
+**2 vraies sessions** existaient (88 s et 120 s). Conséquence : logs
+illisibles, drift apparent du slot. Pas d'impact fonctionnel (drops=0,
+les vraies sessions tenaient), mais inutilisable pour analyser les
+sessions BETA.
+
+**Cause** : la condition de promotion `if !slot_taken && !is_internal`
+se déclenchait sur **n'importe quel** `Message` reçu, y compris les
+`Close` frames que les probes `agent-status.js` envoient en fermant
+leur WS. Ces probes pourtant n'ont rien à voir avec une vraie session.
+
+**Fix** :
+- Promotion **uniquement sur Message::Text** qui se parse en
+  `BrowserMessage` valide. Les Close/Ping/Pong/Binary sont ignorés
+  pour la promotion (mais toujours traités par `handle_one_message`).
+- Log "displacing previous external client" **uniquement si**
+  `prev.send()` réussit (= un client était bien actif). Si le sender
+  était stale (= receiver déjà drop, client précédent déjà cleanup),
+  no-op silencieux : pas de log misleading, pas de pause 50 ms inutile.
+
+### Notes
+
+- Aucune régression fonctionnelle attendue : la sémantique de promotion
+  est exactement la même qu'en v0.4.3, juste filtrée correctement.
+- cargo test --workspace : 29 verts.
+- Préreq pour la prochaine session test : confirmer en bundle que les
+  logs `displacing` ne se produisent QUE sur les vrais cas de reconnect
+  rapide (et non sur chaque probe agent-status.js).
+
 ## [0.4.3] — 2026-05-27
 
 ### Fixed — Slot single-client : kick automatique du précédent + watchdog
