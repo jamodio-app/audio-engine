@@ -30,7 +30,7 @@
 //! L'usage canonique : binding au début de la closure de `thread::spawn`,
 //! drop implicite en fin de boucle.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 /// Détails sur la méthode retenue pour la promotion RT. Loggué via tracing
 /// à `info` pour qu'on puisse confirmer dans `agent.log` lequel des chemins
@@ -102,15 +102,21 @@ impl RtPriorityHandle {
     }
 }
 
-// ─── Anti-double-promotion guard ─────────────────────────────────
+// ─── Anti-double-promotion guard (PER THREAD) ─────────────────────
 //
-// Si un thread re-appelle `promote_thread_for_audio` sans drop le handle
-// précédent, on log warn et on retourne un handle no-op. Pas un vrai
-// thread-local (`thread_local!` est lourd), juste un AtomicBool global
-// optimiste : le but est de signaler les bugs d'usage, pas d'enforcer.
-// Reset à false dans Drop pour permettre une re-promotion légitime
-// (ex. relance encoder thread après stop_capture).
-static PROMOTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+// v0.4.6 — Correction d'un bug introduit avec S3 (split 3 stages) :
+// l'ancien `static AtomicBool` global bloquait les 2e et 3e appels à
+// `promote_thread_for_audio` quand 3 threads voulaient être promus en
+// parallèle. Conséquence : sur 3 stages audio, un seul était au
+// workgroup CoreAudio (capture), les 2 autres tournaient en priorité
+// normale → préemption fréquente → p99 × 9 mesuré en session 27/05.
+//
+// Fix : guard `thread_local!` qui ne bloque QUE la double-promotion
+// SUR LE MÊME thread (= cas du bug d'usage original). Chaque thread RT
+// peut maintenant promote indépendamment, comme attendu.
+thread_local! {
+    static PROMOTION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Promeut le thread courant en priorité audio RT. Best-effort selon l'OS.
 ///
@@ -121,10 +127,20 @@ static PROMOTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Retourne un handle dont le `Drop` libère best-effort. Doit être drop sur
 /// **le même thread** que celui qui a appelé `promote_thread_for_audio`.
 pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityHandle {
-    if PROMOTION_ACTIVE.swap(true, Ordering::SeqCst) {
+    // v0.4.6 — guard PER THREAD (thread_local). N'empêche QUE la
+    // double-promotion sur le MÊME thread. Les autres threads peuvent
+    // promote en parallèle (= cas attendu avec S3 split 3 stages).
+    let already = PROMOTION_ACTIVE.with(|c| {
+        let prev = c.get();
+        if !prev {
+            c.set(true);
+        }
+        prev
+    });
+    if already {
         tracing::warn!(
             target: "jamodio::rt_priority",
-            "double promotion détectée — le handle précédent n'a pas été drop sur ce thread (ou un autre thread a la promotion globale active). Retour d'un handle no-op."
+            "double promotion détectée sur ce thread — le handle précédent n'a pas été drop. Retour d'un handle no-op."
         );
         return make_none_handle();
     }
@@ -283,7 +299,8 @@ impl Drop for RtPriorityHandle {
             }
             PromotionMethod::None => {}
         }
-        PROMOTION_ACTIVE.store(false, Ordering::SeqCst);
+        // v0.4.6 — reset le guard PER THREAD (cf. thread_local plus haut).
+        PROMOTION_ACTIVE.with(|c| c.set(false));
     }
 }
 

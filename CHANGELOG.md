@@ -6,6 +6,72 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.6] — 2026-05-27
+
+### Fixed — CRITIQUE : régression latence v0.4.5 (rt_priority guard global)
+
+Régression introduite avec S3 (v0.4.5) sur la mesure 27/05 après-midi :
+- `pipeline_p50_ms` : 0,120 (baseline v0.4.1) → **0,201** (+68 %)
+- `pipeline_p99_ms` : 2,16 → **19,66** (+810 %, **× 9 pire**)
+- `pipeline_max_ms` : 25,25 → 27,02 (+7 %)
+- `drops_total = 0` (heureusement)
+
+#### Cause racine
+
+Le guard anti-double-promotion dans `audio::rt_priority::promote_thread_for_audio`
+était implémenté comme un **`static AtomicBool` global** :
+
+```rust
+static PROMOTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+// ...
+if PROMOTION_ACTIVE.swap(true, Ordering::SeqCst) { return no-op; }
+```
+
+Conçu en S2 pour signaler le bug d'usage "même thread appelle promote
+deux fois sans drop", il **bloquait aussi les autres threads**. Avec
+S3 split en 3 stages (capture/process/encode) appelant tous
+`promote_thread_for_audio` en parallèle au boot, seul le 1er stage
+(audio-capture) joignait le workgroup CoreAudio. Les 2 autres
+(`audio-process` et `audio-encode`) tournaient en SCHED_OTHER → se
+faisaient préempter par Chrome/Spotlight/etc. → spikes.
+
+Confirmé dans le bug report 27/05 13:13 : `grep "thread promoted"`
+retourne **1 seule ligne** au lieu de 3 attendues. Le `audio-process`
+qui contient le plugin INSERT (= le hot path le plus sensible)
+n'était pas RT.
+
+#### Fix
+
+Migration du guard `static AtomicBool` → **`thread_local!` Cell** :
+
+```rust
+thread_local! {
+    static PROMOTION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+```
+
+Le guard ne bloque QUE la double-promotion sur le MÊME thread (= cas
+d'usage original). Chaque thread RT (capture/process/encode) peut
+maintenant joindre le workgroup CoreAudio indépendamment.
+
+#### Validation attendue post-v0.4.6
+
+- 3 lignes "thread promoted to CoreAudio workgroup" dans `agent.log` au
+  boot (une par stage)
+- Retour aux chiffres v0.4.3 ou meilleurs (`p50 ≤ 0,07 ms`, `p99 ≤ 0,8 ms`)
+- `drops_total = 0` conservé
+
+#### Notes
+
+- cargo test --workspace : 29 verts. Le test
+  `rt_priority::tests::double_promotion_without_drop_yields_none`
+  reste valide (= protection sur LE MÊME thread préservée).
+- Pas de changement protocole. Compat browser v0.4.1+.
+- Apologies pour le ship hâtif v0.4.5 sans détection de cette
+  régression — le test sur le même thread ne pouvait pas la révéler,
+  il aurait fallu un test multi-thread spawn 3 threads + verify chacun
+  a son `RtPriorityHandle != None`. Ajouté en backlog post-S6.
+
 ## [0.4.5] — 2026-05-27
 
 ### Changed — Sprint S3 stabilité : split encoder pipeline en 3 stages
