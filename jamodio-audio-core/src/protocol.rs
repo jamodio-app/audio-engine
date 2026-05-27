@@ -440,6 +440,81 @@ pub enum AgentMessage {
     InputSourceError {
         message: String,
     },
+    /// Sprint S1 — Snapshot périodique (1 Hz) des métriques perf agent.
+    /// Permet au browser de logger (debug only en S1, UI en S5) et au support
+    /// d'avoir des données chiffrées dans le bug-report sans avoir à reconstruire
+    /// depuis le log brut.
+    ///
+    /// `timestampMs` est le `Instant`-since-process-start côté agent — utile
+    /// pour ordonner les snapshots dans le bundle, pas pour comparer avec
+    /// l'horloge browser (qui est sur un autre référentiel).
+    ///
+    /// `plugin = None` quand aucun INSERT plugin actif sur la fenêtre.
+    /// `peers` vide quand pas de remote stream actif. `pipelineLatencyMs.count = 0`
+    /// quand l'encoder est idle (= pas de StartCapture).
+    PerfStats {
+        #[serde(rename = "timestampMs")]
+        timestamp_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plugin: Option<PluginPerf>,
+        #[serde(rename = "pipelineLatencyMs")]
+        pipeline_latency_ms: PipelineLatency,
+        peers: Vec<PeerPerf>,
+    },
+}
+
+/// Sprint S1 — Métriques d'un INSERT plugin actif (process_stereo wall-clock).
+/// `count = 0` n'est jamais sérialisé (cf. skip_serializing_if).
+#[derive(Debug, Serialize)]
+pub struct PluginPerf {
+    pub name: String,
+    pub count: usize,
+    #[serde(rename = "meanMs")]
+    pub mean_ms: f32,
+    #[serde(rename = "p50Ms")]
+    pub p50_ms: f32,
+    #[serde(rename = "p99Ms")]
+    pub p99_ms: f32,
+    #[serde(rename = "maxMs")]
+    pub max_ms: f32,
+}
+
+/// Sprint S1 — Latence interne de l'encoder pipeline (capture → RTP send).
+/// `count = 0` indique encoder idle ; les autres champs sont 0.0 dans ce cas.
+/// `dropsPerSec` = "sample channel full" sur la fenêtre, indicateur direct de
+/// saturation côté capture.rs.
+#[derive(Debug, Serialize)]
+pub struct PipelineLatency {
+    pub count: usize,
+    #[serde(rename = "p50Ms")]
+    pub p50_ms: f32,
+    #[serde(rename = "p99Ms")]
+    pub p99_ms: f32,
+    #[serde(rename = "maxMs")]
+    pub max_ms: f32,
+    #[serde(rename = "meanMs")]
+    pub mean_ms: f32,
+    #[serde(rename = "dropsPerSec")]
+    pub drops_per_sec: u64,
+}
+
+/// Sprint S1 — Métriques par peer remote (drift + jitter buffer + underruns).
+/// `driftPpm` = dernière estimation du `DriftEstimator` (0.0 pendant les ~5
+/// premières secondes de warmup). `bufferTargetMs` = cible adaptative du
+/// jitter buffer pour ce stream. `driftDrops` = cumul des samples drainés
+/// depuis le début de la session (pas seulement la fenêtre 1 s — c'est un
+/// compteur monotone, comme `underruns`).
+#[derive(Debug, Serialize)]
+pub struct PeerPerf {
+    #[serde(rename = "producerId")]
+    pub producer_id: String,
+    #[serde(rename = "driftPpm")]
+    pub drift_ppm: f64,
+    #[serde(rename = "bufferTargetMs")]
+    pub buffer_target_ms: usize,
+    pub underruns: u64,
+    #[serde(rename = "driftDrops")]
+    pub drift_drops: u64,
 }
 
 /// Wire format pour un MIDI device (cf. `audio::midi::MidiDeviceInfo` côté agent).

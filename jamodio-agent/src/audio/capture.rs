@@ -1,6 +1,8 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, SampleRate, StreamConfig, BufferSize, SupportedBufferSize};
 use crossbeam_channel::{Sender, TrySendError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Vérifie si le device input expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Permet de choisir
@@ -56,6 +58,11 @@ fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_
 pub fn start_capture(
     device: &Device,
     sample_tx: Sender<Vec<f32>>,
+    // Sprint S1 — incrémenté à chaque drop "sample channel full". Le compteur
+    // statique précédent (`FULLS`) servait uniquement au throttle de logs ;
+    // celui-ci est lu+reset par ws_server au flush 1 Hz pour publier le
+    // dropsPerSec dans `PerfStats.pipelineLatencyMs.dropsPerSec`.
+    capture_drops: Arc<AtomicU64>,
 ) -> Result<(cpal::Stream, u16, u32), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
     // physiques + le sample rate natif (cf. doc fonction).
@@ -102,6 +109,10 @@ pub fn start_capture(
             match sample_tx.try_send(data.to_vec()) {
                 Ok(_) => {}
                 Err(TrySendError::Full(_)) => {
+                    // Sprint S1 — métrique partagée (lue+reset 1 Hz par ws_server)
+                    capture_drops.fetch_add(1, Ordering::Relaxed);
+                    // Compteur statique inchangé : sert au throttle de logs
+                    // (un warn par puissance de 2) — indépendant de la métrique.
                     static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n == 0 || n.is_power_of_two() {

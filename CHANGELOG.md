@@ -6,6 +6,85 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-05-23
+
+### Added — Sprint S1 stabilité : instrumentation profonde
+
+Premier sprint du chantier "Fondations stabilité agent" (cf.
+`internal-docs/PLAN-EXECUTION-AGENT-STABILITE.md`). Pas de changement
+comportemental visible utilisateur — purement instrumentation pour
+diagnostiquer les futures sessions et établir une baseline chiffrée
+avant les refactors S2 (thread priority) et S3 (split encoder).
+
+- **Nouveau module `jamodio-audio-core::perfstats`** : primitive
+  `Histogram` glissante zero-alloc dans le hot path. Capacity fixe,
+  ring buffer + tri scratch préalloué au flush. Tests unitaires couvrant
+  ring overflow, percentiles, reset, drops independent. ~250 LoC + 7 tests.
+- **`AgentMessage::PerfStats`** ajouté au protocole WS — snapshot 1 Hz
+  des métriques pipeline (capture→send p50/p99/max, drops/s), plugin
+  INSERT (process_stereo p50/p99/max si actif), peers (drift_ppm
+  cumulatif, jitter buffer target_ms, underruns, drift_drops).
+  Tag tracing dédié `jamodio::perfstats` → finit automatiquement dans
+  `agent.log` et donc dans les bug-reports via `GetLogsArchive`.
+- **Instrumentation encoder_thread** : wall-clock par tour de la boucle
+  (capture→RTP send) + wall-clock par appel `host.process_stereo`
+  (mesuré par sous-bloc PLUGIN_BLOCK). Coût `Instant::now()` ≈ 30 ns
+  sur Apple Silicon, négligeable comparé au budget RT 2.7 ms/bloc.
+- **Compteur `capture_drops` partagé** entre CPAL capture callback et
+  `ws_server` (Arc<AtomicU64>, lu+swap 1 Hz). Inclus dans
+  `PipelineLatency.dropsPerSec` — indicateur direct de saturation.
+- **Drift ppm publié par peer** : `recv_decode_task` push la dernière
+  valeur dans un `HashMap<producer_id, f64>` partagé quand elle bouge
+  de plus de 1 ppm. Cleanup au shutdown du task. Lecture côté ws_server
+  au flush 1 Hz.
+- **`mixer::stream_perf_stats()`** : nouvelle méthode publique exposant
+  (producer_id, underruns, drift_drops, target_ms) par stream remote
+  (SELF_MONITOR exclu). Compteurs monotones — le browser fait la
+  différence entre 2 snapshots s'il veut une cadence par seconde.
+
+### Added — Browser side
+
+- **Logger IndexedDB double-buffer** (`app/js/lib/logger.js`) : ring
+  mémoire 5000 entries (= session courante) **+** persistence IndexedDB
+  rotation 7 jours. Write batched async (flush 5 s + sur visibility=hidden +
+  beforeunload), zéro blocage du thread principal. Prune horaire des
+  entries > 7 jours. Fallback transparent au ring seul si IndexedDB
+  indisponible (mode privé Safari ancien, quota dépassé).
+- **API logger étendue** : `log.historySnapshot({ maxDays })` async lit
+  IndexedDB ; `log.dumpWithHistory()` merge ring + history + dédup +
+  tri chronologique. `log.snapshot()` et `log.dump()` inchangés
+  (compat callers existants).
+- **`bug-report.js`** utilise désormais `dumpWithHistory()` → les bundles
+  envoyés au support contiennent les 7 derniers jours de browser logs,
+  pas seulement le tab courant. Résout le pattern observé 22/05 (bundle
+  généré le lendemain ne contenait que 2 lignes browser).
+- **Handler `case 'perf-stats'`** dans `groupe.js` handleAgentMessage :
+  log debug du snapshot reçu. Pas d'UI utilisateur en S1 (UI dashboard
+  arrivera en S5 avec le toast plugin overload).
+
+### Added — Tooling
+
+- **Nouveau script `scripts/agent-latency-baseline.js`** (Node stdlib
+  pur, aucune dépendance npm). Modes :
+  - `--save baseline.json bug-report.txt` : extrait les snapshots
+    perfstats du bug-report, agrège mean/p99/max session, sauve la
+    référence.
+  - `--compare baseline.json bug-report.txt` : compare et exit 1 si
+    régression (`p99 > baseline + 0.5 ms` OU `p50 > baseline` OU
+    `drops_total > 0`). Devient le **gate quantitatif** des PR S2-S6.
+
+### Notes
+
+- Build matrix CI inchangée (Mac ARM + Windows x64 via `agent-v*` tag).
+- Zero impact mesuré sur la latence côté code : instrumentation ajoute
+  ~60 ns par tour de l'encoder (`Instant::now()` × 2). Validation
+  chiffrée à venir lors de la 1re session BETA après S2.
+- 7 tests unitaires `perfstats` passent ; `cargo test --workspace` vert
+  (16 tests audio-core, dont les 7 nouveaux). Build release Mac OK.
+- Préreq pour PR-2 (S3+S4) : exécuter `agent-latency-baseline.js --save`
+  sur une session test 10 min Mac+Win, committer le résultat dans
+  `internal-docs/baselines/agent-v0.4.1-baseline.json`.
+
 ## [0.4.0] — 2026-05-17
 
 ### Added — VST3 host Windows + parité MIDI

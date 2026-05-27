@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod net;
 pub mod mixer;
+pub mod perfstats;
 pub mod plugin_host;
 pub mod protocol;
 pub mod record;

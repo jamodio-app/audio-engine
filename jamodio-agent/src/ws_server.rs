@@ -8,12 +8,13 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use base64::Engine;
 use jamodio_audio_core::protocol::{
-    AgentMessage, AgentState, BrowserMessage, RecordStemSpec, RecordedFileWire, StreamLevel,
-    PROTOCOL_VERSION,
+    AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
+    RecordStemSpec, RecordedFileWire, StreamLevel, PROTOCOL_VERSION,
 };
 use jamodio_audio_core::record::StemSpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
@@ -299,6 +300,134 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     });
 
+    // Sprint S1 — periodic PerfStats sender (1 Hz).
+    //
+    // Flush des histogrammes (capture→send + plugin process_stereo) +
+    // snapshot du compteur drops capture + snapshot drift_ppm par peer +
+    // stats mixer (underruns, drift_drops, target_ms). Construit
+    // `AgentMessage::PerfStats` et l'envoie. Skip l'émission si encoder
+    // idle ET aucun peer actif (= rien d'intéressant à reporter).
+    let perfstats_pipeline = handle.pipeline.clone();
+    let perfstats_tx = out_tx.clone();
+    let perfstats_start = Instant::now();
+    let perfstats_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        // Skip le 1er tick immédiat (sinon flush vide juste après connect).
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let pl = perfstats_pipeline.lock().await;
+            // Flush histograms (acquièrent le lock parking_lot une fois chacun)
+            let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
+            let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
+            // Reset+swap atomic des drops capture
+            let capture_drops_window = pl
+                .perfstats
+                .capture_drops
+                .swap(0, Ordering::Relaxed);
+            // Snapshot drift_ppm par peer (clone du hashmap, cheap car ≤4 peers)
+            let drift_map: std::collections::HashMap<String, f64> =
+                pl.perfstats.drift_ppm_by_producer.lock().clone();
+            // Snapshot mixer stats (underruns + drift_drops cumul + target_ms)
+            let mixer_stats = pl.mixer.lock().stream_perf_stats();
+            // Nom du plugin actif (si chargé) pour `PluginPerf.name` — sinon
+            // on omet PluginPerf entièrement.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let plugin_name: Option<String> = pl
+                .instrument_plugin_info
+                .lock()
+                .as_ref()
+                .map(|info| info.name.clone());
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let plugin_name: Option<String> = None;
+            drop(pl);
+
+            // Plugin perf : seulement si on a observé ET qu'un plugin est
+            // chargé. Le nom peut être absent si la course load↔flush se
+            // termine entre les deux locks — dans ce cas on rapporte
+            // l'observation avec "unknown" pour ne pas perdre la donnée.
+            let plugin_perf = if plugin_snap.count > 0 {
+                Some(PluginPerf {
+                    name: plugin_name.unwrap_or_else(|| "unknown".to_string()),
+                    count: plugin_snap.count,
+                    mean_ms: plugin_snap.mean_ms,
+                    p50_ms: plugin_snap.p50_ms,
+                    p99_ms: plugin_snap.p99_ms,
+                    max_ms: plugin_snap.max_ms,
+                })
+            } else {
+                None
+            };
+
+            // Construction de la couche pipeline_latency (toujours présente,
+            // count=0 indique encoder idle).
+            let pipeline_latency_ms = PipelineLatency {
+                count: pipeline_snap.count,
+                p50_ms: pipeline_snap.p50_ms,
+                p99_ms: pipeline_snap.p99_ms,
+                max_ms: pipeline_snap.max_ms,
+                mean_ms: pipeline_snap.mean_ms,
+                // Inclut les drops "RTP channel full" agrégés par l'histogramme
+                // (record_drop côté encoder) + les drops capture côté CPAL.
+                // Les deux sont des indicateurs de saturation à reporter ensemble.
+                drops_per_sec: pipeline_snap.drops + capture_drops_window,
+            };
+
+            // Construction des peers : on dérive de mixer_stats + drift_map.
+            // Si un producer est dans mixer mais pas dans drift_map (warmup),
+            // ppm = 0.0 (cf. drift.rs).
+            let peers: Vec<PeerPerf> = mixer_stats
+                .into_iter()
+                .map(|(producer_id, underruns, drift_drops, target_ms)| {
+                    let drift_ppm = drift_map.get(&producer_id).copied().unwrap_or(0.0);
+                    PeerPerf {
+                        producer_id,
+                        drift_ppm,
+                        buffer_target_ms: target_ms,
+                        underruns,
+                        drift_drops,
+                    }
+                })
+                .collect();
+
+            // Skip si rien à reporter (encoder idle + pas de peer + pas de plugin)
+            if plugin_perf.is_none()
+                && pipeline_latency_ms.count == 0
+                && pipeline_latency_ms.drops_per_sec == 0
+                && peers.is_empty()
+            {
+                continue;
+            }
+
+            // Log structuré tracing pour qu'il finisse dans agent.log :
+            // permet au support de lire les perfstats même sans bundle browser.
+            tracing::info!(
+                target: "jamodio::perfstats",
+                pipeline_p50_ms = pipeline_latency_ms.p50_ms,
+                pipeline_p99_ms = pipeline_latency_ms.p99_ms,
+                pipeline_max_ms = pipeline_latency_ms.max_ms,
+                pipeline_count = pipeline_latency_ms.count,
+                drops_per_sec = pipeline_latency_ms.drops_per_sec,
+                plugin_name = plugin_perf.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
+                plugin_p99_ms = plugin_perf.as_ref().map(|p| p.p99_ms).unwrap_or(0.0),
+                plugin_max_ms = plugin_perf.as_ref().map(|p| p.max_ms).unwrap_or(0.0),
+                peers = peers.len(),
+                "perfstats snapshot"
+            );
+
+            let msg = AgentMessage::PerfStats {
+                timestamp_ms: perfstats_start.elapsed().as_millis() as u64,
+                plugin: plugin_perf,
+                pipeline_latency_ms,
+                peers,
+            };
+            if perfstats_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Spawn task to forward outgoing messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -343,6 +472,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     tracing::info!(target: "jamodio::ws", is_internal, "client disconnected — cleanup");
 
     levels_task.abort();
+    perfstats_task.abort();
     send_task.abort();
     shutdown_task.abort();
 

@@ -10,6 +10,7 @@ use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
+use jamodio_audio_core::perfstats::Histogram;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 use jamodio_audio_core::protocol::AgentState;
@@ -154,6 +155,42 @@ pub struct PipelineState {
     /// S2.7 — Receiver du port virtuel macOS, persistant et clonable.
     #[cfg(target_os = "macos")]
     virtual_midi_rx: Option<Receiver<MidiEvent>>,
+    /// Sprint S1 — Métriques perf. Histogrammes capacités 512 (couvre 1.3 s à
+    /// 375 obs/s, marge confortable pour le flush 1 Hz côté ws_server).
+    ///
+    /// `plugin_latency` est observé uniquement quand `process_stereo` tourne
+    /// (plugin actif ET non-bypass) — vide en mode pass-through.
+    /// `pipeline_latency` est observé à chaque tour de l'`encoder_thread`
+    /// (= une mesure capture→send par bloc Opus).
+    /// `capture_drops` est incrémenté depuis le callback CPAL (cf. capture.rs)
+    /// quand le `sample_tx` est plein — signal direct de saturation encoder.
+    /// `drift_ppm_by_producer` est mis à jour par les recv tasks après chaque
+    /// `DriftEstimator::observe()`. Lecture côté ws_server au flush 1 Hz.
+    pub perfstats: PerfHandles,
+}
+
+/// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
+/// `recv_task`, et le CPAL capture callback. `Clone` cheap (Arc).
+#[derive(Clone)]
+pub struct PerfHandles {
+    pub plugin_latency: Arc<Mutex<Histogram>>,
+    pub pipeline_latency: Arc<Mutex<Histogram>>,
+    pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    pub drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
+}
+
+impl PerfHandles {
+    /// Histogrammes capacité 512 = ~1.36 s à cadence Opus 48k/120 (≈400 blocs/s),
+    /// marge confortable pour le flush 1 Hz côté ws_server (10 % slack).
+    fn new() -> Self {
+        const HISTOGRAM_CAPACITY: usize = 512;
+        Self {
+            plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            pipeline_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            drift_ppm_by_producer: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// Source d'entrée de l'instrument self (sprint S2). Mutuellement exclusif :
@@ -230,6 +267,7 @@ impl PipelineState {
             virtual_midi_keepalive: None,
             #[cfg(target_os = "macos")]
             virtual_midi_rx: None,
+            perfstats: PerfHandles::new(),
         }
     }
 
@@ -661,7 +699,15 @@ impl PipelineState {
         //    pure (driver, sample-rate impossible, etc.), pas une erreur
         //    de sélection user).
         tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        let (stream, channels_in, native_sr) = crate::audio::capture::start_capture(&device, sample_tx)
+        // Sprint S1 — partage du compteur de drops avec le callback CPAL : il
+        // incrémente quand `sample_tx` est plein, ws_server le lit + reset au
+        // flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
+        let capture_drops_for_callback = self.perfstats.capture_drops.clone();
+        let (stream, channels_in, native_sr) = crate::audio::capture::start_capture(
+            &device,
+            sample_tx,
+            capture_drops_for_callback,
+        )
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
         self.capture_stream = Some(SendStream(stream));
         tracing::info!(
@@ -707,12 +753,14 @@ impl PipelineState {
         let midi_event_rx_for_encoder = self.midi_event_rx.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let input_source_for_encoder = self.input_source.clone();
+        let perfstats_for_encoder = self.perfstats.clone();
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
                 encoder_thread(
                     sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
+                    perfstats_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
@@ -812,8 +860,9 @@ impl PipelineState {
 
         // Spawn receive + decode task (reçoit aussi sfu_addr pour le punch périodique)
         let mixer = self.mixer.clone();
+        let drift_ppm_handle = self.perfstats.drift_ppm_by_producer.clone();
         tokio::spawn(async move {
-            recv_decode_task(receiver, sfu_addr, producer_id, mixer, stop_rx).await;
+            recv_decode_task(receiver, sfu_addr, producer_id, mixer, drift_ppm_handle, stop_rx).await;
         });
 
         // Start playback if not running. Output : id explicite si défini,
@@ -946,6 +995,7 @@ fn encoder_thread(
     channel_index: Option<u8>,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
+    perfstats: PerfHandles,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
@@ -1046,6 +1096,12 @@ fn encoder_thread(
         // Receive audio chunks from CPAL
         match sample_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(samples) => {
+                // Sprint S1 — chrono début du tour : depuis la sortie de
+                // `sample_rx` jusqu'à l'envoi RTP final. Mesure la latence
+                // INTERNE du pipeline (hors buffer CPAL en amont qui dépend
+                // du HAL OS). Coût `Instant::now()` ≈ 30 ns sur Apple Silicon
+                // — négligeable comparé au budget RT 2.7 ms par bloc.
+                let t_block_start = std::time::Instant::now();
                 // RMS calculé sur le canal qui part réellement sur le réseau
                 // (après remap) → le VU-mètre reflète le son transmis, pas la somme brute.
                 let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
@@ -1175,7 +1231,21 @@ fn encoder_thread(
                                 &[]
                             };
                             first_subblock = false;
-                            match host.process_stereo(handle, &mut plugin_left, &mut plugin_right, midi_for_block) {
+                            // Sprint S1 — wall-clock guard plugin INSERT. Mesure
+                            // par sous-bloc PLUGIN_BLOCK (= 128 frames stéréo).
+                            // Le seuil de bypass auto (S5) sera calculé sur cette
+                            // distribution. Coût `Instant::now()` ≈ 30 ns × 2.
+                            let t_plugin = std::time::Instant::now();
+                            let plugin_result = host.process_stereo(
+                                handle,
+                                &mut plugin_left,
+                                &mut plugin_right,
+                                midi_for_block,
+                            );
+                            let plugin_elapsed_ms =
+                                t_plugin.elapsed().as_secs_f32() * 1000.0;
+                            perfstats.plugin_latency.lock().observe(plugin_elapsed_ms);
+                            match plugin_result {
                                 Ok(()) => {
                                     for (k, j) in (idx..end).enumerate() {
                                         stereo[j * 2] = plugin_left[k];
@@ -1276,6 +1346,15 @@ fn encoder_thread(
                         }
                     }
                 }
+
+                // Sprint S1 — fin du tour : capture→send latency mesurée du
+                // pop `sample_rx` jusqu'ici (juste après le dernier try_send
+                // RTP). Inclut remap + resample + plugin + RMS + Opus +
+                // RTP build + handoff au channel tokio (= côté pipeline pur,
+                // hors UDP réseau qui est asynchrone via le tokio task).
+                let block_elapsed_ms =
+                    t_block_start.elapsed().as_secs_f32() * 1000.0;
+                perfstats.pipeline_latency.lock().observe(block_elapsed_ms);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1291,6 +1370,7 @@ async fn recv_decode_task(
     sfu_addr: SocketAddr,
     producer_id: String,
     mixer: Arc<Mutex<AudioMixer>>,
+    drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut decoder = match MusicDecoder::new() {
@@ -1304,6 +1384,12 @@ async fn recv_decode_task(
     // T4.2a — DriftEstimator (mesure pure pour l'instant, log toutes les 30s)
     let drift_label = producer_id.chars().take(8).collect::<String>();
     let mut drift = DriftEstimator::new(drift_label);
+    // Sprint S1 — pour ne pas écraser le hashmap à chaque paquet RTP (= 50/s
+    // par stream), on snapshot le ppm périodiquement. Le DriftEstimator
+    // recalcule à chaque observe() en interne, donc lire 1×/s côté ws_server
+    // donne déjà une vue actuelle ; ici on push uniquement quand la valeur
+    // a "bougé sensiblement" (> 1 ppm) pour minimiser la contention Mutex.
+    let mut last_pushed_ppm: f64 = 0.0;
 
     // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -1355,6 +1441,18 @@ async fn recv_decode_task(
                         if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
                             // T4.2a — alimente l'estimateur de dérive d'horloge
                             drift.observe(_header.timestamp, std::time::Instant::now());
+                            // Sprint S1 — push le ppm courant dans le hashmap
+                            // partagé si la valeur a bougé de > 1 ppm depuis
+                            // la dernière push. Évite la contention Mutex à
+                            // 50 Hz et garde le hashmap lisible pour ws_server
+                            // (1 Hz). À warmup le ppm reste à 0.0 (cf. drift.rs).
+                            let current_ppm = drift.drift_ppm();
+                            if (current_ppm - last_pushed_ppm).abs() > 1.0 {
+                                drift_ppm_by_producer
+                                    .lock()
+                                    .insert(producer_id.clone(), current_ppm);
+                                last_pushed_ppm = current_ppm;
+                            }
                             // Detect packet loss → PLC
                             if let Some(prev) = last_seq {
                                 let expected = prev.wrapping_add(1);
@@ -1417,4 +1515,8 @@ async fn recv_decode_task(
         }
     }
 
+    // Sprint S1 — retire l'entrée drift_ppm de ce producer au shutdown du
+    // task. Sans ça, un peer disparu laisse un ppm fantôme dans le hashmap
+    // → le PerfStats publié continuerait à mentionner ce peer mort.
+    drift_ppm_by_producer.lock().remove(&producer_id);
 }

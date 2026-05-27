@@ -418,6 +418,25 @@ impl AudioMixer {
         }).collect()
     }
 
+    /// Sprint S1 — snapshot perf par stream remote (self-monitor exclu).
+    /// Retourne (producer_id, underruns_cumul, drift_drops_cumul, target_ms_courant).
+    /// Counters monotones depuis la création du stream — le browser fait la
+    /// différence entre 2 snapshots s'il veut une cadence par seconde.
+    pub fn stream_perf_stats(&self) -> Vec<(String, u64, u64, usize)> {
+        self.streams
+            .iter()
+            .filter(|(k, _)| k.as_str() != SELF_MONITOR_ID)
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    s.jitter.underruns(),
+                    s.jitter.drift_drops(),
+                    s.jitter.target_ms(),
+                )
+            })
+            .collect()
+    }
+
     /// Number of active REMOTE streams (self-monitor exclu).
     pub fn stream_count(&self) -> usize {
         self.streams.keys().filter(|k| k.as_str() != SELF_MONITOR_ID).count()
