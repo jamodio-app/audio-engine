@@ -359,6 +359,19 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // Skip le 1er tick immédiat (sinon flush vide juste après connect).
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
+        // Sprint S6 — anti-spam PeerUnstable par producer_id. Map<id, Instant>
+        // contenant le dernier instant d'émission. Émis au max 1× / 30 s par
+        // peer (= si le peer reste instable, l'agent renvoie périodiquement
+        // pour signaler la situation continue, mais sans flooder).
+        let mut last_peer_unstable_emit: std::collections::HashMap<
+            String,
+            Instant,
+        > = std::collections::HashMap::new();
+        const PEER_UNSTABLE_COOLDOWN: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        const PEER_UNSTABLE_WINDOW: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        const PEER_UNSTABLE_THRESHOLD: usize = 16;
         loop {
             interval.tick().await;
             let pl = perfstats_pipeline.lock().await;
@@ -380,6 +393,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 pl.perfstats.drift_ppm_by_producer.lock().clone();
             // Snapshot mixer stats (underruns + drift_drops cumul + target_ms)
             let mixer_stats = pl.mixer.lock().stream_perf_stats();
+            // Sprint S6 — récupère les peers REMOTE instables (= > 16 drift
+            // drains sur fenêtre 30 s). Le mixer purge ses VecDeque internes
+            // au passage. Retour : (producer_id, events_window, drains_total).
+            let unstable_peers: Vec<(String, usize, u64)> = pl
+                .mixer
+                .lock()
+                .stream_unstable_events(
+                    PEER_UNSTABLE_WINDOW,
+                    PEER_UNSTABLE_THRESHOLD,
+                );
             // Nom du plugin actif (si chargé) pour `PluginPerf.name` — sinon
             // on omet PluginPerf entièrement.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -591,6 +614,44 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 if perfstats_tx.send(msg).await.is_err() {
                     break;
                 }
+            }
+
+            // Sprint S6 — émet AgentMessage::PeerUnstable pour chaque peer
+            // au-dessus du seuil. Anti-spam : 1× / 30 s par producer_id.
+            // Le browser maintient le badge "⚠ X envoie par à-coups" pendant
+            // 60 s après le dernier message (= si message renvoyé toutes les
+            // 30 s, badge reste affiché ; sinon il disparaît).
+            let now = Instant::now();
+            for (producer_id, events_window, drains_total) in unstable_peers {
+                let should_emit = match last_peer_unstable_emit.get(&producer_id) {
+                    Some(last) => now.duration_since(*last) >= PEER_UNSTABLE_COOLDOWN,
+                    None => true,
+                };
+                if !should_emit {
+                    continue;
+                }
+                let drift_ppm = drift_map.get(&producer_id).copied().unwrap_or(0.0);
+                tracing::warn!(
+                    target: "jamodio::mixer",
+                    producer = &producer_id[..8.min(producer_id.len())],
+                    events_window,
+                    drains_total,
+                    drift_ppm,
+                    "peer instable détecté — envoie en bursts"
+                );
+                if perfstats_tx
+                    .send(AgentMessage::PeerUnstable {
+                        producer_id: producer_id.clone(),
+                        drift_drains_window: events_window as u64,
+                        drift_drains_total: drains_total,
+                        drift_ppm,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                last_peer_unstable_emit.insert(producer_id, now);
             }
         }
     });

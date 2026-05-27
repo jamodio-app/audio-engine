@@ -477,6 +477,36 @@ pub enum AgentMessage {
         #[serde(rename = "pluginName")]
         plugin_name: String,
     },
+    /// Sprint S6 — Alerte de peer instable : un producer distant a accumulé
+    /// trop de `drift_drain` sur fenêtre 30 s (> 16 events = ~1 par 2 s).
+    /// Indique que le peer envoie par bursts (encoder stalls, Opus DTX
+    /// pause/resume, CPU saturé chez lui, etc.) → on draine périodiquement
+    /// son jitter buffer côté nous → micro-discontinuités audibles.
+    ///
+    /// **Pas une action critique** : le peer continue d'être audible
+    /// (avec drains crossfade). Le but est d'INFORMER l'utilisateur côté
+    /// browser (badge ⚠ sur la tranche du peer concerné) pour qu'il puisse
+    /// inviter le peer à fermer ses apps gourmandes ou changer de carte
+    /// audio.
+    ///
+    /// Anti-spam : émis au max 1× par 30 s par producer_id (= si le peer
+    /// reste instable, l'agent renvoie périodiquement pour signaler la
+    /// situation continue ; si la situation s'améliore, le badge UI
+    /// disparaît après 60 s sans nouveau message).
+    PeerUnstable {
+        #[serde(rename = "producerId")]
+        producer_id: String,
+        /// Nombre de drift drains observés sur la fenêtre 30 s.
+        #[serde(rename = "driftDrainsWindow")]
+        drift_drains_window: u64,
+        /// Cumul depuis le début du stream (= contexte diagnostic).
+        #[serde(rename = "driftDrainsTotal")]
+        drift_drains_total: u64,
+        /// Dernier `drift_ppm` connu pour ce producer (= contexte, non-zéro
+        /// signifie clock skew sender↔receiver détecté).
+        #[serde(rename = "driftPpm")]
+        drift_ppm: f64,
+    },
     /// Sprint INSERT instruments (S2) — réponse à `ListMidiDevices`.
     MidiDeviceList {
         devices: Vec<MidiDeviceWire>,

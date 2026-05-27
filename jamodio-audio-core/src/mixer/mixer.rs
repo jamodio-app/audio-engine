@@ -73,6 +73,13 @@ struct StreamState {
     /// Idem pour le drift drain (pull-side).
     last_drift_drops: u64,
     drift_drain_count: u64,
+    /// Sprint S6 — timestamps des drift drains observés sur la fenêtre
+    /// glissante `UNSTABLE_WINDOW_SECS`. Purgé à chaque ajout (= cold path
+    /// car ~1 drain max par 2 s). Sert à détecter un peer "instable" qui
+    /// envoie en bursts (encoder stalls côté lui, Opus DTX, CPU saturé, etc.).
+    /// `VecDeque` pré-alloué cap 32 = couvre une fenêtre 30 s sans
+    /// réallocation tant que le burst rate < 1 drain/s.
+    drift_drain_history: std::collections::VecDeque<std::time::Instant>,
 }
 
 impl AudioMixer {
@@ -135,6 +142,7 @@ impl AudioMixer {
             buffer_full_count: 0,
             last_drift_drops: 0,
             drift_drain_count: 0,
+            drift_drain_history: std::collections::VecDeque::with_capacity(32),
         });
     }
 
@@ -164,6 +172,7 @@ impl AudioMixer {
             buffer_full_count: 0,
             last_drift_drops: 0,
             drift_drain_count: 0,
+            drift_drain_history: std::collections::VecDeque::with_capacity(32),
         });
     }
 
@@ -304,6 +313,17 @@ impl AudioMixer {
             let new_drops = stream.jitter.drift_drops();
             if new_drops > stream.last_drift_drops {
                 stream.drift_drain_count += 1;
+                // Sprint S6 — track ce drain dans la fenêtre glissante 30 s
+                // pour la détection peer instable. Push timestamp.
+                // (Purge à la lecture côté `stream_unstable_events`.)
+                stream.drift_drain_history.push_back(std::time::Instant::now());
+                // Garde-fou anti-mémoire : si jamais la fenêtre n'est pas
+                // purgée (= caller oublie de call stream_unstable_events),
+                // on cap à 256 entrées (= ~1 min de drains à 4 Hz, suffisant
+                // pour signaler une instabilité massive).
+                while stream.drift_drain_history.len() > 256 {
+                    stream.drift_drain_history.pop_front();
+                }
                 // Bug D : on logue uniquement les drains sévères (events > 4).
                 // Les small drifts (1-4) sont normaux et bruyaient le log
                 // sans signal. Combiné avec is_power_of_two, on logue à
@@ -416,6 +436,44 @@ impl AudioMixer {
         self.streams.iter().map(|(id, stream)| {
             (id.clone(), stream.rms)
         }).collect()
+    }
+
+    /// Sprint S6 — purge la fenêtre glissante de drift drains et retourne
+    /// les peers REMOTE dont le compte d'events sur la fenêtre dépasse
+    /// `threshold`. Self-monitor exclu (= ses drains reflètent overload
+    /// agent local, pas un peer distant instable — cf. AgentPipelineOverload).
+    ///
+    /// Retourne `(producer_id, drift_drains_window, drift_drains_total)`.
+    pub fn stream_unstable_events(
+        &mut self,
+        window: std::time::Duration,
+        threshold: usize,
+    ) -> Vec<(String, usize, u64)> {
+        let now = std::time::Instant::now();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        let mut out = Vec::new();
+        for (producer_id, stream) in self.streams.iter_mut() {
+            if producer_id.as_str() == SELF_MONITOR_ID {
+                continue;
+            }
+            // Purge les timestamps hors fenêtre (= plus anciens que cutoff).
+            while let Some(&front) = stream.drift_drain_history.front() {
+                if front < cutoff {
+                    stream.drift_drain_history.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let events_window = stream.drift_drain_history.len();
+            if events_window > threshold {
+                out.push((
+                    producer_id.clone(),
+                    events_window,
+                    stream.drift_drain_count,
+                ));
+            }
+        }
+        out
     }
 
     /// Sprint S1 — snapshot perf par stream remote (self-monitor exclu).

@@ -6,6 +6,84 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.10] — 2026-05-27
+
+### Added — Sprint S6 (partiel) : détection peer instable + re-switch HD
+
+**Dernier sprint avant BETA** du chantier stabilité agent
+(PLAN-EXECUTION-AGENT-STABILITE.md). Ferme le scope visible utilisateur
+sur les sessions multi-peers.
+
+S6.3 (anti-flap WS persistante) **différé en post-BETA** : v0.4.3
+(slot single-client auto-recycle) a déjà résolu le bug fonctionnel
+sous-jacent ; le cycle close/reconnect cosmétique reste sans impact UX.
+
+#### S6.1 — Détection peer instable (drift drain bursts)
+
+Côté agent :
+- `AudioMixer::stream_unstable_events(window, threshold)` : nouvelle
+  méthode publique qui purge la fenêtre glissante (`VecDeque<Instant>`
+  par stream, alimentée à chaque drift drain dans `report_drift_drops`)
+  et retourne les peers REMOTE au-dessus du seuil. Self-monitor exclu
+  (= ses drains reflètent overload local, pas un peer distant).
+- `ws_server perfstats_task` : à chaque tick 1 Hz, lit les peers
+  instables et émet `AgentMessage::PeerUnstable { producer_id,
+  drift_drains_window, drift_drains_total, drift_ppm }`.
+  Anti-spam : 1× toutes les 30 s par `producer_id` (= si le peer reste
+  instable, l'agent renvoie périodiquement pour signaler la situation
+  continue ; sinon le badge UI disparaît après 60 s sans message).
+- Seuil retenu : **> 16 drift drains sur fenêtre 30 s** (= ~1 par 2 s,
+  cohérent avec le pattern Yannick observé en baseline 22/05).
+- Log warn `jamodio::mixer` (= visible dans agent.log).
+
+Côté browser :
+- Handler `case 'peer-unstable'` dans `groupe.js handleAgentMessage` :
+  recherche le peer via `p.agentMusicProducerId === msg.producerId`,
+  set `p.unstable = true` + métadata, appelle `applyPeerUnstableBadge(p)`.
+- Badge ⚠ flottant haut-droite de la tranche peer concernée
+  (`.gr-ch-unstable-badge` + classe `.unstable` sur `.gr-channel`).
+- Tooltip i18n FR + EN avec détail : "X envoie par à-coups (Y drains/
+  30 s · Z ppm) — encoder saturé chez X ou wifi instable".
+- Auto-clear : interval 5 s qui retire le badge si pas de nouveau
+  message depuis 60 s (= peer s'est stabilisé).
+
+#### S6.2 — Re-switch HD au retour de l'Audio Engine en session
+
+Côté browser uniquement. Listener sur `agentStatus.on('change')` :
+- Quand l'agent passe en CONNECTED ALORS QUE on est en session active
+  (`currentRoomId !== null`) ET en mode fallback WebRTC
+  (`!agentConnected`) ET on était précédemment en HD
+  (`cm.wasInAgentMode === true`) ET pas déjà proposé sur cette session :
+  - Affiche un toast non-intrusif "🎚 Audio Engine reconnecté — tu peux
+    repasser en mode HD" avec bouton **"Repasser HD"** qui déclenche
+    `tryFullRejoin('user-accepted-hd-reswitch')` (= existant) → cycle
+    leave + rejoin + start-capture → audio HD restauré.
+- Pas de migration automatique : confirmation user obligatoire (= éviter
+  de couper l'audio pendant une jam si le retour agent est instable).
+- Flag `_agentBackPrompted` empêche le spam (= 1 toast par session).
+
+i18n FR + EN : `jam.agentBackReSwitch` + `jam.agentBackReSwitchAction`.
+
+### Notes
+
+- cargo test --workspace : 29 verts. cargo build --release Mac OK.
+- Pas de régression latence attendue (= S6 est cold path WS, hors hot
+  audio).
+- Compat browser v0.4.1+ : message `peer-unstable` ignoré silencieusement
+  par un browser ancien.
+- Build matrix CI inchangée (Mac ARM + Windows x64 via tag `v*`).
+
+### Backlog post-BETA (déféré)
+
+- **S6.3 anti-flap WS persistante** : refactor `agentWs` en singleton
+  `main.js` pour éviter le cycle close/reconnect à chaque navigation.
+  3-4 h de dev, risque modéré, pas critique depuis v0.4.3.
+- **Optimisation LoadInstrumentPlugin non-blocking** : background load
+  + swap atomic pour éliminer le spike 100-3000 ms observé v0.4.9.
+- **Test multi-thread `rt_priority` au CI** : éviter une régression
+  type v0.4.5 (1 thread RT au lieu de 3).
+- **Bench mock plugin sleep(20 ms)** : test artificiel S5 overload.
+
 ## [0.4.9] — 2026-05-27
 
 ### Added — Détection saturation pipeline (BFD-like) + watchdog 5s
