@@ -89,16 +89,27 @@ fn make_hello() -> AgentMessage {
 }
 
 /// Handle partagé pour le serveur WS. Permet :
-///   - Single-client policy via `client_active` (AtomicBool)
+///   - Single-client policy avec **kick automatique** du précédent (v0.4.3) :
+///     `client_active` reste un AtomicBool de monitoring, mais le slot est
+///     géré via `active_client_killer` qui permet d'évincer le client zombie
+///     au lieu de rejeter le nouveau. Résout le pattern "agent déjà utilisé"
+///     observé en prod 27/05 (WS browser half-open après tab close brutal,
+///     slot agent jamais libéré jusqu'au quit+relance manuel).
 ///   - Broadcast d'événements globaux (Shutdown sur auto-update) à tous les
 ///     clients connectés via `shutdown_tx` (tokio broadcast channel).
 #[derive(Clone)]
 pub struct WsServerHandle {
     pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
-    /// True quand une WS browser est connectée et active. Les WS suivantes
-    /// sont rejetées (single-client policy) pour éviter les races sur le
-    /// shared `PipelineState`.
+    /// True quand une WS browser EXTERNE est connectée et tient le slot.
+    /// Sert au monitoring (pas à la décision d'admission). Cf. `active_client_killer`.
     client_active: Arc<AtomicBool>,
+    /// v0.4.3 — Sender oneshot du client externe actuellement actif. Le nouveau
+    /// client envoie via ce channel pour "kick" le précédent, qui voit sa
+    /// receive loop break (cf. `tokio::select!` ws_rx + killer_rx). Une fois
+    /// le slot libéré (cleanup terminé), le nouveau le reprend.
+    /// `parking_lot::Mutex` car contention minimale (au plus 1×/connexion).
+    active_client_killer:
+        Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<&'static str>>>>,
     /// Broadcast channel pour notifier tous les clients connectés (1 seul en
     /// pratique avec single-client) qu'un shutdown est imminent (auto-update).
     /// Capacité 4 : largement suffisant pour les ~quelques events de cycle de vie.
@@ -111,6 +122,7 @@ impl WsServerHandle {
         Self {
             pipeline,
             client_active: Arc::new(AtomicBool::new(false)),
+            active_client_killer: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_tx,
         }
     }
@@ -192,34 +204,65 @@ pub async fn start(handle: WsServerHandle) {
     }
 }
 
+/// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
+/// `true` si on doit continuer la receive loop, `false` si on doit la
+/// quitter (envoi sortant cassé). Partagé entre la branche `is_internal`
+/// et la branche externe (qui ajoute en plus killer/watchdog).
+async fn handle_one_message(
+    msg: Message,
+    handle: &WsServerHandle,
+    out_tx: &tokio_mpsc::Sender<AgentMessage>,
+) -> bool {
+    let Message::Text(text) = msg else { return true };
+
+    let browser_msg = match serde_json::from_str::<BrowserMessage>(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            let truncated = &text[..text.len().min(120)];
+            tracing::warn!(
+                target: "jamodio::ws",
+                error = %e,
+                payload = truncated,
+                "invalid browser message"
+            );
+            let err = AgentMessage::Error {
+                message: format!("Invalid message: {} (parse error: {})", truncated, e),
+            };
+            let _ = out_tx.send(err).await;
+            return true;
+        }
+    };
+
+    let responses = handle_message(browser_msg, &handle.pipeline).await;
+    for resp in responses {
+        if out_tx.send(resp).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_internal: bool) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Single-client policy : si une WS NON-INTERNE est déjà active, rejeter
-    // celle-ci. Évite les races sur le shared PipelineState (2 onglets browser
-    // qui se battent pour StartCapture). Les clients internes (UI Tauri webview)
-    // sont autorisés en parallèle car ils sont lecture-seule (get-stats).
+    // v0.4.3 — Single-client policy avec **kick du précédent à la promotion**
+    // au lieu d'un rejet sec. Critique : on NE PROMEUT PAS la connexion au
+    // moment du `on_upgrade` (= aucun kick sur simple open WS), seulement
+    // à la réception du PREMIER BrowserMessage (typiquement HelloAck).
+    // Justification :
+    //   - agent-status.js émet des probes périodiques : ouvre WS, lit Hello,
+    //     ferme. Aucun BrowserMessage envoyé. Si on kickait au connect, chaque
+    //     probe killerait la session active du même browser !
+    //   - groupe.js detectAgent() envoie HelloAck juste après réception Hello.
+    //     C'est ce HelloAck qui sert de "preuve de session réelle" et
+    //     déclenche la promotion + kick du précédent.
     //
-    // compare_exchange : atomique, pas de race entre 2 connexions concurrentes.
-    if !is_internal
-        && handle
-            .client_active
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-    {
-        tracing::warn!(
-            target: "jamodio::ws",
-            "rejecting concurrent WS connection — another external client already active"
-        );
-        let rejected = AgentMessage::Rejected {
-            reason: "another client is already connected to this agent".to_string(),
-        };
-        let _ = ws_tx
-            .send(Message::Text(serde_json::to_string(&rejected).unwrap()))
-            .await;
-        let _ = ws_tx.close().await;
-        return;
-    }
+    // Le slot `client_active` + `active_client_killer` sont donc pris en
+    // charge dans le receive loop ci-dessous (cherche `// PROMOTION`).
+    //
+    // Les clients internes (UI Tauri webview) bypass tout slot management.
+    let mut killer_rx: Option<tokio::sync::oneshot::Receiver<&'static str>> = None;
+    let mut slot_taken = false;
 
     tracing::info!(target: "jamodio::ws", is_internal, "client connected");
 
@@ -439,48 +482,151 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     });
 
-    // Message receive loop
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let Message::Text(text) = msg else { continue };
+    // v0.4.3 — Receive loop unifié.
+    //
+    // Critères d'arrêt :
+    //   1. WS fermée proprement (close frame du browser, erreur réseau)
+    //   2. Eviction par un nouveau client (killer_rx — uniquement post-promotion)
+    //   3. Watchdog (uniquement post-promotion, voir détail ci-dessous)
+    //
+    // Phases :
+    //   - PRE-PROMOTION : on attend un BrowserMessage. Le timeout est
+    //     généreux (60 s) car un probe peut juste lire Hello et fermer,
+    //     mais on veut pouvoir détecter une session "abandonnée" qui ne
+    //     fait que rester ouverte sans rien envoyer. Pas de slot pris,
+    //     pas de killer armé.
+    //   - POST-PROMOTION (déclenchée par 1er BrowserMessage côté externe) :
+    //     on prend le slot, on kick le précédent client, on arme le killer.
+    //     Le watchdog devient 5 s (heartbeat browser = 1.5 s × 3 = 4.5 s).
+    //
+    // Les clients internes (UI Tauri webview) restent en phase pre-promotion :
+    // pas de slot, pas de killer, pas de watchdog agressif.
+    const PRE_PROMOTION_IDLE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(60);
+    const POST_PROMOTION_WATCHDOG: std::time::Duration =
+        std::time::Duration::from_secs(5);
 
-        let browser_msg = match serde_json::from_str::<BrowserMessage>(&text) {
-            Ok(m) => m,
-            Err(e) => {
-                let truncated = &text[..text.len().min(120)];
-                tracing::warn!(
-                    target: "jamodio::ws",
-                    error = %e,
-                    payload = truncated,
-                    "invalid browser message"
-                );
-                let err = AgentMessage::Error {
-                    message: format!("Invalid message: {} (parse error: {})", truncated, e),
-                };
-                let _ = out_tx.send(err).await;
-                continue;
+    let mut exit_reason: &'static str = "ws-closed-normally";
+
+    loop {
+        let current_timeout = if slot_taken {
+            POST_PROMOTION_WATCHDOG
+        } else {
+            PRE_PROMOTION_IDLE_TIMEOUT
+        };
+
+        // Branche killer : `pending()` tant qu'on n'a pas armé (pre-promotion).
+        let killer_fut = async {
+            match killer_rx.as_mut() {
+                Some(rx) => rx.await.ok(),
+                None => std::future::pending().await,
             }
         };
 
-        let responses = handle_message(browser_msg, &handle.pipeline).await;
-        for resp in responses {
-            if out_tx.send(resp).await.is_err() {
+        tokio::select! {
+            biased; // priorité au killer pour libérer le slot vite
+            kicked = killer_fut => {
+                exit_reason = kicked.unwrap_or("displaced");
                 break;
+            }
+            ws_msg = tokio::time::timeout(current_timeout, ws_rx.next()) => {
+                match ws_msg {
+                    Err(_) => {
+                        if slot_taken {
+                            // Heartbeat 1.5 s côté browser aurait dû arriver.
+                            // 5 s sans message = WS half-open (tab killed,
+                            // kernel buffer saturé, etc.). Libère le slot.
+                            tracing::warn!(
+                                target: "jamodio::ws",
+                                timeout_secs = POST_PROMOTION_WATCHDOG.as_secs(),
+                                "watchdog timeout post-promotion — releasing slot"
+                            );
+                            exit_reason = "watchdog-timeout";
+                        } else {
+                            // Pre-promotion idle : probe qui n'a pas fermé,
+                            // ou client mort avant HelloAck. On ferme.
+                            tracing::debug!(
+                                target: "jamodio::ws",
+                                "pre-promotion idle timeout — closing"
+                            );
+                            exit_reason = "pre-promotion-idle";
+                        }
+                        break;
+                    }
+                    Ok(None) => break, // WS closed by browser side
+                    Ok(Some(Err(e))) => {
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            error = %e,
+                            "ws receive error — closing connection"
+                        );
+                        exit_reason = "ws-error";
+                        break;
+                    }
+                    Ok(Some(Ok(msg))) => {
+                        // PROMOTION : premier BrowserMessage reçu d'un client
+                        // externe ⇒ c'est une vraie session, on prend le slot
+                        // et on kick le précédent.
+                        if !slot_taken && !is_internal {
+                            slot_taken = true;
+                            let (new_killer_tx, new_killer_rx) =
+                                tokio::sync::oneshot::channel();
+                            let previous = handle
+                                .active_client_killer
+                                .lock()
+                                .replace(new_killer_tx);
+                            if let Some(prev) = previous {
+                                tracing::warn!(
+                                    target: "jamodio::ws",
+                                    "displacing previous external client (stale slot — likely half-open WS or rapid reconnect)"
+                                );
+                                // Best-effort : Err si receiver déjà drop.
+                                let _ = prev.send("displaced-by-new-client");
+                                // Pause courte pour laisser cleanup ancien
+                                // (stop_all peut prendre quelques ms).
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(50),
+                                ).await;
+                            }
+                            handle.client_active.store(true, Ordering::SeqCst);
+                            killer_rx = Some(new_killer_rx);
+                            tracing::info!(
+                                target: "jamodio::ws",
+                                "external client promoted (first BrowserMessage received) — watchdog armed"
+                            );
+                        }
+
+                        if !handle_one_message(msg, &handle, &out_tx).await {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 
-    tracing::info!(target: "jamodio::ws", is_internal, "client disconnected — cleanup");
+    tracing::info!(
+        target: "jamodio::ws",
+        is_internal,
+        promoted = slot_taken,
+        reason = exit_reason,
+        "client disconnected — cleanup"
+    );
 
     levels_task.abort();
     perfstats_task.abort();
     send_task.abort();
     shutdown_task.abort();
 
-    // Cleanup pipeline UNIQUEMENT pour les clients externes (jamodio.com).
-    // Les clients internes (UI Tauri webview) ne pilotent pas le pipeline,
-    // donc leur close ne doit PAS stop_all (sinon le browser actif perd
-    // sa session quand on ferme la fenêtre Tauri par erreur).
-    if !is_internal {
+    // v0.4.3 — Cleanup pipeline UNIQUEMENT pour les clients externes
+    // qui ont été PROMUS (= ont envoyé au moins un BrowserMessage et donc
+    // pris le slot). Un client externe non promu (= probe qui a juste lu
+    // Hello et fermé) ne touche pas au pipeline et ne libère pas de slot.
+    //
+    // Les clients internes (UI Tauri webview) ne pilotent jamais le pipeline,
+    // donc leur close ne doit PAS stop_all (sinon le browser actif perd sa
+    // session quand on ferme la fenêtre Tauri par erreur).
+    if !is_internal && slot_taken {
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
             handle.pipeline.lock(),
@@ -493,8 +639,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 "pipeline lock timeout during cleanup — stop_all skipped (next client will see stale state)"
             ),
         }
-        // Libère le single-client slot uniquement si on l'avait pris (pas
-        // pour les clients internes qui n'ont jamais consommé le slot).
+        // Libère le slot. Note : on ne `take()` PAS notre Sender dans
+        // `active_client_killer` car s'il a été displaced, c'est déjà le
+        // Sender d'un autre client qui occupe le slot. Le mutex contient
+        // potentiellement un sender stale ; le prochain `replace()` retournera
+        // un Err silencieux sur `send()` (receiver drop) — OK, idempotent.
         handle.client_active.store(false, Ordering::SeqCst);
     }
 }

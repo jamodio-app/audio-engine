@@ -6,6 +6,86 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-05-27
+
+### Fixed — Slot single-client : kick automatique du précédent + watchdog
+
+Résolution du bug "agent déjà utilisé" remonté en prod 27/05 (cf. mémoire
+`agent_slot_libre_todo.md`). Initialement prévu pour S6 du chantier
+stabilité, sorti en patch d'urgence pour débloquer les tests v0.4.2.
+
+#### Symptôme
+
+À chaque connexion au studio (alors que l'Audio Engine est ONLINE), le
+browser reçoit `Rejected: another client is already connected`. Seule
+solution : Quit + relance manuelle de l'agent depuis "Lancer" — encore
+échouait à 1 essai sur 2. Cycle de frustration : impossible de tester
+la version v0.4.2 sans cette répétition mécanique.
+
+#### Cause racine
+
+L'`encoder_thread` côté Rust gardait `client_active = true` après une
+fermeture de tab brutale du browser (reload rapide, kill du Chrome,
+fermeture sans `beforeunload`). La WS restait half-open côté agent
+(TCP keepalive macOS = plusieurs minutes), le slot single-client était
+verrouillé jusqu'au quit/restart du process.
+
+#### Fix
+
+Deux mécanismes ajoutés au `ws_server::handle_connection`, complémentaires :
+
+1. **Promotion à la réception du 1er BrowserMessage** : la connexion WS
+   ne prend PAS immédiatement le slot single-client. Elle entre en phase
+   "pré-promotion" qui sert juste à recevoir le `Hello` agent → fermer
+   (comportement standard des probes `agent-status.js`). Quand un **vrai**
+   BrowserMessage arrive (typiquement le `HelloAck` envoyé par
+   `groupe.js detectAgent()`), la connexion est promue : elle prend le
+   slot et **kick le client précédent** s'il y en a un.
+
+   Bénéfice : les probes `agent-status.js` ne kickent plus la session
+   active (régression évitée du design initial qui n'avait pas cette
+   distinction).
+
+2. **Watchdog heartbeat 5 s post-promotion** : une fois le slot pris,
+   la connexion attend des messages browser. Le heartbeat `get-stats`
+   du browser arrive normalement toutes les 1.5 s
+   (`groupe.js startAgentHeartbeat`). 5 s sans message = WS half-open =
+   slot libéré automatiquement (pas d'attente du TCP keepalive système).
+
+#### Mécanisme technique
+
+- Nouveau champ `WsServerHandle.active_client_killer:
+  Arc<parking_lot::Mutex<Option<oneshot::Sender<&'static str>>>>`. À la
+  promotion d'un nouveau client, `replace()` du sender → si Some(prev),
+  `prev.send("displaced-by-new-client")` → le client précédent voit son
+  killer_rx déclencher dans son `tokio::select!` et break la receive
+  loop → cleanup standard (stop_all + slot libre).
+- Pause de 50 ms après le kick pour laisser le cleanup ancien finir
+  (notamment `stop_all()` qui prend quelques ms).
+- Helper `handle_one_message()` extrait pour partager le code entre la
+  branche pre-promotion et post-promotion.
+- Le `Rejected` message reste défini dans le protocole (compat browsers
+  legacy) mais n'est plus jamais envoyé.
+
+#### Log structuré
+
+Le tag `jamodio::ws` log à `info` :
+- `"client connected" is_internal=...` au open
+- `"external client promoted (first BrowserMessage received)"` à la promotion
+- `"displacing previous external client (stale slot)"` au kick d'un précédent
+- `"client disconnected — cleanup" reason=<displaced|watchdog-timeout|
+  ws-closed-normally|pre-promotion-idle|ws-error>` à la sortie
+
+→ Le bug-report contient la trace exacte du comportement (qui kick qui,
+qui timeout). Plus de "pourquoi le slot était bloqué".
+
+### Notes
+
+- Tests : `cargo test --workspace` : 29 verts (inchangé).
+- Compatible avec le browser v0.4.1+ sans modif — la sémantique probe vs
+  session est entièrement dérivée du comportement existant côté browser.
+- Build matrix CI inchangée. Pas de nouvelle dépendance.
+
 ## [0.4.2] — 2026-05-27
 
 ### Changed — Sprint S2 stabilité : priorité RT effective (workgroup + MMCSS)
