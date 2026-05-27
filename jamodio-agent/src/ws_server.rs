@@ -11,6 +11,7 @@ use jamodio_audio_core::protocol::{
     AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
     RecordStemSpec, RecordedFileWire, StreamLevel, PROTOCOL_VERSION,
 };
+use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -390,6 +391,49 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let plugin_name: Option<String> = None;
 
+            // v0.4.9 — détection saturation pipeline globale (= capture_drops
+            // burst, distinct du plugin overload S5). Cas typique : sample-load
+            // brutal d'un plugin sampler (BFD Player, Kontakt) qui bloque
+            // l'encoder thread alors que `plugin_latency` reste sous le seuil
+            // (les blocs droppés ne traversent pas le plugin → pas mesurés).
+            //
+            // Anti-spam : on n'émet qu'une fois toutes les 10 s pour éviter
+            // le flood en cas de saturation prolongée (BFD chargeant plusieurs
+            // samples consécutifs).
+            const PIPELINE_OVERLOAD_DROP_THRESHOLD: u64 = 100;
+            const PIPELINE_OVERLOAD_COOLDOWN_MS: u128 = 10_000;
+            static LAST_PIPELINE_OVERLOAD_EMIT_MS: OnceLock<
+                std::sync::atomic::AtomicU64,
+            > = OnceLock::new();
+            let last_emit_atomic = LAST_PIPELINE_OVERLOAD_EMIT_MS
+                .get_or_init(|| std::sync::atomic::AtomicU64::new(0));
+            let now_ms = perfstats_start.elapsed().as_millis() as u64;
+            let last_emit = last_emit_atomic.load(Ordering::Relaxed);
+            let pipeline_overload_msg: Option<AgentMessage> =
+                if capture_drops_window > PIPELINE_OVERLOAD_DROP_THRESHOLD
+                    && (now_ms as u128)
+                        .saturating_sub(last_emit as u128)
+                        > PIPELINE_OVERLOAD_COOLDOWN_MS
+                {
+                    last_emit_atomic.store(now_ms, Ordering::Relaxed);
+                    let plugin_name_owned =
+                        plugin_name.clone().unwrap_or_default();
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        drops_per_sec = capture_drops_window,
+                        pipeline_p99_ms = pipeline_snap.p99_ms,
+                        plugin = %plugin_name_owned,
+                        "agent pipeline overload — encoder thread bloqué (sample-load plugin ou CPU tiers)"
+                    );
+                    Some(AgentMessage::AgentPipelineOverload {
+                        drops_per_sec: capture_drops_window,
+                        pipeline_p99_ms: pipeline_snap.p99_ms,
+                        plugin_name: plugin_name_owned,
+                    })
+                } else {
+                    None
+                };
+
             // Sprint S5 — détection plugin overload. Seuil = process_stereo
             // p99 > 4 ms (= 150 % du budget RT 2.7 ms) sur fenêtre 1 s avec
             // au moins 100 mesures (= statistiquement représentatif, exclut
@@ -536,6 +580,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // le trigger, puis le toast UI). 1 seul message par cycle
             // d'overload — protégé par `plugin_auto_bypass_active`.
             if let Some(msg) = overload_msg {
+                if perfstats_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+
+            // v0.4.9 — émet le message AgentPipelineOverload (distinct du
+            // plugin overload S5 ; ne déclenche PAS de bypass plugin).
+            if let Some(msg) = pipeline_overload_msg {
                 if perfstats_tx.send(msg).await.is_err() {
                     break;
                 }

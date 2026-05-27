@@ -450,6 +450,33 @@ pub enum AgentMessage {
         /// la fiabilité statistique (= count élevé = trigger justifié).
         count: usize,
     },
+    /// Sprint v0.4.9 — Alerte d'overload PIPELINE (= saturation globale
+    /// agent, distincte d'un plugin lourd). Émis quand `capture_drops_per_sec`
+    /// > 100 sur la fenêtre 1 s — = le CPAL callback ne peut plus pousser ses
+    /// samples dans le sample_rx car l'encoder thread est complètement bloqué.
+    ///
+    /// Cas typique : un plugin sampler (BFD Player, Kontakt…) qui charge
+    /// brutalement un sample depuis disque pendant le hot path, ou un
+    /// process tiers qui mange tout le CPU.
+    ///
+    /// Différent de `InstrumentPluginOverload` :
+    /// - Aucun bypass auto (= on ne touche pas au plugin, qui peut être OK)
+    /// - Toast d'INFO côté browser, pas d'action user requise
+    /// - Anti-spam : émis au max 1× toutes les 10 s pour éviter le flood en
+    ///   cas de saturation continue (ex : sample-load BFD massif).
+    AgentPipelineOverload {
+        /// Nombre de drops CPAL accumulés sur la fenêtre 1 s. > 100 = sévère.
+        #[serde(rename = "dropsPerSec")]
+        drops_per_sec: u64,
+        /// p99 pipeline_latency_ms observé sur la même fenêtre (= temps
+        /// end-to-end CPAL→RTP). Inflated si stages stallés.
+        #[serde(rename = "pipelineP99Ms")]
+        pipeline_p99_ms: f32,
+        /// Nom du plugin actuellement chargé (= contexte diagnostic, le
+        /// plugin n'est PAS forcément le coupable). Vide si aucun.
+        #[serde(rename = "pluginName")]
+        plugin_name: String,
+    },
     /// Sprint INSERT instruments (S2) — réponse à `ListMidiDevices`.
     MidiDeviceList {
         devices: Vec<MidiDeviceWire>,

@@ -6,6 +6,56 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.9] — 2026-05-27
+
+### Added — Détection saturation pipeline (BFD-like) + watchdog 5s
+
+Couvre le **blind spot** du plugin overload S5 identifié sur l'incident
+BFD Player du 27/05 14:37 : encoder thread bloqué brutalement pendant
+3-4 s pour cause de **sample-load** d'un plugin sampler (BFD, Kontakt,
+etc.), sans que `plugin_latency` ne reflète le problème (les blocs CPAL
+sont DROPPÉS avant d'atteindre `process_stereo`, donc pas mesurés).
+
+#### Nouveau signal : `capture_drops > 100/s`
+
+Dans `ws_server perfstats_task` (1 Hz), si le compteur `capture_drops`
+flushé sur la fenêtre 1 s dépasse 100 :
+- Émet `AgentMessage::AgentPipelineOverload { drops_per_sec,
+  pipeline_p99_ms, plugin_name }`
+- Distinct de `InstrumentPluginOverload` (S5) : **PAS de bypass auto**
+  du plugin (qui peut être innocent — c'est un sample-load I/O ou un
+  process tiers CPU)
+- Anti-spam : 1× toutes les 10 s max (= évite le flood quand la
+  saturation dure)
+- Tracing warn `jamodio::ws` (= visible dans agent.log)
+
+#### UX browser
+
+Nouveau handler `case 'agent-pipeline-overload'` dans `groupe.js` :
+- Toast warn 6 s (pas persistant, pas d'action) avec icône ⚠️
+- Template i18n FR + EN : `"Agent saturé ({drops} drops/s) — ferme
+  d'autres apps gourmandes ou choisis un plugin moins lourd"`
+- Pas de bouton "Réactiver" (= rien à réactiver, juste informer)
+
+### Changed — Browser watchdog 3 s → 5 s
+
+`AGENT_WATCHDOG_TIMEOUT_MS: 3000 → 5000` dans `groupe.js`.
+
+Justification : sur l'incident 27/05, le watchdog 3 s a tué la session
+agent alors que l'incident BFD était transitoire (~3-4 s). 5 s tolère
+ces hoquets sans rompre la session ; le toast `AgentPipelineOverload`
+informe quand-même l'utilisateur. Le compromis :
+- 3 s = trop sensible aux spikes plugin (faux positifs)
+- 5 s = bonne marge pour sample-load I/O sans tuer le studio
+- > 10 s = trop tolérant, l'utilisateur attend trop si vrai crash agent
+
+### Notes
+
+- cargo test --workspace : 29 verts.
+- Pas de changement protocole côté `InstrumentPluginOverload` (S5).
+- Compat browser v0.4.1+ : un browser ancien ignore simplement le
+  nouveau type de message `agent-pipeline-overload`.
+
 ## [0.4.8] — 2026-05-27
 
 ### Added — Mesures perfstats par stage (capture/process/encode)
