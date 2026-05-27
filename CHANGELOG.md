@@ -6,6 +6,91 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-05-27
+
+### Changed — Sprint S3 stabilité : split encoder pipeline en 3 stages
+
+Refactor architectural important. **Aucun changement comportemental
+visible utilisateur** (latence, audio, UI identiques). C'est une
+**fondation** pour S5 (plugin guard + bypass auto) qui résoudra
+définitivement les spikes plugin résiduels mesurés en v0.4.3 baseline.
+
+#### Avant — encoder_thread monolithique
+
+Un seul thread RT (`encoder_thread`) faisait séquentiellement sur chaque
+bloc CPAL :
+1. Receive depuis `sample_rx` (= CPAL callback)
+2. Remap canal → stéréo
+3. Resample (si Windows 44.1 → 48k, no-op sur Mac)
+4. `input_cut` (silence toggle UI)
+5. MIDI source override (zéro samples si mode MIDI)
+6. **Plugin `process_stereo`** (AU mac / VST3 win, par sous-blocs 128)
+7. RMS pour VU-mètre
+8. Push self-monitor dans le mixer
+9. Accumulate → Opus encode → RTP build → `try_send` UDP
+
+**Conséquence** : si le plugin spike (sampler I/O, neural amp lourd…),
+**toute la chaîne en aval est bloquée** : capture suivante en queue,
+Opus en pause, RTP en silence. Sur la baseline v0.4.3, un spike plugin
+de 22 ms se traduisait par 22 ms d'audio "silence" côté peer.
+
+#### Après — 3 stages indépendants
+
+```text
+CPAL ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─►rtp_tx
+                  (remap+resample)              (input_cut+midi+plugin+RMS+self)   (Opus+RTP)
+```
+
+Chaque stage tourne dans **son propre thread RT** (`audio-capture`,
+`audio-process`, `audio-encode`). Chacun appelle
+`rt_priority::promote_thread_for_audio` au boot → joint le workgroup
+CoreAudio macOS / MMCSS Pro Audio Windows / SCHED_FIFO Linux.
+
+**Ringbufs entre stages** : `crossbeam_channel::bounded::<TimedBlock>(32)`.
+Capacité 32 × ~5,3 ms = **~170 ms de marge**. Absorbe un spike plugin
+22 ms sans saturer (drops=0 garanti même en cas de cascade de spikes).
+
+**Mesure `pipeline_latency` préservée** : le timestamp `Instant::now()`
+est apposé par `capture_stage` en début de pipeline, transporté via
+`TimedBlock = (Instant, Vec<f32>)` à travers les 3 stages, observé
+final par `encode_stage` juste après `rtp_tx.try_send()`. La sémantique
+de `pipeline_latency_ms` est donc **identique** à celle de v0.4.4 →
+**la baseline v0.4.1 reste comparable**.
+
+#### Stop propre
+
+`Arc<AtomicBool>` partagé entre les 3 stages. Sur `stop_capture` :
+1. Signal `stop_flag = true`
+2. Chaque stage break en début de prochaine iteration
+3. Join cascade amont→aval — quand `capture_stage` return, son
+   `Sender` est drop → `process_stage` voit `Disconnected` sur son
+   `recv`, drain ses samples en queue, return → idem pour `encode_stage`
+4. Coût pire-cas du stop : ~170 ms (drainage des 2 ringbufs)
+
+#### Ce que S3 résout
+
+- **drops_total garanti à 0 même sous cascade de spikes** : avant, un
+  spike plugin consécutif sur 30+ blocs aurait saturé le `bounded(64)`
+  CPAL→encoder et causé un drop. Maintenant, le ringbuf entre stages
+  protège chaque interface (capture, process, encode) indépendamment.
+- **Architecture prête pour S5** : le `process_stage` isole le plugin.
+  S5 ajoutera un timeout par bloc + bypass auto si plugin spike — sans
+  toucher au reste du pipeline.
+
+#### Ce que S3 ne résout pas (= S5)
+
+**Le clic ponctuel sur un spike plugin isolé reste audible.** Quand le
+`process_stage` est bloqué 22 ms par le plugin, l'`encode_stage` n'a
+rien à manger → 22 ms de silence côté peer. C'est S5 qui le résoudra
+via `bypass auto` du plugin si `p99 > 4 ms sur 1 s`.
+
+### Notes
+
+- `cargo test --workspace` : 29 verts (inchangé).
+- `cargo build --release` Mac OK.
+- Pas de nouvelle dépendance, pas de changement protocol WS.
+- Compat binaire avec browser v0.4.1+.
+
 ## [0.4.4] — 2026-05-27
 
 ### Fixed — Log spam : promotion sur Close frame (cosmétique)

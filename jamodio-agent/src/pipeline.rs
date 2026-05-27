@@ -991,6 +991,39 @@ fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -
 // Helper RT thread — chaque paramètre est un primitive différent et grouper
 // dans un struct ne ferait qu'ajouter un nom intermédiaire sans clarté.
 #[allow(clippy::too_many_arguments)]
+/// Sprint S3 — bloc audio horodaté qui transite entre stages. Le timestamp
+/// est apposé en début de `capture_stage_loop` (= entrée sample_rx) et lu
+/// en fin de `encode_stage_loop` (= juste après try_send RTP). Permet de
+/// conserver la sémantique exacte de `pipeline_latency` historique
+/// (capture→send) malgré la séparation en 3 threads.
+type TimedBlock = (std::time::Instant, Vec<f32>);
+
+/// Sprint S3 — capacité des ringbufs entre stages. 32 chunks × ~5,3 ms
+/// (240 samples stéréo @ 48k) = ~170 ms de marge. Un spike plugin de 22 ms
+/// est absorbé sans saturer la queue.
+const STAGE_CHANNEL_CAPACITY: usize = 32;
+
+/// Sprint S3 — Orchestrateur des 3 stages audio (capture, process, encode).
+///
+/// Architecture (cf. PLAN-EXECUTION-AGENT-STABILITE.md §S3) :
+///
+/// ```text
+/// CPAL callback ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─►rtp_tx─► UDP task
+///                              (remap+resample)              (plugin+RMS+self-monitor)        (Opus+RTP)
+/// ```
+///
+/// Chaque stage tourne dans son propre thread `std::thread` RT promu via
+/// `crate::audio::rt_priority::promote_thread_for_audio` (= workgroup
+/// CoreAudio macOS / MMCSS Windows / thread-priority Linux).
+///
+/// Cette fonction conserve la signature historique (= drop-in replacement
+/// de l'ancien `encoder_thread` monolithique). À l'intérieur, elle :
+/// 1. Crée les channels entre stages
+/// 2. Spawn les 3 sub-threads
+/// 3. Attend le `stop_rx` original (de `stop_capture`)
+/// 4. Propage le signal stop via `stop_flag` atomique
+/// 5. Joint les 3 threads (drainage naturel via Disconnected cascade)
+#[allow(clippy::too_many_arguments)]
 fn encoder_thread(
     sample_rx: Receiver<Vec<f32>>,
     rtp_tx: tokio_mpsc::Sender<Vec<u8>>,
@@ -1011,34 +1044,153 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
-    // Sprint S2 — promotion RT du thread courant. Sur macOS : tente le
-    // workgroup CoreAudio HAL du device output ; fallback sur QoS+time-
-    // constraint Mach. Sur Windows : MMCSS Pro Audio. Sur Linux : best-
-    // effort thread-priority. Le handle est gardé vivant jusqu'à la fin
-    // du thread (Drop = leave/revert). Log info dans agent.log indique
-    // la méthode retenue ("macos-workgroup" attendu sur Apple Silicon).
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let (cap_to_proc_tx, cap_to_proc_rx) =
+        bounded::<TimedBlock>(STAGE_CHANNEL_CAPACITY);
+    let (proc_to_enc_tx, proc_to_enc_rx) =
+        bounded::<TimedBlock>(STAGE_CHANNEL_CAPACITY);
+
+    // ─── Capture stage ────────────────────────────────────
+    let stop_cap = stop_flag.clone();
+    let out_name_cap = output_device_name.clone();
+    let h_cap = std::thread::Builder::new()
+        .name("audio-capture".into())
+        .spawn(move || {
+            capture_stage_loop(
+                sample_rx,
+                cap_to_proc_tx,
+                stop_cap,
+                channels_in,
+                native_sr,
+                channel_index,
+                out_name_cap,
+            );
+        })
+        .expect("spawn audio-capture thread");
+
+    // ─── Process stage ────────────────────────────────────
+    let stop_proc = stop_flag.clone();
+    let out_name_proc = output_device_name.clone();
+    let mixer_proc = mixer.clone();
+    let input_cut_proc = input_cut.clone();
+    let input_rms_proc = input_rms.clone();
+    let perfstats_proc = perfstats.clone();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let plugin_host_proc = plugin_host.clone();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let plugin_handle_proc = plugin_handle.clone();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let plugin_bypass_proc = plugin_bypass.clone();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let input_source_proc = input_source.clone();
+    let h_proc = std::thread::Builder::new()
+        .name("audio-process".into())
+        .spawn(move || {
+            process_stage_loop(
+                cap_to_proc_rx,
+                proc_to_enc_tx,
+                stop_proc,
+                mixer_proc,
+                input_cut_proc,
+                input_rms_proc,
+                perfstats_proc,
+                out_name_proc,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                plugin_host_proc,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                plugin_handle_proc,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                plugin_bypass_proc,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                midi_event_rx,
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                input_source_proc,
+            );
+        })
+        .expect("spawn audio-process thread");
+
+    // ─── Encode stage ─────────────────────────────────────
+    let stop_enc = stop_flag.clone();
+    let out_name_enc = output_device_name;
+    let perfstats_enc = perfstats.clone();
+    let h_enc = std::thread::Builder::new()
+        .name("audio-encode".into())
+        .spawn(move || {
+            encode_stage_loop(
+                proc_to_enc_rx,
+                rtp_tx,
+                stop_enc,
+                ssrc,
+                payload_type,
+                perfstats_enc,
+                out_name_enc,
+            );
+        })
+        .expect("spawn audio-encode thread");
+
+    // ─── Attente stop + drainage cascade ──────────────────
+    //
+    // Le stop_rx vient de `start_capture` (Sender stocké dans `encoder_stop`,
+    // déclenché par `stop_capture`). À la réception :
+    // 1. On flag `stop_flag` → chaque stage break en début de prochaine
+    //    iteration de sa boucle.
+    // 2. On join `h_cap` → quand il return, `cap_to_proc_tx` est drop →
+    //    `process_stage` voit `Disconnected` sur son recv → drain les
+    //    samples restants en queue (max 32 × 5.3ms ≈ 170ms) → return.
+    // 3. Idem pour `proc_to_enc_tx` → `encode_stage` drain et return.
+    //
+    // Ordonner les joins amont→aval garantit qu'aucun sample en queue
+    // n'est perdu au stop. Coût pire-cas du stop : ~170 ms (vidange complète
+    // des deux ringbufs) — négligeable pour un cycle de vie utilisateur.
+    let _ = stop_rx.recv();
+    stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = h_cap.join();
+    let _ = h_proc.join();
+    let _ = h_enc.join();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sprint S3 — Capture stage
+// ═══════════════════════════════════════════════════════════════════
+//
+// Responsabilités :
+//   - Lire les chunks PCM bruts depuis CPAL via `sample_rx`
+//   - Remapper le canal mono sélectionné en stéréo (= dupliquer ou
+//     extraire le bon canal selon `channel_index`)
+//   - Resampler si `native_sr != 48_000` (Rubato SincFixedIn) — pratique
+//     uniquement sur Windows WASAPI shared 44.1k. Sur Mac CoreAudio
+//     l'input est nativement 48k → bypass total (resampler = None).
+//   - Apposer un `Instant::now()` à chaque bloc émis pour mesure
+//     pipeline_latency end-to-end (lu par encode_stage).
+//
+// Coût observé en baseline : < 200 µs par bloc CPAL (= ~5% du budget 2.7 ms).
+// L'isoler en thread propre prépare le terrain pour mesurer
+// `capture_p99_ms` séparément en S4 si besoin.
+
+#[allow(clippy::too_many_arguments)]
+fn capture_stage_loop(
+    sample_rx: Receiver<Vec<f32>>,
+    out_tx: Sender<TimedBlock>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    channels_in: u16,
+    native_sr: u32,
+    channel_index: Option<u8>,
+    output_device_name: Option<String>,
+) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
     );
 
-    let encoder = match MusicEncoder::new() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(target: "jamodio::encoder", error = %e, "failed to create Opus encoder");
-            return;
-        }
-    };
-
-    let frame_size = encoder.frame_size(); // 120 samples/channel
-    let frame_len = frame_size * CHANNELS; // 240 f32s (stereo interleaved, 2.5ms @ 48kHz)
-    let channels_in = channels_in as usize;
-    let mut accumulator: Vec<f32> = Vec::with_capacity(frame_len * 2);
+    // Sprint S3 — shadow channels_in en usize pour les indexations downstream
+    // (remap_to_stereo, slice indexing, ...).
+    let channels_in: usize = channels_in.into();
 
     // Resampler natif → 48 kHz (mic Windows onboard typique = 44.1 kHz, mac
     // CoreAudio est généralement 48 kHz natif → bypass total). Rubato Sinc
     // est sync, ~50-150 µs par bloc 128 samples sur M1. Latence introduite
     // ≈ sinc_len / native_sr = 256 / 44100 ≈ 5.8 ms (acceptable, dominé par
-    // le buffer WASAPI shared 10ms de toute façon sur ce path).
+    // le buffer WASAPI shared 10 ms de toute façon sur ce path).
     let mut resampler: Option<rubato::SincFixedIn<f32>> = if native_sr != 48000 {
         let ratio = 48000.0 / native_sr as f64;
         let params = rubato::SincInterpolationParameters {
@@ -1048,8 +1200,6 @@ fn encoder_thread(
             oversampling_factor: 256,
             window: rubato::WindowFunction::BlackmanHarris2,
         };
-        // chunk_size 1024 = absorbe les buffers WASAPI shared (~480 samples
-        // @44.1k) sans réinit ; padding interne géré par Rubato.
         match rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, 1024, CHANNELS) {
             Ok(r) => {
                 tracing::info!(
@@ -1063,7 +1213,7 @@ fn encoder_thread(
                 tracing::error!(
                     target: "jamodio::encoder",
                     error = %e,
-                    "rubato init failed — capture continuera SANS resampling (audio sera désynchronisé)"
+                    "rubato init failed — capture continuera SANS resampling (audio désynchronisé)"
                 );
                 None
             }
@@ -1071,8 +1221,8 @@ fn encoder_thread(
     } else {
         None
     };
-    // Buffers de sortie Rubato réutilisés entre les itérations pour éviter alloc
-    // dans le hot path. Resize au besoin (output_frames_max).
+    // Buffers de sortie Rubato réutilisés entre les itérations pour éviter
+    // d'allouer dans le hot path. Resize au besoin (output_frames_max).
     let mut resample_out_l: Vec<f32> = Vec::with_capacity(2048);
     let mut resample_out_r: Vec<f32> = Vec::with_capacity(2048);
     // Accumulateur PRE-resample : Rubato impose un chunk_size FIXE en input
@@ -1082,58 +1232,33 @@ fn encoder_thread(
     let mut pre_resample_l: Vec<f32> = Vec::with_capacity(2048);
     let mut pre_resample_r: Vec<f32> = Vec::with_capacity(2048);
     const RESAMPLE_CHUNK: usize = 1024;
-    let mut opus_buf = vec![0u8; 4000];
-    let mut sequence: u16 = 0;
-    let mut timestamp: u32 = 0;
-
-    // SPRINT INSERT (S1.2) — buffers L/R préalloués pour le passage à
-    // travers le plugin (AU sur mac, VST3 sur win). Désentrelacer/ré-entrelacer
-    // par sous-blocs de PLUGIN_BLOCK samples par canal. Capacité fixée à 128
-    // (la frame Opus fait 120 stéréo, et les buffers CPAL typiques < 128 par canal).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    const PLUGIN_BLOCK: usize = 128;
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let mut plugin_left: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let mut plugin_right: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
 
     loop {
-        // Check stop signal (non-blocking)
-        if stop_rx.try_recv().is_ok() {
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-
-        // Receive audio chunks from CPAL
         match sample_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(samples) => {
-                // Sprint S1 — chrono début du tour : depuis la sortie de
-                // `sample_rx` jusqu'à l'envoi RTP final. Mesure la latence
-                // INTERNE du pipeline (hors buffer CPAL en amont qui dépend
-                // du HAL OS). Coût `Instant::now()` ≈ 30 ns sur Apple Silicon
-                // — négligeable comparé au budget RT 2.7 ms par bloc.
+                // Timestamp début pipeline : transporté avec le bloc à travers
+                // tous les stages pour mesure pipeline_latency end-to-end.
                 let t_block_start = std::time::Instant::now();
-                // RMS calculé sur le canal qui part réellement sur le réseau
-                // (après remap) → le VU-mètre reflète le son transmis, pas la somme brute.
                 let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
 
-                // RESAMPLE (Windows mic onboard 44.1k → 48k Opus). Bypass total
-                // si native_sr == 48000 (mac CoreAudio + cartes pro). Rubato
-                // SincFixedIn impose un chunk_size FIXE en input → on accumule
-                // les buffers CPAL (taille variable selon WASAPI/ASIO/CoreAudio)
-                // jusqu'à RESAMPLE_CHUNK puis on process. Output = variable
-                // (~RESAMPLE_CHUNK * 48000/native_sr).
+                // RESAMPLE (Windows 44.1 → 48k). Bypass total si natif = 48k.
                 if let Some(rs) = resampler.as_mut() {
-                    // Désentrelace stereo entrelacé → 2 canaux séparés.
                     for chunk in stereo.chunks_exact(2) {
                         pre_resample_l.push(chunk[0]);
                         pre_resample_r.push(chunk[1]);
                     }
                     stereo.clear();
                     let out_max = rs.output_frames_max();
-                    if resample_out_l.len() < out_max { resample_out_l.resize(out_max, 0.0); }
-                    if resample_out_r.len() < out_max { resample_out_r.resize(out_max, 0.0); }
+                    if resample_out_l.len() < out_max {
+                        resample_out_l.resize(out_max, 0.0);
+                    }
+                    if resample_out_r.len() < out_max {
+                        resample_out_r.resize(out_max, 0.0);
+                    }
                     while pre_resample_l.len() >= RESAMPLE_CHUNK {
-                        // Slices d'entrée sans alloc.
                         let waves_in: [&[f32]; 2] = [
                             &pre_resample_l[..RESAMPLE_CHUNK],
                             &pre_resample_r[..RESAMPLE_CHUNK],
@@ -1144,8 +1269,6 @@ fn encoder_thread(
                         ];
                         match rs.process_into_buffer(&waves_in, &mut waves_out, None) {
                             Ok((_in_used, out_frames)) => {
-                                // Re-entrelace dans `stereo` (= ce que le reste du
-                                // pipeline attend, comme avant).
                                 for i in 0..out_frames {
                                     stereo.push(resample_out_l[i]);
                                     stereo.push(resample_out_r[i]);
@@ -1159,32 +1282,99 @@ fn encoder_thread(
                                 );
                             }
                         }
-                        // Drain le chunk consommé. SincFixedIn consomme TOUJOURS
-                        // chunk_size en input (contrat FixedIn).
                         pre_resample_l.drain(..RESAMPLE_CHUNK);
                         pre_resample_r.drain(..RESAMPLE_CHUNK);
                     }
-                    // Si pas encore assez de samples accumulés, `stereo` reste
-                    // vide ce tour-ci → l'accumulator Opus n'avance pas, on
-                    // attend le prochain buffer CPAL. Comportement attendu.
+                    // Pas encore assez de samples accumulés → on attend le
+                    // prochain buffer CPAL. Le bloc n'est pas émis ce tour-ci.
                     if stereo.is_empty() {
                         continue;
                     }
                 }
 
-                // ENTRÉE OFF (= SetInputCut) : remplace les samples capturés
-                // par du silence avant tout traitement (RMS, self-monitor,
-                // record self stem, mix, envoi RTP). Cohérent avec le mode
-                // browser où on faisait `track.enabled = false` côté WebRTC.
+                // Émet vers process_stage. Si plein (Disconnected = stage en
+                // shutdown), on continue sans bloquer le thread capture (le
+                // bound 32 est large mais on protège contre un blocage de
+                // process_stage pendant un shutdown ordonné).
+                match out_tx.send((t_block_start, stereo)) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        // process_stage downstream a drop son receiver →
+                        // shutdown en cascade. On termine.
+                        break;
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sprint S3 — Process stage
+// ═══════════════════════════════════════════════════════════════════
+//
+// Responsabilités :
+//   - Appliquer `input_cut` (silence forcé en entrée si toggle UI OFF)
+//   - Appliquer le mode MIDI source (force samples=0, le plugin instrument
+//     génère l'audio depuis les events MIDI)
+//   - Appliquer le plugin INSERT (AU mac / VST3 win) via `process_stereo`
+//     par sous-blocs de PLUGIN_BLOCK frames. Mesure wall-clock par
+//     sous-bloc dans `perfstats.plugin_latency` (= signal pour S5 overload).
+//   - Calculer le RMS post-plugin pour le VU-mètre
+//   - Push self-monitor dans le mixer (= ce que l'utilisateur entend wet
+//     dans son casque)
+//   - Forward le bloc + timestamp original vers `encode_stage`
+//
+// C'est le SEUL stage qui peut spiker (plugin lourd). Le ringbuf en amont
+// (depuis capture) absorbe ~170 ms de jitter sans drop CPAL.
+
+#[allow(clippy::too_many_arguments)]
+fn process_stage_loop(
+    in_rx: Receiver<TimedBlock>,
+    out_tx: Sender<TimedBlock>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    mixer: Arc<Mutex<AudioMixer>>,
+    input_cut: Arc<std::sync::atomic::AtomicBool>,
+    input_rms: Arc<std::sync::atomic::AtomicU32>,
+    perfstats: PerfHandles,
+    output_device_name: Option<String>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
+) {
+    let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
+        output_device_name.as_deref(),
+    );
+
+    // Buffers L/R préalloués pour passer le bloc à travers le plugin par
+    // sous-blocs de PLUGIN_BLOCK samples. Capacité fixée à 128 (la frame
+    // Opus stéréo fait 120, et les buffers post-resample ne dépassent
+    // typiquement pas cette taille).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    const PLUGIN_BLOCK: usize = 128;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut plugin_left: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut plugin_right: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
+
+    loop {
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok((t_block_start, mut stereo)) => {
+                // input_cut (= SetInputCut toggle UI "ENTRÉE OFF")
                 if input_cut.load(std::sync::atomic::Ordering::Relaxed) {
                     stereo.fill(0.0);
                 }
 
-                // S2 — Si source = MIDI, on FORCE les samples audio à zéro.
-                // Le micro/carte audio continue d'être ouverte (= elle nous
-                // donne le tick d'horloge 48k/128) mais on ignore son contenu.
-                // Le plugin instrument recevra silence + les events MIDI
-                // accumulés, et produira l'audio depuis les notes jouées.
+                // S2 — source MIDI : force samples = 0 (mic ouvert pour le tick
+                // d'horloge mais on ignore son contenu, le plugin instrument
+                // génère l'audio depuis les events MIDI).
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     let src = input_source.lock().clone();
@@ -1193,27 +1383,25 @@ fn encoder_thread(
                     }
                 }
 
-                // INSERT plugin (S1.2) — applique le plugin chargé (AU sur
-                // mac, VST3 sur win) sur la tranche instrument self entre
-                // remap et self-monitor/encode. Le self-monitor entend donc
-                // le son WET (cohérent avec l'expérience DAW : jouer dans
-                // un ampli simulé en s'écoutant traité).
+                // INSERT plugin (AU mac / VST3 win) appliqué par sous-blocs
+                // de PLUGIN_BLOCK frames. Le self-monitor entend le son WET.
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
-                if !stereo.is_empty() && !plugin_bypass.load(std::sync::atomic::Ordering::Relaxed) {
+                if !stereo.is_empty()
+                    && !plugin_bypass.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     let handle_opt = *plugin_handle.lock();
                     if let Some(handle) = handle_opt {
                         let mut host = plugin_host.lock();
 
-                        // S2 — Drain les events MIDI accumulés depuis le
-                        // dernier bloc. Le receiver est non-blocking : on
-                        // collecte ce qui est dispo MAX BATCH events
-                        // (limite défensive pour ne pas spinner sur un
-                        // device qui flood).
+                        // Drain les events MIDI accumulés depuis le dernier
+                        // bloc. Max 64 events / bloc (limite défensive).
                         let midi_events: Vec<MidiEvent> = if let Some(rx) = &midi_event_rx {
                             let mut batch = Vec::new();
                             while let Ok(ev) = rx.try_recv() {
                                 batch.push(ev);
-                                if batch.len() >= 64 { break; }
+                                if batch.len() >= 64 {
+                                    break;
+                                }
                             }
                             batch
                         } else {
@@ -1222,10 +1410,9 @@ fn encoder_thread(
 
                         let n_pairs = stereo.len() / 2;
                         let mut idx = 0;
-                        // Important : on dispatche TOUS les MIDI events au 1er
-                        // sous-bloc seulement (le plugin AU recevra des notes
-                        // ON/OFF au début du bloc). Pour les sous-blocs
-                        // suivants, MIDI vide (le plugin tient l'état).
+                        // MIDI dispatché au 1er sous-bloc seulement (notes
+                        // ON/OFF au début du bloc) ; sous-blocs suivants
+                        // reçoivent une slice vide.
                         let mut first_subblock = true;
                         while idx < n_pairs {
                             let end = (idx + PLUGIN_BLOCK).min(n_pairs);
@@ -1241,10 +1428,8 @@ fn encoder_thread(
                                 &[]
                             };
                             first_subblock = false;
-                            // Sprint S1 — wall-clock guard plugin INSERT. Mesure
-                            // par sous-bloc PLUGIN_BLOCK (= 128 frames stéréo).
-                            // Le seuil de bypass auto (S5) sera calculé sur cette
-                            // distribution. Coût `Instant::now()` ≈ 30 ns × 2.
+                            // Wall-clock guard plugin INSERT (mesure par
+                            // sous-bloc). Coût `Instant::now()` ≈ 30 ns × 2.
                             let t_plugin = std::time::Instant::now();
                             let plugin_result = host.process_stereo(
                                 handle,
@@ -1263,18 +1448,19 @@ fn encoder_thread(
                                     }
                                 }
                                 Err(e) => {
-                                    // Bug 1 diagnostic (S1.9) — log throttled
-                                    // pour ne pas spam (2.7ms par bloc).
                                     static FAILS: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
-                                    let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let n = FAILS.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                     if n == 0 || n.is_power_of_two() {
                                         tracing::warn!(
                                             target: "jamodio::plugin",
                                             handle = ?handle,
                                             count = n + 1,
                                             error = %e,
-                                            "process_stereo failed in encoder_thread (signal passe DRY)"
+                                            "process_stereo failed in process_stage (signal passe DRY)"
                                         );
                                     }
                                 }
@@ -1284,24 +1470,84 @@ fn encoder_thread(
                     }
                 }
 
+                // RMS + self-monitor (= ce que l'utilisateur entend wet
+                // dans son casque via le callback CPAL playback).
                 if !stereo.is_empty() {
                     let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
                     let rms = (sum_sq / stereo.len() as f32).sqrt();
-                    input_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-
-                    // SELF-MONITOR FORK : push les samples capturés (post-remap)
-                    // dans le mixer local → ils sortent sur le casque via le
-                    // callback CPAL playback. Gated par le volume du stream
-                    // « self » côté mixer (0.0 par défaut = silence). Lock
-                    // parking_lot contended ≤ µs, négligeable pour un RT
-                    // thread à frame 2.7 ms. Le push est no-op si l'id
-                    // n'existe pas (cf. push_self_samples).
+                    input_rms
+                        .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
                     mixer.lock().push_self_samples(&stereo);
                 }
 
+                // Forward vers encode_stage avec le timestamp original.
+                if out_tx.send((t_block_start, stereo)).is_err() {
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sprint S3 — Encode stage
+// ═══════════════════════════════════════════════════════════════════
+//
+// Responsabilités :
+//   - Accumuler les samples reçus dans un buffer ; émettre des frames
+//     Opus de 240 f32 stéréo (= 120 samples par canal, 2.5 ms @ 48 kHz)
+//   - Encoder en Opus
+//   - Construire le packet RTP
+//   - try_send vers le channel tokio (= UDP task qui chiffre + send)
+//   - Observer `pipeline_latency` end-to-end (= elapsed depuis le
+//     `t_block_start` apposé par capture_stage) → conserve la sémantique
+//     historique du `pipeline_latency_ms` mesuré côté browser.
+//
+// Coût observé : ~50-100 µs par frame (Opus encode est constant). Spike
+// rarissime (Opus interne).
+
+fn encode_stage_loop(
+    in_rx: Receiver<TimedBlock>,
+    rtp_tx: tokio_mpsc::Sender<Vec<u8>>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    ssrc: u32,
+    payload_type: u8,
+    perfstats: PerfHandles,
+    output_device_name: Option<String>,
+) {
+    let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
+        output_device_name.as_deref(),
+    );
+
+    let encoder = match MusicEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::encoder",
+                error = %e,
+                "failed to create Opus encoder"
+            );
+            return;
+        }
+    };
+
+    let frame_size = encoder.frame_size(); // 120 samples/channel
+    let frame_len = frame_size * CHANNELS; // 240 f32s stéréo interleaved
+    let mut accumulator: Vec<f32> = Vec::with_capacity(frame_len * 2);
+    let mut opus_buf = vec![0u8; 4000];
+    let mut sequence: u16 = 0;
+    let mut timestamp: u32 = 0;
+
+    loop {
+        if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok((t_block_start, stereo)) => {
                 accumulator.extend_from_slice(&stereo);
 
-                // Encode complete frames (240 f32 stéréo = 2.5ms)
                 while accumulator.len() >= frame_len {
                     let frame: Vec<f32> = accumulator.drain(..frame_len).collect();
 
@@ -1314,19 +1560,19 @@ fn encoder_thread(
                                 ssrc,
                                 marker: sequence == 0,
                             };
-                            let packet = rtp::build_packet(&header, &opus_buf[..encoded_len]);
+                            let packet =
+                                rtp::build_packet(&header, &opus_buf[..encoded_len]);
 
-                            // Non-blocking send to tokio. Distinguer Full vs
-                            // Closed pour ne pas polluer les logs en shutdown :
-                            // - Full   : task UDP saturée → vrai overload, warn.
-                            // - Closed : task UDP terminée (stop_capture) →
-                            //            attendu, debug only.
                             if let Err(e) = rtp_tx.try_send(packet) {
                                 use tokio::sync::mpsc::error::TrySendError;
                                 match e {
                                     TrySendError::Full(_) => {
-                                        static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                        let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        static FULLS: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let n = FULLS.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         if n == 0 || n.is_power_of_two() {
                                             tracing::warn!(
                                                 target: "jamodio::encoder",
@@ -1336,8 +1582,12 @@ fn encoder_thread(
                                         }
                                     }
                                     TrySendError::Closed(_) => {
-                                        static CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                        let n = CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        static CLOSED: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let n = CLOSED.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         if n == 0 {
                                             tracing::debug!(
                                                 target: "jamodio::encoder",
@@ -1352,16 +1602,22 @@ fn encoder_thread(
                             timestamp = timestamp.wrapping_add(frame_size as u32);
                         }
                         Err(e) => {
-                            tracing::error!(target: "jamodio::encoder", error = %e, "Opus encode error");
+                            tracing::error!(
+                                target: "jamodio::encoder",
+                                error = %e,
+                                "Opus encode error"
+                            );
                         }
                     }
                 }
 
-                // Sprint S1 — fin du tour : capture→send latency mesurée du
-                // pop `sample_rx` jusqu'ici (juste après le dernier try_send
-                // RTP). Inclut remap + resample + plugin + RMS + Opus +
-                // RTP build + handoff au channel tokio (= côté pipeline pur,
-                // hors UDP réseau qui est asynchrone via le tokio task).
+                // Sprint S1/S3 — pipeline_latency end-to-end. Le timestamp
+                // `t_block_start` est apposé par `capture_stage_loop` en
+                // début de pipeline et nous arrive intact ici via les
+                // channels. Le elapsed mesure donc EXACTEMENT le temps
+                // CPAL-recv → RTP-send, comme l'ancien `encoder_thread`
+                // monolithique, ce qui garantit la continuité de la
+                // baseline v0.4.1.
                 let block_elapsed_ms =
                     t_block_start.elapsed().as_secs_f32() * 1000.0;
                 perfstats.pipeline_latency.lock().observe(block_elapsed_ms);
@@ -1370,7 +1626,6 @@ fn encoder_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
-
 }
 
 // ─── Receive + decode task (tokio, one per remote stream) ──────────
