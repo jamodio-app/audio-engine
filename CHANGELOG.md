@@ -6,6 +6,84 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-05-27
+
+### Added — Mesures perfstats par stage (capture/process/encode)
+
+Suite à la session test v0.4.7 (Grand Piano + BFD Player) qui a montré
+un `pipeline_max_ms = 113 ms` avec `plugin_max = 4 ms` (= plugin propre,
+spike ailleurs), on a découvert que la métrique `pipeline_latency`
+incluait le **temps passé en file** dans les ringbufs S3 entre stages.
+Devenue trompeuse pour le diagnostic : pas moyen de discriminer
+"vraie surcharge plugin" vs "stall en queue d'un autre stage".
+
+#### Fix
+
+3 nouveaux `Histogram` dans `PerfHandles` :
+
+- `capture_latency` : temps de traitement PUR du `capture_stage_loop`
+  (remap canal + resample éventuel), mesuré depuis `recv_timeout` (= pop
+  `sample_rx`) jusqu'à juste avant `out_tx.send` (= AVANT entrée en
+  file du ringbuf process). N'inclut **pas** le temps d'attente bloc.
+- `process_latency` : temps de traitement PUR du `process_stage_loop`
+  (input_cut, MIDI source, plugin INSERT, RMS, push self-monitor).
+  Mesuré depuis pop `cap_to_proc_rx` jusqu'à juste avant
+  `proc_to_enc_tx.send`. Inclut `plugin_latency` comme sous-ensemble
+  (par sous-bloc dans `process_stereo`).
+- `encode_latency` : temps de traitement PUR du `encode_stage_loop`
+  (Opus encode + RTP build + try_send). Mesuré depuis pop
+  `proc_to_enc_rx` jusqu'au dernier `try_send` RTP.
+
+Chacun observé `.observe(elapsed_ms)` à chaque tour, flushé 1 Hz dans
+`ws_server perfstats_task`.
+
+#### Sémantique pour le diagnostic
+
+```
+pipeline_latency        = capture_in → encode_send (= ce qu'on entend)
+sum(stages_max)         = capture_max + process_max + encode_max
+queue_time_max          = pipeline_max − sum(stages_max)
+```
+
+- `queue_time_max ≈ 0` : stages bien découplés, pas de stall en queue.
+- `queue_time_max ≫ 0` : un stage a stallé, accumulation dans ringbuf.
+  Cas v0.4.7 BFD : `pipeline_max=113ms` − `process_max≈5ms` ≈ 108 ms en
+  queue → un autre stage (probable mixer.lock) a bloqué brièvement.
+
+#### Tracing log étendu
+
+`tracing::info!(target: "jamodio::perfstats")` inclut maintenant 6
+nouveaux champs : `capture_p99_ms`, `capture_max_ms`, `process_p99_ms`,
+`process_max_ms`, `encode_p99_ms`, `encode_max_ms`. Visibles dans le
+bug-report via `GetLogsArchive` existant.
+
+#### Pas de changement protocole WS
+
+Aucune modification de `AgentMessage::PerfStats` : le browser continue
+à recevoir le même payload (= compat). Les nouvelles métriques sont
+uniquement loggées dans `agent.log`, lues par
+`scripts/agent-latency-baseline.js --compare` lors de l'analyse
+post-session côté support.
+
+#### Script baseline étendu
+
+`scripts/agent-latency-baseline.js` parse les 6 nouveaux champs. Le
+mode `--compare` affiche désormais une section "par stage" avec
+`queue_time_max` calculé. Les baselines historiques (v0.4.1, v0.4.6)
+n'ont pas ces champs → `stages: undefined` → la section est skipée
+automatiquement (compat rétrograde).
+
+### Notes
+
+- cargo test --workspace : 29 verts.
+- Coût mesure : 4 × `Instant::now()` supplémentaires par bloc dans le
+  hot path (= ~120 ns sur Apple Silicon). Négligeable vs budget RT 2,7 ms.
+- Pas d'impact sur la latence ressentie utilisateur.
+- Future session test : on attend de voir si `process_max` reste sous
+  5 ms (= plugin propre) tandis que `pipeline_max` pourra être plus
+  élevé en cas de stall en queue (mixer.lock, etc.). Diagnostic fin
+  réactivé.
+
 ## [0.4.7] — 2026-05-27
 
 ### Added — Sprint S5 : plugin overload guard + UX bypass auto

@@ -364,6 +364,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // Flush histograms (acquièrent le lock parking_lot une fois chacun)
             let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
             let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
+            // v0.4.8 — 3 histogrammes par stage pour discriminer "spike
+            // traitement" vs "spike file en queue ringbuf".
+            let capture_snap = pl.perfstats.capture_latency.lock().flush();
+            let process_snap = pl.perfstats.process_latency.lock().flush();
+            let encode_snap = pl.perfstats.encode_latency.lock().flush();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -491,6 +496,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
             // Log structuré tracing pour qu'il finisse dans agent.log :
             // permet au support de lire les perfstats même sans bundle browser.
+            // v0.4.8 — ajout des 3 mesures par stage (capture/process/encode).
+            // Sémantique : pipeline_* = end-to-end (= traitement + temps en
+            // file dans les ringbufs). capture_*/process_*/encode_* = temps
+            // de traitement PUR par stage. Permet de discriminer un spike
+            // "vraie charge plugin" vs "stall en queue".
             tracing::info!(
                 target: "jamodio::perfstats",
                 pipeline_p50_ms = pipeline_latency_ms.p50_ms,
@@ -501,6 +511,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 plugin_name = plugin_perf.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
                 plugin_p99_ms = plugin_perf.as_ref().map(|p| p.p99_ms).unwrap_or(0.0),
                 plugin_max_ms = plugin_perf.as_ref().map(|p| p.max_ms).unwrap_or(0.0),
+                capture_p99_ms = capture_snap.p99_ms,
+                capture_max_ms = capture_snap.max_ms,
+                process_p99_ms = process_snap.p99_ms,
+                process_max_ms = process_snap.max_ms,
+                encode_p99_ms = encode_snap.p99_ms,
+                encode_max_ms = encode_snap.max_ms,
                 peers = peers.len(),
                 "perfstats snapshot"
             );

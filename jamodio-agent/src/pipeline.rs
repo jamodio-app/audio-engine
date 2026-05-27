@@ -186,7 +186,19 @@ pub struct PipelineState {
 #[derive(Clone)]
 pub struct PerfHandles {
     pub plugin_latency: Arc<Mutex<Histogram>>,
+    /// End-to-end CAPTURE_in → ENCODE_send. Inclut le temps en file dans les
+    /// ringbufs entre stages (S3) — c'est la VRAIE latence pipeline ressentie.
     pub pipeline_latency: Arc<Mutex<Histogram>>,
+    /// v0.4.8 — temps de traitement PUR du capture_stage (remap + resample),
+    /// du `recv_timeout` (= pop sample_rx) à juste avant le `send` sortant.
+    /// Sum(capture+process+encode) << pipeline_latency ⇒ stages bien découplés.
+    /// Sum ≈ pipeline_latency ⇒ au moins un stage stall en queue.
+    pub capture_latency: Arc<Mutex<Histogram>>,
+    /// v0.4.8 — temps de traitement PUR du process_stage (plugin + RMS +
+    /// self-monitor). Contient `plugin_latency` comme sous-ensemble par sous-bloc.
+    pub process_latency: Arc<Mutex<Histogram>>,
+    /// v0.4.8 — temps de traitement PUR du encode_stage (Opus + RTP build + send).
+    pub encode_latency: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     pub drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
 }
@@ -199,6 +211,9 @@ impl PerfHandles {
         Self {
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             pipeline_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            capture_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            process_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             drift_ppm_by_producer: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1088,6 +1103,7 @@ fn encoder_thread(
     // ─── Capture stage ────────────────────────────────────
     let stop_cap = stop_flag.clone();
     let out_name_cap = output_device_name.clone();
+    let perfstats_cap = perfstats.clone();
     let h_cap = std::thread::Builder::new()
         .name("audio-capture".into())
         .spawn(move || {
@@ -1098,6 +1114,7 @@ fn encoder_thread(
                 channels_in,
                 native_sr,
                 channel_index,
+                perfstats_cap,
                 out_name_cap,
             );
         })
@@ -1210,6 +1227,7 @@ fn capture_stage_loop(
     channels_in: u16,
     native_sr: u32,
     channel_index: Option<u8>,
+    perfstats: PerfHandles,
     output_device_name: Option<String>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -1276,6 +1294,10 @@ fn capture_stage_loop(
                 // Timestamp début pipeline : transporté avec le bloc à travers
                 // tous les stages pour mesure pipeline_latency end-to-end.
                 let t_block_start = std::time::Instant::now();
+                // v0.4.8 — timer "traitement pur" de ce stage : démarre ici,
+                // s'arrête juste avant out_tx.send (= AVANT l'entrée en file
+                // dans le ringbuf du process_stage).
+                let t_stage_start = t_block_start;
                 let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
 
                 // RESAMPLE (Windows 44.1 → 48k). Bypass total si natif = 48k.
@@ -1325,6 +1347,12 @@ fn capture_stage_loop(
                         continue;
                     }
                 }
+
+                // v0.4.8 — observe le temps de traitement PUR du capture_stage
+                // (= depuis sample_rx.recv jusqu'ici, avant entrée en file).
+                let capture_elapsed_ms =
+                    t_stage_start.elapsed().as_secs_f32() * 1000.0;
+                perfstats.capture_latency.lock().observe(capture_elapsed_ms);
 
                 // Émet vers process_stage. Si plein (Disconnected = stage en
                 // shutdown), on continue sans bloquer le thread capture (le
@@ -1401,6 +1429,9 @@ fn process_stage_loop(
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok((t_block_start, mut stereo)) => {
+                // v0.4.8 — timer "traitement pur" du process_stage : démarre
+                // ici (= après pop ringbuf), s'arrête juste avant le send.
+                let t_stage_start = std::time::Instant::now();
                 // input_cut (= SetInputCut toggle UI "ENTRÉE OFF")
                 if input_cut.load(std::sync::atomic::Ordering::Relaxed) {
                     stereo.fill(0.0);
@@ -1514,6 +1545,11 @@ fn process_stage_loop(
                     mixer.lock().push_self_samples(&stereo);
                 }
 
+                // v0.4.8 — observe le temps de traitement PUR du process_stage.
+                let process_elapsed_ms =
+                    t_stage_start.elapsed().as_secs_f32() * 1000.0;
+                perfstats.process_latency.lock().observe(process_elapsed_ms);
+
                 // Forward vers encode_stage avec le timestamp original.
                 if out_tx.send((t_block_start, stereo)).is_err() {
                     break;
@@ -1580,6 +1616,10 @@ fn encode_stage_loop(
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok((t_block_start, stereo)) => {
+                // v0.4.8 — timer "traitement pur" du encode_stage : depuis le
+                // pop ringbuf jusqu'au try_send RTP final. NB : `block_elapsed_ms`
+                // (pipeline_latency end-to-end) reste mesuré depuis t_block_start.
+                let t_stage_start = std::time::Instant::now();
                 accumulator.extend_from_slice(&stereo);
 
                 while accumulator.len() >= frame_len {
@@ -1655,6 +1695,13 @@ fn encode_stage_loop(
                 let block_elapsed_ms =
                     t_block_start.elapsed().as_secs_f32() * 1000.0;
                 perfstats.pipeline_latency.lock().observe(block_elapsed_ms);
+
+                // v0.4.8 — observe le temps de traitement PUR du encode_stage.
+                // pipeline_latency - encode_latency - process_latency -
+                // capture_latency = temps en file dans les ringbufs entre stages.
+                let encode_elapsed_ms =
+                    t_stage_start.elapsed().as_secs_f32() * 1000.0;
+                perfstats.encode_latency.lock().observe(encode_elapsed_ms);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
