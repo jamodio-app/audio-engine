@@ -6,11 +6,16 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=cpp/au_host.mm");
+    println!("cargo:rerun-if-changed=cpp/audio_workgroup.mm");
 
     cc::Build::new()
         .cpp(true)
         .cpp_link_stdlib("c++")
         .file("cpp/au_host.mm")
+        // Sprint S2 — bindings CoreAudio Workgroup (os_workgroup_join). Compilé
+        // dans la même static lib `au_host` que le hosting AU pour éviter un
+        // crate satellite. Le code est macOS-only (gardes @available 11.0).
+        .file("cpp/audio_workgroup.mm")
         .flag("-fobjc-arc")
         .flag("-std=c++17")
         .flag("-Wno-deprecated-declarations")

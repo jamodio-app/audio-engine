@@ -18,6 +18,11 @@ use jamodio_audio_core::plugin_host::{
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
+// Sprint S2 — bindings CoreAudio Workgroup (os_workgroup_join). Module séparé
+// pour ne pas surcharger ce fichier déjà long. API publique : AudioWorkgroup,
+// is_available(). Cf. PLAN-EXECUTION-AGENT-STABILITE.md §S2.1-S2.2.
+pub mod workgroup;
+
 // ---------- FFI ----------
 
 type AuScanCb = unsafe extern "C" fn(

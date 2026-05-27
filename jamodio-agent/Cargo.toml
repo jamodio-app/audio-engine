@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
 
@@ -50,7 +50,17 @@ tauri-plugin-updater = "2"
 cpal = { version = "0.15", features = ["asio"] }
 # Hôte VST3 plugins — Windows uniquement (parité fonctionnelle avec AU sur macOS).
 jamodio-vst3-host = { path = "../jamodio-vst3-host" }
+# Sprint S2 — MMCSS "Pro Audio" pour la priorité RT du thread encoder
+# (AvSetMmThreadCharacteristicsW dans avrt.dll). Cf. rt_priority.rs.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 # Hôte AU plugins — macOS uniquement.
 [target.'cfg(target_os = "macos")'.dependencies]
 jamodio-au-host = { path = "../jamodio-au-host" }
+# Sprint S2 — bindings Mach (thread_policy_set, mach_timebase_info) pour le
+# fallback QoS+time-constraint quand os_workgroup_join échoue. Cf. rt_priority.rs.
+mach2 = "0.4"
+libc = "0.2"

@@ -6,6 +6,101 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-05-27
+
+### Changed — Sprint S2 stabilité : priorité RT effective (workgroup + MMCSS)
+
+Cause racine R1 du chantier stabilité (cf. PLAN-EXECUTION-AGENT-STABILITE.md).
+Avant ce sprint, `encoder_thread` appelait `thread_priority::Crossplatform(95)`
+qui, sur macOS, se traduit en `pthread_setschedparam` avec une nice value que
+Darwin ignore → SCHED_OTHER en pratique → préemptible par tout autre process
+(Chrome, Spotlight, etc.). Baseline v0.4.1 du 27/05 a confirmé : spikes
+`pipeline_max_ms` jusqu'à 25 ms alors que le budget RT est 2,7 ms/bloc.
+
+S2 remplace ce mécanisme par les APIs natives OS dédiées au scheduling audio.
+
+**Aucune dépendance d'API publique browser/WS** — le changement est purement
+système. La nouvelle version est binaire-compatible avec un browser v0.4.1.
+
+#### macOS — `os_workgroup_join` (HAL CoreAudio)
+
+- Nouveau fichier `jamodio-au-host/cpp/audio_workgroup.mm` : binding ObjC++
+  vers `os_workgroup_join` / `os_workgroup_leave`. Récupère le workgroup
+  HAL via `kAudioDevicePropertyIOThreadOSWorkgroup` du device output choisi
+  par l'utilisateur (match nominal case-insensitive, fallback default OS).
+  Filtre les devices virtuels sans stream output (BlackHole input-only, etc.).
+- ARC géré proprement via `__strong` implicite ObjC++ + `new`/`delete` C++
+  pour la struct handle (cf. doc Apple sur ARC + structs C).
+- Nouveau module Rust `jamodio_au_host::workgroup` : wrapper RAII
+  `AudioWorkgroup::join_default()` / `join_by_name(name)`. `Send`, `!Sync`
+  (token de leave thread-local). Drop = `os_workgroup_leave` auto.
+- 3 tests unitaires (disponibilité, join default, join nom inexistant).
+
+#### macOS — fallback QoS + THREAD_TIME_CONSTRAINT_POLICY
+
+Si `os_workgroup_join` indisponible (macOS < 11, device virtuel sans
+workgroup, thread déjà dans un workgroup) :
+- `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` : hint
+  scheduler "travail user-facing prioritaire".
+- `thread_policy_set(THREAD_TIME_CONSTRAINT_POLICY)` : annonce explicite
+  d'un budget déterministe au scheduler Mach. Paramètres alignés sur la
+  frame Opus 2,5 ms : period 2,5 ms, computation 1,2 ms, constraint 2 ms,
+  preemptible true (sécurité anti-deadlock système). Conversion ns → ticks
+  via `mach_timebase_info` (mémoïsé via `OnceLock`).
+- Bindings Mach raw via `mach2` + `libc` (déjà transitifs, ajoutés
+  explicitement à la dep liste pour clarté).
+
+#### Windows — MMCSS "Pro Audio"
+
+- `AvSetMmThreadCharacteristicsW(L"Pro Audio")` au démarrage du thread
+  encoder + `AvRevertMmThreadCharacteristics` au Drop. C'est l'API
+  officielle MMCSS pour signaler un thread audio temps-réel (utilisée
+  par tous les DAW pro depuis Vista).
+- UTF-16 NUL-terminé statique pour "Pro Audio" (évite dépendance au
+  macro `w!` du crate `windows`).
+- Nouvelle dépendance `windows-sys = "0.59"` (features `Foundation`,
+  `System_Threading`) sous `[target.'cfg(windows)']`.
+
+#### Module chapeau `audio::rt_priority`
+
+- `promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityHandle`
+  cache la sélection par OS. Tracing `info` (cible `jamodio::rt_priority`)
+  loggue la méthode retenue (`macos-workgroup` / `macos-time-constraint`
+  / `windows-mmcss` / `generic` / `none`). Le bug-report contient donc
+  une preuve directe du chemin emprunté.
+- Anti-double-promotion via AtomicBool global : si un thread re-appelle
+  promote sans drop, log warn et retourne handle no-op (= bug d'usage,
+  ne plante pas la prod). Reset auto au Drop.
+- 3 tests unitaires : promote/drop safe, re-promotion après drop OK,
+  double-promote sans drop = handle None.
+
+#### Intégration `encoder_thread`
+
+- Suppression du `thread_priority::set_current_thread_priority(Crossplatform(95))`.
+- Ajout du nom du device output extrait du format `"{idx}:{name}"`
+  (cf. mémoire `strict_device_id`) et passé à `rt_priority`.
+- Le handle RT vit pour toute la durée du thread (drop en fin de boucle
+  = leave/revert auto).
+
+#### Cible chiffrée (à valider sur session test post-v0.4.2)
+
+- `pipeline_p50_ms ≤ 0.120` (médiane stricte, baseline v0.4.1)
+- `pipeline_p99_ms ≤ 2.661` (= baseline 2.161 + tolérance 0.5 ms)
+- **`pipeline_max_ms < 5 ms` attendu** (vs 25.249 ms baseline) — c'est la
+  métrique signature de la réussite de S2.
+- `drops_total = 0` (déjà acquis en v0.4.1).
+
+### Notes
+
+- `cargo test --workspace` : 29 tests verts sur Mac (3 workgroup, 9 agent
+  dont 3 rt_priority, 16 audio-core, 1 ignored).
+- Build matrix CI inchangée — windows-sys et mach2 sont gated par
+  `[target.'cfg(...)']` donc le Mac ne link pas Windows et inversement.
+- Pas de changement de protocole WS : 100 % compatible browser v0.4.1.
+- Préreq mesure post-merge : `node scripts/agent-latency-baseline.js
+  --compare internal-docs/baselines/agent-v0.4.1-baseline.json <session-v0.4.2.txt>`
+  doit exit 0.
+
 ## [0.4.1] — 2026-05-23
 
 ### Added — Sprint S1 stabilité : instrumentation profonde

@@ -754,13 +754,21 @@ impl PipelineState {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let input_source_for_encoder = self.input_source.clone();
         let perfstats_for_encoder = self.perfstats.clone();
+        // Sprint S2 — nom du device output (extrait du format "{idx}:{name}")
+        // passé à rt_priority pour matcher le workgroup CoreAudio HAL. Si
+        // aucun device explicite (None ⇒ default OS), on passera None et
+        // le workgroup utilisera le default output.
+        let output_device_name_for_encoder = self
+            .output_device_id
+            .as_deref()
+            .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
         std::thread::Builder::new()
             .name("encoder".into())
             .spawn(move || {
                 encoder_thread(
                     sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
-                    perfstats_for_encoder,
+                    perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
@@ -996,20 +1004,22 @@ fn encoder_thread(
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
+    output_device_name: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
-    // Best-effort RT priority — sur Linux sans CAP_SYS_NICE c'est refusé,
-    // dans ce cas on continue en priorité normale plutôt que de planter.
-    let prio = thread_priority::ThreadPriority::Crossplatform(
-        95u8.try_into().expect("0..=100"),
+    // Sprint S2 — promotion RT du thread courant. Sur macOS : tente le
+    // workgroup CoreAudio HAL du device output ; fallback sur QoS+time-
+    // constraint Mach. Sur Windows : MMCSS Pro Audio. Sur Linux : best-
+    // effort thread-priority. Le handle est gardé vivant jusqu'à la fin
+    // du thread (Drop = leave/revert). Log info dans agent.log indique
+    // la méthode retenue ("macos-workgroup" attendu sur Apple Silicon).
+    let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
+        output_device_name.as_deref(),
     );
-    if let Err(e) = thread_priority::set_current_thread_priority(prio) {
-        tracing::warn!(target: "jamodio::encoder", error = ?e, "RT priority refusée — fallback prio normale");
-    }
 
     let encoder = match MusicEncoder::new() {
         Ok(e) => e,
