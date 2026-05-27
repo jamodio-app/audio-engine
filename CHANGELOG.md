@@ -6,6 +6,93 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.7] — 2026-05-27
+
+### Added — Sprint S5 : plugin overload guard + UX bypass auto
+
+Protection automatique contre les plugins INSERT qui saturent le CPU.
+Aucun impact sur la latence en charge normale (les chiffres v0.4.6
+sont conservés). Critère métier : **plugin-agnostique** — fonctionne
+pour AmpliTube, TONEX, neural amps, reverbs denses, etc. **sans
+liste blanche/noire** ni hardcoding de nom.
+
+#### Détection (agent)
+
+Dans `ws_server perfstats_task` (= la tâche tokio 1 Hz qui flush déjà
+les histogrammes), après chaque flush du `plugin_latency` :
+
+- Si `p99_ms > 4.0` ET `count >= 100` ET pas déjà en bypass auto :
+  - Set `instrument_plugin_bypass = true` (= signal dry sort,
+    cohérent UX avec le bypass A/B manuel existant)
+  - Set `plugin_auto_bypass_active = true` (= guard pour ne pas
+    re-émettre tant que l'user n'a pas acté)
+  - Log warn `jamodio::plugin` (visible dans `agent.log`)
+  - Émet `AgentMessage::InstrumentPluginOverload { name, p99_ms,
+    max_ms, count }` (= **après** le PerfStats pour que le browser
+    voie d'abord les chiffres qui ont déclenché)
+
+**Seuils choisis** :
+- `p99 > 4 ms` (= 150 % du budget RT 2,7 ms à 48 kHz/128) : marge
+  qui couvre les spikes acceptables (warm-up plugin, sample-load
+  isolé) sans tolérer un plugin constamment hors budget.
+- `count >= 100` : exclut le warm-up plugin (~10-20 premiers blocs
+  souvent lents le temps que le plugin se "préchauffe"). Statistique
+  fiable après ≈ 250 ms d'activité.
+
+#### Reset (agent)
+
+Le flag `plugin_auto_bypass_active` est reset à `false` (= un nouveau
+message d'overload pourra être émis) sur :
+- `LoadInstrumentPlugin` (= nouveau plugin = fresh start). Flush
+  aussi l'histogramme `plugin_latency` pour ne pas mélanger les
+  mesures du plugin précédent avec celles du nouveau.
+- `UnloadInstrumentPlugin`
+- `SetInstrumentPluginBypass` (= toggle manuel par l'user dans les
+  deux sens : si l'user re-active manuellement et que le plugin
+  re-spike, on l'avertit à nouveau).
+
+#### UX browser
+
+Nouveau handler `case 'instrument-plugin-overload'` dans
+`groupe.js handleAgentMessage` :
+
+- Toast persistant (`duration: 0`) non-dismissible auto, avec icône
+  ⚠️ et action "Réactiver" qui send `SetInstrumentPluginBypass { false }`
+- Texte template : `"⚠ {name} surcharge le CPU ({p99} ms) — bypass
+  auto activé. Choisis un preset plus léger."` — i18n FR + EN.
+  Le `{name}` est injecté depuis la payload agent, jamais hardcodé.
+- Re-render du slot FX `self` pour afficher le badge bypass.
+- Log warn structuré (`log.warn('plugin', 'overload détecté')`) pour
+  que la trace remonte au bug-report.
+
+#### Nouveau message protocole
+
+```rust
+AgentMessage::InstrumentPluginOverload {
+    name: String,
+    p99_ms: f32,
+    max_ms: f32,
+    count: usize,
+}
+```
+
+(camelCase sur le wire : `name`, `p99Ms`, `maxMs`, `count`).
+
+Pas de nouveau `BrowserMessage` — on réutilise `SetInstrumentPluginBypass`
+existant pour le bouton "Réactiver".
+
+### Notes
+
+- cargo test --workspace : 29 verts.
+- cargo build --release Mac OK. Smoke test toast UI vérifié en preview.
+- Pas de bench mock dans cette version : le déclenchement réel
+  nécessite un plugin lourd (TONEX, AmpliTube high-gain) qui n'est
+  pas installé en CI. Le path overload sera validé en session BETA
+  avec utilisateurs ayant des plugins variés. Test artificiel via
+  un mock `PluginHost` qui sleep(5 ms) à ajouter en backlog post-S6.
+- Compat browser v0.4.1+ (le browser ancien ignore simplement les
+  messages WS de type inconnu).
+
 ## [0.4.6] — 2026-05-27
 
 ### Fixed — CRITIQUE : régression latence v0.4.5 (rt_priority guard global)

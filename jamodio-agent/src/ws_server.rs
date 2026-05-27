@@ -384,6 +384,52 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 .map(|info| info.name.clone());
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let plugin_name: Option<String> = None;
+
+            // Sprint S5 — détection plugin overload. Seuil = process_stereo
+            // p99 > 4 ms (= 150 % du budget RT 2.7 ms) sur fenêtre 1 s avec
+            // au moins 100 mesures (= statistiquement représentatif, exclut
+            // le warm-up plugin). Émet UN SEUL message d'overload par cycle
+            // (= flag plugin_auto_bypass_active reste true tant que l'user
+            // n'a pas reset via SetInstrumentPluginBypass false ou n'a pas
+            // chargé un nouveau plugin).
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let overload_msg: Option<AgentMessage> = {
+                const OVERLOAD_P99_THRESHOLD_MS: f32 = 4.0;
+                const OVERLOAD_MIN_COUNT: usize = 100;
+                if plugin_snap.p99_ms > OVERLOAD_P99_THRESHOLD_MS
+                    && plugin_snap.count >= OVERLOAD_MIN_COUNT
+                    && !pl
+                        .plugin_auto_bypass_active
+                        .load(Ordering::SeqCst)
+                {
+                    // Trigger : on flag bypass auto + auto_bypass_active = true.
+                    pl.instrument_plugin_bypass.store(true, Ordering::SeqCst);
+                    pl.plugin_auto_bypass_active
+                        .store(true, Ordering::SeqCst);
+                    let name = plugin_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::warn!(
+                        target: "jamodio::plugin",
+                        plugin = %name,
+                        p99_ms = plugin_snap.p99_ms,
+                        max_ms = plugin_snap.max_ms,
+                        count = plugin_snap.count,
+                        "plugin overload détecté — bypass auto activé"
+                    );
+                    Some(AgentMessage::InstrumentPluginOverload {
+                        name,
+                        p99_ms: plugin_snap.p99_ms,
+                        max_ms: plugin_snap.max_ms,
+                        count: plugin_snap.count,
+                    })
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let overload_msg: Option<AgentMessage> = None;
+
             drop(pl);
 
             // Plugin perf : seulement si on a observé ET qu'un plugin est
@@ -467,6 +513,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;
+            }
+
+            // Sprint S5 — émet le message d'overload APRÈS le PerfStats (le
+            // browser voit d'abord les chiffres "vérité" qui ont déclenché
+            // le trigger, puis le toast UI). 1 seul message par cycle
+            // d'overload — protégé par `plugin_auto_bypass_active`.
+            if let Some(msg) = overload_msg {
+                if perfstats_tx.send(msg).await.is_err() {
+                    break;
+                }
             }
         }
     });

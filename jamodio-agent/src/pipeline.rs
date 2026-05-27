@@ -120,6 +120,18 @@ pub struct PipelineState {
     pub instrument_plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    /// Sprint S5 — état "bypass auto suite à overload détecté". Flag activé
+    /// quand `perfstats.plugin_latency.p99 > 4 ms` (cf. ws_server perfstats_task).
+    /// Set en même temps que `instrument_plugin_bypass = true` + émission
+    /// d'un message `InstrumentPluginOverload` au browser.
+    /// Reset à false sur :
+    ///   - `SetInstrumentPluginBypass { bypass: false }` (= user clique Réactiver)
+    ///   - `LoadInstrumentPlugin` (= nouveau plugin → fresh start)
+    ///   - `UnloadInstrumentPlugin`
+    /// Permet au perfstats_task de ne PAS re-émettre un message d'overload
+    /// tant que le cycle précédent n'a pas été acté par l'utilisateur.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub plugin_auto_bypass_active: Arc<std::sync::atomic::AtomicBool>,
     /// Cache du scan plugin. Le scan complet (mac : AU ~122ms-13s ; win :
     /// VST3 instancie chaque plugin pour lire latence/bus, ~5-15s) tourne UNE
     /// fois en background au boot et stocke le résultat ici. `ListPlugins`
@@ -253,6 +265,8 @@ impl PipelineState {
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            plugin_auto_bypass_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -440,6 +454,13 @@ impl PipelineState {
         *self.instrument_plugin_handle.lock() = Some(handle);
         self.instrument_plugin_bypass
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // S5 — reset le flag overload : nouveau plugin = fresh start,
+        // le perfstats_task peut à nouveau émettre un overload si nécessaire.
+        // Aussi : flush l'histogramme plugin_latency pour ne pas mélanger
+        // les mesures du plugin précédent avec celles du nouveau.
+        self.plugin_auto_bypass_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.perfstats.plugin_latency.lock().flush();
         // S1.5 — snapshot complet pour resync au reconnect.
         *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
             plugin_ref: plugin_ref.clone(),
@@ -465,6 +486,9 @@ impl PipelineState {
             *self.instrument_plugin_info.lock() = None;
             self.instrument_plugin_bypass
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            // S5 — reset flag overload (cohérent avec load_instrument_plugin).
+            self.plugin_auto_bypass_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             tracing::info!(target: "jamodio::plugin", "instrument plugin unloaded");
         }
     }
@@ -484,6 +508,16 @@ impl PipelineState {
     pub fn set_instrument_plugin_bypass(&self, bypass: bool) {
         self.instrument_plugin_bypass
             .store(bypass, std::sync::atomic::Ordering::Relaxed);
+        // S5 — reset flag overload : un toggle manuel (= action user
+        // explicite, via UI "Réactiver" ou bypass A/B) signifie que
+        // l'user a pris connaissance et acte. Le perfstats_task peut
+        // à nouveau émettre un overload si le plugin re-spike après.
+        // On reset DANS LES DEUX SENS (bypass=true et bypass=false) car
+        // un toggle vers true = pas un overload-detection automatique
+        // (= l'user a choisi de muter manuellement, il n'a pas besoin
+        // du toast d'alerte).
+        self.plugin_auto_bypass_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

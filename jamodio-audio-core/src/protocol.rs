@@ -422,6 +422,34 @@ pub enum AgentMessage {
     InstrumentPluginError {
         message: String,
     },
+    /// Sprint S5 — Alerte d'overload CPU détectée sur le plugin INSERT actif.
+    /// Émis automatiquement par l'agent quand `process_stereo` p99 dépasse le
+    /// budget RT (`p99 > 4 ms` sur fenêtre 1 s avec au moins 100 mesures).
+    /// L'agent a déjà mis le plugin en bypass auto (= signal dry remplacé)
+    /// → cohérent UX : l'utilisateur n'entend plus le plugin mais entend
+    /// quand même son signal direct.
+    ///
+    /// Côté browser, déclenche un toast persistant "{name} CPU-saturé,
+    /// bypass auto activé" + bouton "Réactiver" qui send
+    /// `SetInstrumentPluginBypass { bypass: false }`.
+    ///
+    /// Émis **une seule fois** par cycle d'overload (= jusqu'à ce que l'user
+    /// reset via SetInstrumentPluginBypass false, ou load un nouveau plugin).
+    InstrumentPluginOverload {
+        /// Nom du plugin tel que rapporté côté agent (= `LoadedPluginInfo.name`).
+        /// Le browser l'injecte dans son template de toast — pas hardcodé.
+        name: String,
+        /// 99e percentile observé sur la fenêtre de détection (ms).
+        #[serde(rename = "p99Ms")]
+        p99_ms: f32,
+        /// Max observé sur la fenêtre (ms). Utile pour différencier
+        /// "constamment lent" vs "spike isolé énorme".
+        #[serde(rename = "maxMs")]
+        max_ms: f32,
+        /// Nombre de mesures dans la fenêtre. Permet au browser de vérifier
+        /// la fiabilité statistique (= count élevé = trigger justifié).
+        count: usize,
+    },
     /// Sprint INSERT instruments (S2) — réponse à `ListMidiDevices`.
     MidiDeviceList {
         devices: Vec<MidiDeviceWire>,
