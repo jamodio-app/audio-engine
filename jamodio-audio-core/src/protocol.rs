@@ -546,11 +546,17 @@ pub enum AgentMessage {
         pipeline_latency_ms: PipelineLatency,
         peers: Vec<PeerPerf>,
         /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin sur la
-        /// fenêtre 1 s. `> 1.0` ⇒ le plugin sort au-delà de 0 dBFS (le soft-clip
-        /// de sécurité a protégé le DAC/réseau/record, mais l'utilisateur
-        /// devrait baisser la sortie de son plugin) → voyant CLIP côté UI.
+        /// fenêtre 1 s. Diagnostic (un transitoire peut dépasser 1.0 sans être
+        /// audible une fois soft-clippé — c'est `output_clip_pct` qui pilote le
+        /// voyant, pas ce pic).
         #[serde(rename = "outputPeak")]
         output_peak: f32,
+        /// Chantier C (v0.4.15) — TAUX de saturation soutenue : % de samples
+        /// ayant dépassé la pleine-échelle (|x| > 1.0) sur la fenêtre. Pilote le
+        /// voyant CLIP : reste ~0 sur les transitoires (batterie/piano, écrêtage
+        /// inaudible), monte seulement sur un overdrive SOUTENU réel.
+        #[serde(rename = "outputClipPct")]
+        output_clip_pct: f32,
         /// Chantier C — latence courante du buffer self-monitor (ms) et nombre
         /// d'underruns cumulés. Diagnostic : la latence grandit transitoirement
         /// quand un plugin spike (absorbe la gigue), revient à ~5 ms au calme.

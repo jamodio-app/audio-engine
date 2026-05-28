@@ -6,6 +6,33 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.15] — 2026-05-28
+
+### Fixed — Voyant CLIP : faux positifs sur les transitoires + message générique
+
+Retour test v0.4.14 (BFD + Piano) : le voyant CLIP **restait allumé en
+permanence alors que le son était parfait**. Analyse des logs : la sortie pique
+bien au-dessus de 0 dBFS (peak p90 = 1.29, max 9.56) — **mais sur des
+transitoires** (attaques de batterie/piano), pas en continu. Ces pics sont
+soft-clippés de façon **inaudible** (quelques samples par attaque). Le voyant
+se basait sur le **pic instantané** (≥ 0.99) → il s'allumait sur chaque attaque.
+
+Fix :
+- Le voyant est désormais piloté par le **TAUX de saturation SOUTENUE**
+  (`output_clip_pct` = % de samples qui dépassent réellement la pleine-échelle
+  sur la seconde), pas le pic instantané. Un transitoire = taux ~0 % → pas de
+  voyant. Un overdrive réel et soutenu (≥ 1 % des samples) → voyant. Fini les
+  faux positifs sur batterie/piano.
+- **Message générique** (l'utilisateur n'a pas forcément de plugin) : « baisse
+  ton niveau (gain d'entrée de ta carte son, OU sortie de ton plugin) ».
+- Soft-clip plus **transparent** : seuil 0,94 → **0,98** (-0,17 dBFS) → on ne
+  shape QUE le tout haut du signal (vrais dépassements), plus le signal fort
+  propre.
+
+`output_peak` reste exposé (diagnostic). `output_clip_pct` ajouté à PerfStats +
+agent.log. cargo test --workspace : 42 verts (nouveau test : transitoire vs
+overdrive soutenu).
+
 ## [0.4.14] — 2026-05-28
 
 ### Fixed — Chantier C : anti-clip plugin-agnostic + buffer monitor adaptatif

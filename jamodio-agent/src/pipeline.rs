@@ -203,9 +203,15 @@ pub struct PerfHandles {
     pub drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
-    /// pour `fetch_max`). Lu+reset par perfstats_task 1 Hz → indicateur CLIP UI.
-    /// Permet de signaler à l'utilisateur quand son plugin sort > 0 dBFS.
+    /// pour `fetch_max`). Lu+reset par perfstats_task 1 Hz. Diagnostic.
     pub output_peak: Arc<std::sync::atomic::AtomicU32>,
+    /// Chantier C (v0.4.15) — nombre de samples ayant dépassé la pleine-échelle
+    /// (|x| > 1.0) sur la fenêtre = vrais écrêtages rattrapés par le soft-clip.
+    /// `output_clip_samples / output_total_samples` = taux de saturation soutenu
+    /// → c'est CE taux (pas le pic transitoire) qui allume le voyant CLIP, pour
+    /// ne pas crier au loup sur les transitoires inaudibles (batterie/piano).
+    pub output_clip_samples: Arc<std::sync::atomic::AtomicU64>,
+    pub output_total_samples: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PerfHandles {
@@ -222,6 +228,8 @@ impl PerfHandles {
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             drift_ppm_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -1442,29 +1450,43 @@ fn capture_stage_loop(
 // C'est le SEUL stage qui peut spiker (plugin lourd). Le ringbuf en amont
 // (depuis capture) absorbe ~170 ms de jitter sans drop CPAL.
 
-/// Chantier C (v0.4.14) — soft-clip de sécurité ZÉRO-latence, plugin-agnostic.
+/// Chantier C (v0.4.14, révisé v0.4.15) — soft-clip de sécurité ZÉRO-latence,
+/// plugin-agnostic.
 ///
 /// En dessous de `threshold` : identité (signal bit-identique, coût ≈ 1 abs +
 /// 1 compare par sample). Au-dessus : genou `tanh` qui plafonne en douceur vers
 /// ±1.0 — continu et de pente continue à `threshold` (tanh'(0)=1) → pas de
 /// rupture. Asymptote à ±1.0 : la sortie ne dépasse JAMAIS 0 dBFS. Aucun
 /// lookahead → aucune latence ajoutée. Protège le DAC (monitoring), le réseau
-/// et l'enregistrement quand un plugin sort trop chaud (cf. AmpliTube +6 dB).
-/// Retourne le pic ABSOLU d'ENTRÉE (pré-clip) → alimente l'indicateur CLIP UI.
-fn soft_clip_block(samples: &mut [f32], threshold: f32) -> f32 {
+/// et l'enregistrement quel que soit le plugin (ou même sans plugin, un gain
+/// d'entrée trop élevé). `threshold` ≈ 0.98 (-0,17 dBFS) → on ne touche QUE le
+/// tout haut du signal (les pics ≥ pleine-échelle), pas le signal fort propre.
+///
+/// Retourne `(peak, overs)` :
+///   - `peak` = pic ABSOLU d'ENTRÉE (pré-clip), diagnostic ;
+///   - `overs` = nombre de samples qui DÉPASSAIENT la pleine-échelle (|x| > 1.0)
+///     = vrais écrêtages que le soft-clip a rattrapés. Sur un transitoire isolé
+///     (attaque batterie/piano) `overs` est minuscule (inaudible) ; un overdrive
+///     SOUTENU produit un `overs` élevé → c'est ce signal-là (taux soutenu, pas
+///     le pic instantané) qui doit allumer le voyant CLIP.
+fn soft_clip_block(samples: &mut [f32], threshold: f32) -> (f32, u64) {
     let mut peak = 0.0f32;
+    let mut overs = 0u64;
     let range = 1.0 - threshold;
     for s in samples.iter_mut() {
         let a = s.abs();
         if a > peak {
             peak = a;
         }
+        if a > 1.0 {
+            overs += 1;
+        }
         if a > threshold {
             let over = (a - threshold) / range;
             *s = (threshold + range * over.tanh()).copysign(*s);
         }
     }
-    peak
+    (peak, overs)
 }
 
 /// Chantier B (v0.4.13) — fondu équal-power dry→wet IN-PLACE.
@@ -1729,11 +1751,16 @@ fn process_stage_loop(
                 // latence. Remonte le pic d'entrée (pré-clip) → indicateur CLIP
                 // si le plugin sort > 0 dBFS (l'user doit baisser sa sortie).
                 if !stereo.is_empty() {
-                    const SOFT_CLIP_THRESHOLD: f32 = 0.94; // ≈ -0,5 dBFS
-                    let peak = soft_clip_block(&mut stereo, SOFT_CLIP_THRESHOLD);
+                    // 0.98 ≈ -0,17 dBFS : ne shape QUE le tout haut (vrais
+                    // dépassements pleine-échelle), pas le signal fort propre.
+                    const SOFT_CLIP_THRESHOLD: f32 = 0.98;
+                    let (peak, overs) = soft_clip_block(&mut stereo, SOFT_CLIP_THRESHOLD);
+                    use std::sync::atomic::Ordering::Relaxed;
+                    perfstats.output_peak.fetch_max(peak.to_bits(), Relaxed);
+                    perfstats.output_clip_samples.fetch_add(overs, Relaxed);
                     perfstats
-                        .output_peak
-                        .fetch_max(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        .output_total_samples
+                        .fetch_add(stereo.len() as u64, Relaxed);
                 }
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
@@ -2246,17 +2273,21 @@ mod dsp_tests {
         // Tout signal sous le seuil reste bit-identique (aucune coloration).
         let orig: Vec<f32> = vec![-0.9, -0.5, 0.0, 0.3, 0.93, -0.94];
         let mut x = orig.clone();
-        let peak = soft_clip_block(&mut x, 0.94);
+        let (peak, overs) = soft_clip_block(&mut x, 0.94);
         assert_eq!(x, orig, "signal sous seuil inchangé");
         assert!((peak - 0.94).abs() < 1e-6, "peak = max abs d'entrée");
+        assert_eq!(overs, 0, "aucun sample > pleine-échelle");
     }
 
     #[test]
     fn soft_clip_never_exceeds_full_scale() {
         // Un plugin hot (jusqu'à ±3.0) ne doit JAMAIS sortir > ±1.0 après clip.
         let mut x: Vec<f32> = vec![3.0, -2.0, 1.5, -1.2, 1.0, 0.97];
-        let peak = soft_clip_block(&mut x, 0.94);
+        let (peak, overs) = soft_clip_block(&mut x, 0.94);
         assert!(peak >= 3.0 - 1e-6, "peak reflète l'entrée brute (3.0)");
+        // 4 samples dépassent STRICTEMENT 1.0 (3.0, 2.0, 1.5, 1.2) → vrais
+        // écrêtages comptés ; 1.0 et 0.97 ne comptent pas.
+        assert_eq!(overs, 4, "compte les samples > pleine-échelle");
         for &v in &x {
             // Asymptote = ±1.0 (0 dBFS, plein-échelle représentable, PAS un
             // clip) : jamais dépassé, atteint sur très gros dépassement (tanh
@@ -2272,7 +2303,7 @@ mod dsp_tests {
         // marche). On compare l'identité (seuil) au clip d'un poil au-dessus.
         let t = 0.94f32;
         let mut just_above = vec![t + 1e-4];
-        soft_clip_block(&mut just_above, t);
+        let _ = soft_clip_block(&mut just_above, t);
         assert!(
             (just_above[0] - t).abs() < 1e-3,
             "transition douce au seuil, got {}",
@@ -2280,7 +2311,28 @@ mod dsp_tests {
         );
         // Monotonie + signe préservés.
         let mut neg = vec![-2.0f32];
-        soft_clip_block(&mut neg, t);
+        let _ = soft_clip_block(&mut neg, t);
         assert!(neg[0] < 0.0, "signe préservé");
+    }
+
+    #[test]
+    fn soft_clip_transients_vs_sustained_overs() {
+        // Le voyant CLIP doit distinguer un transitoire (peu d'overs) d'un
+        // overdrive soutenu (beaucoup d'overs). Bloc de 4800 samples : un
+        // transitoire = quelques samples > 1.0 ; un overdrive soutenu = la
+        // majorité. C'est le TAUX (overs/total) qui compte, pas le pic.
+        let mut transient = vec![0.3f32; 4800];
+        for s in transient.iter_mut().take(8) {
+            *s = 2.0; // 8 samples au-dessus de 1.0 sur 4800 = 0.17 %
+        }
+        let (_p, overs_t) = soft_clip_block(&mut transient, 0.98);
+        assert_eq!(overs_t, 8);
+        let pct_t = 100.0 * overs_t as f32 / 4800.0;
+        assert!(pct_t < 1.0, "transitoire = taux faible ({pct_t} %)");
+
+        let mut sustained = vec![1.5f32; 4800]; // tout dépasse 1.0
+        let (_p2, overs_s) = soft_clip_block(&mut sustained, 0.98);
+        let pct_s = 100.0 * overs_s as f32 / 4800.0;
+        assert!(pct_s > 50.0, "overdrive soutenu = taux élevé ({pct_s} %)");
     }
 }

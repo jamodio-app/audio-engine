@@ -388,9 +388,17 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 .perfstats
                 .capture_drops
                 .swap(0, Ordering::Relaxed);
-            // Chantier C — pic de sortie post-plugin (reset à 0 = +0.0 f32).
+            // Chantier C — pic de sortie post-plugin (reset à 0 = +0.0 f32) +
+            // taux de saturation soutenue (% samples > pleine-échelle).
             let output_peak =
                 f32::from_bits(pl.perfstats.output_peak.swap(0, Ordering::Relaxed));
+            let clip_samples = pl.perfstats.output_clip_samples.swap(0, Ordering::Relaxed);
+            let total_samples = pl.perfstats.output_total_samples.swap(0, Ordering::Relaxed);
+            let output_clip_pct = if total_samples > 0 {
+                100.0 * clip_samples as f32 / total_samples as f32
+            } else {
+                0.0
+            };
             // Snapshot drift_ppm par peer (clone du hashmap, cheap car ≤4 peers)
             let drift_map: std::collections::HashMap<String, f64> =
                 pl.perfstats.drift_ppm_by_producer.lock().clone();
@@ -616,6 +624,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 encode_max_ms = encode_snap.max_ms,
                 peers = peers.len(),
                 output_peak,
+                output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
                 "perfstats snapshot"
@@ -627,6 +636,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 pipeline_latency_ms,
                 peers,
                 output_peak,
+                output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
             };
