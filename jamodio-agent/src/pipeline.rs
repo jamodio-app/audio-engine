@@ -255,6 +255,110 @@ pub struct LoadedPluginInfo {
     pub has_editor: bool,
 }
 
+/// Chantier A (v0.4.12) — bundle d'`Arc` strictement nécessaire pour charger /
+/// décharger un plugin SANS tenir le lock `PipelineState`.
+///
+/// Pourquoi : l'init / teardown natif d'un plugin (AU/VST3) prend 0,4 à 4 s sur
+/// les gros plugins (AmpliTube, BFD, Kontakt…). Avant, ce travail tournait en
+/// tenant le lock `PipelineState` (→ perfstats_task bloqué) ET `plugin_host`
+/// (→ thread audio bloqué → drops → glitch). Désormais le handler WS clone ce
+/// bundle (cheap), relâche le lock `PipelineState`, puis exécute l'opération
+/// lente sur `spawn_blocking`. Le thread audio voit `handle = None` → dry
+/// passthrough (cf. `try_lock` dans le process stage) et ne bloque jamais.
+///
+/// Clone = simples `Arc::clone` (pas de copie de données).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Clone)]
+pub struct PluginControl {
+    plugin_host: Arc<Mutex<PluginHostImpl>>,
+    instrument_plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
+    instrument_plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
+    plugin_auto_bypass_active: Arc<std::sync::atomic::AtomicBool>,
+    plugin_scan_cache: Arc<Mutex<PluginScanCache>>,
+    instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
+    plugin_latency: Arc<Mutex<Histogram>>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl PluginControl {
+    /// Décharge le plugin courant (no-op si aucun). Pose `handle = None` AVANT
+    /// le teardown natif → le thread audio passe en dry immédiatement, puis le
+    /// teardown lent s'exécute sans bloquer l'audio (try_lock côté process).
+    /// À appeler hors du lock `PipelineState` (idéalement `spawn_blocking`).
+    pub fn unload(&self) {
+        // Détache d'abord le handle (dry instantané), PUIS teardown natif.
+        let old = self.instrument_plugin_handle.lock().take();
+        if let Some(handle) = old {
+            let _ = self.plugin_host.lock().unload(handle);
+            // S1.5 — clear le snapshot AVEC le handle pour cohérence.
+            *self.instrument_plugin_info.lock() = None;
+            self.instrument_plugin_bypass
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // S5 — reset flag overload (cohérent avec load).
+            self.plugin_auto_bypass_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(target: "jamodio::plugin", "instrument plugin unloaded");
+        }
+    }
+
+    /// Charge `plugin_ref` sur l'instrument self. Décharge l'éventuel précédent
+    /// (single slot MVP). `max_frames = 128` (cf. PLUGIN_BLOCK). Le thread audio
+    /// reste en dry (`handle = None`) toute la durée du load natif, puis bascule
+    /// wet une fois le handle posé. Retourne (name, latency_samples, has_editor)
+    /// pour l'ack browser. À appeler hors du lock `PipelineState`.
+    pub fn load(&self, plugin_ref: &PluginRef) -> Result<(String, u32, bool), String> {
+        // Décharger d'abord (pose handle=None → dry immédiat).
+        self.unload();
+
+        // Load natif (lent). handle reste None → thread audio en dry.
+        let mut host = self.plugin_host.lock();
+        let handle = host.load(plugin_ref, 128).map_err(|e| format!("{e}"))?;
+        let latency = host.latency_samples(handle);
+        drop(host);
+
+        // Retrouver name + has_editor depuis le cache pour l'ack browser. Si le
+        // scan tourne encore (cas limite), valeurs par défaut — le browser a de
+        // toute façon déjà le name dans sa liste.
+        let (name, has_editor) = {
+            let scan = self.plugin_scan_cache.lock();
+            if let PluginScanCache::Ready(items) = &*scan {
+                items
+                    .iter()
+                    .find(|p| p.plugin_ref == *plugin_ref)
+                    .map(|p| (p.name.clone(), p.has_editor))
+                    .unwrap_or_else(|| ("Unknown plugin".to_string(), false))
+            } else {
+                ("Unknown plugin".to_string(), false)
+            }
+        };
+
+        // Bascule wet : pose le handle (le thread audio le récupère au prochain
+        // bloc via try_lock → traitement plugin actif).
+        *self.instrument_plugin_handle.lock() = Some(handle);
+        self.instrument_plugin_bypass
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // S5 — reset le flag overload + flush l'histogramme plugin_latency pour
+        // ne pas mélanger les mesures de l'ancien plugin avec le nouveau.
+        self.plugin_auto_bypass_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.plugin_latency.lock().flush();
+        // S1.5 — snapshot complet pour resync au reconnect.
+        *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
+            plugin_ref: plugin_ref.clone(),
+            name: name.clone(),
+            latency_samples: latency,
+            has_editor,
+        });
+        tracing::info!(
+            target: "jamodio::plugin",
+            name = %name,
+            latency_samples = latency,
+            "instrument plugin loaded"
+        );
+        Ok((name, latency, has_editor))
+    }
+}
+
 const CHANNELS: usize = 2;
 
 impl PipelineState {
@@ -432,81 +536,21 @@ impl PipelineState {
         }
     }
 
-    /// Charge un plugin sur l'instrument self. Décharge l'éventuel précédent.
-    /// `max_frames` = 128 (cf. PLUGIN_BLOCK dans encoder_thread). Retourne
-    /// (name, latency_samples, has_editor) pour ack côté browser.
+    /// Chantier A — clone le bundle d'`Arc` plugin pour exécuter load/unload
+    /// HORS du lock `PipelineState` (cf. `PluginControl`). Cheap (Arc::clone).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn load_instrument_plugin(
-        &self,
-        plugin_ref: &PluginRef,
-    ) -> Result<(String, u32, bool), String> {
-        // Décharger d'abord (single slot MVP).
-        self.unload_instrument_plugin();
-
-        let mut host = self.plugin_host.lock();
-        let handle = host
-            .load(plugin_ref, 128)
-            .map_err(|e| format!("{e}"))?;
-        let latency = host.latency_samples(handle);
-        drop(host);
-
-        // Retrouver name + has_editor depuis le cache pour l'ack côté browser.
-        // Si le scan tourne encore (cas limite), on retourne des valeurs par
-        // défaut — le browser a de toute façon déjà le name dans sa liste.
-        let (name, has_editor) = {
-            let scan = self.plugin_scan_cache.lock();
-            if let PluginScanCache::Ready(items) = &*scan {
-                items
-                    .iter()
-                    .find(|p| p.plugin_ref == *plugin_ref)
-                    .map(|p| (p.name.clone(), p.has_editor))
-                    .unwrap_or_else(|| ("Unknown plugin".to_string(), false))
-            } else {
-                ("Unknown plugin".to_string(), false)
-            }
-        };
-
-        *self.instrument_plugin_handle.lock() = Some(handle);
-        self.instrument_plugin_bypass
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset le flag overload : nouveau plugin = fresh start,
-        // le perfstats_task peut à nouveau émettre un overload si nécessaire.
-        // Aussi : flush l'histogramme plugin_latency pour ne pas mélanger
-        // les mesures du plugin précédent avec celles du nouveau.
-        self.plugin_auto_bypass_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.perfstats.plugin_latency.lock().flush();
-        // S1.5 — snapshot complet pour resync au reconnect.
-        *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
-            plugin_ref: plugin_ref.clone(),
-            name: name.clone(),
-            latency_samples: latency,
-            has_editor,
-        });
-        tracing::info!(
-            target: "jamodio::plugin",
-            name = %name,
-            latency_samples = latency,
-            "instrument plugin loaded"
-        );
-        Ok((name, latency, has_editor))
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn unload_instrument_plugin(&self) {
-        let mut handle_guard = self.instrument_plugin_handle.lock();
-        if let Some(handle) = handle_guard.take() {
-            let _ = self.plugin_host.lock().unload(handle);
-            // S1.5 — clear le snapshot AVEC le handle pour cohérence.
-            *self.instrument_plugin_info.lock() = None;
-            self.instrument_plugin_bypass
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            // S5 — reset flag overload (cohérent avec load_instrument_plugin).
-            self.plugin_auto_bypass_active
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            tracing::info!(target: "jamodio::plugin", "instrument plugin unloaded");
+    pub fn plugin_control(&self) -> PluginControl {
+        PluginControl {
+            plugin_host: self.plugin_host.clone(),
+            instrument_plugin_handle: self.instrument_plugin_handle.clone(),
+            instrument_plugin_bypass: self.instrument_plugin_bypass.clone(),
+            plugin_auto_bypass_active: self.plugin_auto_bypass_active.clone(),
+            plugin_scan_cache: self.plugin_scan_cache.clone(),
+            instrument_plugin_info: self.instrument_plugin_info.clone(),
+            plugin_latency: self.perfstats.plugin_latency.clone(),
         }
     }
+
 
     /// S1.5 — Snapshot pour resync au reconnect WS. Retourne None si aucun
     /// plugin actuellement chargé. Le bypass est dans le AtomicBool dédié.
@@ -1450,13 +1494,31 @@ fn process_stage_loop(
 
                 // INSERT plugin (AU mac / VST3 win) appliqué par sous-blocs
                 // de PLUGIN_BLOCK frames. Le self-monitor entend le son WET.
+                //
+                // `'plugin_block` permet de SAUTER le traitement plugin ce bloc
+                // (→ dry passthrough) sans court-circuiter le RMS/self-monitor/
+                // encode qui suivent. Utilisé quand le lock plugin est tenu par
+                // un (dé)chargement natif en cours (cf. try_lock plus bas).
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
+                'plugin_block: {
                 if !stereo.is_empty()
                     && !plugin_bypass.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let handle_opt = *plugin_handle.lock();
                     if let Some(handle) = handle_opt {
-                        let mut host = plugin_host.lock();
+                        // try_lock : ne JAMAIS bloquer le thread audio. Pendant
+                        // un (dé)chargement plugin natif lent (load/unload), le
+                        // lock est tenu ailleurs → on laisse passer le signal
+                        // SEC ce bloc (dry passthrough) → zéro coupure au swap.
+                        let Some(mut host) = plugin_host.try_lock() else {
+                            // Purge la file MIDI : events périmés pour le plugin
+                            // en cours de swap (sinon burst au bloc suivant).
+                            if let Some(rx) = &midi_event_rx {
+                                while rx.try_recv().is_ok() {}
+                            }
+                            // Signal sec → continue vers RMS/self-monitor/encode.
+                            break 'plugin_block;
+                        };
 
                         // Drain les events MIDI accumulés depuis le dernier
                         // bloc. Max 64 events / bloc (limite défensive).
@@ -1532,8 +1594,14 @@ fn process_stage_loop(
                             }
                             idx = end;
                         }
+                    } else if let Some(rx) = &midi_event_rx {
+                        // Pas de plugin actif (ou swap en cours, handle=None) →
+                        // purge la file MIDI pour éviter un burst d'events
+                        // périmés (note-on orphelins) au prochain plugin.
+                        while rx.try_recv().is_ok() {}
                     }
                 }
+                } // 'plugin_block
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
                 // dans son casque via le callback CPAL playback).
@@ -1865,4 +1933,118 @@ async fn recv_decode_task(
     // task. Sans ça, un peer disparu laisse un ppm fantôme dans le hashmap
     // → le PerfStats publié continuerait à mentionner ce peer mort.
     drift_ppm_by_producer.lock().remove(&producer_id);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Chantier A (v0.4.12) — tests PluginControl (load/unload non-bloquant)
+// ═══════════════════════════════════════════════════════════════════
+//
+// macOS uniquement : on charge de vrais AudioUnits Apple natifs (présents
+// sur toute machine macOS, load rapide). Sous `cargo test`, NSApp est nil
+// donc l'hôte exécute load/unload inline (cf. jmo_run_on_main_sync). La
+// parité Windows (VST3) sera couverte dans la session de validation Windows.
+//
+// Ce qu'on valide : la machine à états de PluginControl (handle / info /
+// flags). La propriété « 0 drops pendant un load » (= le thread audio ne
+// bloque pas) dépend du hardware audio → validée on-device.
+#[cfg(all(test, target_os = "macos"))]
+mod plugin_control_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn make_control() -> PluginControl {
+        PluginControl {
+            plugin_host: Arc::new(Mutex::new(PluginHostImpl::new())),
+            instrument_plugin_handle: Arc::new(Mutex::new(None)),
+            // bypass=true + overload=true au départ → on vérifie que load() les
+            // remet à false (= fresh start).
+            instrument_plugin_bypass: Arc::new(AtomicBool::new(true)),
+            plugin_auto_bypass_active: Arc::new(AtomicBool::new(true)),
+            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
+            instrument_plugin_info: Arc::new(Mutex::new(None)),
+            plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),
+        }
+    }
+
+    // AUNBandEQ — effet Apple natif, présent partout, load rapide & déterministe.
+    fn eq_ref() -> PluginRef {
+        PluginRef::Au {
+            au_type: "aufx".into(),
+            subtype: "nbeq".into(),
+            manufacturer: "appl".into(),
+        }
+    }
+
+    #[test]
+    fn load_sets_handle_and_resets_flags() {
+        let ctrl = make_control();
+        ctrl.load(&eq_ref()).expect("load AUNBandEQ");
+        assert!(
+            ctrl.instrument_plugin_handle.lock().is_some(),
+            "handle posé après load (→ thread audio passe en wet)"
+        );
+        assert!(
+            ctrl.instrument_plugin_info.lock().is_some(),
+            "snapshot info posé (resync reconnect)"
+        );
+        assert!(
+            !ctrl.instrument_plugin_bypass.load(Ordering::Relaxed),
+            "bypass reset à false au load"
+        );
+        assert!(
+            !ctrl.plugin_auto_bypass_active.load(Ordering::SeqCst),
+            "flag overload reset à false au load"
+        );
+        ctrl.unload();
+    }
+
+    #[test]
+    fn unload_clears_handle_and_info() {
+        let ctrl = make_control();
+        ctrl.load(&eq_ref()).expect("load");
+        ctrl.unload();
+        assert!(
+            ctrl.instrument_plugin_handle.lock().is_none(),
+            "handle libéré au unload (→ thread audio en dry)"
+        );
+        assert!(
+            ctrl.instrument_plugin_info.lock().is_none(),
+            "info clear au unload"
+        );
+    }
+
+    #[test]
+    fn reload_swap_keeps_consistent_state() {
+        // Swap A→B : pas de leak/panic, l'ancien est déchargé avant le nouveau.
+        let ctrl = make_control();
+        ctrl.load(&eq_ref()).expect("load 1");
+        ctrl.load(&eq_ref()).expect("load 2 (swap, unload interne du 1er)");
+        assert!(
+            ctrl.instrument_plugin_handle.lock().is_some(),
+            "handle posé après swap"
+        );
+        ctrl.unload();
+        assert!(ctrl.instrument_plugin_handle.lock().is_none());
+    }
+
+    #[test]
+    fn failed_load_leaves_handle_none() {
+        // Plugin inexistant → Err. Invariant de sûreté : le handle reste None
+        // (jamais de wet sur une instance fantôme) → le thread audio reste dry.
+        let ctrl = make_control();
+        let bogus = PluginRef::Au {
+            au_type: "aufx".into(),
+            subtype: "zzzz".into(),
+            manufacturer: "zzzz".into(),
+        };
+        assert!(ctrl.load(&bogus).is_err(), "load d'un AU inexistant doit échouer");
+        assert!(
+            ctrl.instrument_plugin_handle.lock().is_none(),
+            "handle reste None après échec de load (pas de wet fantôme)"
+        );
+        assert!(
+            ctrl.instrument_plugin_info.lock().is_none(),
+            "info reste None après échec de load"
+        );
+    }
 }

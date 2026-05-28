@@ -6,6 +6,54 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.12] — 2026-05-28
+
+### Fixed — Chantier A : chargement/déchargement de plugin non-bloquant
+
+**Glitches audio pendant un swap de plugin** (remontés par la session test
+28/05, Mac Mini M1, AmpliTube/BFD/Piano). Diagnostic via `agent.log` :
+les 3 seuls bursts de drops de la session coïncidaient **exactement** avec
+un load/unload de plugin, avec un `process_max` de **2,6 à 4,1 secondes**
+(= le thread audio gelé pendant tout l'init/teardown natif).
+
+Cause : `load`/`unload` tenaient `plugin_host.lock()` (et le lock
+`PipelineState`) pendant l'init/teardown natif AU (0,4–4 s sur les gros
+plugins). Le thread audio attendait ce même lock → débordement du ringbuf
+de capture → drops → glitch. (Et perfstats_task était bloqué → trous dans
+les métriques.) **AmpliTube/BFD ne sont pas en cause** : en régime établi
+ils tournent à p99 ~1,7 ms, bien sous le budget.
+
+Fix en deux pièces :
+
+1. **Thread audio : `try_lock` au lieu de `lock`** (process stage). En
+   régime établi le thread audio est seul à prendre le lock → `try_lock`
+   réussit toujours (zéro changement, zéro latence ajoutée). Pendant un
+   (dé)chargement, `try_lock` échoue → **dry passthrough** ce bloc (signal
+   sec, aucune coupure) au lieu de bloquer. La file MIDI est purgée dans
+   les chemins dry pour éviter un burst d'events périmés au prochain plugin.
+
+2. **Load/unload hors du lock `PipelineState`.** Nouveau `PluginControl`
+   (bundle d'`Arc`, clone cheap) : le handler WS clone le bundle, relâche
+   le lock `PipelineState`, puis exécute l'opération native lente sur
+   `spawn_blocking`. Le handle est posé à `None` AVANT le travail natif
+   (→ dry instantané), puis à `Some(h)` une fois prêt (→ wet). Sérialisé
+   via `PLUGIN_OPS_LOCK` (jamais deux init/teardown natifs concurrents).
+   Supprime les `pipeline.lock() timeout — skipping handler` pendant un load.
+
+Résultat attendu : charger/changer/retirer un plugin **n'interrompt plus
+jamais l'audio** (dry le temps du load, puis wet). Plugin-agnostic, aucun
+nom en dur. Le crash fix v0.4.11 (teardown sur le main thread) est conservé.
+
+### Notes
+
+- cargo test --workspace : 32 verts (dont 4 nouveaux tests `PluginControl`
+  chargeant de vrais AudioUnits Apple — load/unload/swap/échec).
+- **Latence inchangée** : hot path identique (`lock`→`try_lock`, même coût
+  non-contendu). Les opérations lentes sont sur le cold path (spawn_blocking).
+- Validation « 0 drops pendant un load » à confirmer on-device (nécessite
+  le hardware audio) — la session de test utilisateur la couvrira.
+- Parité Windows (VST3) du non-blocking à valider lors de la session Windows.
+
 ## [0.4.11] — 2026-05-28
 
 ### Fixed — Crash unload AU + bypass plugin trop agressif

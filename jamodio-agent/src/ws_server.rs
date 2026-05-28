@@ -969,6 +969,18 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
     tracing::info!(target: "jamodio::ws", "logs-only client disconnected (no cleanup)");
 }
 
+/// Chantier A (v0.4.12) — sérialise les opérations plugin LENTES (load/unload
+/// natif AU/VST3, 0,4–4 s). Tenu HORS du lock `PipelineState` et du chemin
+/// audio → ne gèle rien. Garantit qu'on n'exécute jamais deux init/teardown
+/// natifs concurrents (course handle ↔ instance) même si le browser spamme.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static PLUGIN_OPS_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn plugin_ops_lock() -> &'static tokio::sync::Mutex<()> {
+    PLUGIN_OPS_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,
 /// retourne None et le caller répond Error{overloaded} au lieu de bloquer.
 async fn try_lock_pipeline(
@@ -1271,12 +1283,33 @@ async fn handle_message(
         BrowserMessage::LoadInstrumentPlugin { plugin_ref } => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
-                    return vec![AgentMessage::InstrumentPluginError {
-                        message: "agent overloaded".into(),
-                    }];
+                // Chantier A — on ne tient PAS le lock PipelineState pendant le
+                // load natif (0,4–4 s) : on clone le bundle d'Arcs (cheap) puis
+                // on relâche immédiatement. Le thread audio passe en dry
+                // (handle=None + try_lock) et perfstats_task n'est pas bloqué.
+                let ctrl = {
+                    let Some(pl) = try_lock_pipeline(pipeline).await else {
+                        return vec![AgentMessage::InstrumentPluginError {
+                            message: "agent overloaded".into(),
+                        }];
+                    };
+                    pl.plugin_control()
                 };
-                match pl.load_instrument_plugin(&plugin_ref) {
+                // Sérialise vs un autre load/unload en cours, puis exécute le
+                // load natif sur le pool blocking (ne bloque pas le runtime
+                // tokio ni les autres handlers/tasks).
+                let _ops = plugin_ops_lock().lock().await;
+                let pref = plugin_ref.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || ctrl.load(&pref)).await;
+                // `spawn_blocking` ne panique que si la task panique : on traite
+                // le JoinError comme une erreur de chargement plutôt que de
+                // propager un panic dans le handler WS.
+                let result = match result {
+                    Ok(inner) => inner,
+                    Err(join_err) => Err(format!("plugin load task failed: {join_err}")),
+                };
+                match result {
                     Ok((name, latency_samples, has_editor)) => {
                         vec![AgentMessage::InstrumentPluginLoaded {
                             name,
@@ -1284,7 +1317,7 @@ async fn handle_message(
                             latency_samples,
                             has_editor,
                             // Reset au load — l'agent met bypass à false dans
-                            // load_instrument_plugin, on miroite pour le wire.
+                            // PluginControl::load, on miroite pour le wire.
                             bypass: false,
                         }]
                     }
@@ -1322,10 +1355,18 @@ async fn handle_message(
         BrowserMessage::UnloadInstrumentPlugin => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
-                    return vec![];
+                // Chantier A — même principe que le load : clone le bundle,
+                // relâche le lock PipelineState, teardown natif sur le pool
+                // blocking (le thread audio est déjà passé en dry dès que
+                // PluginControl::unload pose handle=None).
+                let ctrl = {
+                    let Some(pl) = try_lock_pipeline(pipeline).await else {
+                        return vec![];
+                    };
+                    pl.plugin_control()
                 };
-                pl.unload_instrument_plugin();
+                let _ops = plugin_ops_lock().lock().await;
+                let _ = tokio::task::spawn_blocking(move || ctrl.unload()).await;
                 vec![AgentMessage::InstrumentPluginUnloaded]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
