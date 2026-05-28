@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-vst3-host"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2021"
 description = "Jamodio VST3 plugin host — Windows uniquement, impl du trait PluginHost de jamodio-audio-core"
 

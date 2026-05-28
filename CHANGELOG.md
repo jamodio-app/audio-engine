@@ -6,6 +6,72 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.11] — 2026-05-28
+
+### Fixed — Crash unload AU + bypass plugin trop agressif
+
+Deux bugs bloquants remontés par la session de test du 28/05 (Mac Mini
+M1, AmpliTube 5 + BFD Player). **AmpliTube et BFD sont des plugins
+stables : les deux bugs étaient de NOTRE côté**, pas dans les plugins.
+
+#### Crash « JAMODIO AUDIO ENGINE a quitté de manière imprévue »
+
+Cause (diagnostic via le rapport `.ips`) : SIGSEGV null-deref sur le
+**main thread**, dans le timer `CFRunLoop` interne du plugin
+(`BFDPlayer::MessagePort::ProcessEditorMessages` via `ATC_Tick`).
+
+L'ancien `unload` disposait l'`AudioUnit` **depuis le thread WS** (≠ main)
+tout en fermant l'éditeur en `dispatch_async` (= plus tard). Les gros
+plugins enregistrent un timer périodique sur le main runloop **dès le
+load** (pas seulement à l'ouverture de l'éditeur) : disposer l'instance
+pendant que ce timer accède encore aux objets internes = use-after-free.
+
+Fix (`au_host.mm`) : tout le teardown (close editor → uninitialize →
+dispose) s'exécute désormais **synchroniquement sur le main thread** via
+le helper `jmo_run_on_main_sync` (= celui déjà utilisé par le load).
+Le main runloop sérialise : le teardown s'exécute ENTRE deux itérations,
+jamais pendant un timer callback du plugin. Le helper gère aussi le cas
+test/CLI (`NSApp == nil` → exécution inline, pas de deadlock `cargo
+test`) et garde un filet de sécurité timeout 10 s.
+
+#### Plugin bypassé à tort (« son guitare comme si BYPASS » + silence MIDI)
+
+Cause (diagnostic via `agent.log`) : la détection d'overload S5
+(`v0.4.7`) déclenchait le bypass auto sur le **seul** critère
+`plugin p99 > 4 ms`. Or sur la session 28/05, AmpliTube 5 et BFD Player
+tournaient à p99 4-6 ms **avec `drops_per_sec = 0`** (= le ringbuf S3
+absorbait, audio nickel). Ils étaient donc bypassés alors qu'ils
+fonctionnaient parfaitement → l'utilisateur entendait le signal DRY
++ silence total en mode MIDI (BFD bypassé = pas de son).
+
+Le seuil p99 absolu est **hardware-dépendant** : 5 ms par bloc est viable
+sur une machine, pas sur une autre. Le seul signal fiable de « le plugin
+sature VRAIMENT » = `capture_drops > 0` (= le callback CPAL ne peut plus
+pousser ses samples car l'encoder est durablement bloqué).
+
+Fix (`ws_server.rs`) : le bypass auto ne se déclenche désormais que si
+les **trois** conditions cumulatives sont réunies :
+1. `capture_drops_window > 20/s` (= vraies coupures soutenues, pas 1-2
+   blocs isolés) — **hardware-agnostic** ;
+2. plugin actif et `p99 > 3 ms` sur ≥ 50 blocs (= il consomme un temps
+   significatif → candidat coupable, vs drops venus d'ailleurs) ;
+3. pas déjà bypassé (anti-spam, flag reset au load/unload/toggle user).
+On bypasse quand ça coupe RÉELLEMENT, pas quand un plugin lourd mais
+viable prend 5 ms par bloc. Plugin-agnostic : aucun nom en dur.
+
+Quand un bypass plugin part sur une fenêtre de drops, le toast générique
+`AgentPipelineOverload` est supprimé pour le même tick (= une seule cause
+remontée à l'UI, pas deux toasts pour le même évènement).
+
+### Notes
+
+- cargo test --workspace : 28 verts (dont `load_unload_aumatrixreverb`).
+  Le helper `jmo_run_on_main_sync` côté unload corrige aussi un **deadlock
+  `cargo test`** latent : un `dispatch_sync(main)` brut depuis un thread
+  worker de test pendait indéfiniment (NSApp nil → main queue non pompée).
+- Aucun impact latence : hot path inchangé (process lock-free), les deux
+  fix sont sur le cold path (unload + perfstats_task 1 Hz).
+
 ## [0.4.10] — 2026-05-27
 
 ### Added — Sprint S6 (partiel) : détection peer instable + re-switch HD

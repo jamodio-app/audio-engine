@@ -457,19 +457,39 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     None
                 };
 
-            // Sprint S5 — détection plugin overload. Seuil = process_stereo
-            // p99 > 4 ms (= 150 % du budget RT 2.7 ms) sur fenêtre 1 s avec
-            // au moins 100 mesures (= statistiquement représentatif, exclut
-            // le warm-up plugin). Émet UN SEUL message d'overload par cycle
-            // (= flag plugin_auto_bypass_active reste true tant que l'user
-            // n'a pas reset via SetInstrumentPluginBypass false ou n'a pas
-            // chargé un nouveau plugin).
+            // Sprint S5 (révisé v0.4.11) — bypass auto plugin SEULEMENT s'il
+            // cause des DROPS RÉELS.
+            //
+            // L'ancienne logique (p99 plugin > 4 ms seul) était trop agressive
+            // et hardware-dépendante : sur la session 28/05 (Mac Mini M1),
+            // AmpliTube 5 et BFD Player tournaient à p99 4-6 ms AVEC
+            // drops_per_sec=0 (= le ringbuf S3 absorbait, audio nickel) mais
+            // étaient bypassés à tort → l'utilisateur entendait le DRY
+            // ("comme si bypass") + silence total en mode MIDI.
+            //
+            // Le SEUL signal fiable de "le plugin sature vraiment" =
+            // `capture_drops` > 0 (= le CPAL callback ne peut plus pousser ses
+            // samples car l'encoder est durablement bloqué). Hardware-agnostic :
+            // on bypasse quand ça coupe RÉELLEMENT, pas quand un plugin lourd
+            // mais viable prend 5 ms par bloc.
+            //
+            // Conditions cumulatives :
+            //   1. capture_drops_window > seuil (= vraies coupures, pas 1-2 isolés)
+            //   2. plugin actif (= candidat) avec p99 notable (= il consomme)
+            //   3. pas déjà bypassé (anti-spam — flag reset par l'user/load)
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let overload_msg: Option<AgentMessage> = {
-                const OVERLOAD_P99_THRESHOLD_MS: f32 = 4.0;
-                const OVERLOAD_MIN_COUNT: usize = 100;
-                if plugin_snap.p99_ms > OVERLOAD_P99_THRESHOLD_MS
-                    && plugin_snap.count >= OVERLOAD_MIN_COUNT
+                // Seuil drops : > 20/s = saturation soutenue (≈ 5 % des blocs
+                // CPAL droppés). En-dessous, c'est tolérable / transitoire.
+                const OVERLOAD_DROPS_THRESHOLD: u64 = 20;
+                // p99 minimal pour incriminer le plugin (= il consomme du temps
+                // significatif ; sinon les drops viennent d'ailleurs → couvert
+                // par AgentPipelineOverload).
+                const OVERLOAD_PLUGIN_P99_MIN_MS: f32 = 3.0;
+                let plugin_is_culprit = plugin_snap.count >= 50
+                    && plugin_snap.p99_ms > OVERLOAD_PLUGIN_P99_MIN_MS;
+                if capture_drops_window > OVERLOAD_DROPS_THRESHOLD
+                    && plugin_is_culprit
                     && !pl
                         .plugin_auto_bypass_active
                         .load(Ordering::SeqCst)
@@ -486,8 +506,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         plugin = %name,
                         p99_ms = plugin_snap.p99_ms,
                         max_ms = plugin_snap.max_ms,
+                        drops_per_sec = capture_drops_window,
                         count = plugin_snap.count,
-                        "plugin overload détecté — bypass auto activé"
+                        "plugin overload détecté (drops réels) — bypass auto activé"
                     );
                     Some(AgentMessage::InstrumentPluginOverload {
                         name,
@@ -602,6 +623,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // browser voit d'abord les chiffres "vérité" qui ont déclenché
             // le trigger, puis le toast UI). 1 seul message par cycle
             // d'overload — protégé par `plugin_auto_bypass_active`.
+            let plugin_overload_fired = overload_msg.is_some();
             if let Some(msg) = overload_msg {
                 if perfstats_tx.send(msg).await.is_err() {
                     break;
@@ -610,8 +632,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
             // v0.4.9 — émet le message AgentPipelineOverload (distinct du
             // plugin overload S5 ; ne déclenche PAS de bypass plugin).
+            // v0.4.11 — si un bypass plugin vient de partir sur la même
+            // fenêtre de drops, on supprime ce toast générique : le bypass
+            // plugin EST la cause/remédiation spécifique, deux toasts pour
+            // le même évènement = bruit UX.
             if let Some(msg) = pipeline_overload_msg {
-                if perfstats_tx.send(msg).await.is_err() {
+                if !plugin_overload_fired && perfstats_tx.send(msg).await.is_err() {
                     break;
                 }
             }

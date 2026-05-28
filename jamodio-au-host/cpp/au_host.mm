@@ -615,22 +615,57 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     entries.erase(it);
     os_unfair_lock_unlock(&lock);
 
-    // Cleanup AU & window — hors lock pour éviter de tenir le lock pendant
-    // dealloc lourd. Branche selon le path utilisé au load.
-    if (entry->editor_window) {
-        NSWindow *w = entry->editor_window;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [w close];
-        });
-    }
-    if (entry->is_v3) {
-        [entry->au_v3 deallocateRenderResources];
-        entry->au_v3 = nil; // ARC
-        entry->render_block_v3 = nullptr;
-    } else if (entry->au_inst) {
-        AudioUnitUninitialize(entry->au_inst);
-        AudioComponentInstanceDispose(entry->au_inst);
-    }
+    // ─── FIX CRASH (v0.4.11) — teardown SYNCHRONE sur le MAIN THREAD ───
+    //
+    // Bug observé 28/05 (crash Mac Mini, BFD Player) : SIGSEGV null-deref
+    // sur le main thread dans `BFDPlayer::MessagePort::ProcessEditorMessages`
+    // (timer CFRunLoop interne du plugin via `ATC_Tick`).
+    //
+    // Cause : l'ancien code disposait l'AudioUnit DEPUIS LE THREAD WS (= un
+    // thread différent du main) tout en fermant l'éditeur en `dispatch_async`
+    // (= plus tard). Les gros plugins (BFD, AmpliTube, Kontakt…) enregistrent
+    // un timer périodique sur le main runloop dès le LOAD — pas seulement à
+    // l'ouverture de l'éditeur. Disposer l'instance pendant que ce timer
+    // accède encore aux objets internes du plugin = use-after-free → crash.
+    //
+    // Fix : on exécute TOUT le teardown (close editor → uninitialize →
+    // dispose) dans un bloc synchrone sur le main queue. Garanties :
+    //   1. Le main runloop sérialise : le bloc s'exécute ENTRE deux
+    //      itérations, jamais pendant un timer callback du plugin.
+    //   2. L'AU est disposée sur le MAIN THREAD (requis pour les AU à éditeur
+    //      — leurs views/timers vivent sur ce thread).
+    //   3. Ordre strict : close window AVANT dispose (sinon la window
+    //      référence une instance morte).
+    //   4. Le wait synchrone (helper bloquant) ⇒ l'`entry` (unique_ptr) reste
+    //      vivant pendant tout le teardown (détruit seulement au `return`).
+    //
+    // Exécution via `jmo_run_on_main_sync` (= même helper que le load) :
+    //   - sur le main thread → inline ;
+    //   - en contexte test/CLI (NSApp == nil, main queue non pompée) → inline
+    //     (ÉVITE le deadlock `dispatch_sync(main)` depuis un thread worker
+    //     `cargo test`, qui sinon pend indéfiniment) ;
+    //   - en prod (Tauri, NSApp != nil) → dispatch_async + wait, exécuté en
+    //     ~50 µs entre deux itérations du runloop, jamais pendant un timer
+    //     callback du plugin. Timeout 10 s = filet de sécurité si le main
+    //     thread est wedgé (fallback inline, comme le load).
+    // `dispatch_sync` brut serait incorrect ici : il deadlocke en CI car les
+    // fonctions `#[test]` Rust tournent sur des threads worker, pas le main.
+    Entry *e = entry.get();
+    jmo_run_on_main_sync(^{
+        if (e->editor_window) {
+            [e->editor_window close];
+            e->editor_window = nil; // ARC
+        }
+        if (e->is_v3) {
+            [e->au_v3 deallocateRenderResources];
+            e->au_v3 = nil; // ARC
+            e->render_block_v3 = nullptr;
+        } else if (e->au_inst) {
+            AudioUnitUninitialize(e->au_inst);
+            AudioComponentInstanceDispose(e->au_inst);
+            e->au_inst = nullptr;
+        }
+    });
     return 0;
 }
 
