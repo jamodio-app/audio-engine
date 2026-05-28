@@ -388,11 +388,20 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 .perfstats
                 .capture_drops
                 .swap(0, Ordering::Relaxed);
+            // Chantier C — pic de sortie post-plugin (reset à 0 = +0.0 f32).
+            let output_peak =
+                f32::from_bits(pl.perfstats.output_peak.swap(0, Ordering::Relaxed));
             // Snapshot drift_ppm par peer (clone du hashmap, cheap car ≤4 peers)
             let drift_map: std::collections::HashMap<String, f64> =
                 pl.perfstats.drift_ppm_by_producer.lock().clone();
             // Snapshot mixer stats (underruns + drift_drops cumul + target_ms)
-            let mixer_stats = pl.mixer.lock().stream_perf_stats();
+            // + Chantier C : stats du self-monitor (latence courante + underruns).
+            let (mixer_stats, monitor_buffer_ms, monitor_underruns) = {
+                let m = pl.mixer.lock();
+                let stats = m.stream_perf_stats();
+                let (mt, mu) = m.self_monitor_stats();
+                (stats, mt, mu)
+            };
             // Sprint S6 — récupère les peers REMOTE instables (= > 16 drift
             // drains sur fenêtre 30 s). Le mixer purge ses VecDeque internes
             // au passage. Retour : (producer_id, events_window, drains_total).
@@ -606,6 +615,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 encode_p99_ms = encode_snap.p99_ms,
                 encode_max_ms = encode_snap.max_ms,
                 peers = peers.len(),
+                output_peak,
+                monitor_buffer_ms,
+                monitor_underruns,
                 "perfstats snapshot"
             );
 
@@ -614,6 +626,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 plugin: plugin_perf,
                 pipeline_latency_ms,
                 peers,
+                output_peak,
+                monitor_buffer_ms,
+                monitor_underruns,
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;

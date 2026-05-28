@@ -201,6 +201,11 @@ pub struct PerfHandles {
     pub encode_latency: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     pub drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
+    /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
+    /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
+    /// pour `fetch_max`). Lu+reset par perfstats_task 1 Hz → indicateur CLIP UI.
+    /// Permet de signaler à l'utilisateur quand son plugin sort > 0 dBFS.
+    pub output_peak: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl PerfHandles {
@@ -216,6 +221,7 @@ impl PerfHandles {
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             drift_ppm_by_producer: Arc::new(Mutex::new(HashMap::new())),
+            output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
@@ -1436,6 +1442,31 @@ fn capture_stage_loop(
 // C'est le SEUL stage qui peut spiker (plugin lourd). Le ringbuf en amont
 // (depuis capture) absorbe ~170 ms de jitter sans drop CPAL.
 
+/// Chantier C (v0.4.14) — soft-clip de sécurité ZÉRO-latence, plugin-agnostic.
+///
+/// En dessous de `threshold` : identité (signal bit-identique, coût ≈ 1 abs +
+/// 1 compare par sample). Au-dessus : genou `tanh` qui plafonne en douceur vers
+/// ±1.0 — continu et de pente continue à `threshold` (tanh'(0)=1) → pas de
+/// rupture. Asymptote à ±1.0 : la sortie ne dépasse JAMAIS 0 dBFS. Aucun
+/// lookahead → aucune latence ajoutée. Protège le DAC (monitoring), le réseau
+/// et l'enregistrement quand un plugin sort trop chaud (cf. AmpliTube +6 dB).
+/// Retourne le pic ABSOLU d'ENTRÉE (pré-clip) → alimente l'indicateur CLIP UI.
+fn soft_clip_block(samples: &mut [f32], threshold: f32) -> f32 {
+    let mut peak = 0.0f32;
+    let range = 1.0 - threshold;
+    for s in samples.iter_mut() {
+        let a = s.abs();
+        if a > peak {
+            peak = a;
+        }
+        if a > threshold {
+            let over = (a - threshold) / range;
+            *s = (threshold + range * over.tanh()).copysign(*s);
+        }
+    }
+    peak
+}
+
 /// Chantier B (v0.4.13) — fondu équal-power dry→wet IN-PLACE.
 ///
 /// Mélange `wet` (sortie plugin, interleaved stéréo) avec `dry` (signal sec de
@@ -1691,6 +1722,18 @@ fn process_stage_loop(
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     wet_was_active = wet_applied;
+                }
+
+                // Chantier C — soft-clip de sécurité sur la sortie post-plugin
+                // (couvre self-monitor + encode + record, tous en aval). Zéro
+                // latence. Remonte le pic d'entrée (pré-clip) → indicateur CLIP
+                // si le plugin sort > 0 dBFS (l'user doit baisser sa sortie).
+                if !stereo.is_empty() {
+                    const SOFT_CLIP_THRESHOLD: f32 = 0.94; // ≈ -0,5 dBFS
+                    let peak = soft_clip_block(&mut stereo, SOFT_CLIP_THRESHOLD);
+                    perfstats
+                        .output_peak
+                        .fetch_max(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
@@ -2188,5 +2231,56 @@ mod plugin_control_tests {
             ctrl.instrument_plugin_info.lock().is_none(),
             "info reste None après échec de load"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Chantier C (v0.4.14) — tests soft-clip de sécurité (cross-platform)
+// ═══════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod dsp_tests {
+    use super::soft_clip_block;
+
+    #[test]
+    fn soft_clip_identity_below_threshold() {
+        // Tout signal sous le seuil reste bit-identique (aucune coloration).
+        let orig: Vec<f32> = vec![-0.9, -0.5, 0.0, 0.3, 0.93, -0.94];
+        let mut x = orig.clone();
+        let peak = soft_clip_block(&mut x, 0.94);
+        assert_eq!(x, orig, "signal sous seuil inchangé");
+        assert!((peak - 0.94).abs() < 1e-6, "peak = max abs d'entrée");
+    }
+
+    #[test]
+    fn soft_clip_never_exceeds_full_scale() {
+        // Un plugin hot (jusqu'à ±3.0) ne doit JAMAIS sortir > ±1.0 après clip.
+        let mut x: Vec<f32> = vec![3.0, -2.0, 1.5, -1.2, 1.0, 0.97];
+        let peak = soft_clip_block(&mut x, 0.94);
+        assert!(peak >= 3.0 - 1e-6, "peak reflète l'entrée brute (3.0)");
+        for &v in &x {
+            // Asymptote = ±1.0 (0 dBFS, plein-échelle représentable, PAS un
+            // clip) : jamais dépassé, atteint sur très gros dépassement (tanh
+            // sature).
+            assert!(v.abs() <= 1.0 + 1e-6, "sortie bornée à 0 dBFS, got {v}");
+            assert!(v.abs() >= 0.94 - 1e-6, "au-dessus du seuil, reste >= seuil");
+        }
+    }
+
+    #[test]
+    fn soft_clip_continuous_at_threshold() {
+        // Continuité : une valeur juste au-dessus du seuil ne saute pas (pas de
+        // marche). On compare l'identité (seuil) au clip d'un poil au-dessus.
+        let t = 0.94f32;
+        let mut just_above = vec![t + 1e-4];
+        soft_clip_block(&mut just_above, t);
+        assert!(
+            (just_above[0] - t).abs() < 1e-3,
+            "transition douce au seuil, got {}",
+            just_above[0]
+        );
+        // Monotonie + signe préservés.
+        let mut neg = vec![-2.0f32];
+        soft_clip_block(&mut neg, t);
+        assert!(neg[0] < 0.0, "signe préservé");
     }
 }

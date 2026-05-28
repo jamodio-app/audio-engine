@@ -6,6 +6,58 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.14] — 2026-05-28
+
+### Fixed — Chantier C : anti-clip plugin-agnostic + buffer monitor adaptatif
+
+Analyse de la session test v0.4.13 (Mac Mini M1, AmpliTube/Piano) **croisée
+avec l'enregistrement audio** (STEM décodé + analysé) :
+- **0 drop** de capture sur toute la session (Chantier A toujours bon).
+- Le signal **enregistré est propre** (aucun clic) → les craquements entendus
+  étaient dans le **monitoring uniquement**, pas dans l'audio livré.
+- Mais **clipping généralisé** : pic +6 dBFS (peak 2.06), 112 s/322 clippées →
+  AmpliTube sort trop chaud, écrêtage dur du DAC + de l'enregistrement.
+- AmpliTube spike périodiquement à **8–22 ms** par bloc (intrinsèque : les 3
+  threads sont bien promus au workgroup CoreAudio) → le buffer self-monitor de
+  5 ms ne pouvait pas absorber → underruns → clics dans le casque.
+
+#### Anti-clipping — soft-clip de sécurité (plugin-agnostic, ZÉRO latence)
+
+`soft_clip_block` (process stage, post-plugin) : en dessous de −0,5 dBFS le
+signal est **bit-identique** ; au-dessus, genou `tanh` qui plafonne en douceur
+vers ±1,0 (au lieu d'un écrêtage dur qui craque). **Aucun lookahead → aucune
+latence ajoutée.** Protège le DAC (monitoring), le réseau et l'enregistrement
+quel que soit le plugin. Voyant **CLIP** sur la tranche self quand la sortie
+dépasse 0 dBFS (via `PerfStats.output_peak`) → invite à baisser la sortie du
+plugin (la vraie correction côté source).
+
+#### Buffer self-monitor adaptatif (latence-first)
+
+Mode « local » du `JitterBuffer` pour le self-monitor :
+- **Concealment** : sur underrun (spike plugin), au lieu d'une coupure sèche
+  (clic), fondu de sortie + fondu d'entrée à la reprise → le trou devient un
+  bref creux lissé, **zéro clic**. Zéro latence ajoutée.
+- **Adaptation bornée** : baseline **5 ms inchangée** (latence mini quand le
+  plugin se comporte) ; sous spikes, la cible grandit mais est **plafonnée à
+  15 ms** (latence de monitoring bornée) et **redescend vers 5 ms dès le
+  calme**. Les streams réseau gardent leur comportement (cap 40 ms).
+- Diagnostic : `PerfStats.monitorBufferMs` + `monitorUnderruns` (visible dans
+  agent.log + bundle) → on voit la latence monitoring grimper/redescendre.
+
+Priorité latence respectée : en régime normal, latence monitoring identique à
+avant (~5 ms self + I/O). Elle ne monte (≤ 15 ms) que transitoirement quand un
+plugin sature vraiment le CPU, et revient à la baseline.
+
+### Notes
+
+- cargo test --workspace : 41 verts (6 nouveaux : 3 soft-clip cross-platform,
+  3 buffer local — concealment, fade-in reprise, cap d'adaptation).
+- Côté navigateur (repo principal) : voyant CLIP sur la tranche self.
+- Limite physique honnête : un plugin qui stalle le CPU 22 ms force soit ~22 ms
+  de buffer monitor (latence), soit un bref creux. On plafonne à 15 ms +
+  concealment → meilleur compromis sans clic. La vraie élimination passe par
+  un plugin moins gourmand / un preset plus léger.
+
 ## [0.4.13] — 2026-05-28
 
 ### Fixed — Crossfade dry→wet à l'activation d'un plugin (fin du clic de swap)

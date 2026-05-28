@@ -28,6 +28,19 @@ pub struct JitterBuffer {
     /// Position courante (en samples interleaved) dans `crossfade_tail`.
     /// `crossfade_pos < crossfade_tail.len()` ⇒ un crossfade est en cours.
     crossfade_pos: usize,
+    /// Chantier C (v0.4.14) — mode « self-monitor local ».
+    ///
+    /// Le self-monitor n'a PAS de gigue réseau, mais subit la gigue de
+    /// TRAITEMENT (un plugin CPU-lourd comme AmpliTube produit des blocs de
+    /// 8–22 ms par à-coups). En mode local, sur underrun on fait un fondu de
+    /// sortie + un fondu d'entrée à la reprise (`conceal`) → le trou devient un
+    /// bref creux lissé, ZÉRO clic ; et l'adaptation reste bornée à
+    /// `LOCAL_MAX_TARGET_MS` (latence plafonnée) puis redescend vers 5 ms dès
+    /// le calme. Hors mode local (streams réseau) : comportement inchangé.
+    local_mode: bool,
+    /// Nombre de samples de fondu d'ENTRÉE restant à appliquer à la reprise
+    /// après un trou (concealment). 0 = pas de fondu en cours.
+    conceal_fade_in_remaining: usize,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -59,6 +72,18 @@ const DRIFT_DRAIN_FACTOR: usize = 3;
 /// buffer reste `target_samples`.
 const CROSSFADE_MS: usize = 5;
 const CROSSFADE_SAMPLES: usize = CROSSFADE_MS * SAMPLE_RATE * CHANNELS / 1000;
+/// Chantier C — plafond d'adaptation du self-monitor en mode local. La latence
+/// de monitoring ne dépasse JAMAIS cette valeur (priorité latence absolue).
+/// 15 ms = compromis : absorbe la plupart des spikes plugin tout en restant
+/// jouable à la guitare. Revient à 5 ms dès le calme.
+const LOCAL_MAX_TARGET_MS: usize = 15;
+/// Mode local : hold avant de réduire la cible (plus long que le réseau pour
+/// éviter d'osciller entre deux spikes plugin espacés).
+const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
+/// Durée du fondu de concealment (entrée/sortie) autour d'un trou self-monitor.
+/// ~2 ms = assez pour tuer le clic, assez court pour rester transparent.
+const CONCEAL_FADE_MS: usize = 2;
+const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 
 impl JitterBuffer {
     pub fn new() -> Self {
@@ -77,7 +102,15 @@ impl JitterBuffer {
             drift_drops: 0,
             crossfade_tail: Vec::with_capacity(CROSSFADE_SAMPLES),
             crossfade_pos: 0,
+            local_mode: false,
+            conceal_fade_in_remaining: 0,
         }
+    }
+
+    /// Chantier C — active le mode self-monitor local (concealment des trous +
+    /// adaptation bornée à `LOCAL_MAX_TARGET_MS`). Appelé par `add_local_stream`.
+    pub fn set_local_mode(&mut self, on: bool) {
+        self.local_mode = on;
     }
 
     /// Push decoded PCM samples (interleaved stereo f32).
@@ -165,12 +198,41 @@ impl JitterBuffer {
             if available > 0 {
                 self.consumer.pop_slice(&mut output[..available]);
             }
+            // Chantier C — mode local : au lieu d'une coupure sèche (clic), on
+            // fond la fin du réel vers le silence et on armera un fondu
+            // d'entrée à la reprise → le trou (spike plugin) devient un bref
+            // creux lissé, ZÉRO craquement. La latence reste inchangée.
+            if self.local_mode {
+                let n = CONCEAL_FADE_SAMPLES.min(available);
+                let start = available - n;
+                for (i, s) in output[start..available].iter_mut().enumerate() {
+                    *s *= 1.0 - (i as f32 + 1.0) / n.max(1) as f32;
+                }
+                self.conceal_fade_in_remaining = CONCEAL_FADE_SAMPLES;
+            }
             output[available..].fill(0.0);
             self.underruns += 1;
             self.adapt_up();
             self.primed = false;
             available
         };
+
+        // Chantier C — fondu d'ENTRÉE à la reprise après un trou (mode local) :
+        // rampe 0→1 sur les premiers samples RÉELS poppés → pas de clic au bord
+        // de reprise. On l'applique UNIQUEMENT sur un pull plein (= vraie
+        // reprise), jamais sur le pull d'underrun lui-même (dont la tête est
+        // l'audio d'AVANT le trou, déjà fondu en sortie). S'étale sur plusieurs
+        // pulls si needed < fondu restant.
+        if self.local_mode && self.conceal_fade_in_remaining > 0 && pulled == needed {
+            let total = CONCEAL_FADE_SAMPLES;
+            let n = self.conceal_fade_in_remaining.min(pulled);
+            for (i, s) in output[..n].iter_mut().enumerate() {
+                let done = total - self.conceal_fade_in_remaining;
+                let g = ((done + i) as f32 + 1.0) / total as f32;
+                *s *= g.min(1.0);
+            }
+            self.conceal_fade_in_remaining -= n;
+        }
 
         // Applique le crossfade en cours sur les premiers samples poppés.
         // Le fade s'étale sur plusieurs pulls si output.len() < tail_len.
@@ -238,13 +300,20 @@ impl JitterBuffer {
 
     fn adapt_up(&mut self) {
         let grow = 5 * SAMPLE_RATE * CHANNELS / 1000;
-        let max = MAX_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        // Chantier C — en mode local la cible est plafonnée à LOCAL_MAX_TARGET_MS
+        // (latence de monitoring bornée, priorité absolue). Les streams réseau
+        // gardent MAX_TARGET_MS (40 ms).
+        let max_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
+        let max = max_ms * SAMPLE_RATE * CHANNELS / 1000;
         self.target_samples = (self.target_samples + grow).min(max);
         self.last_adapt = std::time::Instant::now();
     }
 
     fn adapt_down(&mut self) {
-        if self.last_adapt.elapsed().as_secs() >= 5 {
+        // Mode local : hold plus long (évite d'osciller entre deux spikes
+        // plugin) — mais on redescend bien vers 5 ms dès le calme installé.
+        let hold = if self.local_mode { LOCAL_ADAPT_DOWN_SECS } else { 5 };
+        if self.last_adapt.elapsed().as_secs() >= hold {
             let shrink = 2 * SAMPLE_RATE * CHANNELS / 1000 + SAMPLE_RATE * CHANNELS / 2000;
             let min = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
             self.target_samples = self.target_samples.saturating_sub(shrink).max(min);
@@ -355,6 +424,81 @@ mod tests {
             jb.drift_drops(),
             expected_drained as u64,
             "drift_drops doit compter pre_drop + tail conservé pour le crossfade"
+        );
+    }
+
+    // ─── Chantier C — self-monitor local (concealment + adaptation bornée) ───
+
+    #[test]
+    fn local_mode_conceals_underrun_no_click() {
+        // En mode local, un underrun ne doit PAS produire de coupure sèche : la
+        // fin du signal réel est fondue vers le silence (pas de clic au bord).
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        // Amorce avec un plein régime +1.0.
+        jb.push(&vec![1.0_f32; t]);
+        // Tire bien plus que disponible → underrun + concealment.
+        let mut out = vec![0.0_f32; t + 4800];
+        let pulled = jb.pull(&mut out);
+        assert!(pulled > 0 && pulled < out.len(), "underrun partiel attendu");
+        // Le dernier sample réel (avant la zone silence) est fondu ≈ 0 → la
+        // transition vers le silence est lisse (pas de marche 1.0 → 0).
+        assert!(
+            out[pulled - 1].abs() < 0.15,
+            "fin du réel fondue vers 0, got {}",
+            out[pulled - 1]
+        );
+        assert_eq!(jb.underruns(), 1);
+    }
+
+    #[test]
+    fn local_mode_fades_in_on_resume() {
+        // Après un trou, la reprise est fondue (rampe 0→1) → pas de clic au bord
+        // de reprise.
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out1 = vec![0.0_f32; t + 4800];
+        jb.pull(&mut out1); // underrun → arme le fondu d'entrée + re-prime
+        // Reprise : on re-amorce LARGEMENT (l'underrun a fait grandir la cible
+        // via adapt_up ; il faut dépasser la nouvelle cible pour re-primer).
+        jb.push(&vec![1.0_f32; 4 * t]);
+        let mut out2 = vec![0.0_f32; t];
+        jb.pull(&mut out2);
+        // Le tout premier sample réel est fondu (proche de 0), pas un saut sec.
+        assert!(out2[0].abs() < 0.5, "1er sample de reprise fondu, got {}", out2[0]);
+        // Un peu plus loin, le signal a retrouvé son niveau plein.
+        let later = (CONCEAL_FADE_SAMPLES + 64).min(out2.len() - 1);
+        assert!(out2[later].abs() > 0.9, "niveau plein retrouvé après le fondu");
+    }
+
+    #[test]
+    fn local_mode_adapt_capped_at_local_max() {
+        // En mode local, l'adaptation auto est plafonnée à LOCAL_MAX_TARGET_MS
+        // (latence de monitoring bornée). Plusieurs cycles prime→underrun ne
+        // doivent jamais dépasser ce plafond.
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(5);
+        for _ in 0..12 {
+            let t = jb.target_ms() * SAMPLE_RATE * CHANNELS / 1000;
+            jb.push(&vec![0.1_f32; t.max(1)]); // amorce à la cible courante
+            let mut big = vec![0.0_f32; t + 9600]; // tire bien plus → underrun
+            jb.pull(&mut big);
+        }
+        assert!(
+            jb.target_ms() <= LOCAL_MAX_TARGET_MS,
+            "cap local respecté: {} ms",
+            jb.target_ms()
+        );
+        assert!(
+            jb.target_ms() > 5,
+            "la cible a bien grandi sous underruns répétés: {} ms",
+            jb.target_ms()
         );
     }
 }

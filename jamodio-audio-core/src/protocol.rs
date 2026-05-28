@@ -545,6 +545,19 @@ pub enum AgentMessage {
         #[serde(rename = "pipelineLatencyMs")]
         pipeline_latency_ms: PipelineLatency,
         peers: Vec<PeerPerf>,
+        /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin sur la
+        /// fenêtre 1 s. `> 1.0` ⇒ le plugin sort au-delà de 0 dBFS (le soft-clip
+        /// de sécurité a protégé le DAC/réseau/record, mais l'utilisateur
+        /// devrait baisser la sortie de son plugin) → voyant CLIP côté UI.
+        #[serde(rename = "outputPeak")]
+        output_peak: f32,
+        /// Chantier C — latence courante du buffer self-monitor (ms) et nombre
+        /// d'underruns cumulés. Diagnostic : la latence grandit transitoirement
+        /// quand un plugin spike (absorbe la gigue), revient à ~5 ms au calme.
+        #[serde(rename = "monitorBufferMs")]
+        monitor_buffer_ms: usize,
+        #[serde(rename = "monitorUnderruns")]
+        monitor_underruns: u64,
     },
 }
 

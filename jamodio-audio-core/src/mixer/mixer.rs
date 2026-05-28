@@ -163,6 +163,9 @@ impl AudioMixer {
     pub fn add_local_stream(&mut self) {
         let mut jitter = JitterBuffer::new();
         jitter.set_target_ms(SELF_MONITOR_TARGET_MS);
+        // Chantier C — mode local : concealment des trous (pas de clic sur les
+        // spikes plugin) + adaptation bornée (latence plafonnée, retour 5 ms).
+        jitter.set_local_mode(true);
         self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
             jitter,
             volume: 0.0,
@@ -493,6 +496,18 @@ impl AudioMixer {
                 )
             })
             .collect()
+    }
+
+    /// Chantier C (v0.4.14) — stats du self-monitor pour diagnostic : latence
+    /// courante du buffer (ms) + underruns cumulés. Permet de visualiser que
+    /// la latence monitoring grandit transitoirement sous les spikes plugin
+    /// (≤ LOCAL_MAX_TARGET_MS) et revient à ~5 ms au calme. (0, 0) si le
+    /// self-monitor n'est pas actif (pas de capture en cours).
+    pub fn self_monitor_stats(&self) -> (usize, u64) {
+        match self.streams.get(SELF_MONITOR_ID) {
+            Some(s) => (s.jitter.target_ms(), s.jitter.underruns()),
+            None => (0, 0),
+        }
     }
 
     /// Number of active REMOTE streams (self-monitor exclu).
