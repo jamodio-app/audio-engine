@@ -1436,6 +1436,38 @@ fn capture_stage_loop(
 // C'est le SEUL stage qui peut spiker (plugin lourd). Le ringbuf en amont
 // (depuis capture) absorbe ~170 ms de jitter sans drop CPAL.
 
+/// Chantier B (v0.4.13) — fondu équal-power dry→wet IN-PLACE.
+///
+/// Mélange `wet` (sortie plugin, interleaved stéréo) avec `dry` (signal sec de
+/// même longueur) sur la fenêtre de fondu restante. Gains `sin`/`cos` (équal-
+/// power : `g_dry² + g_wet² = 1` → loudness perçue constante, pas de creux au
+/// milieu du fondu). Le fondu démarre à dry pur (`g_wet=0`) et finit wet pur.
+/// Retourne `fade_remaining` après consommation. Une fois à 0, l'audio est
+/// 100 % wet et cette fonction n'est plus appelée.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn apply_dry_wet_fade(
+    wet: &mut [f32],
+    dry: &[f32],
+    mut fade_remaining: usize,
+    fade_total: usize,
+) -> usize {
+    debug_assert_eq!(wet.len(), dry.len(), "dry/wet doivent être alignés");
+    let n_pairs = wet.len() / 2;
+    for k in 0..n_pairs {
+        if fade_remaining == 0 {
+            break;
+        }
+        let pos = fade_total - fade_remaining; // 0 → fade_total-1
+        let t = pos as f32 / fade_total as f32; // 0.0 → ~1.0
+        let a = t * std::f32::consts::FRAC_PI_2;
+        let (g_wet, g_dry) = (a.sin(), a.cos());
+        wet[k * 2] = dry[k * 2] * g_dry + wet[k * 2] * g_wet;
+        wet[k * 2 + 1] = dry[k * 2 + 1] * g_dry + wet[k * 2 + 1] * g_wet;
+        fade_remaining -= 1;
+    }
+    fade_remaining
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_stage_loop(
     in_rx: Receiver<TimedBlock>,
@@ -1466,6 +1498,23 @@ fn process_stage_loop(
     let mut plugin_left: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let mut plugin_right: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK);
+
+    // Chantier B (v0.4.13) — état du crossfade dry→wet à l'activation plugin.
+    // À chaque bascule "pas de plugin" → "plugin actif" (load terminé, un-bypass,
+    // reprise après un swap), on amorce un fondu équal-power de FADE_SAMPLES
+    // pour supprimer le clic de transition (le signal passe du sec au wet sans
+    // discontinuité). En régime établi (wet stable), `fade_remaining == 0` →
+    // coût nul (un seul test booléen par bloc, aucune copie, aucune latence).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    const FADE_SAMPLES: usize = 8 * 48; // 8 ms @ 48 kHz, par canal
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut wet_was_active = false;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut fade_remaining: usize = 0;
+    // Copie du signal SEC du bloc, uniquement pendant un fondu (pré-alloué,
+    // réutilisé → zéro alloc en régime établi).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mut dry_scratch: Vec<f32> = Vec::with_capacity(PLUGIN_BLOCK * 2 * 4);
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1499,6 +1548,13 @@ fn process_stage_loop(
                 // (→ dry passthrough) sans court-circuiter le RMS/self-monitor/
                 // encode qui suivent. Utilisé quand le lock plugin est tenu par
                 // un (dé)chargement natif en cours (cf. try_lock plus bas).
+                //
+                // `wet_applied` : a-t-on réellement traité via le plugin ce bloc ?
+                // Sert à détecter la bascule dry→wet pour le crossfade (cf. fin
+                // du bloc). False par défaut (dry/bypass/swap) → mis à true sur
+                // le chemin wet.
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let mut wet_applied = false;
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 'plugin_block: {
                 if !stereo.is_empty()
@@ -1534,6 +1590,18 @@ fn process_stage_loop(
                         } else {
                             Vec::new()
                         };
+
+                        // Chantier B — crossfade dry→wet : si le plugin vient de
+                        // s'activer (bloc précédent en dry), amorce le fondu et
+                        // sauvegarde le signal SEC AVANT que le plugin n'écrase
+                        // `stereo` (le blend a lieu après le traitement).
+                        if !wet_was_active {
+                            fade_remaining = FADE_SAMPLES;
+                        }
+                        if fade_remaining > 0 {
+                            dry_scratch.clear();
+                            dry_scratch.extend_from_slice(&stereo);
+                        }
 
                         let n_pairs = stereo.len() / 2;
                         let mut idx = 0;
@@ -1594,6 +1662,19 @@ fn process_stage_loop(
                             }
                             idx = end;
                         }
+
+                        // Chantier B — applique le fondu équal-power dry→wet sur
+                        // la fenêtre restante. `dry_scratch` (sec) et `stereo`
+                        // (wet) sont alignés (même longueur, interleaved stéréo).
+                        if fade_remaining > 0 {
+                            fade_remaining = apply_dry_wet_fade(
+                                &mut stereo,
+                                &dry_scratch,
+                                fade_remaining,
+                                FADE_SAMPLES,
+                            );
+                        }
+                        wet_applied = true;
                     } else if let Some(rx) = &midi_event_rx {
                         // Pas de plugin actif (ou swap en cours, handle=None) →
                         // purge la file MIDI pour éviter un burst d'events
@@ -1602,6 +1683,15 @@ fn process_stage_loop(
                     }
                 }
                 } // 'plugin_block
+
+                // Chantier B — mémorise l'état wet pour détecter la prochaine
+                // bascule dry→wet (déclenche le crossfade). Hors plugin (dry,
+                // bypass, swap, échec) → wet_applied reste false → le retour au
+                // wet refera un fondu propre.
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    wet_was_active = wet_applied;
+                }
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
                 // dans son casque via le callback CPAL playback).
@@ -2025,6 +2115,58 @@ mod plugin_control_tests {
         );
         ctrl.unload();
         assert!(ctrl.instrument_plugin_handle.lock().is_none());
+    }
+
+    // ─── Chantier B — crossfade dry→wet ───────────────────────────────
+
+    #[test]
+    fn fade_starts_dry_ends_wet() {
+        // dry = 1.0 partout, wet = -1.0 partout (signaux opposés → on voit
+        // clairement le mélange). Fondu sur 4 frames (8 samples interleaved).
+        let total = 4;
+        let dry = vec![1.0f32; total * 2];
+        let mut wet = vec![-1.0f32; total * 2];
+        let rem = apply_dry_wet_fade(&mut wet, &dry, total, total);
+        assert_eq!(rem, 0, "le fondu doit être entièrement consommé");
+        // Premier frame : t=0 → dry pur (g_dry=1, g_wet=0) → +1.0.
+        assert!((wet[0] - 1.0).abs() < 1e-5, "1er sample = dry pur, got {}", wet[0]);
+        assert!((wet[1] - 1.0).abs() < 1e-5);
+        // Dernier frame du fondu : t≈0.75 → majoritairement wet → négatif.
+        assert!(wet[(total - 1) * 2] < 0.0, "dernier sample tend vers wet");
+    }
+
+    #[test]
+    fn fade_is_equal_power() {
+        // Invariant équal-power : à chaque step, g_dry² + g_wet² == 1
+        // → pas de creux de loudness. On le vérifie en mixant dry=1/wet=0
+        // (sortie = g_dry) et dry=0/wet=1 (sortie = g_wet) au même index.
+        let total = 16;
+        let mut a = vec![0.0f32; total * 2]; // wet=0 → sortie = g_dry
+        let dry1 = vec![1.0f32; total * 2];
+        apply_dry_wet_fade(&mut a, &dry1, total, total);
+        let mut b = vec![1.0f32; total * 2]; // wet=1, dry=0 → sortie = g_wet
+        let dry0 = vec![0.0f32; total * 2];
+        apply_dry_wet_fade(&mut b, &dry0, total, total);
+        for k in 0..total {
+            let g_dry = a[k * 2];
+            let g_wet = b[k * 2];
+            let power = g_dry * g_dry + g_wet * g_wet;
+            assert!((power - 1.0).abs() < 1e-4, "équal-power à k={k} : {power}");
+        }
+    }
+
+    #[test]
+    fn fade_partial_then_completes_across_blocks() {
+        // Fondu de 8 frames étalé sur 2 blocs de 4 frames : le 1er bloc
+        // consomme 4, le 2e les 4 derniers → rem=0, signal 100 % wet ensuite.
+        let total = 8;
+        let dry = vec![1.0f32; 4 * 2];
+        let mut blk1 = vec![-1.0f32; 4 * 2];
+        let rem1 = apply_dry_wet_fade(&mut blk1, &dry, total, total);
+        assert_eq!(rem1, 4, "1er bloc consomme 4 frames");
+        let mut blk2 = vec![-1.0f32; 4 * 2];
+        let rem2 = apply_dry_wet_fade(&mut blk2, &dry, rem1, total);
+        assert_eq!(rem2, 0, "2e bloc termine le fondu");
     }
 
     #[test]

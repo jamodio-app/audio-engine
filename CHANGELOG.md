@@ -6,6 +6,31 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.13] — 2026-05-28
+
+### Fixed — Crossfade dry→wet à l'activation d'un plugin (fin du clic de swap)
+
+Suite à la validation on-device de v0.4.12 (load/unload non-bloquant, **0
+drop**), un petit **craquement** subsistait au moment précis où un plugin
+s'active : le signal basculait instantanément du son SEC (dry) au son traité
+(wet) à une frontière de bloc, sans fondu → discontinuité audible.
+
+Fix (`pipeline.rs`, process stage) : à chaque bascule « pas de plugin » →
+« plugin actif » (load terminé, un-bypass, reprise après un swap), on applique
+un **fondu équal-power ~8 ms** (`sin`/`cos`, `g_dry² + g_wet² = 1` → loudness
+perçue constante) entre le signal sec sauvegardé et la sortie wet. Helper pur
+`apply_dry_wet_fade` (testé). Couvre aussi le clic du toggle bypass A/B.
+
+- Coût **nul en régime établi** : un seul test booléen par bloc (`fade_remaining
+  == 0`), aucune copie, aucune latence ajoutée. La copie du signal sec
+  (pré-allouée, réutilisée) n'a lieu que pendant les ~3 blocs du fondu.
+- Plugin-agnostic. cargo test --workspace : 35 verts (3 nouveaux tests fondu :
+  dry→wet, invariant équal-power, fondu étalé sur plusieurs blocs).
+
+> Côté navigateur (hors agent, repo principal) : l'affichage de latence sur la
+> tranche est désormais lissé (médiane glissante des pings) pour ne plus sauter
+> sur un pic de mesure isolé, + latence de monitoring dans le tooltip.
+
 ## [0.4.12] — 2026-05-28
 
 ### Fixed — Chantier A : chargement/déchargement de plugin non-bloquant
