@@ -496,4 +496,44 @@ mod tests {
         assert!(matches!(h2.method(), PromotionMethod::None));
         // h1 drop en fin de scope reset le guard.
     }
+
+    /// Anti-régression v0.4.5 — les 3 stages audio (capture/process/encode)
+    /// promeuvent INDÉPENDAMMENT, chacun sur son thread.
+    ///
+    /// Bug v0.4.5 : `static PROMOTION_ACTIVE: AtomicBool` GLOBAL → seul le 1er
+    /// thread promouvait, les 2 autres recevaient un handle None → 2 stages sur
+    /// 3 en SCHED_OTHER → p99 pipeline ×9 (2,16 → 19,66 ms). Le guard est
+    /// désormais `thread_local!` (v0.4.6), donc chaque thread promeut seul.
+    ///
+    /// Le test unitaire mono-thread `double_promotion_without_drop_yields_none`
+    /// ne pouvait PAS détecter ce bug (1 seul thread). Celui-ci le ferait.
+    #[test]
+    fn three_threads_promote_independently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let promoted = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let promoted = promoted.clone();
+            handles.push(std::thread::spawn(move || {
+                let h = promote_thread_for_audio(None);
+                if !matches!(h.method(), PromotionMethod::None) {
+                    promoted.fetch_add(1, Ordering::SeqCst);
+                }
+                drop(h); // reset le guard thread-local de CE thread
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let n = promoted.load(Ordering::SeqCst);
+        // Mac/Win avec privilèges RT → 3 promus. CI sans privilèges (Linux GH
+        // Actions) → 0 promu. JAMAIS 1 ni 2 (= la signature exacte du bug
+        // v0.4.5 : guard global qui bloque les threads 2 et 3).
+        assert!(
+            n == 0 || n == 3,
+            "attendu 0 ou 3 threads promus, obtenu {n} (régression v0.4.5 = 1)"
+        );
+    }
 }
