@@ -6,6 +6,70 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.16] — 2026-06-04
+
+### Fixed — S5 fix #1 : retry+backoff sur ouverture CPAL post-restart agent
+
+Quand l'agent vient de redémarrer (auto-update via tauri-plugin-updater,
+kill manuel, install nouvelle release), la **1ʳᵉ ouverture du device input
+peut échouer** parce que le driver audio USB n'a pas encore fini de se
+libérer du process précédent. Côté CPAL/CoreAudio le symptôme est un
+timeout :
+
+```
+ERROR CPAL input: A backend-specific error has occurred:
+       timeout waiting for sample rate update for device
+```
+
+Conséquence : le browser tombe en **fallback WebRTC silencieux** (mode
+musique en 25-30 ms au lieu du mode HD agent), et l'utilisateur devait
+sortir + re-rentrer dans le studio pour que la 2ᵉ tentative passe.
+Observé sur Scarlett Solo 4th Gen mais **générique** : tout driver USB
+lent à libérer son device après un restart de process est concerné.
+
+#### Fix
+
+Nouveau helper pur `retry_with_backoff` (`capture.rs`) générique sur
+`F: FnMut() -> Result<T, E>`, qui rejoue l'opération avec un slice de
+`Duration` fourni. Total d'essais = `backoffs.len() + 1`. Découplé du
+`sleep` (durée passée en paramètre) → testable sans I/O en utilisant
+`&[Duration::ZERO; N]`.
+
+`start_capture` enveloppe désormais `device.build_input_stream` dans
+ce helper avec `BUILD_STREAM_BACKOFFS = [200ms, 500ms, 1000ms]` :
+- **4 essais max**, pire-cas **~1,7 s** avant remontée de l'erreur
+  (vs fallback WebRTC silencieux immédiat avant).
+- `is_retryable` fail-fast sur `BuildStreamError::StreamConfigNotSupported`
+  (= config invalide channels/SR/buffer → retry inutile). Toutes les
+  autres variantes (timeout, `DeviceNotAvailable`, `BackendSpecific`)
+  sont supposées transitoires.
+- **Latence du hot path inchangée** : en régime normal, le 1ᵉʳ essai
+  réussit immédiatement (zéro sleep, même chemin code qu'avant).
+- Logs tracing structurés `jamodio::capture` : `warn` à chaque essai
+  qui échoue (`attempt`, `error`), `info` final si succès après retry
+  (`attempts`).
+
+#### Pourquoi générique (pas device-spécifique)
+
+L'option « détecter Scarlett et appliquer retry uniquement pour cette
+famille » a été écartée : fragile (nouveau hardware similaire = bug
+réintroduit), tandis qu'un retry court borné ne pénalise les autres
+devices que de quelques µs en régime normal.
+
+### Notes
+
+- `cargo test --workspace` : 47 verts (43 + 4 nouveaux tests retry :
+  succès direct, succès après 2 échecs, épuisement des essais,
+  fail-fast non-retryable). Tests purs CPU, pas d'I/O — exécution < 1 ms.
+- `cargo build --release` Mac OK, zéro warning.
+- Aucun changement de protocole WS, 100 % compat browser v0.4.1+.
+- Build matrix CI inchangée (Mac ARM + Windows x64 via tag `agent-v*`).
+- Validation runtime : reproduit on-device au prochain auto-update agent
+  qui touche le binaire (Scarlett ou autre device USB lent).
+- Hors périmètre : modification du 4ᵉ argument `None` de
+  `build_input_stream` (= timeout du callback CPAL pendant la run,
+  pas de l'init — ne joue pas dans le bug).
+
 ## [0.4.15] — 2026-05-28
 
 ### Fixed — Voyant CLIP : faux positifs sur les transitoires + message générique

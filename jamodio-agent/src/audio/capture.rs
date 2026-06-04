@@ -3,6 +3,55 @@ use cpal::{Device, SampleRate, StreamConfig, BufferSize, SupportedBufferSize};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Backoffs entre les essais de `build_input_stream` quand un driver
+/// audio est lent à se libérer (typiquement après un restart de process —
+/// auto-update agent, kill manuel, install nouvelle release). Observé sur
+/// Scarlett Solo 4th Gen mais générique : c'est le cycle libération/réacquisition
+/// CoreAudio (kAudioDevicePropertyNominalSampleRate ack tardif) qui timeoute.
+///
+/// 3 backoffs → 4 essais total → pire-cas ~1,7 s avant fallback WebRTC.
+/// Mieux que le fallback silencieux actuel (qui demandait à l'user de
+/// sortir + re-rentrer dans le studio).
+const BUILD_STREAM_BACKOFFS: &[Duration] = &[
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+];
+
+/// Retry générique avec backoff configurable. Le slice `backoffs` fixe à
+/// la fois le NOMBRE de retries (`backoffs.len()`) et la durée entre chaque
+/// retry. Total d'essais = `backoffs.len() + 1`.
+///
+/// Découplé du `sleep` (durée fournie en paramètre) → testable sans I/O
+/// en passant `&[Duration::ZERO; N]`.
+///
+/// `is_retryable` permet de NE retry que les erreurs transitoires (timing,
+/// I/O) et de fail-fast sur les erreurs structurelles (config invalide).
+fn retry_with_backoff<F, T, E, R>(
+    backoffs: &[Duration],
+    mut op: F,
+    is_retryable: R,
+) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    R: Fn(&E) -> bool,
+{
+    let mut idx = 0usize;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_retryable(&e) || idx >= backoffs.len() {
+                    return Err(e);
+                }
+                std::thread::sleep(backoffs[idx]);
+                idx += 1;
+            }
+        }
+    }
+}
 
 /// Vérifie si le device input expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Permet de choisir
@@ -94,54 +143,165 @@ pub fn start_capture(
         buffer_size,
     };
 
-    let stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-            // Send a copy of the audio samples to the encoder thread.
-            // Deux cas d'erreur distincts à ne PAS confondre :
-            // - Full       : encoder saturé (CPU/IO surchargé) → vrai signal
-            //                d'overload qu'on veut voir → warn power-of-2.
-            // - Disconnected : l'encoder thread a quitté (stop_capture) →
-            //                attendu, mais le callback CPAL peut continuer à
-            //                pousser pendant quelques centaines de ms (drop
-            //                cpal::Stream est asynchrone côté CoreAudio) →
-            //                debug only, pas de pollution dans les logs.
-            match sample_tx.try_send(data.to_vec()) {
-                Ok(_) => {}
-                Err(TrySendError::Full(_)) => {
-                    // Sprint S1 — métrique partagée (lue+reset 1 Hz par ws_server)
-                    capture_drops.fetch_add(1, Ordering::Relaxed);
-                    // Compteur statique inchangé : sert au throttle de logs
-                    // (un warn par puissance de 2) — indépendant de la métrique.
-                    static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n == 0 || n.is_power_of_two() {
-                        tracing::warn!(
-                            target: "jamodio::capture",
-                            drop_count = n + 1,
-                            samples_dropped = data.len(),
-                            "sample channel full — encoder thread saturé (CPU overload?)"
-                        );
+    // Callback CPAL : capturé par valeur (Move) via Arc clone — `build_input_stream`
+    // peut être appelé plusieurs fois (retry), il faut donc qu'à chaque appel
+    // on re-fabrique une closure indépendante. `sample_tx` et `capture_drops`
+    // sont des Sender/Arc, clone-safe.
+    let attempts = std::cell::Cell::new(0usize);
+    let build_one = || {
+        let attempt = attempts.get() + 1;
+        attempts.set(attempt);
+        let sample_tx = sample_tx.clone();
+        let capture_drops = capture_drops.clone();
+        let result = device.build_input_stream(
+            &config,
+            move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                // Send a copy of the audio samples to the encoder thread.
+                // Deux cas d'erreur distincts à ne PAS confondre :
+                // - Full       : encoder saturé (CPU/IO surchargé) → vrai signal
+                //                d'overload qu'on veut voir → warn power-of-2.
+                // - Disconnected : l'encoder thread a quitté (stop_capture) →
+                //                attendu, mais le callback CPAL peut continuer à
+                //                pousser pendant quelques centaines de ms (drop
+                //                cpal::Stream est asynchrone côté CoreAudio) →
+                //                debug only, pas de pollution dans les logs.
+                match sample_tx.try_send(data.to_vec()) {
+                    Ok(_) => {}
+                    Err(TrySendError::Full(_)) => {
+                        // Sprint S1 — métrique partagée (lue+reset 1 Hz par ws_server)
+                        capture_drops.fetch_add(1, Ordering::Relaxed);
+                        // Compteur statique inchangé : sert au throttle de logs
+                        // (un warn par puissance de 2) — indépendant de la métrique.
+                        static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n == 0 || n.is_power_of_two() {
+                            tracing::warn!(
+                                target: "jamodio::capture",
+                                drop_count = n + 1,
+                                samples_dropped = data.len(),
+                                "sample channel full — encoder thread saturé (CPU overload?)"
+                            );
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        static DISCONNECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = DISCONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n == 0 {
+                            tracing::debug!(
+                                target: "jamodio::capture",
+                                "sample channel disconnected — CPAL still pushing post stop_capture (will stop soon)"
+                            );
+                        }
                     }
                 }
-                Err(TrySendError::Disconnected(_)) => {
-                    static DISCONNECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = DISCONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n == 0 {
-                        tracing::debug!(
-                            target: "jamodio::capture",
-                            "sample channel disconnected — CPAL still pushing post stop_capture (will stop soon)"
-                        );
-                    }
-                }
-            }
-        },
-        |err| {
-            tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
-        },
-        None, // No timeout
-    )?;
+            },
+            |err| {
+                tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
+            },
+            None, // No timeout côté callback CPAL (la stratégie retry concerne l'init, pas la run).
+        );
+        if let Err(ref e) = result {
+            // Logué à chaque essai pour tracer la séquence de retry dans agent.log.
+            // Le warn final (essai épuisé) reste émis par le caller via ws_server.
+            tracing::warn!(
+                target: "jamodio::capture",
+                attempt, error = %e,
+                "build_input_stream failed"
+            );
+        }
+        result
+    };
+
+    let stream = retry_with_backoff(BUILD_STREAM_BACKOFFS, build_one, |err| {
+        // Fail-fast sur config invalide (= retry inutile, le device ne supporte
+        // pas cette combinaison channels/SR/buffer). Toutes les autres erreurs
+        // (timeout sample-rate, DeviceNotAvailable transitoire, BackendSpecific)
+        // sont supposées transitoires → on retry avec backoff.
+        !matches!(err, cpal::BuildStreamError::StreamConfigNotSupported)
+    })?;
+
+    let final_attempts = attempts.get();
+    if final_attempts > 1 {
+        tracing::info!(
+            target: "jamodio::capture",
+            attempts = final_attempts,
+            "build_input_stream succeeded after retry"
+        );
+    }
 
     stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
     Ok((stream, channels, native_sr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Helper : slice de Durations à zéro pour tester sans dormir.
+    const NO_SLEEP: &[Duration] = &[Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
+    #[test]
+    fn retry_succeeds_on_first_attempt() {
+        let calls = Cell::new(0usize);
+        let result: Result<i32, &str> = retry_with_backoff(
+            NO_SLEEP,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(42)
+            },
+            |_| true,
+        );
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.get(), 1, "no retry needed on direct success");
+    }
+
+    #[test]
+    fn retry_succeeds_after_transient_failures() {
+        let calls = Cell::new(0usize);
+        let result: Result<&str, &str> = retry_with_backoff(
+            NO_SLEEP,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err("transient")
+                } else {
+                    Ok("ok")
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(calls.get(), 3, "two failures then success on third attempt");
+    }
+
+    #[test]
+    fn retry_returns_last_error_when_all_attempts_fail() {
+        let calls = Cell::new(0usize);
+        let result: Result<(), &str> = retry_with_backoff(
+            NO_SLEEP,
+            || {
+                calls.set(calls.get() + 1);
+                Err("always-fails")
+            },
+            |_| true,
+        );
+        assert_eq!(result, Err("always-fails"));
+        assert_eq!(calls.get(), NO_SLEEP.len() + 1, "all attempts exhausted");
+    }
+
+    #[test]
+    fn retry_fails_fast_on_non_retryable_error() {
+        let calls = Cell::new(0usize);
+        let result: Result<(), &str> = retry_with_backoff(
+            NO_SLEEP,
+            || {
+                calls.set(calls.get() + 1);
+                Err("structural")
+            },
+            |e| *e != "structural",
+        );
+        assert_eq!(result, Err("structural"));
+        assert_eq!(calls.get(), 1, "no retry when is_retryable returns false");
+    }
 }
