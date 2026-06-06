@@ -6,6 +6,58 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.17] — 2026-06-05
+
+### Fixed — MIDI physique muet après bascule AUDIO→MIDI in-session
+
+Reproduction (Mac AU + Grand Piano, clavier MIDI physique) :
+1. Configurer le clavier MIDI dans Paramètres AVANT d'entrer dans le studio.
+2. Entrer dans le studio en mode agent + plugin instrument → MIDI physique
+   OK (le plugin reçoit les notes, le son sort).
+3. Bascule la source d'entrée à AUDIO (pour brancher une guitare par exemple).
+4. Re-bascule en MIDI + re-sélectionne le même clavier MIDI physique.
+5. Les notes jouées sur le clavier physique **ne déclenchent plus aucun son**.
+   Le clavier virtuel HTML (touches piano sur le browser) marche toujours.
+
+#### Bug racine
+
+`encoder_thread` reçoit `midi_event_rx: Option<Receiver<MidiEvent>>` **par
+valeur** au `start_capture` (= clone du receiver crossbeam figé à ce moment).
+Au passage AUDIO, `set_input_source` met `self.midi_event_rx = None`. Au
+retour MIDI, un **nouveau** channel `(tx, rx)` est créé via `bounded::<…>(256)`
+et `self.midi_event_rx = Some(rx)` — mais l'encoder garde son ancien clone
+pointant sur l'ANCIEN channel orphelin. Les notes du clavier physique partent
+dans le nouveau `tx` → personne ne les lit → silence.
+
+Le clavier virtuel HTML, lui, contourne ce channel (`PlayMidiNote` côté WS
+appelle directement `plugin_host.dispatch_midi_only(handle, &[event])`),
+ce qui explique pourquoi il continuait à fonctionner.
+
+#### Fix
+
+`midi_event_rx` devient `Arc<Mutex<Option<Receiver<MidiEvent>>>>` (champ
+`PipelineState` + paramètres `encoder_thread` + `process_stage_loop`).
+`set_input_source` swappe désormais l'Option intérieure via `lock()`, et
+l'encoder thread lookup l'Option via `lock()` à chaque bloc audio (= 375 Hz,
+parking_lot non-contendu en régime établi → coût négligeable, set_input_source
+est rare).
+
+Conséquences :
+- Bascule MIDI ↔ AUDIO ↔ MIDI sans restart de la capture, sans gap audio,
+  sans churn SFU/SRTP.
+- L'encoder voit immédiatement le nouveau receiver au prochain bloc.
+- Plugin instrument + handle + bypass + workgroup CoreAudio : tous préservés
+  (aucun thread RT recréé).
+
+#### Notes
+
+- `cargo build --release` : OK, zéro warning.
+- `cargo test --workspace` : 47 verts (aucun nouveau test — le scénario est
+  difficile à reproduire en unit sans mocker `midi::MidiInput::open`, qui
+  ouvre un device physique. Test runtime côté beta tester valide le fix).
+- Aucun changement de protocole WS, 100 % compat browser v0.4.1+.
+- Build matrix CI inchangée.
+
 ## [0.4.16] — 2026-06-04
 
 ### Fixed — S5 fix #1 : retry+backoff sur ouverture CPAL post-restart agent

@@ -156,8 +156,20 @@ pub struct PipelineState {
     midi_input: Option<crate::audio::midi::MidiInput>,
     /// S2 — Receiver des events MIDI cumulés depuis le dernier bloc audio.
     /// Drainé par l'encoder_thread juste avant `process_stereo`.
+    ///
+    /// Encapsulé dans `Arc<Mutex<Option<…>>>` pour que `set_input_source` puisse
+    /// swapper le receiver **en cours de session** sans avoir à redémarrer la
+    /// capture. L'encoder thread reçoit un clone du `Arc` au start_capture et
+    /// lit l'Option intérieure à chaque bloc audio → suit automatiquement les
+    /// bascules MIDI→AUDIO→MIDI sans redémarrage CPAL.
+    ///
+    /// Avant ce fix (≤ v0.4.16), l'encoder gardait un clone du receiver figé
+    /// au moment du start_capture → toute re-bascule en MIDI créait un nouveau
+    /// channel côté pipeline mais l'encoder continuait à lire l'ancien (vide),
+    /// résultat : MIDI physique muet alors que le clavier HTML (= chemin
+    /// PlayMidiNote → dispatch_midi_only) restait fonctionnel.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    midi_event_rx: Option<Receiver<MidiEvent>>,
+    midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
     /// S2.7 — Port virtuel "Jamodio Virtual MIDI" créé au boot agent et tenu
     /// vivant toute la durée d'exécution. Apparaît dans CoreMIDI = destination
     /// visible dans toutes les apps MIDI macOS (Logic, Ableton, GarageBand…).
@@ -409,7 +421,7 @@ impl PipelineState {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             midi_input: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            midi_event_rx: None,
+            midi_event_rx: Arc::new(Mutex::new(None)),
             #[cfg(target_os = "macos")]
             virtual_midi_keepalive: None,
             #[cfg(target_os = "macos")]
@@ -454,7 +466,10 @@ impl PipelineState {
                 // Ferme le MIDI input physique s'il y en avait un. Le port
                 // virtuel macOS reste vivant (= virtual_midi_keepalive intact).
                 self.midi_input = None;
-                self.midi_event_rx = None;
+                // Set l'Option intérieure du Arc — l'encoder thread (qui détient
+                // un clone du Arc) verra `None` au prochain lock et basculera
+                // en mode audio passthrough sans devoir être redémarré.
+                *self.midi_event_rx.lock() = None;
             }
             InputSource::Midi(device_id) => {
                 let is_virtual = device_id
@@ -467,7 +482,7 @@ impl PipelineState {
                         "virtual MIDI port not available (creation failed at boot)".to_string()
                     })?;
                     self.midi_input = None;
-                    self.midi_event_rx = Some(rx);
+                    *self.midi_event_rx.lock() = Some(rx);
                     *self.input_source.lock() = source;
                     return Ok(());
                 }
@@ -482,7 +497,7 @@ impl PipelineState {
                     // Pas d'ouverture midir (= pas de réception physique
                     // depuis d'autres apps OS pour l'instant).
                     self.midi_input = None;
-                    self.midi_event_rx = None;
+                    *self.midi_event_rx.lock() = None;
                     *self.input_source.lock() = source;
                     return Ok(());
                 }
@@ -492,7 +507,9 @@ impl PipelineState {
                 let (tx, rx) = bounded::<MidiEvent>(256);
                 let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
                 self.midi_input = Some(midi);
-                self.midi_event_rx = Some(rx);
+                // Set l'Option intérieure du Arc → l'encoder thread RT lit le
+                // NOUVEAU receiver au prochain bloc audio (sans restart).
+                *self.midi_event_rx.lock() = Some(rx);
             }
         }
         *self.input_source.lock() = source;
@@ -853,9 +870,11 @@ impl PipelineState {
         let plugin_handle_for_encoder = self.instrument_plugin_handle.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_bypass_for_encoder = self.instrument_plugin_bypass.clone();
-        // S2 — receiver MIDI cloné si on est en mode MIDI au moment du
-        // start_capture. Si l'user switch en cours de session, restart
-        // capture = sprint robustesse (= prochain).
+        // S2 — Arc partagé du receiver MIDI. L'encoder thread lit l'Option
+        // intérieure à chaque bloc et suit donc automatiquement les
+        // bascules MIDI ↔ AUDIO ↔ MIDI faites via set_input_source, sans
+        // restart de capture (= fix bug v0.4.16 → unreleased : MIDI physique
+        // muet après bascule AUDIO→MIDI).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let midi_event_rx_for_encoder = self.midi_event_rx.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1148,7 +1167,7 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1534,7 +1553,7 @@ fn process_stage_loop(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Option<Receiver<MidiEvent>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -1622,26 +1641,37 @@ fn process_stage_loop(
                         let Some(mut host) = plugin_host.try_lock() else {
                             // Purge la file MIDI : events périmés pour le plugin
                             // en cours de swap (sinon burst au bloc suivant).
-                            if let Some(rx) = &midi_event_rx {
+                            // Lock court (parking_lot Mutex, non-contendu en
+                            // régime établi) ; set_input_source est rare.
+                            let guard = midi_event_rx.lock();
+                            if let Some(rx) = guard.as_ref() {
                                 while rx.try_recv().is_ok() {}
                             }
+                            drop(guard);
                             // Signal sec → continue vers RMS/self-monitor/encode.
                             break 'plugin_block;
                         };
 
                         // Drain les events MIDI accumulés depuis le dernier
                         // bloc. Max 64 events / bloc (limite défensive).
-                        let midi_events: Vec<MidiEvent> = if let Some(rx) = &midi_event_rx {
-                            let mut batch = Vec::new();
-                            while let Ok(ev) = rx.try_recv() {
-                                batch.push(ev);
-                                if batch.len() >= 64 {
-                                    break;
+                        // Lock court : juste le temps de pump le channel
+                        // (re-lookup de l'Option par bloc → suit auto les
+                        // bascules MIDI/AUDIO de set_input_source).
+                        let midi_events: Vec<MidiEvent> = {
+                            let guard = midi_event_rx.lock();
+                            match guard.as_ref() {
+                                Some(rx) => {
+                                    let mut batch = Vec::new();
+                                    while let Ok(ev) = rx.try_recv() {
+                                        batch.push(ev);
+                                        if batch.len() >= 64 {
+                                            break;
+                                        }
+                                    }
+                                    batch
                                 }
+                                None => Vec::new(),
                             }
-                            batch
-                        } else {
-                            Vec::new()
                         };
 
                         // Chantier B — crossfade dry→wet : si le plugin vient de
@@ -1728,11 +1758,15 @@ fn process_stage_loop(
                             );
                         }
                         wet_applied = true;
-                    } else if let Some(rx) = &midi_event_rx {
+                    } else {
                         // Pas de plugin actif (ou swap en cours, handle=None) →
                         // purge la file MIDI pour éviter un burst d'events
                         // périmés (note-on orphelins) au prochain plugin.
-                        while rx.try_recv().is_ok() {}
+                        let guard = midi_event_rx.lock();
+                        if let Some(rx) = guard.as_ref() {
+                            while rx.try_recv().is_ok() {}
+                        }
+                        drop(guard);
                     }
                 }
                 } // 'plugin_block
