@@ -80,10 +80,53 @@ pub struct CaptureStartedInfo {
     pub channels: u16,
 }
 
+/// Source de timing actuelle du pipeline audio quand une session est active.
+///
+/// Variante A du Chantier #2 : en mode MIDI avec plugin instrument INSERT,
+/// la capture CPAL est inutile (le plugin génère son audio depuis les events
+/// MIDI). On la remplace par un ticker silencieux (cf. `audio::midi_clock`)
+/// qui fournit la même cadence de blocs à l'encoder thread, sans toucher au
+/// pipeline aval.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+enum CaptureMode {
+    /// Capture CPAL classique (mic / line-in / aggregate device).
+    /// Le `SendStream` est tenu vivant uniquement pour son Drop (= ferme
+    /// le stream natif). Le callback CPAL pousse les samples dans
+    /// `capture_sample_tx` directement.
+    Audio(#[allow(dead_code)] SendStream),
+    /// Ticker silencieux (mode MIDI — pas de capture audio, économise un
+    /// callback CPAL + une copie + supprime le risque qu'un device de
+    /// routing externe injecte un signal parasite). Le `MidiSilenceClock`
+    /// est tenu vivant pour son Drop (= signal stop + join du thread
+    /// ticker). Le thread pousse des blocs silencieux dans
+    /// `capture_sample_tx` au rythme audio bloc.
+    Midi(#[allow(dead_code)] crate::audio::midi_clock::MidiSilenceClock),
+}
+
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
 pub struct PipelineState {
     pub mixer: Arc<Mutex<AudioMixer>>,
-    /// CPAL streams must be kept alive — dropping them stops audio.
+    /// Source d'alimentation du `sample_tx` quand le pipeline tourne : CPAL
+    /// stream (mode AUDIO) ou ticker silencieux (mode MIDI). `None` hors
+    /// session (avant `start_capture`, après `stop_capture`).
+    /// Voir `CaptureMode` + Chantier #2 (Variante A).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    capture_mode: Option<CaptureMode>,
+    /// Format audio fixé au `start_capture` et tenu constant pendant la
+    /// session : `(channels, sample_rate)` utilisés pour configurer l'encoder
+    /// thread. Le ticker MIDI pousse des blocs de silence à CE format pour
+    /// que la bascule MIDI↔AUDIO soit invisible côté pipeline aval.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    capture_format: Option<(u16, u32)>,
+    /// Clone du `Sender<Vec<f32>>` qui alimente le sample_rx de l'encoder
+    /// thread. Conservé hors du `CaptureMode` pour pouvoir re-instancier
+    /// une source (CPAL ou ticker) sur `set_input_source` sans toucher au
+    /// pipeline aval. `None` hors session.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    capture_sample_tx: Option<Sender<Vec<f32>>>,
+    /// Linux / autres : pas de host plugin instrument, pas de mode MIDI. On
+    /// garde le simple wrapper CPAL pour rester compilable.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
     /// Handle to stop the encoder thread.
@@ -393,6 +436,13 @@ impl PipelineState {
     pub fn new(mixer: Arc<Mutex<AudioMixer>>) -> Self {
         Self {
             mixer,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            capture_mode: None,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            capture_format: None,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            capture_sample_tx: None,
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             capture_stream: None,
             playback_stream: None,
             encoder_stop: None,
@@ -456,65 +506,166 @@ impl PipelineState {
     #[cfg(not(target_os = "macos"))]
     pub fn spawn_virtual_midi(&mut self) {}
 
-    /// S2 — change la source d'entrée. Appelé par le WS handler quand le
-    /// browser bascule entre Audio et MIDI. En mode MIDI, ouvre un MidiInput
-    /// via midir et stocke son receiver pour drainage dans encoder_thread.
-    /// L'ouverture du device peut échouer si introuvable → erreur retournée
-    /// au caller (qui fait un toast browser).
+    /// Change la source d'entrée — Audio (CPAL) ou MIDI (events MIDI →
+    /// plugin instrument INSERT). Appelé par le WS handler quand le browser
+    /// bascule l'utilisateur entre les deux modes.
+    ///
+    /// Comportements selon l'état :
+    /// - **Hors session** (`capture_mode.is_none()`) : on met juste à jour
+    ///   le receiver MIDI + la préférence. Le prochain `start_capture`
+    ///   utilisera la nouvelle source.
+    /// - **En session avec changement de catégorie** (Audio↔MIDI) :
+    ///   bascule atomique du `CaptureMode` — drop l'ancienne source (CPAL
+    ///   stream OU ticker silencieux), instancie la nouvelle au format
+    ///   audio fixé par `start_capture`. Gap de silence borné à ~1 bloc
+    ///   audio (~2,7 ms) côté pipeline aval.
+    /// - **En session sans changement de catégorie** (Midi→Midi : nouveau
+    ///   device MIDI, ou Audio→Audio non géré ici) : juste ré-ouverture
+    ///   MIDI, pas de swap du CaptureMode.
+    ///
+    /// Limitation v1 : la bascule MIDI→AUDIO en cours de session échoue si
+    /// le device audio courant ne supporte pas le format `(channels, sr)`
+    /// fixé au `start_capture`. C'est rare (la majorité des users ont une
+    /// interface audio cohérente), et le diagnostic est explicite. Pour
+    /// recouvrer : `stop_capture` + `start_capture` en mode AUDIO.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_input_source(&mut self, source: InputSource) -> Result<(), String> {
+        // 1. Catégories avant/après — détermine si un swap de CaptureMode
+        //    sera nécessaire (uniquement quand la catégorie CHANGE).
+        let was_midi = matches!(*self.input_source.lock(), InputSource::Midi(_));
+        let will_be_midi = matches!(source, InputSource::Midi(_));
+
+        // 2. (Re)configure le MIDI input et `midi_event_rx` selon la cible.
         match &source {
             InputSource::Audio => {
                 // Ferme le MIDI input physique s'il y en avait un. Le port
                 // virtuel macOS reste vivant (= virtual_midi_keepalive intact).
                 self.midi_input = None;
-                // Set l'Option intérieure du Arc — l'encoder thread (qui détient
-                // un clone du Arc) verra `None` au prochain lock et basculera
-                // en mode audio passthrough sans devoir être redémarré.
+                // Set l'Option intérieure du Arc — l'encoder thread (qui
+                // détient un clone du Arc) verra `None` au prochain lock.
                 *self.midi_event_rx.lock() = None;
             }
             InputSource::Midi(device_id) => {
                 let is_virtual = device_id
                     .starts_with(crate::audio::midi::VIRTUAL_PORT_ID_PREFIX);
                 #[cfg(target_os = "macos")]
-                if is_virtual {
+                let new_rx: Option<Receiver<CapturedMidiEvent>> = if is_virtual {
                     // Port virtuel macOS : on réutilise le receiver persistant
                     // créé au boot. Pas d'ouverture nouvelle.
                     let rx = self.virtual_midi_rx.clone().ok_or_else(|| {
                         "virtual MIDI port not available (creation failed at boot)".to_string()
                     })?;
                     self.midi_input = None;
-                    *self.midi_event_rx.lock() = Some(rx);
-                    *self.input_source.lock() = source;
-                    return Ok(());
-                }
+                    Some(rx)
+                } else {
+                    let (tx, rx) = bounded::<CapturedMidiEvent>(256);
+                    let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
+                    self.midi_input = Some(midi);
+                    Some(rx)
+                };
                 #[cfg(target_os = "windows")]
-                if is_virtual {
+                let new_rx: Option<Receiver<CapturedMidiEvent>> = if is_virtual {
                     // Sur Windows, le pseudo "Jamodio Virtual MIDI" n'a pas
-                    // (encore) de vrai port CoreMIDI-équivalent (= S2.5 via
+                    // (encore) de vrai port équivalent (= sprint futur via
                     // teVirtualMIDI). En attendant, accepter la sélection
-                    // permet de basculer source=MIDI et d'utiliser le
-                    // clavier HTML intégré qui dispatch directement au
-                    // plugin via PlayMidiNote → Vst3Host::dispatch_midi_only.
-                    // Pas d'ouverture midir (= pas de réception physique
-                    // depuis d'autres apps OS pour l'instant).
+                    // permet d'utiliser le clavier HTML intégré qui dispatch
+                    // directement au plugin via PlayMidiNote.
                     self.midi_input = None;
-                    *self.midi_event_rx.lock() = None;
-                    *self.input_source.lock() = source;
-                    return Ok(());
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                let _ = is_virtual;
-
-                let (tx, rx) = bounded::<CapturedMidiEvent>(256);
-                let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
-                self.midi_input = Some(midi);
-                // Set l'Option intérieure du Arc → l'encoder thread RT lit le
-                // NOUVEAU receiver au prochain bloc audio (sans restart).
-                *self.midi_event_rx.lock() = Some(rx);
+                    None
+                } else {
+                    let (tx, rx) = bounded::<CapturedMidiEvent>(256);
+                    let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
+                    self.midi_input = Some(midi);
+                    Some(rx)
+                };
+                *self.midi_event_rx.lock() = new_rx;
             }
         }
+
+        // 3. Swap atomique du CaptureMode si la catégorie change ET qu'une
+        //    session est active. Hors session, le prochain `start_capture`
+        //    instanciera le bon mode.
+        if was_midi != will_be_midi && self.capture_mode.is_some() {
+            self.swap_capture_mode(will_be_midi)?;
+        }
+
+        // 4. Commit de l'état logique.
         *self.input_source.lock() = source;
+        Ok(())
+    }
+
+    /// Construit le nouveau `CaptureMode` cible et l'installe en remplaçant
+    /// l'ancien atomiquement (drop ancien → init nouveau → store).
+    ///
+    /// Appelé uniquement depuis `set_input_source` après vérification que
+    /// `capture_mode.is_some()` et que la catégorie change effectivement.
+    /// Pré-condition : `capture_format` et `capture_sample_tx` sont Some.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn swap_capture_mode(&mut self, target_midi: bool) -> Result<(), String> {
+        let sample_tx = self.capture_sample_tx.clone().ok_or_else(|| {
+            "internal: capture_mode set but sample_tx missing".to_string()
+        })?;
+        let (channels_in, native_sr) = self.capture_format.ok_or_else(|| {
+            "internal: capture_mode set but format missing".to_string()
+        })?;
+
+        if target_midi {
+            // AUDIO → MIDI : drop CPAL, instancie ticker silencieux au
+            // format fixé au start_capture (pas de mismatch possible).
+            let clock = crate::audio::midi_clock::MidiSilenceClock::start(
+                sample_tx,
+                channels_in,
+                native_sr,
+            )
+                .map_err(|e| format!("MIDI silence clock spawn: {e}"))?;
+            self.capture_mode = Some(CaptureMode::Midi(clock));
+            tracing::info!(
+                target: "jamodio::pipeline",
+                channels = channels_in,
+                sample_rate = native_sr,
+                "capture mode swapped: AUDIO → MIDI (ticker silencieux)"
+            );
+        } else {
+            // MIDI → AUDIO : drop ticker, ré-ouvre CPAL avec le device_id
+            // courant. Vérifie que le format natif du device matche celui
+            // fixé au start_capture (sinon l'encoder thread aurait un format
+            // mismatch — on échoue proprement).
+            let input_id = self.input_device_id.clone();
+            let device_opt = match input_id.as_deref() {
+                Some(id) => crate::audio::device::get_input_device(id),
+                None => crate::audio::device::default_input_id()
+                    .as_deref()
+                    .and_then(crate::audio::device::get_input_device),
+            };
+            let Some(device) = device_opt else {
+                return Err(format!("input device introuvable : {input_id:?}"));
+            };
+
+            // Drop l'ancien (ticker) AVANT d'ouvrir le nouveau CPAL stream
+            // pour libérer toute ressource device potentiellement détenue.
+            self.capture_mode.take();
+
+            let capture_drops = self.perfstats.capture_drops.clone();
+            let (stream, ch, sr) = crate::audio::capture::start_capture(
+                &device,
+                sample_tx,
+                capture_drops,
+            )
+                .map_err(|e| format!("CPAL input: {e}"))?;
+            if ch != channels_in || sr != native_sr {
+                return Err(format!(
+                    "format device {ch}ch/{sr}Hz incompatible avec encoder {channels_in}ch/{native_sr}Hz \
+                     (fixé au start_capture) — recommandation : stop_capture + start_capture"
+                ));
+            }
+            self.capture_mode = Some(CaptureMode::Audio(SendStream(stream)));
+            tracing::info!(
+                target: "jamodio::pipeline",
+                channels = ch,
+                sample_rate = sr,
+                "capture mode swapped: MIDI → AUDIO (CPAL re-opened)"
+            );
+        }
         Ok(())
     }
 
@@ -767,31 +918,44 @@ impl PipelineState {
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
         use cpal::traits::DeviceTrait;
 
-        // 1. RÉSOUDRE LE DEVICE D'ABORD — avant de toucher quoi que ce soit
-        // d'autre. Si le device demandé n'existe pas, on échoue tout de suite,
-        // proprement, sans avoir stoppé une capture en cours ni alloué un
-        // socket UDP. Comportement strict : l'id du browser DOIT pointer sur
-        // un device courant. Aucun fallback default.
+        // 1. RÉSOUDRE LA SOURCE D'INPUT — fail-fast, sans effets de bord.
+        //
+        // En mode AUDIO : on résout le device CPAL avant toute opération
+        // destructive. Si l'id du browser pointe sur un device introuvable,
+        // on échoue immédiatement sans avoir stoppé une capture en cours ni
+        // alloué un socket UDP. Aucun fallback silencieux.
+        //
+        // En mode MIDI (mac/win uniquement) : Chantier #2 Variante A. Le
+        // plugin instrument INSERT génère l'audio depuis les events MIDI ;
+        // CPAL est remplacé par un ticker silencieux (audio::midi_clock).
+        // L'`input_device_id` est conservé en mémoire — il servira de device
+        // par défaut si l'utilisateur bascule vers AUDIO en cours de session.
         let input_id = self.input_device_id.clone();
-        let input_device = match input_id.as_deref() {
-            Some(id) => crate::audio::device::get_input_device(id),
-            None => {
-                // Premier lancement, browser n'a rien sélectionné : on prend
-                // le default système (uniquement dans ce cas-là).
-                crate::audio::device::default_input_id()
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let in_midi_mode = matches!(*self.input_source.lock(), InputSource::Midi(_));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let in_midi_mode = false;
+
+        let audio_device_resolved = if in_midi_mode {
+            None
+        } else {
+            let dev = match input_id.as_deref() {
+                Some(id) => crate::audio::device::get_input_device(id),
+                None => crate::audio::device::default_input_id()
                     .as_deref()
-                    .and_then(crate::audio::device::get_input_device)
-            }
+                    .and_then(crate::audio::device::get_input_device),
+            };
+            let Some(dev) = dev else {
+                return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
+            };
+            let in_name = dev.name().unwrap_or_default();
+            // L'id qu'on rapporte est celui demandé (si présent) ou celui du
+            // default résolu — toujours au format `{idx}:{name}` pour cohérence.
+            let resolved_id = input_id.clone().unwrap_or_else(|| {
+                crate::audio::device::default_input_id().unwrap_or_else(|| in_name.clone())
+            });
+            Some((dev, in_name, resolved_id))
         };
-        let Some(device) = input_device else {
-            return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
-        };
-        let in_name = device.name().unwrap_or_default();
-        // L'id qu'on rapporte est celui demandé (si présent) ou celui du
-        // default résolu — toujours au format `{idx}:{name}` pour cohérence.
-        let resolved_input_id = input_id.unwrap_or_else(|| {
-            crate::audio::device::default_input_id().unwrap_or_else(|| in_name.clone())
-        });
 
         // Stop any existing capture (only after device resolved successfully)
         self.stop_capture();
@@ -820,22 +984,76 @@ impl PipelineState {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
-        // 5. Start CPAL input stream (le device est déjà résolu, ici on
-        //    ouvre seulement le stream — toute erreur ici est technique
-        //    pure (driver, sample-rate impossible, etc.), pas une erreur
-        //    de sélection user).
-        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
+        // 5. Démarre la source de timing : CPAL en mode AUDIO, ticker
+        //    silencieux en mode MIDI. La sortie (`channels_in`, `native_sr`)
+        //    est captée pour configurer l'encoder thread aval. Le format
+        //    reste constant pendant toute la session — `set_input_source`
+        //    fait la bascule CPAL↔ticker mais préserve le format au format
+        //    fixé ici (cf. `capture_format`).
+        //
         // Sprint S1 — partage du compteur de drops avec le callback CPAL : il
         // incrémente quand `sample_tx` est plein, ws_server le lit + reset au
         // flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
         let capture_drops_for_callback = self.perfstats.capture_drops.clone();
-        let (stream, channels_in, native_sr) = crate::audio::capture::start_capture(
-            &device,
-            sample_tx,
-            capture_drops_for_callback,
-        )
-            .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
-        self.capture_stream = Some(SendStream(stream));
+        let (channels_in, native_sr, in_name, resolved_input_id) = match audio_device_resolved {
+            Some((device, in_name, resolved_id)) => {
+                tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
+                let (stream, ch, sr) = crate::audio::capture::start_capture(
+                    &device,
+                    sample_tx.clone(),
+                    capture_drops_for_callback,
+                )
+                    .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    self.capture_mode = Some(CaptureMode::Audio(SendStream(stream)));
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    self.capture_stream = Some(SendStream(stream));
+                }
+                (ch, sr, in_name, resolved_id)
+            }
+            None => {
+                // Mode MIDI (Variante A). Format canonique stéréo 48 kHz —
+                // pas de capture audio, donc pas de contrainte device.
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    let _ = capture_drops_for_callback;
+                    const MIDI_CHANNELS: u16 = 2;
+                    const MIDI_SR: u32 = 48_000;
+                    let clock = crate::audio::midi_clock::MidiSilenceClock::start(
+                        sample_tx.clone(),
+                        MIDI_CHANNELS,
+                        MIDI_SR,
+                    )
+                        .map_err(|e| CaptureStartError::Other(format!("MIDI silence clock spawn: {e}")))?;
+                    self.capture_mode = Some(CaptureMode::Midi(clock));
+                    let resolved_id = input_id
+                        .clone()
+                        .unwrap_or_else(|| "midi-silence-clock".to_string());
+                    tracing::info!(
+                        target: "jamodio::pipeline",
+                        channels = MIDI_CHANNELS, sample_rate = MIDI_SR,
+                        "MIDI mode: ticker silencieux (CPAL capture bypassed)"
+                    );
+                    (MIDI_CHANNELS, MIDI_SR, "MIDI Silence Clock".to_string(), resolved_id)
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    // Impossible : `in_midi_mode` est forcé à false sur Linux.
+                    unreachable!("MIDI mode is not supported on this platform")
+                }
+            }
+        };
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.capture_format = Some((channels_in, native_sr));
+            self.capture_sample_tx = Some(sample_tx);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = sample_tx; // moved into CPAL callback on Linux
+
         tracing::info!(
             target: "jamodio::pipeline",
             channels_in, native_sr, ?channel_index,
@@ -879,8 +1097,6 @@ impl PipelineState {
         // muet après bascule AUDIO→MIDI).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let midi_event_rx_for_encoder = self.midi_event_rx.clone();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let input_source_for_encoder = self.input_source.clone();
         let perfstats_for_encoder = self.perfstats.clone();
         // Sprint S2 — nom du device output (extrait du format "{idx}:{name}")
         // passé à rt_priority pour matcher le workgroup CoreAudio HAL. Si
@@ -901,7 +1117,6 @@ impl PipelineState {
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx_for_encoder,
-                    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source_for_encoder,
                 );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
@@ -1032,7 +1247,19 @@ impl PipelineState {
     }
 
     fn stop_capture(&mut self) {
-        self.capture_stream.take(); // Drop stops CPAL stream
+        // Drop la source de timing : CPAL stream OU ticker MIDI. Les deux
+        // implémentent Drop pour libérer leurs ressources (CPAL : ferme le
+        // stream natif ; MidiSilenceClock : signale stop + join le thread).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.capture_mode.take();
+            self.capture_format.take();
+            self.capture_sample_tx.take();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            self.capture_stream.take();
+        }
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
@@ -1042,11 +1269,24 @@ impl PipelineState {
         self.mixer.lock().remove_local_stream();
     }
 
+    /// Indique si une source de capture (CPAL audio ou ticker MIDI) est
+    /// actuellement active. True entre `start_capture` et `stop_capture`.
+    fn capture_is_active(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.capture_mode.is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            self.capture_stream.is_some()
+        }
+    }
+
     pub fn stop_all(&mut self) {
         // Évite le bruit en idle : si rien ne tourne, on log en debug pour
         // pas spammer info à chaque WS disconnect du browser (le probe agent
         // ouvre/ferme une WS toutes les 30 s, ce qui appelait stop_all).
-        let was_active = self.capture_stream.is_some()
+        let was_active = self.capture_is_active()
             || self.playback_stream.is_some()
             || !self.recv_stops.is_empty()
             || self.recorder.is_some();
@@ -1226,7 +1466,6 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1268,8 +1507,6 @@ fn encoder_thread(
     let plugin_handle_proc = plugin_handle.clone();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let plugin_bypass_proc = plugin_bypass.clone();
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let input_source_proc = input_source.clone();
     let h_proc = std::thread::Builder::new()
         .name("audio-process".into())
         .spawn(move || {
@@ -1290,8 +1527,6 @@ fn encoder_thread(
                 plugin_bypass_proc,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 midi_event_rx,
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                input_source_proc,
             );
         })
         .expect("spawn audio-process thread");
@@ -1612,7 +1847,6 @@ fn process_stage_loop(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -1660,16 +1894,11 @@ fn process_stage_loop(
                     stereo.fill(0.0);
                 }
 
-                // S2 — source MIDI : force samples = 0 (mic ouvert pour le tick
-                // d'horloge mais on ignore son contenu, le plugin instrument
-                // génère l'audio depuis les events MIDI).
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                {
-                    let src = input_source.lock().clone();
-                    if matches!(src, InputSource::Midi(_)) {
-                        stereo.fill(0.0);
-                    }
-                }
+                // Mode MIDI : depuis le Chantier #2 (Variante A), la capture
+                // CPAL est remplacée par un ticker silencieux côté pipeline,
+                // donc le buffer `stereo` est déjà à zéro en arrivée ici —
+                // pas de fill(0) artificiel nécessaire. Le plugin instrument
+                // INSERT génère l'audio depuis les events MIDI.
 
                 // INSERT plugin (AU mac / VST3 win) appliqué par sous-blocs
                 // de PLUGIN_BLOCK frames. Le self-monitor entend le son WET.
