@@ -1534,6 +1534,13 @@ async fn handle_message(
                 };
                 let handle_opt = *pl.instrument_plugin_handle.lock();
                 if let Some(handle) = handle_opt {
+                    // Clavier HTML virtuel (browser → WS → agent) : pas de
+                    // source temporelle précise (mousedown/keydown soumis au
+                    // lag UI + transit WebSocket). `frame_offset: 0` est
+                    // l'approximation honnête — l'event est joué au tout
+                    // début du prochain bloc rendu par dispatch_midi_only.
+                    // Le path MIDI USB physique passe par `midi.rs` qui, lui,
+                    // est sample-accurate via `CapturedMidiEvent::captured_at`.
                     let event = jamodio_audio_core::plugin_host::MidiEvent {
                         frame_offset: 0,
                         data: [status, data1, data2],

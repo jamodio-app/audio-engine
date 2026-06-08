@@ -19,7 +19,6 @@
 //! Windows MIDI.
 
 use crossbeam_channel::Sender;
-use jamodio_audio_core::plugin_host::MidiEvent;
 use midir::{MidiInput as MidirInput, MidiInputConnection, MidiInputPort};
 // Port virtuel MIDI = Unix-only (CoreMIDI macOS, ALSA Linux). Windows MIDI
 // (winmm) ne supporte pas nativement la création de ports virtuels — pas de
@@ -28,6 +27,28 @@ use midir::{MidiInput as MidirInput, MidiInputConnection, MidiInputPort};
 #[cfg(unix)]
 use midir::os::unix::VirtualInput;
 use serde::Serialize;
+use std::time::Instant;
+
+/// Event MIDI horodaté à la réception du callback midir.
+///
+/// Représente un event MIDI tel que capturé par le driver, avant conversion
+/// vers le `MidiEvent` consommé par les plugins. Le `captured_at` est posé
+/// dans le callback midir (overhead ≈ 1-3 µs vs le moment réel où l'event
+/// est arrivé sur le bus USB/CoreMIDI) — la précision résultante du
+/// `frame_offset` est donc bornée par le sample 48 kHz lui-même (~20 µs).
+///
+/// L'encoder thread convertit `CapturedMidiEvent → MidiEvent` au drain en
+/// calculant `frame_offset = (captured_at - block_start) * 48 / 1000 µs`,
+/// clampé dans `[0, BLOCK_SIZE)`. Voir `pipeline.rs::process_stage` pour la
+/// référence temporelle `block_start`.
+#[derive(Debug, Clone, Copy)]
+pub struct CapturedMidiEvent {
+    /// Wall-clock du callback midir, source de la précision sample-accurate.
+    pub captured_at: Instant,
+    /// Bytes MIDI (max 3) — note on/off, CC, pitch bend tiennent en 3 bytes.
+    /// Les events SysEx (longueur variable) sont ignorés à la source.
+    pub data: [u8; 3],
+}
 
 /// Nom du port virtuel MIDI créé au boot agent. Exposé dans CoreMIDI sous
 /// ce nom — les autres apps macOS (Logic, Ableton, GarageBand, MainStage,
@@ -108,7 +129,7 @@ pub fn list_devices() -> Vec<MidiDeviceInfo> {
 /// sur mac. Le `cfg(unix)` ici garde la définition cohérente avec l'API
 /// `midir::os::unix::VirtualInput` qui n'existe que sur Unix.
 #[cfg(unix)]
-pub fn create_virtual_input(tx: Sender<MidiEvent>) -> Result<MidiInput, String> {
+pub fn create_virtual_input(tx: Sender<CapturedMidiEvent>) -> Result<MidiInput, String> {
     let input = MidirInput::new("Jamodio Agent")
         .map_err(|e| format!("MidirInput virtual init: {e}"))?;
 
@@ -116,6 +137,11 @@ pub fn create_virtual_input(tx: Sender<MidiEvent>) -> Result<MidiInput, String> 
         .create_virtual(
             VIRTUAL_PORT_NAME,
             move |_timestamp_us, message, _state| {
+                // `_timestamp_us` est volontairement ignoré : sa sémantique varie
+                // selon l'OS (µs depuis ouverture port sur CoreMIDI/ALSA, ms sur
+                // Windows winmm). On capture `Instant::now()` à la place : monotone,
+                // cross-platform, précis à la µs, et directement comparable au
+                // `block_start` capturé côté encoder thread.
                 if message.is_empty() || message.len() > 3 {
                     return;
                 }
@@ -123,8 +149,8 @@ pub fn create_virtual_input(tx: Sender<MidiEvent>) -> Result<MidiInput, String> 
                 for (i, b) in message.iter().enumerate() {
                     data[i] = *b;
                 }
-                let _ = tx.try_send(MidiEvent {
-                    frame_offset: 0,
+                let _ = tx.try_send(CapturedMidiEvent {
+                    captured_at: Instant::now(),
                     data,
                 });
             },
@@ -159,7 +185,7 @@ impl MidiInput {
     /// propre thread géré par CoreMIDI.
     ///
     /// Mode omni : tous les channels sont acceptés. Filtrage = futur.
-    pub fn open(device_id: &str, tx: Sender<MidiEvent>) -> Result<Self, String> {
+    pub fn open(device_id: &str, tx: Sender<CapturedMidiEvent>) -> Result<Self, String> {
         let parsed_idx = device_id
             .split_once(':')
             .and_then(|(i, _)| i.parse::<usize>().ok())
@@ -184,6 +210,11 @@ impl MidiInput {
                     // Note On/Off + CC + Pitch bend tiennent en 3 bytes.
                     // SysEx (variable length) est ignoré au MVP — peu de plugins
                     // l'utilisent pour le live, et notre wire MidiEvent fait 3 bytes.
+                    //
+                    // `_timestamp_us` est volontairement ignoré : sa sémantique
+                    // varie selon l'OS. On capture `Instant::now()` à la place :
+                    // monotone, cross-platform, précis à la µs, et directement
+                    // comparable au `block_start` côté encoder thread.
                     if message.is_empty() || message.len() > 3 {
                         return;
                     }
@@ -191,10 +222,8 @@ impl MidiInput {
                     for (i, b) in message.iter().enumerate() {
                         data[i] = *b;
                     }
-                    let event = MidiEvent {
-                        frame_offset: 0, // S2 MVP : tous les events traités au début du bloc.
-                                         // Sample-precise timing (= timestamp_us → frame_offset)
-                                         // = sprint futur si jitter audible.
+                    let event = CapturedMidiEvent {
+                        captured_at: Instant::now(),
                         data,
                     };
                     // try_send non bloquant : si la queue est pleine (= encoder

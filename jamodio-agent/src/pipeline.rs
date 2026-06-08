@@ -13,6 +13,8 @@ use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::perfstats::Histogram;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::audio::midi::CapturedMidiEvent;
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
@@ -169,7 +171,7 @@ pub struct PipelineState {
     /// résultat : MIDI physique muet alors que le clavier HTML (= chemin
     /// PlayMidiNote → dispatch_midi_only) restait fonctionnel.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
+    midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
     /// S2.7 — Port virtuel "Jamodio Virtual MIDI" créé au boot agent et tenu
     /// vivant toute la durée d'exécution. Apparaît dans CoreMIDI = destination
     /// visible dans toutes les apps MIDI macOS (Logic, Ableton, GarageBand…).
@@ -178,7 +180,7 @@ pub struct PipelineState {
     virtual_midi_keepalive: Option<crate::audio::midi::MidiInput>,
     /// S2.7 — Receiver du port virtuel macOS, persistant et clonable.
     #[cfg(target_os = "macos")]
-    virtual_midi_rx: Option<Receiver<MidiEvent>>,
+    virtual_midi_rx: Option<Receiver<CapturedMidiEvent>>,
     /// Sprint S1 — Métriques perf. Histogrammes capacités 512 (couvre 1.3 s à
     /// 375 obs/s, marge confortable pour le flush 1 Hz côté ws_server).
     ///
@@ -436,7 +438,7 @@ impl PipelineState {
     /// Appelée une fois après `new()` par `main.rs`.
     #[cfg(target_os = "macos")]
     pub fn spawn_virtual_midi(&mut self) {
-        let (tx, rx) = bounded::<MidiEvent>(512);
+        let (tx, rx) = bounded::<CapturedMidiEvent>(512);
         match crate::audio::midi::create_virtual_input(tx) {
             Ok(mi) => {
                 self.virtual_midi_keepalive = Some(mi);
@@ -504,7 +506,7 @@ impl PipelineState {
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 let _ = is_virtual;
 
-                let (tx, rx) = bounded::<MidiEvent>(256);
+                let (tx, rx) = bounded::<CapturedMidiEvent>(256);
                 let midi = crate::audio::midi::MidiInput::open(device_id, tx)?;
                 self.midi_input = Some(midi);
                 // Set l'Option intérieure du Arc → l'encoder thread RT lit le
@@ -1129,6 +1131,62 @@ type TimedBlock = (std::time::Instant, Vec<f32>);
 /// est absorbé sans saturer la queue.
 const STAGE_CHANNEL_CAPACITY: usize = 32;
 
+/// Convertit le `captured_at` d'un `CapturedMidiEvent` en `frame_offset`
+/// sample-accurate (= index sample dans le bloc audio courant) pour le
+/// dispatch au plugin instrument.
+///
+/// `block_start` = wall-clock juste avant le drain MIDI (= référence de
+/// l'instant zéro du bloc audio en cours de traitement).
+/// `max_offset` = dernier index sample valide du bloc (= `n_pairs - 1`).
+///
+/// Sémantique du clamp :
+/// - `captured_at < block_start` → 0 (event arrivé pendant le queueing du
+///   bloc précédent → snap au début, position la plus précoce jouable)
+/// - `captured_at` au-delà du bloc → `max_offset` (extrêmement rare car
+///   la prochaine itération aura un `block_start` plus récent ; safety net).
+///
+/// Précision : bornée par le sample 48 kHz (≈ 20 µs).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn midi_frame_offset(
+    captured_at: std::time::Instant,
+    block_start: std::time::Instant,
+    max_offset: u32,
+) -> u32 {
+    captured_at
+        .checked_duration_since(block_start)
+        .map(|d| (d.as_micros() as u32) * 48 / 1000)
+        .unwrap_or(0)
+        .min(max_offset)
+}
+
+/// Filtre les events MIDI dont le `frame_offset` (absolu dans le bloc parent)
+/// tombe dans `[sub_start, sub_end)`, et écrit dans `out` les events ré-exprimés
+/// avec un offset relatif au début du sous-bloc.
+///
+/// `out` est cleared avant remplissage. Le caller passe son buffer réutilisable
+/// (pré-alloué cap 64) pour éviter une allocation par sous-bloc dans le hot
+/// path encoder thread.
+///
+/// Cas dégénéré (CPAL Fixed(128) = 1 sous-bloc = tout le bloc) : O(N) où
+/// N = nombre d'events (<= 64), trivialement rapide.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn dispatch_subblock_midi(
+    events: &[MidiEvent],
+    sub_start: u32,
+    sub_end: u32,
+    out: &mut Vec<MidiEvent>,
+) {
+    out.clear();
+    for ev in events {
+        if ev.frame_offset >= sub_start && ev.frame_offset < sub_end {
+            out.push(MidiEvent {
+                frame_offset: ev.frame_offset - sub_start,
+                data: ev.data,
+            });
+        }
+    }
+}
+
 /// Sprint S3 — Orchestrateur des 3 stages audio (capture, process, encode).
 ///
 /// Architecture (cf. PLAN-EXECUTION-AGENT-STABILITE.md §S3) :
@@ -1167,7 +1225,7 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1553,7 +1611,7 @@ fn process_stage_loop(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle: Arc<Mutex<Option<PluginHandle>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<MidiEvent>>>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -1653,17 +1711,32 @@ fn process_stage_loop(
                         };
 
                         // Drain les events MIDI accumulés depuis le dernier
-                        // bloc. Max 64 events / bloc (limite défensive).
-                        // Lock court : juste le temps de pump le channel
-                        // (re-lookup de l'Option par bloc → suit auto les
-                        // bascules MIDI/AUDIO de set_input_source).
+                        // bloc et convertit le `captured_at` (timestamp midir)
+                        // en `frame_offset` sample-accurate (cf.
+                        // `midi_frame_offset`). Cible : timing DAW-grade
+                        // (~20 µs) sur pads/batterie, vs ±1,33 ms RMS du
+                        // dispatch block-quantized antérieur.
+                        //
+                        // Max 64 events / bloc (limite défensive). Lock court :
+                        // re-lookup de l'Option par bloc → suit auto les
+                        // bascules MIDI/AUDIO de set_input_source.
+                        let n_pairs = stereo.len() / 2;
+                        let block_start = std::time::Instant::now();
                         let midi_events: Vec<MidiEvent> = {
                             let guard = midi_event_rx.lock();
                             match guard.as_ref() {
                                 Some(rx) => {
                                     let mut batch = Vec::new();
-                                    while let Ok(ev) = rx.try_recv() {
-                                        batch.push(ev);
+                                    let max_offset = (n_pairs as u32).saturating_sub(1);
+                                    while let Ok(cap) = rx.try_recv() {
+                                        batch.push(MidiEvent {
+                                            frame_offset: midi_frame_offset(
+                                                cap.captured_at,
+                                                block_start,
+                                                max_offset,
+                                            ),
+                                            data: cap.data,
+                                        });
                                         if batch.len() >= 64 {
                                             break;
                                         }
@@ -1686,12 +1759,12 @@ fn process_stage_loop(
                             dry_scratch.extend_from_slice(&stereo);
                         }
 
-                        let n_pairs = stereo.len() / 2;
                         let mut idx = 0;
-                        // MIDI dispatché au 1er sous-bloc seulement (notes
-                        // ON/OFF au début du bloc) ; sous-blocs suivants
-                        // reçoivent une slice vide.
-                        let mut first_subblock = true;
+                        // Dispatch sample-accurate par sous-bloc (cf.
+                        // `dispatch_subblock_midi`). Le cas commun (CPAL
+                        // Fixed(128) = 1 sous-bloc = tout le bloc) clone
+                        // simplement les events sans ajustement d'offset.
+                        let mut subblock_midi: Vec<MidiEvent> = Vec::with_capacity(64);
                         while idx < n_pairs {
                             let end = (idx + PLUGIN_BLOCK).min(n_pairs);
                             plugin_left.clear();
@@ -1700,12 +1773,12 @@ fn process_stage_loop(
                                 plugin_left.push(stereo[i * 2]);
                                 plugin_right.push(stereo[i * 2 + 1]);
                             }
-                            let midi_for_block: &[MidiEvent] = if first_subblock {
-                                &midi_events
-                            } else {
-                                &[]
-                            };
-                            first_subblock = false;
+                            dispatch_subblock_midi(
+                                &midi_events,
+                                idx as u32,
+                                end as u32,
+                                &mut subblock_midi,
+                            );
                             // Wall-clock guard plugin INSERT (mesure par
                             // sous-bloc). Coût `Instant::now()` ≈ 30 ns × 2.
                             let t_plugin = std::time::Instant::now();
@@ -1713,7 +1786,7 @@ fn process_stage_loop(
                                 handle,
                                 &mut plugin_left,
                                 &mut plugin_right,
-                                midi_for_block,
+                                &subblock_midi,
                             );
                             let plugin_elapsed_ms =
                                 t_plugin.elapsed().as_secs_f32() * 1000.0;
@@ -2368,5 +2441,134 @@ mod dsp_tests {
         let (_p2, overs_s) = soft_clip_block(&mut sustained, 0.98);
         let pct_s = 100.0 * overs_s as f32 / 4800.0;
         assert!(pct_s > 50.0, "overdrive soutenu = taux élevé ({pct_s} %)");
+    }
+}
+
+// ─── MIDI sample-accurate dispatch (Chantier #1) ─────────────────────────
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod midi_dispatch_tests {
+    use super::{dispatch_subblock_midi, midi_frame_offset};
+    use jamodio_audio_core::plugin_host::MidiEvent;
+    use std::time::{Duration, Instant};
+
+    // ─── midi_frame_offset ───
+
+    #[test]
+    fn frame_offset_event_at_block_start_is_zero() {
+        let t0 = Instant::now();
+        assert_eq!(midi_frame_offset(t0, t0, 127), 0);
+    }
+
+    #[test]
+    fn frame_offset_proportional_to_us_delay() {
+        // 1 ms delay @ 48 kHz = 48 samples.
+        let block_start = Instant::now();
+        let captured = block_start + Duration::from_micros(1000);
+        assert_eq!(midi_frame_offset(captured, block_start, 127), 48);
+    }
+
+    #[test]
+    fn frame_offset_subsample_precision_truncates_below_sample() {
+        // 10 µs delay @ 48 kHz = 0.48 sample → tronqué à 0 (= snap au début).
+        let block_start = Instant::now();
+        let captured = block_start + Duration::from_micros(10);
+        assert_eq!(midi_frame_offset(captured, block_start, 127), 0);
+    }
+
+    #[test]
+    fn frame_offset_event_before_block_start_snaps_to_zero() {
+        // Event arrivé pendant le queueing du bloc précédent : captured_at
+        // antérieur à block_start → 0 (position la plus précoce du bloc).
+        let block_start = Instant::now();
+        let captured = block_start - Duration::from_micros(500);
+        assert_eq!(midi_frame_offset(captured, block_start, 127), 0);
+    }
+
+    #[test]
+    fn frame_offset_clamps_to_max_offset() {
+        // Event tardif (10 ms = 480 samples) avec bloc 128 → clampé à 127.
+        let block_start = Instant::now();
+        let captured = block_start + Duration::from_millis(10);
+        assert_eq!(midi_frame_offset(captured, block_start, 127), 127);
+    }
+
+    #[test]
+    fn frame_offset_zero_max_returns_zero() {
+        // max_offset = 0 (bloc vide théorique) → tous events à 0.
+        let block_start = Instant::now();
+        let captured = block_start + Duration::from_millis(2);
+        assert_eq!(midi_frame_offset(captured, block_start, 0), 0);
+    }
+
+    // ─── dispatch_subblock_midi ───
+
+    fn ev(frame_offset: u32) -> MidiEvent {
+        MidiEvent { frame_offset, data: [0x90, 60, 100] }
+    }
+
+    #[test]
+    fn dispatch_single_subblock_keeps_all_events_unchanged() {
+        // Cas commun CPAL Fixed(128) = 1 sous-bloc = tout le bloc :
+        // les offsets restent identiques car sub_start = 0.
+        let events = vec![ev(0), ev(32), ev(64), ev(127)];
+        let mut out = Vec::with_capacity(64);
+        dispatch_subblock_midi(&events, 0, 128, &mut out);
+        assert_eq!(out.len(), 4);
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(out[i].frame_offset, e.frame_offset);
+            assert_eq!(out[i].data, e.data);
+        }
+    }
+
+    #[test]
+    fn dispatch_multi_subblock_routes_events_to_correct_subblock() {
+        // Bloc 256 samples = 2 sous-blocs de 128. Event à offset 130 doit
+        // aller dans le 2e sous-bloc, avec offset relatif 130-128 = 2.
+        let events = vec![ev(10), ev(127), ev(128), ev(130), ev(255)];
+        let mut out = Vec::with_capacity(64);
+
+        dispatch_subblock_midi(&events, 0, 128, &mut out);
+        assert_eq!(out.len(), 2, "1er sous-bloc : offsets 10 et 127");
+        assert_eq!(out[0].frame_offset, 10);
+        assert_eq!(out[1].frame_offset, 127);
+
+        dispatch_subblock_midi(&events, 128, 256, &mut out);
+        assert_eq!(out.len(), 3, "2e sous-bloc : offsets 128, 130, 255");
+        assert_eq!(out[0].frame_offset, 0, "128 - 128 = 0");
+        assert_eq!(out[1].frame_offset, 2, "130 - 128 = 2");
+        assert_eq!(out[2].frame_offset, 127, "255 - 128 = 127");
+    }
+
+    #[test]
+    fn dispatch_clears_output_before_filling() {
+        // Le buffer out est cleared à chaque appel : pas de fuite entre
+        // appels successifs (= contrat avec le caller du hot path).
+        let mut out = vec![ev(99), ev(99)];
+        dispatch_subblock_midi(&[], 0, 128, &mut out);
+        assert!(out.is_empty(), "empty events → out vide après dispatch");
+    }
+
+    #[test]
+    fn dispatch_no_match_yields_empty() {
+        // Event à 100, sous-bloc [128, 256) → aucun match.
+        let events = vec![ev(100)];
+        let mut out = Vec::with_capacity(64);
+        dispatch_subblock_midi(&events, 128, 256, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dispatch_boundary_exclusive_on_sub_end() {
+        // Event à offset = sub_end → exclu (sub_end est exclusif).
+        let events = vec![ev(128)];
+        let mut out = Vec::with_capacity(64);
+        dispatch_subblock_midi(&events, 0, 128, &mut out);
+        assert!(out.is_empty(), "frame_offset == sub_end est exclu");
+
+        dispatch_subblock_midi(&events, 128, 256, &mut out);
+        assert_eq!(out.len(), 1, "frame_offset == sub_start est inclus");
+        assert_eq!(out[0].frame_offset, 0);
     }
 }

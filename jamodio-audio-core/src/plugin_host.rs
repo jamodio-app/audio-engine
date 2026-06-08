@@ -65,7 +65,17 @@ fn default_true() -> bool {
     true
 }
 
-/// Évènement MIDI pour les plugins instruments (S2). Pas utilisé en S1 mais réservé.
+/// Évènement MIDI dispatché à un plugin instrument (AU/VST3).
+///
+/// `frame_offset` est sample-accurate : c'est l'index du sample (relatif au
+/// début du sous-bloc passé à `process_stereo`) auquel l'event doit s'aligner.
+/// Calculé côté agent à partir du timestamp de capture midir
+/// (`CapturedMidiEvent::captured_at` dans `crate::audio::midi`) — cf.
+/// `pipeline.rs::process_stage` pour la conversion.
+///
+/// Précision : bornée par le sample 48 kHz (~20 µs). Garantit un timing
+/// DAW-grade pour les pads/batterie/drums, vs ±1,33 ms RMS de l'ancien
+/// dispatch block-quantized (frame_offset toujours 0).
 #[derive(Clone, Debug)]
 pub struct MidiEvent {
     pub frame_offset: u32,
