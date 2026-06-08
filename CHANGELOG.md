@@ -6,6 +6,124 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.18] — 2026-06-08
+
+### Removed — Latency-equalizer (sous-système entier, Chantier #3)
+
+L'égaliseur de latence côté serveur (broadcast `latency-align` toutes les
+2 s, computé sur le RTT WebSocket) écrasait la cible adaptative du jitter
+buffer (5-40 ms autonome) en la forçant à `10 + delay_ms` via `SetPeerDelay`.
+En pratique, un seul peer pathologique (drift d'horloge > 200 ppm, Wi-Fi
+instable…) tirait toutes les cibles de la room jusqu'à 100+ ms et déclenchait
+un drift drain régulier visible dans les perfstats BETA.
+
+Suppressions côté agent :
+- `BrowserMessage::SetPeerDelay` (protocol).
+- Handler `SetPeerDelay` (`ws_server`).
+- `AudioMixer::set_peer_delay` + constantes `REMOTE_BASE_TARGET_MS` +
+  `PEER_DELAY_HYSTERESIS_MS`.
+- `MAX_ALIGN_TARGET_MS` (200 ms) du ring buffer — `set_target_ms` clampe
+  désormais à `[MIN_TARGET_MS=5, MAX_TARGET_MS=40]`, cohérent avec
+  l'adaptation auto.
+
+L'ancrage temporel inter-peer (métronome + backing track) reste assuré par
+la clock-sync NTP (`pong.serverTs` + `_clockOffset`), inchangée.
+
+### Added — MIDI sample-accurate (Chantier #1)
+
+Le path `clavier MIDI USB → midir → encoder → plugin instrument` quantifiait
+chaque event au début du bloc audio (`frame_offset: 0`), soit ±1,33 ms RMS
+de jitter aléatoire par frappe. Sur une batterie électronique (Alesis Nitro
+Max → BFD Player), les pairs distants entendaient les drums avec un
+flottement subtil mais reproductible (vs guitare directe sample-accurate).
+
+Fix : nouvelle struct `CapturedMidiEvent { captured_at: Instant, data }` posée
+dans le callback midir, transportée via channel crossbeam vers l'encoder
+thread, et convertie en `MidiEvent { frame_offset, data }` au drain :
+
+```
+frame_offset = (captured_at − block_start) × 48 / 1000 µs
+```
+
+clampé dans `[0, n_pairs)` (events de queueing → 0, events tardifs → max).
+Précision : ~20 µs (= sample 48 kHz lui-même), DAW-grade.
+
+Helpers extraits + 11 tests unitaires (`midi_dispatch_tests`) :
+- `midi_frame_offset(captured_at, block_start, max_offset)` — conversion µs
+  → frame_offset avec snap au début et clamp à la fin.
+- `dispatch_subblock_midi(events, sub_start, sub_end, out)` — route chaque
+  event vers le sous-bloc qui contient son `frame_offset` absolu (l'ancien
+  `first_subblock` qui collait tout au sous-bloc 0 disparaît).
+
+Cas particulier conservé en `frame_offset=0` : le clavier HTML virtuel
+(`PlayMidiNote` via WS) — son timing source n'est de toute façon pas
+sample-accurate (mousedown/keydown + lag UI + transit WebSocket).
+
+### Added — Ticker silencieux en mode MIDI (Variante A, Chantier #2)
+
+Quand `input_source = InputSource::Midi(_)` et qu'un plugin instrument INSERT
+est chargé, la capture audio CPAL n'a aucune utilité : le plugin génère
+son audio depuis les events MIDI. Avant ce sprint, l'agent gardait CPAL
+ouvert et forçait `samples = 0` côté process_stage = 1 callback CPAL / bloc
++ 1 lecture device + 1 fill(0) pour rien, et un device de routing externe
+(Pro Tools Audio Bridge, BlackHole…) restait actif et risquait d'injecter un
+signal parasite.
+
+Architecture :
+
+```
+enum CaptureMode { Audio(SendStream), Midi(MidiSilenceClock) }
+PipelineState {
+    capture_mode: Option<CaptureMode>,
+    capture_format: Option<(u16, u32)>,      // fixé au start_capture
+    capture_sample_tx: Option<Sender<...>>,  // pour re-créer le mode au swap
+}
+```
+
+L'encoder thread aval reste strictement identique : il consomme `sample_rx`
+sans savoir si la source est CPAL ou ticker. Le swap CPAL↔ticker en amont
+est transparent.
+
+Nouveau module `audio/midi_clock.rs` :
+- Thread dédié promu RT (workgroup macOS / MMCSS Windows / generic Linux),
+  cohérent avec encoder thread.
+- Deadline absolue (`start + n × block_duration`) + sleep coarse + busy-spin
+  pour les derniers 300 µs → précision ±100 µs.
+- Windows : `timeBeginPeriod(1)` activé via RAII pour amener la granularité
+  sleep de 15 ms (défaut) à 1 ms.
+- Drop : signal stop + join, arrêt borné à ~2,7 ms.
+- 7 tests unitaires (rate approx, drop, format custom 4ch/44,1 kHz, channel
+  full, channel disconnected, validation params).
+
+Transitions gérées par `set_input_source` :
+- Hors session (`capture_mode = None`) : update préférence seulement, le
+  prochain `start_capture` instancie le bon mode.
+- En session, bascule de catégorie AUDIO↔MIDI : swap atomique du
+  `CaptureMode` au format fixé par `start_capture`. Gap de silence ≤ 1 bloc
+  audio (~2,7 ms) côté pipeline aval.
+- En session, même catégorie (Midi→Midi nouveau device) : ré-ouverture
+  MIDI uniquement, pas de swap.
+
+Limitation v1 explicite : la bascule MIDI→AUDIO en cours de session échoue
+si le device audio courant ne supporte pas le format `(channels,
+sample_rate)` fixé au `start_capture`. Diagnostic clair, recovery par
+`stop_capture` + `start_capture`.
+
+Code mort éliminé :
+- `if matches!(src, InputSource::Midi(_)) { stereo.fill(0.0); }` dans
+  process_stage — le ticker pousse déjà des zéros au format attendu.
+- Paramètre `input_source: Arc<Mutex<InputSource>>` retiré de
+  `encoder_thread` et `process_stage_loop`.
+
+### Chore — 14 warnings clippy nettoyés
+
+Build agent désormais propre sous `cargo clippy --workspace --all-targets
+-- -D warnings`. Permet de gater la CI sur clippy strict pour les chantiers
+futurs.
+
+Tests : 65 OK (37 jamodio-agent dont 18 nouveaux midi_dispatch + midi_clock,
+9 au_host, 19 audio_core).
+
 ## [0.4.17] — 2026-06-05
 
 ### Fixed — MIDI physique muet après bascule AUDIO→MIDI in-session
