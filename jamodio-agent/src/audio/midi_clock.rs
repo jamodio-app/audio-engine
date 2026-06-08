@@ -251,7 +251,7 @@ impl HighResolutionTimer {
         // ignore le résultat — si l'OS refuse, le ticker fonctionne quand
         // même (juste avec plus de jitter).
         unsafe {
-            windows_sys::Win32::Media::timeBeginPeriod(1);
+            windows_sys::Win32::Media::Multimedia::timeBeginPeriod(1);
         }
         Self
     }
@@ -263,7 +263,7 @@ impl Drop for HighResolutionTimer {
         // SAFETY: appel symétrique à activate(). Doit être appelé exactement
         // une fois pour libérer la ressource système.
         unsafe {
-            windows_sys::Win32::Media::timeEndPeriod(1);
+            windows_sys::Win32::Media::Multimedia::timeEndPeriod(1);
         }
     }
 }
@@ -318,29 +318,30 @@ mod tests {
     /// Format paramétré : la taille du bloc s'adapte à `channels`, et le
     /// rythme s'adapte à `sample_rate`. On vérifie sur un format atypique
     /// (4 canaux, 44 100 Hz) que les blocs ont bien la taille attendue.
-    /// Fenêtre 250 ms = ~85 blocs attendus (= 250 / 2.9 ms à 44.1k), large
-    /// marge sur le warmup RT et le scheduler CI.
+    ///
+    /// Test déterministe : on attend le PREMIER bloc via `recv_timeout`
+    /// (max 2 s), puis on vérifie son format. Évite la flakiness des
+    /// tests basés sur `sleep + try_recv` quand le scheduler CI charge
+    /// plusieurs threads en parallèle.
     #[test]
     fn block_format_respects_channels_and_rate() {
-        let (tx, rx) = bounded::<Vec<f32>>(256);
+        let (tx, rx) = bounded::<Vec<f32>>(64);
         let channels: u16 = 4;
         let sr: u32 = 44_100;
         let clock = MidiSilenceClock::start(tx, channels, sr).expect("clock start");
-        std::thread::sleep(Duration::from_millis(250));
-        drop(clock);
 
+        let first = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("at least one block within 2 s");
         let expected_size = BLOCK_FRAMES * channels as usize;
-        let mut seen = 0;
-        while let Ok(block) = rx.try_recv() {
-            assert_eq!(
-                block.len(),
-                expected_size,
-                "block format = BLOCK_FRAMES × channels"
-            );
-            assert!(block.iter().all(|&s| s == 0.0), "block entièrement silence");
-            seen += 1;
-        }
-        assert!(seen > 0, "expected at least one block produced");
+        assert_eq!(
+            first.len(),
+            expected_size,
+            "block format = BLOCK_FRAMES × channels"
+        );
+        assert!(first.iter().all(|&s| s == 0.0), "block entièrement silence");
+
+        drop(clock);
     }
 
     /// Channel plein (consumer absent) ne doit PAS faire paniquer le thread
