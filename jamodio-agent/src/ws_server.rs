@@ -1187,18 +1187,6 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::SetPeerDelay { producer_id, delay_ms } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            // Le mixer clampe à MAX_ALIGN_TARGET_MS (200) en interne via
-            // ring_buffer::set_target_ms. Pas de log info ici : le broadcast
-            // arrive toutes les 2 s, on logue uniquement les changements
-            // significatifs côté mixer (debug + hystérèse interne).
-            pl.mixer.lock().set_peer_delay(&producer_id, delay_ms);
-            vec![]
-        }
-
         BrowserMessage::GetStats => {
             // GetStats est appelé en heartbeat (toutes les 1.5 s). Si on ne peut
             // pas acquérir le lock dans 200 ms, on répond Error pour que le

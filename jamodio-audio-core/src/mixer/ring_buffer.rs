@@ -48,16 +48,9 @@ const CHANNELS: usize = 2;
 const MIN_TARGET_MS: usize = 5;
 const MAX_TARGET_MS: usize = 40;
 const INITIAL_TARGET_MS: usize = 10;
-/// Sprint B — borne max du target quand fixé manuellement via `set_target_ms`
-/// (latency-align mode agent : delay = maxHalfRtt − peerHalfRtt, peut atteindre
-/// 100+ ms en internet WAN). L'adaptation automatique reste bornée à
-/// MAX_TARGET_MS (40 ms) pour ne pas grimper sur underrun, mais le pilotage
-/// externe (browser → SetPeerDelay) peut monter plus haut pour aligner les
-/// peers sur le plus lent.
-const MAX_ALIGN_TARGET_MS: usize = 200;
 /// Capacité du ring buffer, en ms d'audio stéréo. Marge confortable au-dessus
-/// de MAX_ALIGN_TARGET_MS (200) pour absorber les bursts SFU sans truncation
-/// même avec un fort delay d'alignement. Coût RAM : ~115 KB / stream.
+/// de MAX_TARGET_MS (40) pour absorber les bursts SFU sans truncation
+/// même quand le buffer est proche de sa cible haute. Coût RAM : ~115 KB / stream.
 const CAPACITY_MS: usize = 300;
 /// Seuil hystérèse de drift-drain : si le buffer dépasse `DRIFT_DRAIN_FACTOR
 /// × target_samples`, on draine les plus anciens samples pour ramener à
@@ -268,16 +261,13 @@ impl JitterBuffer {
         self.target_samples * 1000 / (SAMPLE_RATE * CHANNELS)
     }
 
-    /// Override la cible du buffer (utilisé par les handlers SetBuffer et
-    /// SetPeerDelay côté UI). Clamp dans [MIN_TARGET_MS, MAX_ALIGN_TARGET_MS]
-    /// — borne supérieure élargie depuis le sprint B pour permettre
-    /// l'alignement de latence agent au peer le plus lent (delay 100+ ms en
-    /// WAN). L'adaptation automatique reste bornée à MAX_TARGET_MS (40 ms)
-    /// pour ne pas grimper sur underrun.
+    /// Override la cible du buffer (utilisé par le handler SetBuffer côté UI :
+    /// slider de tuning manuel du jitter buffer). Clamp dans
+    /// [MIN_TARGET_MS, MAX_TARGET_MS] — mêmes bornes que l'adaptation auto.
     /// Repasse en `unprimed` pour que le pull attende le nouveau target
     /// avant de reprendre le playout.
     pub fn set_target_ms(&mut self, target_ms: usize) {
-        let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_ALIGN_TARGET_MS);
+        let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
         self.target_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
         self.last_adapt = std::time::Instant::now();
         self.primed = false;
