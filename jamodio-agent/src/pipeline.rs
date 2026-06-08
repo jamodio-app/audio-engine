@@ -655,8 +655,10 @@ impl PipelineState {
                 .map_err(|e| format!("CPAL input: {e}"))?;
             if ch != channels_in || sr != native_sr {
                 return Err(format!(
-                    "format device {ch}ch/{sr}Hz incompatible avec encoder {channels_in}ch/{native_sr}Hz \
-                     (fixé au start_capture) — recommandation : stop_capture + start_capture"
+                    "Le device audio sélectionné a changé de format \
+                     ({channels_in}ch/{native_sr}Hz → {ch}ch/{sr}Hz) depuis le \
+                     démarrage de la session. Quitte et reviens dans le studio \
+                     pour réinitialiser l'encoder au nouveau format."
                 ));
             }
             self.capture_mode = Some(CaptureMode::Audio(SendStream(stream)));
@@ -1016,17 +1018,20 @@ impl PipelineState {
                 (ch, sr, in_name, resolved_id)
             }
             None => {
-                // Mode MIDI (Variante A). Format canonique stéréo 48 kHz —
-                // pas de capture audio, donc pas de contrainte device.
+                // Mode MIDI (Variante A). On ne TOUCHE PAS au device CPAL,
+                // mais on PROBE son format natif (channels, sample_rate) pour
+                // configurer l'encoder + le ticker au format que CPAL
+                // utilisera dès que l'utilisateur basculera vers AUDIO. Sans
+                // ce probe, un device 4ch (Scarlett, Focusrite, MOTU…)
+                // provoquait un mismatch au swap MIDI→AUDIO.
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     let _ = capture_drops_for_callback;
-                    const MIDI_CHANNELS: u16 = 2;
-                    const MIDI_SR: u32 = 48_000;
+                    let (midi_channels, midi_sr) = probe_input_format(input_id.as_deref());
                     let clock = crate::audio::midi_clock::MidiSilenceClock::start(
                         sample_tx.clone(),
-                        MIDI_CHANNELS,
-                        MIDI_SR,
+                        midi_channels,
+                        midi_sr,
                     )
                         .map_err(|e| CaptureStartError::Other(format!("MIDI silence clock spawn: {e}")))?;
                     self.capture_mode = Some(CaptureMode::Midi(clock));
@@ -1035,10 +1040,12 @@ impl PipelineState {
                         .unwrap_or_else(|| "midi-silence-clock".to_string());
                     tracing::info!(
                         target: "jamodio::pipeline",
-                        channels = MIDI_CHANNELS, sample_rate = MIDI_SR,
-                        "MIDI mode: ticker silencieux (CPAL capture bypassed)"
+                        channels = midi_channels,
+                        sample_rate = midi_sr,
+                        probed_device = ?input_id,
+                        "MIDI mode: ticker silencieux (CPAL capture bypassed, format calé sur device cible)"
                     );
-                    (MIDI_CHANNELS, MIDI_SR, "MIDI Silence Clock".to_string(), resolved_id)
+                    (midi_channels, midi_sr, "MIDI Silence Clock".to_string(), resolved_id)
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
@@ -1371,6 +1378,46 @@ type TimedBlock = (std::time::Instant, Vec<f32>);
 /// (240 samples stéréo @ 48k) = ~170 ms de marge. Un spike plugin de 22 ms
 /// est absorbé sans saturer la queue.
 const STAGE_CHANNEL_CAPACITY: usize = 32;
+
+/// Interroge le format natif (`channels`, `sample_rate`) d'un device d'input
+/// CPAL **sans l'ouvrir** (via `default_input_config`).
+///
+/// Utilisé en mode MIDI au `start_capture` (Chantier #2 Variante A) pour
+/// configurer l'encoder thread et le ticker silencieux au format que
+/// **CPAL utilisera** quand l'utilisateur basculera vers AUDIO. Sans ce
+/// probe, l'encoder était hardcodé à `(2, 48_000)` et un device 4ch
+/// (Scarlett, Focusrite, MOTU…) provoquait un mismatch au swap MIDI→AUDIO
+/// avec toast utilisateur bloquant.
+///
+/// Fallback `(2, 48_000)` (canonique stéréo 48 kHz) si :
+/// - `input_id` est `None` ET aucun device default disponible,
+/// - Le device sélectionné est introuvable côté CPAL,
+/// - `default_input_config()` retourne une erreur (driver KO).
+///
+/// Dans ce fallback, un swap MIDI→AUDIO ultérieur peut encore échouer si le
+/// vrai device a un format différent — mais c'est un edge case déjà
+/// périphérique (= device disparu pendant la session).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn probe_input_format(input_id: Option<&str>) -> (u16, u32) {
+    use cpal::traits::DeviceTrait;
+    let device = match input_id {
+        Some(id) => crate::audio::device::get_input_device(id),
+        None => crate::audio::device::default_input_id()
+            .as_deref()
+            .and_then(crate::audio::device::get_input_device),
+    };
+    match device.and_then(|d| d.default_input_config().ok()) {
+        Some(cfg) => (cfg.channels().max(1), cfg.sample_rate().0),
+        None => {
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                input_id = ?input_id,
+                "probe_input_format: device introuvable ou default_input_config KO, fallback (2, 48000)"
+            );
+            (2, 48_000)
+        }
+    }
+}
 
 /// Convertit le `captured_at` d'un `CapturedMidiEvent` en `frame_offset`
 /// sample-accurate (= index sample dans le bloc audio courant) pour le
@@ -2800,5 +2847,74 @@ mod midi_dispatch_tests {
         dispatch_subblock_midi(&events, 128, 256, &mut out);
         assert_eq!(out.len(), 1, "frame_offset == sub_start est inclus");
         assert_eq!(out[0].frame_offset, 0);
+    }
+}
+
+// ─── probe_input_format : non-régression bug v0.4.18 ──────────────────────
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod probe_input_format_tests {
+    use super::probe_input_format;
+
+    /// Régression bug v0.4.18 → fix v0.4.19 :
+    ///
+    /// En mode MIDI, l'encoder était hardcodé à (2 ch, 48 kHz). Un device
+    /// 4ch (Scarlett 2i2/4i4, Focusrite, MOTU…) provoquait au swap
+    /// MIDI→AUDIO un toast utilisateur bloquant :
+    ///   "format device 4ch/48000Hz incompatible avec encoder 2ch/48000Hz"
+    ///
+    /// Le fix utilise `probe_input_format` pour aligner l'encoder sur le
+    /// format natif du device cible AU MOMENT du start_capture, sans
+    /// l'ouvrir. Si le device est introuvable, fallback canonique stéréo.
+    ///
+    /// Ce test verrouille le fallback (= la seule branche déterministe sans
+    /// hardware). Le chemin "device existant" est validé par le test manuel
+    /// avec Scarlett, qui couvre la régression empirique reportée.
+    #[test]
+    fn probe_falls_back_to_canonical_when_device_missing() {
+        // Format `{idx}:{name}` improbable (idx 9999 = pas de device).
+        let (channels, sr) =
+            probe_input_format(Some("9999:device-that-does-not-exist"));
+        assert_eq!(
+            (channels, sr),
+            (2, 48_000),
+            "fallback canonique stéréo 48 kHz attendu sur device introuvable"
+        );
+    }
+
+    /// Sanity : le probe ne panique JAMAIS sur un id mal formé. C'est le
+    /// chemin critique du Chantier #2 — un crash ici planterait l'agent au
+    /// démarrage de session.
+    #[test]
+    fn probe_does_not_panic_on_malformed_id() {
+        let _ = probe_input_format(Some(""));
+        let _ = probe_input_format(Some("not-a-valid-format"));
+        let _ = probe_input_format(Some(":"));
+        let _ = probe_input_format(Some("abc:def"));
+        // Si on arrive ici, c'est qu'aucun panic n'a explosé.
+    }
+
+    /// Sanity : `None` (= laisser l'OS choisir le default) ne panique pas
+    /// et renvoie un tuple valide (soit le format default si dispo, soit
+    /// le fallback canonique). Cas qui se produit au tout premier lancement
+    /// quand le browser n'a sélectionné aucun device.
+    #[test]
+    fn probe_handles_no_device_id() {
+        let (channels, sr) = probe_input_format(None);
+        assert!(channels >= 1, "channels valide");
+        assert!(sr >= 8_000, "sample_rate plausible (>= 8 kHz)");
+    }
+
+    /// La valeur de retour est UTILISABLE par MidiSilenceClock (= contrat
+    /// implicite : channels > 0 et sample_rate > 0, sinon le ticker
+    /// panique avec `channels must be > 0` ou `sample_rate must be > 0`).
+    #[test]
+    fn probe_return_is_valid_clock_input() {
+        // Même sur un device fantôme, la valeur de retour est valide pour
+        // construire un MidiSilenceClock (= les asserts du clock passent).
+        let (channels, sr) = probe_input_format(Some("invalid"));
+        assert!(channels > 0);
+        assert!(sr > 0);
     }
 }
