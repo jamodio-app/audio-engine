@@ -2918,3 +2918,70 @@ mod probe_input_format_tests {
         assert!(sr > 0);
     }
 }
+
+// ─── Invariant : playback indépendant du capture mode ─────────────────────
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod playback_independence_tests {
+    /// Invariant architectural (rapport BETA Yannick, v0.4.19) : en mode
+    /// MIDI, l'INPUT CPAL est bypassed (Variante A, ticker silencieux),
+    /// mais l'OUTPUT CPAL (= la sortie du device choisi, typiquement la
+    /// même interface audio = Scarlett) DOIT rester 100% opérationnelle.
+    ///
+    /// Sans ça, l'utilisateur :
+    /// - n'entend plus son propre plugin instrument (BFD, Kontakt…)
+    /// - n'entend plus le backing track, le métronome, les pairs
+    ///
+    /// → session totalement silencieuse au casque.
+    ///
+    /// Ce test verrouille la SÉPARATION des chemins : les méthodes qui
+    /// gèrent l'INPUT (`set_input_source`, `swap_capture_mode`,
+    /// `stop_capture`) ne touchent JAMAIS au field `playback_stream`.
+    ///
+    /// Implémenté par inspection grep — les sites qui assignent
+    /// `playback_stream` sont strictement bornés au code OUTPUT :
+    ///   - start_capture step 8 (création initiale)
+    ///   - restart_playback (changement d'output device)
+    ///   - add_stream step 4 (si playback pas encore créé)
+    ///   - stop_all (teardown final quand on quitte le studio)
+    ///
+    /// Si quelqu'un ajoute un `self.playback_stream.take()` dans
+    /// `set_input_source` / `swap_capture_mode` / `stop_capture`, le grep
+    /// `playback` dans ces fonctions doit rester vide. Le test ci-dessous
+    /// est un GARDE-FOU lexical sur le code source — vu qu'on ne peut pas
+    /// instancier un PipelineState en test (deps async + tokio runtime).
+    #[test]
+    fn input_path_must_not_touch_playback_stream() {
+        // Cette assertion est un point de référence : si elle fail, c'est
+        // que les chemins INPUT et OUTPUT ont été couplés. Le test vrai
+        // est dans la grep ci-dessous.
+        const _SENTINEL: () = ();
+
+        // Lecture du code source à la compilation pour vérifier qu'aucune
+        // des 3 fonctions input ne mentionne `playback_stream`.
+        let src = include_str!("pipeline.rs");
+
+        for fn_name in ["pub fn set_input_source", "fn swap_capture_mode", "fn stop_capture"] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("function '{fn_name}' introuvable dans pipeline.rs"));
+            // Lit jusqu'à la prochaine ligne qui commence par exactement
+            // 4 espaces + '}' (= fin de méthode dans `impl PipelineState`).
+            let body = &src[start..];
+            let end = body
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("fin de '{fn_name}' introuvable"));
+            let fn_body = &body[..end];
+
+            assert!(
+                !fn_body.contains("playback_stream"),
+                "RÉGRESSION : la fonction '{fn_name}' touche maintenant à \
+                 playback_stream. C'est une violation de l'invariant : \
+                 l'INPUT (capture) doit rester découplé de l'OUTPUT \
+                 (playback) — sinon le mode MIDI silencie la sortie de \
+                 l'utilisateur. Cf. v0.4.19 rapport BETA Yannick."
+            );
+        }
+    }
+}
