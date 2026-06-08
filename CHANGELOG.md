@@ -6,6 +6,69 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.21] — 2026-06-08
+
+### Reverted — Variante A (ticker silencieux mode MIDI)
+
+Rapport BETA Yannick (v0.4.18 → v0.4.20) : craquement numérique
+reproductible sur swaps successifs MIDI↔AUDIO. 3 tentatives de fix
+(probe_input_format v0.4.19, drain 80 ms v0.4.20) n'ont pas résolu en
+pratique. La Variante A introduisait un swap de source CPAL↔ticker au
+moment de la bascule mode, et la frontière entre les samples du vieux
+source (CPAL réel ≠ 0) et du nouveau (ticker silence = 0, ou
+réciproquement) ne parvenait pas à être lissée de façon fiable malgré
+le Chantier C conceal_fade.
+
+#### Retour à la stratégie v0.4.17
+
+CPAL **toujours ouvert** dans les deux modes. En mode MIDI, ses samples
+sont **forcés à 0 en software** côté `process_stage` :
+
+```rust
+if matches!(*input_source.lock(), InputSource::Midi(_)) {
+    stereo.fill(0.0);
+}
+```
+
+Zéro swap de source = zéro risque de craquement à la frontière des
+buffers audio. Le plugin instrument INSERT (BFD, Kontakt, AUSampler…)
+génère son audio depuis les events MIDI, indépendamment du contenu du
+buffer d'entrée (qui est silencieux).
+
+**Coût** : 1 callback CPAL + 1 `stereo.fill(0)` par bloc audio
+(2,67 ms) = ~0,01 % CPU. Négligeable.
+
+**Compromis assumé** : un device de routing externe (Pro Tools Audio
+Bridge, BlackHole…) reste actif côté driver pendant le mode MIDI, mais
+ses samples ne polluent jamais le mix car ils sont écrasés à 0 dès
+l'entrée du process_stage. Le risque de fuite signal est éliminé en
+software, pas en hardware.
+
+#### Conservé
+
+- Chantier #1 — MIDI sample-accurate (`CapturedMidiEvent.captured_at`,
+  frame_offset calculé sample-accurate, helpers `midi_frame_offset` +
+  `dispatch_subblock_midi`, 11 tests `midi_dispatch_tests`).
+- Chantier #3 — suppression latency-equalizer.
+- Chantier C — conceal_fade local mode pour le self-monitor.
+- Tous les fixes clippy strict (build sous `-D warnings`).
+
+#### Supprimé
+
+- `audio/midi_clock.rs` (entier — 405 lignes).
+- `CaptureMode` enum + champs `capture_mode`, `capture_format`,
+  `capture_sample_tx` de `PipelineState`.
+- `probe_input_format` helper + ses 4 tests.
+- `swap_capture_mode` method.
+- Branche MIDI dans `start_capture`.
+- `playback_independence_tests` (verrou architectural sans objet
+  maintenant que le swap n'existe plus).
+- Feature `Win32_Media` / `Win32_Media_Multimedia` de `windows-sys`
+  (était pour timeBeginPeriod du ticker, plus utilisé).
+
+Net : **−825 lignes**. Code simpler, plus sûr. 58 tests workspace OK
+(30 jamodio-agent + 9 au_host + 19 audio_core). Clippy strict propre.
+
 ## [0.4.20] — 2026-06-08
 
 ### Fixed — Craquement numérique sur swaps successifs MIDI↔AUDIO

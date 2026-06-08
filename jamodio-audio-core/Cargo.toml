@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.4.20"
+version = "0.4.21"
 edition = "2021"
 description = "Jamodio audio engine core — Opus codec, RTP, UDP, mixer, jitter buffer"
 
