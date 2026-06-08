@@ -63,6 +63,13 @@ jobs:
         with:
           workspaces: './ -> target'
           key: ${{ matrix.target }}
+          # Sur tag push (= release), on RESTAURE la cache mais on ne SAUVE
+          # PAS. Raison : le tar.exe Windows + zstd sur ~3-5 GB d'artefacts
+          # cargo peut prendre 5-15 min, ce qui bloque le job `build` (et
+          # donc le job `publish` qui en dépend). Les caches sont alimentées
+          # par les CI sur main (où save-if reste true). Gain release : ~5-10
+          # min, et plus jamais de draft bloqué sur cache save.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # Le crate `audiopus` (dans jamodio-audio-core) lie libopus via
       # pkg-config. Chaque runner doit fournir libopus + pkg-config pour
