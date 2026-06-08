@@ -239,6 +239,23 @@ fn run(
 // La doc Microsoft recommande timeBeginPeriod(1) au plus juste — c'est ce
 // qu'on utilise. Limite : impacte TOUS les sleeps du process. Coût
 // énergétique négligeable pour notre usage (1 thread audio).
+//
+// Binding via `extern "system"` direct contre `winmm.dll` (lib statique
+// `winmm.lib` côté MSVC) — évite la dépendance aux paths internes de
+// `windows-sys` qui peuvent changer entre features (`Win32_Media` vs
+// `Win32_Media_Multimedia`). La signature MSDN officielle est :
+//
+//   MMRESULT timeBeginPeriod(UINT uPeriod);
+//   MMRESULT timeEndPeriod(UINT uPeriod);
+//
+// `MMRESULT` est un `u32` (0 = TIMERR_NOERROR, 97 = TIMERR_NOCANDO).
+
+#[cfg(target_os = "windows")]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(uperiod: u32) -> u32;
+    fn timeEndPeriod(uperiod: u32) -> u32;
+}
 
 #[cfg(target_os = "windows")]
 struct HighResolutionTimer;
@@ -246,12 +263,12 @@ struct HighResolutionTimer;
 #[cfg(target_os = "windows")]
 impl HighResolutionTimer {
     fn activate() -> Self {
-        // SAFETY: timeBeginPeriod prend une période en ms (u32) et retourne
+        // SAFETY: timeBeginPeriod prend une période en ms et retourne
         // TIMERR_NOERROR (0) ou TIMERR_NOCANDO (97) si non supporté. On
         // ignore le résultat — si l'OS refuse, le ticker fonctionne quand
-        // même (juste avec plus de jitter).
+        // même (juste avec plus de jitter scheduler).
         unsafe {
-            windows_sys::Win32::Media::Multimedia::timeBeginPeriod(1);
+            timeBeginPeriod(1);
         }
         Self
     }
@@ -261,9 +278,9 @@ impl HighResolutionTimer {
 impl Drop for HighResolutionTimer {
     fn drop(&mut self) {
         // SAFETY: appel symétrique à activate(). Doit être appelé exactement
-        // une fois pour libérer la ressource système.
+        // une fois pour libérer la ressource système (refcount interne OS).
         unsafe {
-            windows_sys::Win32::Media::Multimedia::timeEndPeriod(1);
+            timeEndPeriod(1);
         }
     }
 }
