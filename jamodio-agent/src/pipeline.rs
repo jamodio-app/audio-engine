@@ -173,6 +173,7 @@ pub struct PipelineState {
     ///   - `SetInstrumentPluginBypass { bypass: false }` (= user clique Réactiver)
     ///   - `LoadInstrumentPlugin` (= nouveau plugin → fresh start)
     ///   - `UnloadInstrumentPlugin`
+    ///
     /// Permet au perfstats_task de ne PAS re-émettre un message d'overload
     /// tant que le cycle précédent n'a pas été acté par l'utilisateur.
     #[cfg(any(target_os = "macos", target_os = "windows"))]

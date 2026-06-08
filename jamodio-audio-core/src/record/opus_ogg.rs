@@ -60,7 +60,7 @@ impl OpusOggRecorder {
         let serial = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
-            .unwrap_or(0)) ^ (std::process::id() as u32);
+            .unwrap_or(0)) ^ std::process::id();
 
         let mut ogg = OggWriter::new(serial);
 
@@ -135,7 +135,7 @@ impl OpusOggRecorder {
         // les derniers samples non encodés sont perdus). Padding silencieux.
         if !self.frame_buf.is_empty() && self.frame_buf.len() < FRAME_SAMPLES_INTERLEAVED {
             let needed = FRAME_SAMPLES_INTERLEAVED - self.frame_buf.len();
-            self.frame_buf.extend(std::iter::repeat(0.0f32).take(needed));
+            self.frame_buf.extend(std::iter::repeat_n(0.0f32, needed));
             // Encode cette dernière frame paddée
             let frame: Vec<f32> = self.frame_buf.drain(..FRAME_SAMPLES_INTERLEAVED).collect();
             if let Ok(n) = self.encoder.encode_float(&frame, &mut self.opus_out) {

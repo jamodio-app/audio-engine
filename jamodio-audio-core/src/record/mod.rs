@@ -81,7 +81,7 @@ impl Recorder {
     pub fn armed_specs(&self) -> Vec<StemSpec> {
         let mut out = Vec::new();
         if let Some((s, _)) = &self.self_recorder { out.push(s.clone()); }
-        for (_, (s, _)) in &self.peer_recorders { out.push(s.clone()); }
+        for (s, _) in self.peer_recorders.values() { out.push(s.clone()); }
         if let Some((s, _)) = &self.mix_recorder { out.push(s.clone()); }
         out
     }

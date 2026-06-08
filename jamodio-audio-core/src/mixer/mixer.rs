@@ -70,6 +70,12 @@ struct StreamState {
     drift_drain_history: std::collections::VecDeque<std::time::Instant>,
 }
 
+impl Default for AudioMixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioMixer {
     pub fn new() -> Self {
         Self {
@@ -344,7 +350,7 @@ impl AudioMixer {
         // Log mixed output RMS every ~20 seconds (48000*2 / 256 ≈ 375 calls/s)
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if c % 7500 == 0 && !self.streams.is_empty() {
+        if c.is_multiple_of(7500) && !self.streams.is_empty() {
             let rms: f32 = (output.iter().map(|s| s * s).sum::<f32>() / output.len() as f32).sqrt();
             tracing::debug!(target: "jamodio::mixer", streams = self.streams.len(), rms, "mix_into heartbeat");
         }

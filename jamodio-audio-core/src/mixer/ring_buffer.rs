@@ -78,6 +78,12 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 const CONCEAL_FADE_MS: usize = 2;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 
+impl Default for JitterBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitterBuffer {
     pub fn new() -> Self {
         let capacity = CAPACITY_MS * SAMPLE_RATE * CHANNELS / 1000;

@@ -176,11 +176,11 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
                     method = "macos-time-constraint",
                     "thread promoted via QoS USER_INTERACTIVE + THREAD_TIME_CONSTRAINT_POLICY"
                 );
-                return RtPriorityHandle {
+                RtPriorityHandle {
                     method: PromotionMethod::MacOsTimeConstraint,
                     workgroup: None,
                     _not_sync: std::marker::PhantomData,
-                };
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -188,7 +188,7 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
                     error = %e,
                     "macos fallback (QoS + time-constraint) failed — running at normal priority"
                 );
-                return make_none_handle();
+                make_none_handle()
             }
         }
     }
@@ -393,10 +393,7 @@ mod macos_fallback {
             )
         };
         if st != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("thread_policy_set returned {}", st),
-            ));
+            return Err(io::Error::other(format!("thread_policy_set returned {}", st)));
         }
         Ok(())
     }

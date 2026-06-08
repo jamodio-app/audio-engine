@@ -80,7 +80,7 @@ impl RtpReceiver {
         // si le SFU réutilise un transport ou si plusieurs receivers cohabitent.
         let mut seed = [0u8; 10];
         getrandom::getrandom(&mut seed)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let ssrc = u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]);
         let seq = u16::from_be_bytes([seed[4], seed[5]]);
         let ts = u32::from_be_bytes([seed[6], seed[7], seed[8], seed[9]]);

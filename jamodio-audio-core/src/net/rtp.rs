@@ -12,7 +12,6 @@
 /// |                             SSRC                              |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-
 pub const RTP_HEADER_SIZE: usize = 12;
 
 pub struct RtpHeader {
@@ -116,7 +115,7 @@ mod tests {
         assert_eq!(parsed.sequence, 1234);
         assert_eq!(parsed.timestamp, 48000);
         assert_eq!(parsed.ssrc, 0xDEADBEEF);
-        assert_eq!(parsed.marker, false);
+        assert!(!parsed.marker);
         assert_eq!(parsed_payload, payload);
     }
 }

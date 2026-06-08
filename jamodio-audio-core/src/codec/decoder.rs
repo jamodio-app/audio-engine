@@ -43,7 +43,7 @@ impl MusicDecoder {
         let packet = match Packet::try_from(opus_data) {
             Ok(p) => p,
             Err(e) => {
-                if self.log_count % 500 == 0 {
+                if self.log_count.is_multiple_of(500) {
                     tracing::warn!(target: "jamodio::decoder", bytes = opus_data.len(), error = ?e, "Packet::try_from failed");
                 }
                 self.log_count += 1;
@@ -61,7 +61,7 @@ impl MusicDecoder {
         let decoded = match self.decoder.decode(Some(packet), signals, false) {
             Ok(n) => n,
             Err(e) => {
-                if self.log_count % 500 == 0 {
+                if self.log_count.is_multiple_of(500) {
                     tracing::warn!(target: "jamodio::decoder", bytes = opus_data.len(), error = ?e, "decode failed");
                 }
                 self.log_count += 1;

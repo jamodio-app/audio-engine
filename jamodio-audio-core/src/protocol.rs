@@ -390,9 +390,9 @@ pub enum AgentMessage {
     /// automatique au connect WS si un plugin est déjà chargé (sync state
     /// au reconnect, S1.5). `latencySamples` est la latence intrinsèque
     /// rapportée par l'AU ; le browser doit refuser d'activer le plugin si
-    /// > 64 (= au-delà du budget live). `pluginRef` permet au browser de
-    /// matcher avec son localStorage. `bypass` reflète l'état courant
-    /// (utile au reconnect pour resynchroniser le bouton bypass UI).
+    /// elle dépasse 64 samples (= au-delà du budget live). `pluginRef` permet
+    /// au browser de matcher avec son localStorage. `bypass` reflète l'état
+    /// courant (utile au reconnect pour resynchroniser le bouton bypass UI).
     InstrumentPluginLoaded {
         name: String,
         #[serde(rename = "pluginRef")]
@@ -439,8 +439,8 @@ pub enum AgentMessage {
     },
     /// Sprint v0.4.9 — Alerte d'overload PIPELINE (= saturation globale
     /// agent, distincte d'un plugin lourd). Émis quand `capture_drops_per_sec`
-    /// > 100 sur la fenêtre 1 s — = le CPAL callback ne peut plus pousser ses
-    /// samples dans le sample_rx car l'encoder thread est complètement bloqué.
+    /// dépasse 100 sur la fenêtre 1 s — = le CPAL callback ne peut plus pousser
+    /// ses samples dans le sample_rx car l'encoder thread est complètement bloqué.
     ///
     /// Cas typique : un plugin sampler (BFD Player, Kontakt…) qui charge
     /// brutalement un sample depuis disque pendant le hot path, ou un
