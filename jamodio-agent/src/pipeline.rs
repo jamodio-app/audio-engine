@@ -596,13 +596,38 @@ impl PipelineState {
     }
 
     /// Construit le nouveau `CaptureMode` cible et l'installe en remplaçant
-    /// l'ancien atomiquement (drop ancien → init nouveau → store).
+    /// l'ancien (drop ancien → drain pipeline → init nouveau → store).
+    ///
+    /// ## Anti-click (rapport BETA v0.4.19)
+    ///
+    /// Sans drain entre drop et install, la frontière entre les samples du
+    /// vieux source (CPAL réel ≠ 0) et du nouveau (ticker silence = 0) tombe
+    /// au milieu du buffer audio du self-monitor sans transition → step
+    /// d'amplitude → craquement numérique audible. Le user a reporté ce bug
+    /// après 2 swaps successifs MIDI↔AUDIO.
+    ///
+    /// Fix : `SWAP_DRAIN_MS` (80 ms) d'attente entre drop et install. Pendant
+    /// ce temps :
+    /// - le `sample_tx` channel se vide (encoder consomme les résidus),
+    /// - capture_stage / process_stage / encode_stage time-out sur
+    ///   `recv_timeout` en cascade (~50 ms),
+    /// - le mixer self-stream sous-alimenté underrun → Chantier C
+    ///   `conceal_fade_out` (2 ms inaudible) au lieu d'un step net,
+    /// - le nouveau source démarre frais et son premier bloc est
+    ///   fondu-in via Chantier C `conceal_fade_in_remaining`.
+    ///
+    /// 80 ms est sous le seuil de latence perceptible pour un changement
+    /// de mode initié par l'utilisateur (< 100 ms = "instantané").
     ///
     /// Appelé uniquement depuis `set_input_source` après vérification que
     /// `capture_mode.is_some()` et que la catégorie change effectivement.
     /// Pré-condition : `capture_format` et `capture_sample_tx` sont Some.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn swap_capture_mode(&mut self, target_midi: bool) -> Result<(), String> {
+        /// Durée du gap drain + Chantier C fade-out entre drop et install.
+        /// Voir doc de `swap_capture_mode` pour le rationale empirique.
+        const SWAP_DRAIN_MS: u64 = 80;
+
         let sample_tx = self.capture_sample_tx.clone().ok_or_else(|| {
             "internal: capture_mode set but sample_tx missing".to_string()
         })?;
@@ -610,9 +635,39 @@ impl PipelineState {
             "internal: capture_mode set but format missing".to_string()
         })?;
 
+        // Sur la branche MIDI→AUDIO, on doit résoudre le device AVANT de
+        // drop l'ancien — sinon en cas d'échec de résolution on se retrouve
+        // sans aucun source et avec un encoder en silence permanent. Pour
+        // homogénéiser, on résout d'abord (ce qui peut échouer) puis on
+        // drop + drain + install.
+        let device_for_audio = if target_midi {
+            None
+        } else {
+            let input_id = self.input_device_id.clone();
+            let device_opt = match input_id.as_deref() {
+                Some(id) => crate::audio::device::get_input_device(id),
+                None => crate::audio::device::default_input_id()
+                    .as_deref()
+                    .and_then(crate::audio::device::get_input_device),
+            };
+            Some(device_opt.ok_or_else(|| format!("input device introuvable : {input_id:?}"))?)
+        };
+
+        // 1. Drop l'ancien source EXPLICITEMENT (CPAL Stream OU
+        //    MidiSilenceClock). Leur Drop libère les ressources OS
+        //    (stream natif arrêté, thread ticker join). À partir de cet
+        //    instant, plus aucun push ne part vers `sample_tx`.
+        self.capture_mode.take();
+
+        // 2. Gap drain : voir doc `swap_capture_mode` § Anti-click. Pendant
+        //    cette fenêtre, le pipeline aval se vide naturellement et le
+        //    Chantier C conceal_fade smooth la transition côté self-monitor.
+        std::thread::sleep(std::time::Duration::from_millis(SWAP_DRAIN_MS));
+
+        // 3. Installer la nouvelle source. Premier push → encoder reprend →
+        //    self-stream se ré-alimente → Chantier C conceal_fade_in (2 ms)
+        //    applique au premier pull post-underrun.
         if target_midi {
-            // AUDIO → MIDI : drop CPAL, instancie ticker silencieux au
-            // format fixé au start_capture (pas de mismatch possible).
             let clock = crate::audio::midi_clock::MidiSilenceClock::start(
                 sample_tx,
                 channels_in,
@@ -624,28 +679,11 @@ impl PipelineState {
                 target: "jamodio::pipeline",
                 channels = channels_in,
                 sample_rate = native_sr,
-                "capture mode swapped: AUDIO → MIDI (ticker silencieux)"
+                drain_ms = SWAP_DRAIN_MS,
+                "capture mode swapped: AUDIO → MIDI (ticker silencieux, transition click-free)"
             );
         } else {
-            // MIDI → AUDIO : drop ticker, ré-ouvre CPAL avec le device_id
-            // courant. Vérifie que le format natif du device matche celui
-            // fixé au start_capture (sinon l'encoder thread aurait un format
-            // mismatch — on échoue proprement).
-            let input_id = self.input_device_id.clone();
-            let device_opt = match input_id.as_deref() {
-                Some(id) => crate::audio::device::get_input_device(id),
-                None => crate::audio::device::default_input_id()
-                    .as_deref()
-                    .and_then(crate::audio::device::get_input_device),
-            };
-            let Some(device) = device_opt else {
-                return Err(format!("input device introuvable : {input_id:?}"));
-            };
-
-            // Drop l'ancien (ticker) AVANT d'ouvrir le nouveau CPAL stream
-            // pour libérer toute ressource device potentiellement détenue.
-            self.capture_mode.take();
-
+            let device = device_for_audio.expect("device_for_audio résolu plus haut");
             let capture_drops = self.perfstats.capture_drops.clone();
             let (stream, ch, sr) = crate::audio::capture::start_capture(
                 &device,
@@ -666,7 +704,8 @@ impl PipelineState {
                 target: "jamodio::pipeline",
                 channels = ch,
                 sample_rate = sr,
-                "capture mode swapped: MIDI → AUDIO (CPAL re-opened)"
+                drain_ms = SWAP_DRAIN_MS,
+                "capture mode swapped: MIDI → AUDIO (CPAL re-opened, transition click-free)"
             );
         }
         Ok(())
