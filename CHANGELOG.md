@@ -6,6 +6,49 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.19] — 2026-06-08
+
+### Fixed — Swap MIDI→AUDIO échouait sur devices > 2ch (régression v0.4.18)
+
+Reproduction (rapport BETA Yannick) :
+1. Entrer en studio en mode MIDI (clavier + plugin instrument INSERT chargé)
+2. Commuter en mode AUDIO depuis l'UI (panneau Source d'entrée)
+3. Toast bloquant :
+   `format device 4ch/48000Hz incompatible avec encoder 2ch/48000Hz`
+4. L'agent reste en mode MIDI orphelin — l'audio input ne fonctionne plus
+   jusqu'à un stop/start complet de session.
+
+#### Cause
+
+Régression introduite dans le Chantier #2 Variante A (v0.4.18) : au
+`start_capture` en mode MIDI, l'encoder était configuré avec un format
+canonique HARDCODÉ `(2 ch, 48 kHz)`. La "limitation v1" documentée
+supposait que la majorité des users ont une interface stéréo — c'était
+FAUX : les interfaces pro grand public (Scarlett 2i2/4i4, Focusrite,
+MOTU, Apollo…) exposent quasi toutes 4+ canaux côté CPAL.
+
+#### Fix
+
+Nouveau helper `probe_input_format(input_id) -> (channels, sample_rate)`
+qui interroge `default_input_config` du device cible **sans l'ouvrir**.
+Utilisé en mode MIDI au `start_capture` pour configurer l'encoder ET le
+ticker silencieux au format que CPAL utilisera au swap MIDI→AUDIO.
+
+Fallback `(2, 48_000)` si le device est introuvable ou la probe échoue
+(edge case rare = device disparu mid-session).
+
+Message d'erreur du swap reformulé pour décrire le scénario réel (= device
+a changé de format en cours de session) plutôt que la technique interne.
+
+Tests de non-régression ajoutés (4 dans `probe_input_format_tests`) :
+- Fallback canonique sur device fantôme (= verrou du bug v0.4.18).
+- Pas de panic sur input_id mal formé (chemins critiques).
+- Pas de panic sur `None` (1er lancement).
+- Tuple retourné toujours valide comme entrée de `MidiSilenceClock`.
+
+Validation BETA attendue : reproduire la séquence Scarlett → swap doit
+réussir silencieusement, audio input fonctionnel immédiatement.
+
 ## [0.4.18] — 2026-06-08
 
 ### Removed — Latency-equalizer (sous-système entier, Chantier #3)
