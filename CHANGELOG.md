@@ -6,6 +6,53 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.20] — 2026-06-08
+
+### Fixed — Craquement numérique sur swaps successifs MIDI↔AUDIO
+
+Rapport BETA Yannick v0.4.19 :
+- Entrée studio en MIDI : OK
+- Bascule AUDIO : OK (1er swap propre)
+- Re-bascule MIDI : **craquement numérique**
+- Re-bascule AUDIO : **craquement numérique**
+
+#### Cause
+
+Dans `swap_capture_mode`, le nouveau source démarrait **immédiatement**
+après le drop de l'ancien, sans laisser au pipeline aval le temps de
+drainer ni au mixer self-stream le temps de underrun. La frontière entre
+les samples du vieux source (CPAL audio ≠ 0) et du nouveau (ticker
+silence = 0, ou réciproquement) tombait au milieu du buffer audio sans
+transition → step d'amplitude → click.
+
+Le 1er swap MIDI→AUDIO sortait propre par hasard : amplitude micro
+encore basse (= ambient au démarrage de session). Les swaps suivants
+attrapaient le mic à niveau plein de jeu → click net audible.
+
+#### Fix
+
+`SWAP_DRAIN_MS = 80 ms` d'attente entre drop et install dans
+`swap_capture_mode`. Pendant ce gap :
+
+1. `sample_tx` channel se vide (encoder consomme les résidus)
+2. `capture_stage` / `process_stage` / `encode_stage` time-out sur
+   `recv_timeout` en cascade (~50 ms)
+3. Mixer self-stream sous-alimenté → underrun → Chantier C
+   `conceal_fade_out` (2 ms inaudible) au lieu d'un step
+4. Nouveau source démarre frais → premier bloc fondu-in via
+   Chantier C `conceal_fade_in_remaining`
+
+80 ms = sous le seuil de latence perceptible pour une bascule initiée
+par l'utilisateur (< 100 ms = "instantané" perçu).
+
+#### Refactor symétrique
+
+Résolution device AVANT drop sur la branche MIDI→AUDIO. Sinon un échec
+de résolution device laissait le pipeline orphelin sans source
+(encoder en silence permanent). Désormais : si la résolution device
+fail → erreur retournée **avant** toute opération destructive, le mode
+courant reste actif.
+
 ## [0.4.19] — 2026-06-08
 
 ### Fixed — Swap MIDI→AUDIO échouait sur devices > 2ch (régression v0.4.18)
