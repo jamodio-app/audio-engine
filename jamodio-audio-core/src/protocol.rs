@@ -346,8 +346,18 @@ pub enum AgentMessage {
         srtp_parameters: SrtpParameters,
     },
     /// Per-stream RMS levels for VU meters.
+    ///
+    /// Sprint B talkback auto-mute : payload étendu avec 2 champs optionnels
+    /// pour piloter le détecteur d'activité instrument côté browser :
+    /// - `input_rms` (linéaire 0..1) : RMS instrument self post-plugin
+    /// - `midi_active` : true si une Note ON a été reçue dans les ~200 dernières ms
+    /// Les 2 champs sont absents si l'agent ne capture pas (back-compat browser).
     StreamLevels {
         levels: Vec<StreamLevel>,
+        #[serde(rename = "inputRms", skip_serializing_if = "Option::is_none")]
+        input_rms: Option<f32>,
+        #[serde(rename = "midiActive", skip_serializing_if = "Option::is_none")]
+        midi_active: Option<bool>,
     },
     /// Réponse à `GetLogsArchive`. Contient les logs agent concaténés en
     /// plain text (UTF-8), avec entêtes par fichier `====== agent.log.YYYY-MM-DD ======`.

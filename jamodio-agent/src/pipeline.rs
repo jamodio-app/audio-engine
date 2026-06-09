@@ -114,6 +114,15 @@ pub struct PipelineState {
     pub buffer_samples: u32,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
+    /// Talkback auto-mute (Sprint B) — true tant qu'au moins un MIDI Note ON
+    /// a été reçu dans les ~200 dernières ms. Reset par la boucle process_stage
+    /// quand le délai est dépassé sans nouvel event. Lu par ws_server.rs au
+    /// push 100 ms des StreamLevels pour piloter l'auto-mute talkback côté
+    /// browser quand l'utilisateur joue en MIDI (clavier USB ou virtuel).
+    pub midi_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Timestamp ms (depuis epoch process) du dernier MIDI Note ON détecté.
+    /// Utilisé en interne par process_stage pour le timeout de midi_active.
+    pub midi_last_note_on_ms: Arc<std::sync::atomic::AtomicU64>,
     /// REC-3 : handle vers le thread record actif. `None` quand pas
     /// d'enregistrement. Le `tx` du handle est aussi posé dans le mixer
     /// via `set_record_tx` pour activer les tap sites.
@@ -416,6 +425,8 @@ impl PipelineState {
             state: AgentState::Idle,
             buffer_samples: 0,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            midi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             recorder: None,
             input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "macos")]
@@ -912,6 +923,9 @@ impl PipelineState {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let input_source_for_encoder = self.input_source.clone();
         let perfstats_for_encoder = self.perfstats.clone();
+        // Sprint B talkback auto-mute — clones pour le thread encoder.
+        let midi_active_for_encoder = self.midi_active.clone();
+        let midi_last_note_on_ms_for_encoder = self.midi_last_note_on_ms.clone();
         // Sprint S2 — nom du device output (extrait du format "{idx}:{name}")
         // passé à rt_priority pour matcher le workgroup CoreAudio HAL. Si
         // aucun device explicite (None ⇒ default OS), on passera None et
@@ -932,6 +946,8 @@ impl PipelineState {
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source_for_encoder,
+                    midi_active_for_encoder,
+                    midi_last_note_on_ms_for_encoder,
                 );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
@@ -1257,6 +1273,10 @@ fn encoder_thread(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
+    // Sprint B talkback auto-mute : drapeau "MIDI Note ON dans les ~200 ms
+    // précédentes". Set par process_stage à chaque Note ON, lu par ws_server.
+    midi_active: Arc<std::sync::atomic::AtomicBool>,
+    midi_last_note_on_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1300,6 +1320,9 @@ fn encoder_thread(
     let plugin_bypass_proc = plugin_bypass.clone();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let input_source_proc = input_source.clone();
+    // Sprint B talkback auto-mute — clones pour le thread process.
+    let midi_active_proc = midi_active.clone();
+    let midi_last_note_on_ms_proc = midi_last_note_on_ms.clone();
     let h_proc = std::thread::Builder::new()
         .name("audio-process".into())
         .spawn(move || {
@@ -1322,6 +1345,8 @@ fn encoder_thread(
                 midi_event_rx,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 input_source_proc,
+                midi_active_proc,
+                midi_last_note_on_ms_proc,
             );
         })
         .expect("spawn audio-process thread");
@@ -1643,6 +1668,9 @@ fn process_stage_loop(
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_bypass: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] midi_event_rx: Arc<Mutex<Option<Receiver<CapturedMidiEvent>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] input_source: Arc<Mutex<InputSource>>,
+    // Sprint B talkback auto-mute : updated par cette boucle à chaque Note ON.
+    midi_active: Arc<std::sync::atomic::AtomicBool>,
+    midi_last_note_on_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -1779,6 +1807,35 @@ fn process_stage_loop(
                                 None => Vec::new(),
                             }
                         };
+
+                        // Sprint B talkback auto-mute — détecte Note ON
+                        // (status 0x90..0x9F + velocity > 0) dans le batch. Set
+                        // midi_active=true et stocke le timestamp pour le reset
+                        // timeout 200 ms (vérifié à chaque bloc plus bas).
+                        for ev in &midi_events {
+                            let status = ev.data[0];
+                            let velocity = ev.data[2];
+                            if (status & 0xF0) == 0x90 && velocity > 0 {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                midi_last_note_on_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                midi_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break; // Un seul Note ON suffit pour le flag.
+                            }
+                        }
+                        // Reset midi_active si timeout 200 ms sans Note ON (chaque bloc).
+                        if midi_active.load(std::sync::atomic::Ordering::Relaxed) {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let last_ms = midi_last_note_on_ms.load(std::sync::atomic::Ordering::Relaxed);
+                            if now_ms.saturating_sub(last_ms) >= 200 {
+                                midi_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
 
                         // Chantier B — crossfade dry→wet : si le plugin vient de
                         // s'activer (bloc précédent en dry), amorce le fondu et

@@ -6,6 +6,30 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.22] — 2026-06-09
+
+### Added — Talkback auto-mute (signaux MIDI + audio RMS)
+
+Le pipeline expose désormais 2 signaux pour piloter l'auto-mute du
+talkback côté browser quand l'utilisateur joue de son instrument :
+
+- **`midi_active`** (`AtomicBool`) : passé à `true` à chaque MIDI Note ON
+  reçu par le `process_stage` (status `0x9N` + velocity > 0). Reset à
+  `false` après 200 ms sans nouvel event (timeout vérifié à chaque bloc).
+  Couvre les claviers USB-MIDI hardware ET le clavier MIDI virtuel HTML
+  (qui transite par l'agent dans tous les cas).
+- **`input_rms`** : déjà calculé post-plugin (sqrt(mean(samples²))),
+  désormais exposé dans le payload WS `StreamLevels` (10 Hz).
+
+Le message `StreamLevels` accueille deux nouveaux champs optionnels
+`inputRms: Option<f32>` et `midiActive: Option<bool>` (back-compat : un
+browser plus ancien ignorera ces champs sans erreur).
+
+Côté browser, un détecteur d'activité avec hold time 250 ms consomme
+ces signaux et fait passer le bouton TALK en jaune pendant que
+l'instrument joue (mode AUTO sur la tranche voix), sans toucher au
+chemin audio chaud (`voiceTrack.enabled` uniquement, zero-latence).
+
 ## [0.4.21] — 2026-06-08
 
 ### Reverted — Variante A (ticker silencieux mode MIDI)

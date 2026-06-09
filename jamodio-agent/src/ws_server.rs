@@ -331,13 +331,31 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
             let rms_data = pl.mixer.lock().stream_rms();
+            // Sprint B talkback auto-mute : lit input_rms (instrument self post-plugin)
+            // et midi_active (Note ON dans les ~200 dernières ms) pour piloter le
+            // détecteur d'activité côté browser. Ces 2 valeurs sont reset entre les
+            // captures (Pipeline::new), donc Some(...) toujours valides côté agent
+            // — le serializer écrira `null`/absent uniquement si l'utilisateur veut
+            // un payload minimaliste (back-compat).
+            let input_rms = f32::from_bits(
+                pl.input_rms.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let midi_active = pl.midi_active.load(std::sync::atomic::Ordering::Relaxed);
             drop(pl);
-            if !rms_data.is_empty() {
+            // Push si on a soit des niveaux peers, soit un signal self (RMS > 0
+            // ou MIDI actif). En idle complet, on saute le push.
+            let has_self_signal = input_rms > 0.0 || midi_active;
+            if !rms_data.is_empty() || has_self_signal {
                 let levels: Vec<StreamLevel> = rms_data
                     .into_iter()
                     .map(|(producer_id, rms)| StreamLevel { producer_id, rms })
                     .collect();
-                if levels_tx.send(AgentMessage::StreamLevels { levels }).await.is_err() {
+                let msg = AgentMessage::StreamLevels {
+                    levels,
+                    input_rms: Some(input_rms),
+                    midi_active: Some(midi_active),
+                };
+                if levels_tx.send(msg).await.is_err() {
                     break;
                 }
             }
