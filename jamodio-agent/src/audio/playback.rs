@@ -25,11 +25,14 @@ fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_
 
 /// Start audio playback on the given device.
 /// Pulls mixed audio from the shared AudioMixer.
-/// Returns the CPAL stream (must be kept alive).
+/// Returns `(stream, fixed_buffer)` — le stream doit rester vivant (RAII)
+/// et `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`,
+/// `None` si fallback `BufferSize::Default` (driver auto). Sert à la
+/// télémétrie `outputBufferMs` côté wire (cf. `protocol::Stats`).
 pub fn start_playback(
     device: &Device,
     mixer: Arc<Mutex<AudioMixer>>,
-) -> Result<cpal::Stream, cpal::BuildStreamError> {
+) -> Result<(cpal::Stream, Option<u32>), cpal::BuildStreamError> {
     // Diagnostic SR : on force CPAL en 48 kHz mais si le device préfère un
     // autre rate (Mac casque jack 44.1, BlackHole 2ch, etc.), CoreAudio fait
     // un resampling implicite de qualité variable → potentielles distortions.
@@ -57,8 +60,8 @@ pub fn start_playback(
     // qui imposent leur propre buffer (jack onboard Realtek, HDMI typique →
     // Range { min: 480, max: 480 } ou Unknown). Symétrie complète avec la
     // logique input de capture.rs.
-    let buffer_size = if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, TARGET_BUFFER) {
-        BufferSize::Fixed(TARGET_BUFFER)
+    let (buffer_size, fixed_buffer) = if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, TARGET_BUFFER) {
+        (BufferSize::Fixed(TARGET_BUFFER), Some(TARGET_BUFFER))
     } else {
         let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
         tracing::info!(
@@ -66,7 +69,7 @@ pub fn start_playback(
             device = %device_name,
             "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
         );
-        BufferSize::Default
+        (BufferSize::Default, None)
     };
 
     let config = StreamConfig {
@@ -88,5 +91,5 @@ pub fn start_playback(
     )?;
 
     stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
-    Ok(stream)
+    Ok((stream, fixed_buffer))
 }

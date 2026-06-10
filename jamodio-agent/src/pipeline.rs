@@ -110,8 +110,17 @@ pub struct PipelineState {
     output_device_id: Option<String>,
     /// State
     pub state: AgentState,
-    /// Buffer size in samples (set when capture starts)
-    pub buffer_samples: u32,
+    /// Buffer CPAL côté CAPTURE, en samples (mono), set au start_capture.
+    /// `Some(N)` si `BufferSize::Fixed(N)` accepté par le driver,
+    /// `None` si fallback `BufferSize::Default` (= driver auto, taille
+    /// non connue côté agent). Lu par ws_server pour le wire
+    /// `Stats.inputBufferMs`. Reset à `None` quand pas en capture.
+    pub input_buffer_samples: Option<u32>,
+    /// Buffer CPAL côté PLAYBACK, en samples (mono), set au start_playback.
+    /// Sémantique identique à `input_buffer_samples`. Peut DIVERGER de
+    /// l'input sur Windows WASAPI shared où un côté tombe sur Fixed et
+    /// l'autre sur Default. Reset à `None` quand pas en playback.
+    pub output_buffer_samples: Option<u32>,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
     /// Talkback auto-mute (Sprint B) — true tant qu'au moins un MIDI Note ON
@@ -423,7 +432,8 @@ impl PipelineState {
             input_device_id: None,
             output_device_id: None,
             state: AgentState::Idle,
-            buffer_samples: 0,
+            input_buffer_samples: None,
+            output_buffer_samples: None,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             midi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -754,12 +764,13 @@ impl PipelineState {
         // → minimise le gap audio (sinon brève silence → jitter buffer
         // overflow → crackles au resume).
         match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
-            Ok(stream) => {
+            Ok((stream, output_buf)) => {
                 // .replace() : crée le nouveau stream AVANT de drop l'ancien
                 // → minimise le gap audio (sinon brève silence → jitter buffer
                 // overflow → crackles au resume). L'Option<> retournée est
                 // droppée en fin de scope = CPAL stoppe l'ancien stream.
                 let _old = self.playback_stream.replace(SendStream(stream));
+                self.output_buffer_samples = output_buf;
                 tracing::info!(target: "jamodio::pipeline", device = %resolved_name, "output device switched");
             }
             Err(e) => tracing::error!(
@@ -870,7 +881,7 @@ impl PipelineState {
         // incrémente quand `sample_tx` est plein, ws_server le lit + reset au
         // flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
         let capture_drops_for_callback = self.perfstats.capture_drops.clone();
-        let (stream, channels_in, native_sr) = crate::audio::capture::start_capture(
+        let (stream, channels_in, native_sr, input_buf) = crate::audio::capture::start_capture(
             &device,
             sample_tx,
             capture_drops_for_callback,
@@ -977,13 +988,19 @@ impl PipelineState {
             };
             let out_name = out_device.name().unwrap_or_default();
             tracing::info!(target: "jamodio::pipeline", device = %out_name, "output device opened");
-            let out_stream = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
+            let (out_stream, output_buf) = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
                 .map_err(|e| CaptureStartError::Other(format!("CPAL output: {}", e)))?;
             self.playback_stream = Some(SendStream(out_stream));
+            self.output_buffer_samples = output_buf;
         }
 
         self.state = AgentState::Capturing;
-        self.buffer_samples = 128; // matches capture.rs BufferSize::Fixed(128)
+        // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
+        // toujours connu ici (la branche capture vient de réussir). Pour
+        // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
+        // mis à jour juste au-dessus), soit un stream playback existait déjà
+        // (= valeur conservée du précédent start_playback).
+        self.input_buffer_samples = input_buf;
         tracing::info!(
             target: "jamodio::pipeline",
             sfu = format!("{}:{}", sfu_ip, sfu_port),
@@ -1056,9 +1073,10 @@ impl PipelineState {
                 None => crate::audio::device::default_output_device().map(|(d, _)| d),
             };
             let out_device = out_device_opt.ok_or("output device introuvable")?;
-            let out_stream = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
+            let (out_stream, output_buf) = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
                 .map_err(|e| format!("CPAL output: {}", e))?;
             self.playback_stream = Some(SendStream(out_stream));
+            self.output_buffer_samples = output_buf;
         }
 
         tracing::info!(
@@ -1086,6 +1104,10 @@ impl PipelineState {
         // Sans ça, le stream subsisterait dans le mixer avec son volume courant
         // et continuerait à mixer son ring buffer résiduel jusqu'à underrun.
         self.mixer.lock().remove_local_stream();
+        // Le buffer input n'a plus de sens hors capture (capture_stream droppé).
+        // L'output reste actif (peut continuer à jouer les peers reçus), on
+        // garde donc `output_buffer_samples` tel quel jusqu'au `stop_all`.
+        self.input_buffer_samples = None;
     }
 
     pub fn stop_all(&mut self) {
@@ -1109,6 +1131,7 @@ impl PipelineState {
             self.remove_stream(&id);
         }
         self.playback_stream.take();
+        self.output_buffer_samples = None;
         self.state = AgentState::Idle;
         if was_active {
             tracing::info!(target: "jamodio::pipeline", "pipeline stopped");

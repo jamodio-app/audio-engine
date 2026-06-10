@@ -69,7 +69,11 @@ fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_
 }
 
 /// Start capturing audio from the given device.
-/// Returns `(stream, channels_captured, native_sample_rate)`. Le SR natif est
+/// Returns `(stream, channels_captured, native_sample_rate, fixed_buffer)`.
+/// `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`, `None`
+/// si on a fallback sur `BufferSize::Default` (= le driver choisit, valeur
+/// non connue côté agent sans instrumenter le callback). Sert à la
+/// télémétrie `inputBufferMs` côté wire (cf. `protocol::Stats`). Le SR natif est
 /// **respecté tel quel** (pas forcé à 48000) pour rester compatible avec les
 /// devices Windows WASAPI shared mode (qui imposent le mix format Windows :
 /// souvent 44100 sur les chipsets Realtek onboard) — l'`encoder_thread`
@@ -93,7 +97,7 @@ pub fn start_capture(
     // celui-ci est lu+reset par ws_server au flush 1 Hz pour publier le
     // dropsPerSec dans `PerfStats.pipelineLatencyMs.dropsPerSec`.
     capture_drops: Arc<AtomicU64>,
-) -> Result<(cpal::Stream, u16, u32), cpal::BuildStreamError> {
+) -> Result<(cpal::Stream, u16, u32, Option<u32>), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
     // physiques + le sample rate natif (cf. doc fonction).
     let default_cfg = device
@@ -107,15 +111,15 @@ pub fn start_capture(
     // fallback sur Default si le device n'expose pas ce range (= WASAPI
     // shared sur mic onboard typique, qui impose ~10ms min). Le fallback
     // évite l'erreur `StreamConfigNotSupported` qui bloquait v0.3.0 sur PC.
-    let buffer_size = if device_supports_fixed_buffer(device, channels, native_sr, 128) {
-        BufferSize::Fixed(128)
+    let (buffer_size, fixed_buffer) = if device_supports_fixed_buffer(device, channels, native_sr, 128) {
+        (BufferSize::Fixed(128), Some(128u32))
     } else {
         tracing::info!(
             target: "jamodio::capture",
             channels, native_sr,
             "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
         );
-        BufferSize::Default
+        (BufferSize::Default, None)
     };
 
     let config = StreamConfig {
@@ -211,7 +215,7 @@ pub fn start_capture(
     }
 
     stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
-    Ok((stream, channels, native_sr))
+    Ok((stream, channels, native_sr, fixed_buffer))
 }
 
 #[cfg(test)]

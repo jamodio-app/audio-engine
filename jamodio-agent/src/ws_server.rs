@@ -1220,12 +1220,20 @@ async fn handle_message(
                 id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id))
             });
 
-            // Real latency from CPAL buffer: samples / 48000 * 1000
-            let buf_ms = if is_capturing {
-                pl.buffer_samples as f32 / 48.0 // 128 samples @ 48kHz = 2.67ms
-            } else {
-                0.0
-            };
+            // Real latency from CPAL buffer: samples / 48000 * 1000.
+            // input/output sont des Option<u32> côté pipeline (Some si
+            // BufferSize::Fixed appliqué, None si fallback Default — taille
+            // réelle inconnue côté agent). Pour les composants de la latence
+            // totale on est obligés d'estimer le None — on prend 10 ms
+            // (= 480 samples / 48), la valeur conservatrice WASAPI shared
+            // standard, alignée sur les recommandations FarPlay/Jamulus pour
+            // ce mode. Les champs wire `inputBufferMs` / `outputBufferMs`
+            // restent absents (= None) pour ne pas mentir.
+            const DEFAULT_BUF_MS_FALLBACK: f32 = 10.0;
+            let input_buf_ms_opt: Option<f32> = pl.input_buffer_samples.map(|n| n as f32 / 48.0);
+            let output_buf_ms_opt: Option<f32> = pl.output_buffer_samples.map(|n| n as f32 / 48.0);
+            let input_buf_ms_est = input_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
+            let output_buf_ms_est = output_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz
 
             let mixer = pl.mixer.lock();
@@ -1233,8 +1241,12 @@ async fn handle_message(
             let jitter_target_ms = mixer.mean_target_ms();
             drop(mixer);
 
+            // Total = input_buf + opus_enc + opus_dec + jitter + output_buf
+            // (cf. doc `Stats::total_latency_ms`). Utilise les estimations
+            // input/output séparées au lieu du double-buf hérité — corrige
+            // le calcul faux sur Windows shared où in et out peuvent diverger.
             let total_latency_ms = if is_capturing {
-                buf_ms + opus_ms + opus_ms + jitter_target_ms + buf_ms
+                input_buf_ms_est + opus_ms + opus_ms + jitter_target_ms + output_buf_ms_est
             } else {
                 0.0
             };
@@ -1243,9 +1255,14 @@ async fn handle_message(
                 make_status(pl.state.clone()),
                 AgentMessage::Stats {
                     device: device_name,
-                    capture_latency_ms: if is_capturing { buf_ms + opus_ms } else { 0.0 },
-                    playback_latency_ms: if is_capturing { buf_ms } else { 0.0 },
-                    buffer_ms: if is_capturing { buf_ms } else { 0.0 },
+                    capture_latency_ms: if is_capturing { input_buf_ms_est + opus_ms } else { 0.0 },
+                    playback_latency_ms: if is_capturing { output_buf_ms_est } else { 0.0 },
+                    // bufferMs (rétrocompat) = input (sémantique historique
+                    // utilisée par les browsers pré-Q3 qui le sommaient avec
+                    // opus_ms pour estimer la capture).
+                    buffer_ms: if is_capturing { input_buf_ms_est } else { 0.0 },
+                    input_buffer_ms: input_buf_ms_opt,
+                    output_buffer_ms: output_buf_ms_opt,
                     jitter_target_ms,
                     total_latency_ms,
                     streams: stream_count,

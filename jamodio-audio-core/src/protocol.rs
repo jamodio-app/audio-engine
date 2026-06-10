@@ -284,10 +284,27 @@ pub enum AgentMessage {
         /// Latence playback : buffer CPAL output uniquement.
         #[serde(rename = "playbackLatencyMs")]
         playback_latency_ms: f32,
-        /// Buffer CPAL I/O en ms (capture/playback). Identique côté in/out
-        /// car on utilise BufferSize::Fixed(128) des deux côtés.
+        /// Buffer CPAL en ms — sémantique côté INPUT (capture) pour
+        /// rétrocompat avec les browsers pré-Q3. Égal à `input_buffer_ms`
+        /// quand celui-ci est connu, sinon estimation conservatrice
+        /// (10 ms = Default Win shared standard). À NE PLUS utiliser
+        /// pour de nouveaux affichages : préférer `inputBufferMs` /
+        /// `outputBufferMs` qui sont précis (ou absents si fallback Default).
         #[serde(rename = "bufferMs")]
         buffer_ms: f32,
+        /// Buffer CPAL côté CAPTURE en ms. `None` (= champ absent du JSON)
+        /// si le driver a appliqué `BufferSize::Default` (= taille non
+        /// connue côté agent sans instrumenter le callback — cas WASAPI
+        /// shared mic onboard Windows). Aligné sur `bufferMs` côté wire
+        /// si présent.
+        #[serde(rename = "inputBufferMs", skip_serializing_if = "Option::is_none")]
+        input_buffer_ms: Option<f32>,
+        /// Buffer CPAL côté PLAYBACK en ms. Peut DIVERGER de l'input sur
+        /// Windows WASAPI shared où un côté tombe sur Fixed et l'autre
+        /// sur Default (asymétrie introduite par les drivers shared).
+        /// Même sémantique de `None` que `inputBufferMs`.
+        #[serde(rename = "outputBufferMs", skip_serializing_if = "Option::is_none")]
+        output_buffer_ms: Option<f32>,
         /// Cible adaptative du jitter buffer (moyenne des streams actifs, ms).
         /// 0 si aucun stream actif. C'est le levier principal de tuning latence
         /// vs robustesse au jitter — affiché dans l'UI agent.
