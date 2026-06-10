@@ -20,7 +20,7 @@ use cpal::{SampleRate, SupportedBufferSize, SupportedStreamConfigRange};
 /// - Windows ASIO          : `Range { min: 16, max: 4096 }` typique.
 /// - Windows WASAPI excl.  : Range large, dépend du device.
 /// - Windows WASAPI shared : `Range { min: 480, max: 480 }` (10 ms à 48k)
-///                           ou `BufferSize::Unknown` → refus pour 128.
+///   ou `BufferSize::Unknown` → refus pour 128.
 pub fn configs_support_fixed_buffer<I>(
     configs: I,
     channels: u16,

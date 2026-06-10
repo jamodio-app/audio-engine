@@ -1115,6 +1115,7 @@ async fn handle_message(
                             device_id: info.device_id,
                             device_name: info.device_name,
                             channels: info.channels,
+                            native_sample_rate: info.native_sample_rate,
                         },
                     ]
                 }

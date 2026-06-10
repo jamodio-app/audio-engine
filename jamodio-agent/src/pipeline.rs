@@ -78,6 +78,10 @@ pub struct CaptureStartedInfo {
     pub device_id: String,
     pub device_name: String,
     pub channels: u16,
+    /// Sample rate natif du device (Hz). Si ≠ 48 000, le resampler Rubato
+    /// est actif → ~29 ms de latence cachée. Le browser surface un badge
+    /// rouge UI sur la base de cette valeur.
+    pub native_sample_rate: u32,
 }
 
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
@@ -1013,6 +1017,7 @@ impl PipelineState {
             device_id: resolved_input_id,
             device_name: in_name,
             channels: channels_in,
+            native_sample_rate: native_sr,
         };
         Ok((local_port, agent_srtp, info))
     }

@@ -338,6 +338,15 @@ pub enum AgentMessage {
         device_name: String,
         /// Nombre de canaux physiques effectivement ouverts.
         channels: u16,
+        /// Sample rate natif du device (Hz). Si ≠ 48 000, le resampler
+        /// Rubato (cf. `pipeline.rs:capture_stage_loop`) est actif et ajoute
+        /// ~29 ms de latence cachée (1024-sample accumulateur + sinc 256).
+        /// Le browser utilise cette valeur pour afficher un badge rouge UI
+        /// et un toast au join, conseillant au user de configurer son
+        /// interface en 48 kHz natif (cas typique Windows Sound Properties
+        /// par défaut en 44 100 Hz sur Realtek onboard).
+        #[serde(rename = "nativeSampleRate")]
+        native_sample_rate: u32,
     },
     /// Erreur explicite quand la capture ne peut pas démarrer parce que le
     /// device demandé n'est pas trouvé. Plus de silent fallback to default :
@@ -368,6 +377,7 @@ pub enum AgentMessage {
     /// pour piloter le détecteur d'activité instrument côté browser :
     /// - `input_rms` (linéaire 0..1) : RMS instrument self post-plugin
     /// - `midi_active` : true si une Note ON a été reçue dans les ~200 dernières ms
+    ///
     /// Les 2 champs sont absents si l'agent ne capture pas (back-compat browser).
     StreamLevels {
         levels: Vec<StreamLevel>,
