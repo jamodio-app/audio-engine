@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, SampleRate, StreamConfig, BufferSize, SupportedBufferSize};
+use cpal::{Device, SampleRate, StreamConfig, BufferSize};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,38 +53,19 @@ where
     }
 }
 
-/// Vérifie si le device input expose une `BufferSize::Range` qui contient
+/// Vérifie si le device INPUT expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Permet de choisir
 /// `Fixed(target_buf)` (low-latency) si supporté, sinon de tomber sur
 /// `Default` (= laisse le backend choisir, ~10ms WASAPI shared typique).
 ///
-/// Sur Windows :
-/// - ASIO expose typiquement `Range { min: 16, max: 4096 }` → Fixed(128) OK.
-/// - WASAPI shared mode expose `Range { min: 480, max: 480 }` (10ms à 48k)
-///   ou `BufferSize::Unknown` → Fixed(128) refusé.
-/// - WASAPI exclusive expose un range plus large mais nécessite un device pas
-///   utilisé par d'autres apps.
-///
-/// Sur macOS CoreAudio expose presque toujours un range qui contient 128.
+/// Comportement par OS / type de device : cf. doc de
+/// `super::buffer_size::configs_support_fixed_buffer` (logique partagée
+/// avec le côté output dans `playback.rs`).
 fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_buf: u32) -> bool {
     let Ok(supported) = device.supported_input_configs() else {
         return false;
     };
-    let target_sr = SampleRate(sr);
-    for cfg in supported {
-        if cfg.channels() != channels {
-            continue;
-        }
-        if cfg.min_sample_rate() > target_sr || cfg.max_sample_rate() < target_sr {
-            continue;
-        }
-        if let SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
-            if target_buf >= *min && target_buf <= *max {
-                return true;
-            }
-        }
-    }
-    false
+    super::buffer_size::configs_support_fixed_buffer(supported, channels, sr, target_buf)
 }
 
 /// Start capturing audio from the given device.
