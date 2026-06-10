@@ -6,6 +6,90 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+### Fixed — Playback Windows shared mode : fallback symétrique au capture
+
+Avant : `audio::playback::start_playback` forçait `BufferSize::Fixed(128)`
+sans vérifier que le device output supporte cette valeur. Sur une sortie
+Windows WASAPI shared mode qui n'expose pas Fixed(128) dans son
+`SupportedBufferSize::Range` (sortie jack onboard Realtek, HDMI),
+`build_output_stream` échouait avec `StreamConfigNotSupported` →
+studio bloqué côté agent.
+
+Côté capture, la logique existait déjà depuis v0.3.2 (helper
+`device_supports_fixed_buffer` + fallback `Default`). Le bug était une
+asymétrie input/output pure — invisible sur Mac (CoreAudio output expose
+toujours Fixed(128)) et sur Windows ASIO / WASAPI exclusive, mais
+bloquait potentiellement les Windows WASAPI shared output (= cible
+"sans carte audio externe").
+
+Refactor au lieu de duplication :
+- nouveau module `audio::buffer_size` avec helper générique
+  `configs_support_fixed_buffer<I>` sur
+  `impl Iterator<Item = SupportedStreamConfigRange>`.
+- `capture.rs` : helper interne devient un fin wrapper sur le générique
+  (3 lignes au lieu de 20). Import `SupportedBufferSize` retiré.
+- `playback.rs` : helper symétrique `device_supports_fixed_buffer` côté
+  output + fallback `Default` avec le même log info que capture
+  (cohérence diagnostique).
+
+Aucun impact comportemental Mac. Résout silencieusement le crash
+potentiel Windows shared sans changer la sémantique du happy path.
+
+### Changed — Télémétrie buffer CPAL séparée input/output (wire honnête)
+
+Avant : `pipeline.buffer_samples: u32` était HARDCODÉ à 128 au démarrage
+de capture, et le wire `Stats.bufferMs` en dérivait. Le commentaire du
+protocole disait « Identique côté in/out car on utilise
+`BufferSize::Fixed(128)` des deux côtés » — **mensonge** dès que capture
+ou playback fallback sur `BufferSize::Default` (Windows shared, post fix
+ci-dessus). Conséquence : `totalLatencyMs` calculé avec un double input
+estimé à 2,67 ms même quand le driver réel imposait 10 ms → la latence
+end-to-end annoncée sous-estimait la réalité d'environ 14 ms sur les
+setups Windows shared.
+
+Refactor en vraie source de vérité :
+
+- `audio::capture::start_capture` retourne désormais
+  `(Stream, channels, sr, Option<u32>)` : le 4ᵉ élément = `Some(N)` si
+  `BufferSize::Fixed(N)` accepté par le driver, `None` si fallback
+  `Default`.
+- `audio::playback::start_playback` retourne `(Stream, Option<u32>)`,
+  symétriquement.
+- `pipeline.buffer_samples: u32` REMPLACÉ par deux champs séparés
+  `input_buffer_samples: Option<u32>` et `output_buffer_samples: Option<u32>`
+  qui reflètent exactement ce que les fonctions `start_*` ont appliqué.
+  Propagation aux 4 sites d'appel (start_capture, deux start_playback,
+  restart_playback). Reset propre dans `stop_capture` (input only —
+  playback peut continuer en écoute peers) et `stop_all` (les deux).
+- `protocol::Stats` : commentaire `bufferMs` corrigé (deprecated,
+  sémantique historique = input). Ajout `inputBufferMs: Option<f32>` et
+  `outputBufferMs: Option<f32>` avec `skip_serializing_if = "Option::is_none"` :
+  les champs sont ABSENTS du JSON quand le driver est en `Default`
+  (impossible à mesurer précisément côté agent sans instrumenter le
+  callback CPAL).
+- `ws_server.rs` : recalcule séparément `input_buf_ms_est` et
+  `output_buf_ms_est`, avec fallback estimé 10 ms (= 480 samples / 48,
+  valeur conservatrice WASAPI shared, alignée FarPlay / Jamulus) si
+  `Option` est `None`. `totalLatencyMs` utilise désormais
+  `input + opus_enc + opus_dec + jitter + output` au lieu du double-input
+  hérité — corrige le calcul faux sur Windows shared.
+- `bufferMs` conserve sa sémantique d'avant (= valeur input estimée)
+  pour rétrocompat avec les browsers pré-Q3 qui le sommaient avec
+  `opus_ms`.
+
+Validé en local (MacBook Pro mic interne) — wire JSON observé :
+`inputBufferMs: 2.67`, `outputBufferMs: 2.67`, `bufferMs: 2.67`
+(identique), `captureLatencyMs: 5.17` (= 2.67 + 2.5),
+`playbackLatencyMs: 2.67`, `totalLatencyMs: 10.33`
+(= 2.67 + 2.5 + 2.5 + 0 + 2.67, streams = 0). Sur Windows shared
+(post-lancement), les champs `Option<f32>` seront absents si fallback
+`Default` côté capture, et `totalLatencyMs` reflétera enfin la réalité
+~25 ms vs ~10 ms aujourd'hui mensonger.
+
+Rétrocompat browser : aucun champ retiré, deux champs ajoutés
+optionnels. Les browsers pré-Q3 ignorent simplement les nouveaux
+champs (comportement standard JSON).
+
 ## [0.4.22] — 2026-06-09
 
 ### Added — Talkback auto-mute (signaux MIDI + audio RMS)
