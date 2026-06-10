@@ -6,6 +6,37 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.23] — 2026-06-10
+
+### Added — Garde-fou 48 kHz natif (Q3 Chantier A)
+
+Exposition côté agent du sample rate natif du device d'entrée pour
+permettre au browser d'alerter l'utilisateur quand le resampler Rubato
+est actif (= ~29 ms de latence cachée non visible dans le budget).
+
+**Protocole** :
+- `protocol::AgentMessage::CaptureStarted` reçoit un nouveau champ
+  `nativeSampleRate: u32` (renommé en camelCase pour le JSON via serde).
+  Populé depuis le `native_sr` retourné par CPAL au start_capture, déjà
+  disponible — pas de probe supplémentaire.
+- `pipeline::CaptureStartedInfo` étendu du même champ. Propagé dans
+  `ws_server.rs` au moment de construire le message agent → browser.
+
+**Cible** : surtout Windows (Realtek HD Audio onboard configuré en
+44 100 Hz par défaut dans Sound Properties) + interfaces USB
+grand public mal configurées. Sur Mac, la quasi-totalité des cartes
+pro tournent déjà en 48 kHz natif (peu impacté).
+
+Rétrocompat browser : champ ajouté optionnel. Les browsers pré-Q3
+ignorent simplement le nouveau champ (comportement JSON standard).
+
+Côté browser (= monorepo Jamodio, hors scope agent) : nouveau module
+`lib/agent-input-status.js` qui stocke le dernier device confirmé,
+badge UI dans la modal Paramètres audio (vert si 48 kHz, rouge avec
+explication ~29 ms cachées + lien vers article support), toast au
+join anti-spam via localStorage, article support enrichi avec
+procédure complète Windows Sound Properties.
+
 ### Fixed — Playback Windows shared mode : fallback symétrique au capture
 
 Avant : `audio::playback::start_playback` forçait `BufferSize::Fixed(128)`
