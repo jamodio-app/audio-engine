@@ -6,6 +6,41 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.24] — 2026-06-10
+
+### Added — Sample rate natif exposé dans la liste des devices
+
+Extension du Q3 Chantier A (garde-fou 48 kHz) : le sample rate natif
+est désormais disponible **dès la liste des devices** retournée par
+`GetDevices`, pas seulement après `CaptureStarted`. Permet d'afficher
+le badge UI dans la modal Paramètres audio **hors session** (page
+"Mes Studios" / Paramètres), sans devoir entrer dans un studio.
+
+**Protocole** :
+- `protocol::AudioDevice` reçoit un nouveau champ
+  `nativeSampleRate: u32` (camelCase JSON via serde). 0 si la probe
+  CPAL `default_input_config` / `default_output_config` échoue
+  (device introuvable ou driver KO).
+- `audio::device::list_inputs` et `list_outputs` : refactor pour
+  appeler `default_input_config` / `default_output_config` une seule
+  fois (récupère channels ET sample rate), puis remplit les 2 champs.
+  Cohérence des deux infos garantie.
+
+Rétrocompat browser : champ ajouté, pas retiré. Les browsers pré-Q3
+ignorent le champ inconnu (comportement JSON standard).
+
+Côté browser (= monorepo Jamodio, hors scope agent) : le helper
+`resolveDeviceFormat` dans `studio-settings-modal.js` a maintenant 2
+sources de vérité (priorité décroissante) :
+1. `agent-input-status.js#getStatus()` (= `capture-started` reçu) —
+   le plus fiable, c'est le format réellement utilisé par le pipeline.
+2. Lookup dans la liste des devices agent du device courant sélectionné
+   et lecture de son `nativeSampleRate` — utile dès la page Paramètres
+   hors session.
+
+Plus refresh live du badge quand l'utilisateur change le device dans
+le select (`refreshAudioFormatBadge` greffé sur l'event `change`).
+
 ## [0.4.23] — 2026-06-10
 
 ### Added — Garde-fou 48 kHz natif (Q3 Chantier A)

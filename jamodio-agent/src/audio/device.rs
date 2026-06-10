@@ -44,12 +44,18 @@ pub fn list_inputs() -> Vec<AudioDevice> {
         .enumerate()
         .filter_map(|(idx, d)| {
             let name = d.name().ok()?;
-            let channels = d.default_input_config().map(|c| c.channels()).unwrap_or(0);
+            // Q3 garde-fou 48 kHz : un seul appel à `default_input_config`
+            // pour récupérer channels ET sample rate natif (évite la double
+            // probe + cohérence des deux infos).
+            let cfg = d.default_input_config().ok();
+            let channels = cfg.as_ref().map(|c| c.channels()).unwrap_or(0);
+            let native_sample_rate = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
             Some(AudioDevice {
                 id: make_id(idx, &name),
                 name: name.clone(),
                 is_default: Some(&name) == default.as_ref(),
                 channels,
+                native_sample_rate,
             })
         })
         .collect()
@@ -65,12 +71,15 @@ pub fn list_outputs() -> Vec<AudioDevice> {
         .enumerate()
         .filter_map(|(idx, d)| {
             let name = d.name().ok()?;
-            let channels = d.default_output_config().map(|c| c.channels()).unwrap_or(0);
+            let cfg = d.default_output_config().ok();
+            let channels = cfg.as_ref().map(|c| c.channels()).unwrap_or(0);
+            let native_sample_rate = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
             Some(AudioDevice {
                 id: make_id(idx, &name),
                 name: name.clone(),
                 is_default: Some(&name) == default.as_ref(),
                 channels,
+                native_sample_rate,
             })
         })
         .collect()

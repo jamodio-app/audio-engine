@@ -695,6 +695,14 @@ pub struct AudioDevice {
     /// Permet au browser de restreindre le sélecteur "canal d'entrée" au vrai nombre
     /// de canaux disponibles (ex : 2 pour Scarlett Solo, 4 pour 4i4, 18 pour 18i20).
     pub channels: u16,
+    /// Sample rate natif du device (Hz) tel qu'exposé par CPAL
+    /// `default_input_config` / `default_output_config`. Permet au browser
+    /// d'afficher un badge UI dès la page Paramètres audio (Mes Studios)
+    /// AVANT que la capture démarre, alertant l'utilisateur si le format
+    /// n'est pas 48 000 Hz (= resampler Rubato actif, ~29 ms de latence
+    /// cachée). 0 si la probe échoue.
+    #[serde(rename = "nativeSampleRate")]
+    pub native_sample_rate: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
