@@ -6,6 +6,40 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.28] — 2026-06-11
+
+### Fixed — polish éditeur VST3 Windows (suite v0.4.27, qui OUVRE la fenêtre ✅)
+
+- **Fenêtre éditeur derrière l'UI Jamodio** : l'agent est un process
+  background → `SetForegroundWindow` est refusé par Windows (d'où le
+  comportement non systématique). Fix : toggle `HWND_TOPMOST` →
+  `HWND_NOTOPMOST` après `ShowWindow` (place la fenêtre devant sans voler
+  le focus clavier) + `SetForegroundWindow` best-effort.
+- **Réouverture impossible après fermeture** : à la fermeture, on ne
+  déconnectait jamais component↔controller et on ne terminate() jamais le
+  controller. Le component JUCE gardait le pointeur de l'ancien controller
+  et **ignorait** le handshake du suivant (`if juceVST3EditController ==
+  nullptr` dans son notify) → `createView` null à la 2e ouverture. Fix :
+  teardown complet sur WM_DESTROY (ordre plugprovider SDK) : `removed()` →
+  release view/frame/handler → `disconnect()` des deux IConnectionPoint →
+  `terminate()` + release du controller (uniquement si instance séparée du
+  component).
+
+### Fixed — tray icon Windows invisible
+
+`tray.png` est un glyphe "template" gris foncé : macOS le recolore selon le
+thème (`iconAsTemplate`), Windows l'affiche tel quel → quasi invisible sur
+la barre des tâches sombre par défaut (il fallait le Gestionnaire des
+tâches pour quitter l'agent). Sur Windows, l'icône du tray est désormais
+l'icône couleur de l'app (tuile noire + glyphe jaune) — visible sur thème
+sombre et clair. Menu Afficher/Quitter inchangé.
+
+### CI — NSIS plus buildé pour rien
+
+`--bundles` explicite par plateforme dans release.yml (`app,dmg` macOS,
+`msi` Windows) : le bundler NSIS tournait à chaque build Windows (~2 min
+perdues) alors que seul le MSI est publié.
+
 ## [0.4.27] — 2026-06-11
 
 ### Fixed — VST3 editor Windows : fix racine (thread vst3-main unique)

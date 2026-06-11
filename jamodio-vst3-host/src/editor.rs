@@ -56,8 +56,9 @@ use vst3::{
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowTextW,
-        ShowWindow, SW_SHOW, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetForegroundWindow,
+        SetWindowPos, SetWindowTextW, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
         WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     },
 };
@@ -120,26 +121,38 @@ impl IPlugFrameTrait for PlugFrame {
 
 // ---------- Registry des fenêtres ouvertes (thread-local vst3-main) ----------
 
-/// Keep-alives d'une fenêtre d'éditeur ouverte. Tout est droppé dans le
-/// wnd_proc sur WM_DESTROY, dans l'ordre de déclaration : frame → view →
-/// handler → proxies → controller → host_app → component → module. Le plugin
-/// cache les pointeurs des proxies / du handler → les release trop tôt =
-/// use-after-free.
+/// Wiring `IConnectionPoint` actif entre component et controller. Conservé
+/// pour pouvoir `disconnect()` proprement à la fermeture — indispensable :
+/// le component JUCE garde le pointeur du controller tant qu'on ne le
+/// déconnecte pas (`disconnect` → `juceVST3EditController = {}`), et IGNORE
+/// tout handshake d'un nouveau controller (`if juceVST3EditController ==
+/// nullptr` dans son notify). Sans disconnect, la 2e ouverture donnait un
+/// `createView` null.
+struct ConnState {
+    comp_cp: ComPtr<IConnectionPoint>,
+    ctrl_cp: ComPtr<IConnectionPoint>,
+    proxy_for_comp: ComWrapper<ConnectionProxy>,
+    proxy_for_ctrl: ComWrapper<ConnectionProxy>,
+}
+
+/// Keep-alives d'une fenêtre d'éditeur ouverte. Teardown dans le wnd_proc
+/// sur WM_DESTROY (cf. `editor_wnd_proc`) : `view.removed()` → release
+/// view/frame/handler → disconnect → terminate du controller (si séparé).
+/// Le plugin cache les pointeurs des proxies / du handler → les release
+/// trop tôt = use-after-free.
 struct EditorState {
-    #[allow(dead_code)]
     frame: ComPtr<IPlugFrame>,
     view: ComPtr<IPlugView>,
-    #[allow(dead_code)]
     handler: ComPtr<IComponentHandler>,
-    #[allow(dead_code)]
-    proxies: Option<(ComWrapper<ConnectionProxy>, ComWrapper<ConnectionProxy>)>,
-    #[allow(dead_code)]
+    conn: Option<ConnState>,
     controller: ComPtr<IEditController>,
-    #[allow(dead_code)]
+    /// `true` si le controller est une instance séparée (createInstance +
+    /// initialize par nous) → on doit le terminate() à la fermeture. `false`
+    /// = même objet que le component (single-component plugin) → le
+    /// terminate appartient au cycle de vie de l'Instance, pas de l'éditeur.
+    controller_separate: bool,
     host_app: ComPtr<IHostApplication>,
-    #[allow(dead_code)]
     component: ComPtr<IComponent>,
-    #[allow(dead_code)]
     module: Arc<LoadedModule>,
     shared: Arc<EditorShared>,
 }
@@ -233,15 +246,51 @@ unsafe extern "system" fn editor_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_DESTROY {
-        // Retire l'état AVANT de dropper : view.removed() pendant que la
-        // HWND existe encore, puis release des ComPtrs (ordre des champs).
+        // Teardown complet, dans l'ordre du plugprovider SDK :
+        // 1. view.removed() pendant que la HWND existe encore
+        // 2. release view/frame/handler
+        // 3. disconnect component↔controller (sinon le component garde le
+        //    pointeur de CE controller et ignorera le handshake du suivant
+        //    → createView null à la réouverture)
+        // 4. terminate + release du controller (si instance séparée)
         let state = OPEN_EDITORS.with(|m| m.borrow_mut().remove(&(hwnd as isize)));
         if let Some(st) = state {
             let _ = st.view.removed();
-            st.shared.hwnd.store(std::ptr::null_mut(), Ordering::SeqCst);
-            st.shared.state.store(STATE_CLOSED, Ordering::SeqCst);
-            tracing::info!(target: "jamodio::vst3::editor", "editor window destroyed, plugin view removed");
-            // drop(st) → release frame/view/handler/proxies/controller/…
+            let EditorState {
+                frame,
+                view,
+                handler,
+                conn,
+                controller,
+                controller_separate,
+                host_app,
+                component,
+                module,
+                shared,
+            } = st;
+            drop(frame);
+            drop(view);
+            drop(handler);
+            if let Some(c) = conn {
+                let p_comp = c.proxy_for_comp.to_com_ptr::<IConnectionPoint>();
+                let p_ctrl = c.proxy_for_ctrl.to_com_ptr::<IConnectionPoint>();
+                if let (Some(p1), Some(p2)) = (p_comp, p_ctrl) {
+                    let _ = c.comp_cp.disconnect(p1.as_ptr());
+                    let _ = c.ctrl_cp.disconnect(p2.as_ptr());
+                }
+                drop(c);
+            }
+            if controller_separate {
+                let _ = controller.terminate();
+            }
+            drop(controller);
+            drop((host_app, component, module));
+            shared.hwnd.store(std::ptr::null_mut(), Ordering::SeqCst);
+            shared.state.store(STATE_CLOSED, Ordering::SeqCst);
+            tracing::info!(
+                target: "jamodio::vst3::editor",
+                "editor window destroyed — view removed, connections disconnected, controller released"
+            );
         }
         return 0;
     }
@@ -298,13 +347,13 @@ fn open_editor_on_main_thread(
 
     // 2. Resolve le controller sur CE thread (= le thread de la factory, le
     //    seul que les plugins considèrent comme "main").
-    let controller = resolve_controller(&component, &module, &host_app)?;
+    let (controller, controller_separate) = resolve_controller(&component, &module, &host_app)?;
 
     // 3. IConnectionPoint bidirectionnel via proxies thread-checked (pattern
     //    SDK Steinberg, cf. conn_proxy.rs). Les notify du thread audio RT
     //    sont droppés, tout le reste est forwardé. Le handshake JUCE
     //    controller→component (sendIntMessage) passe ici, pendant connect().
-    let proxies = connect_component_to_controller_via_proxies(&component, &controller);
+    let conn = connect_component_to_controller_via_proxies(&component, &controller);
 
     // 4. State sync via stream (toléré E_NOTIMPL).
     sync_component_state(&component, &controller);
@@ -379,8 +428,17 @@ fn open_editor_on_main_thread(
     unsafe {
         SetWindowTextW(hwnd, title_w.as_ptr());
         ShowWindow(hwnd, SW_SHOW);
+        // Bring-to-front fiable : l'agent est un process background, donc
+        // SetForegroundWindow seul est souvent refusé par Windows (la fenêtre
+        // apparaissait DERRIÈRE le browser, de façon non systématique). Le
+        // toggle TOPMOST→NOTOPMOST place la fenêtre au-dessus des fenêtres
+        // normales sans voler le focus clavier ; SetForegroundWindow ensuite
+        // en best-effort (réussit si l'user vient de cliquer dans Jamodio).
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let _ = SetForegroundWindow(hwnd);
     }
-    tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée");
+    tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée (top)");
 
     // 9. IPlugFrame + attached. Sur CE thread (= message thread JUCE), la
     //    création du peer JUCE est directe — pas de marshaling cross-thread.
@@ -421,8 +479,9 @@ fn open_editor_on_main_thread(
                 frame,
                 view,
                 handler,
-                proxies,
+                conn,
                 controller,
+                controller_separate,
                 host_app,
                 component,
                 module,
@@ -480,13 +539,13 @@ fn sync_component_state(component: &ComPtr<IComponent>, controller: &ComPtr<IEdi
 /// `host_app.createInstance(IMessage)` + notify à travers le proxy — les deux
 /// côtés tournent sur vst3-main, donc le filtre laisse passer.
 ///
-/// Retourne les 2 ComWrappers pour les garder vivants (= dans
-/// `EditorState.proxies`) — sinon refcount à 0 = use-after-free dès que le
-/// plugin tente un notify.
+/// Retourne le wiring complet (`ConnState`) pour le garder vivant dans
+/// `EditorState.conn` (le plugin cache les pointeurs des proxies —
+/// refcount à 0 = use-after-free) et pouvoir `disconnect()` au teardown.
 fn connect_component_to_controller_via_proxies(
     component: &ComPtr<IComponent>,
     controller: &ComPtr<IEditController>,
-) -> Option<(ComWrapper<ConnectionProxy>, ComWrapper<ConnectionProxy>)> {
+) -> Option<ConnState> {
     let comp_cp = component.cast::<IConnectionPoint>()?;
     let ctrl_cp = controller.cast::<IConnectionPoint>()?;
 
@@ -518,23 +577,32 @@ fn connect_component_to_controller_via_proxies(
             "IConnectionPoint connect via proxy partiel"
         );
     }
-    Some((proxy_for_comp, proxy_for_ctrl))
+    Some(ConnState {
+        comp_cp,
+        ctrl_cp,
+        proxy_for_comp,
+        proxy_for_ctrl,
+    })
 }
 
 /// Récupère un `IEditController` pour le composant. Si le composant l'expose
 /// directement (plugin "single-component"), on le partage. Sinon on crée une
 /// instance séparée via la factory et on l'initialise avec le host context.
+///
+/// Retourne `(controller, separate)` — `separate = true` si l'instance a été
+/// créée (et donc initialisée) par nous : c'est alors à l'éditeur de la
+/// terminate() au teardown.
 fn resolve_controller(
     component: &ComPtr<IComponent>,
     module: &LoadedModule,
     host_app: &ComPtr<IHostApplication>,
-) -> Result<ComPtr<IEditController>, String> {
+) -> Result<(ComPtr<IEditController>, bool), String> {
     if let Some(c) = component.cast::<IEditController>() {
         tracing::info!(
             target: "jamodio::vst3::editor",
             "controller = same instance as component (single-component plugin)"
         );
-        return Ok(c);
+        return Ok((c, false));
     }
 
     let mut cid: TUID = [0; 16];
@@ -569,5 +637,5 @@ fn resolve_controller(
         target: "jamodio::vst3::editor",
         "controller = separate class instance, initialized on vst3-main"
     );
-    Ok(controller)
+    Ok((controller, true))
 }

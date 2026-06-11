@@ -36,6 +36,11 @@ jobs:
           # Intel arrêté 2022 → Jamodio cible Apple Silicon + Windows.
           - runner: macos-14
             target: aarch64-apple-darwin
+            # `--bundles` explicite par plateforme : sans lui, le bundler
+            # construisait aussi NSIS sur Windows (~2 min perdues par build)
+            # alors que seul le MSI est publié. app = requis pour le
+            # .app.tar.gz de l'updater (createUpdaterArtifacts).
+            bundles: app,dmg
           # ─────────────────────────────────────────────────────────────────
           # Windows : RÉACTIVÉ en v0.3.0 (2026-05-15).
           #
@@ -47,6 +52,7 @@ jobs:
           # `srtp_strategy.md` pour le détail.
           - runner: windows-2022
             target: x86_64-pc-windows-msvc
+            bundles: msi
 
     runs-on: ${{ matrix.runner }}
     steps:
@@ -156,7 +162,7 @@ jobs:
           releaseDraft: true      # chaque matrix complète le draft
           prerelease: false
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   publish:
     needs: build
