@@ -6,6 +6,19 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.30] — 2026-06-11
+
+### Fixed — installeur MSI : texte enfin lisible (v2 des BMPs)
+
+Le texte des dialogs MSI est rendu par Windows en GRIS FONCÉ, non
+recolorable (captures Ben ×2). La v1 (v0.4.29) avait dégagé les zones de
+texte mais en les laissant sombres → texte foncé sur fond foncé. v2 :
+- `dialog.bmp` : bande de marque sombre à gauche (glyphe + JAMODIO),
+  zone de texte DROITE en clair (#f7f8f9) — la bande blanche du checkbox
+  « Launch » de l'ExitDlg s'y fond naturellement.
+- `banner.bmp` : fond clair, glyphe sur tuile sombre arrondie à droite
+  (style icône app), liseré bas.
+
 ## [0.4.29] — 2026-06-11
 
 ### Added — ASIO par défaut sur Windows (chantier A, bloquant v0.5.0)

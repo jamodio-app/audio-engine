@@ -1,21 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- WiX MSI top banner — 493×58, écrans intermédiaires.
-     MSI dessine le titre de page (x≈11) + sous-titre (x≈19) sur la
-     GAUCHE du bandeau → la marque vit à DROITE (glyphe seul), le reste
-     est un fond uni. (Avant : glyphe + "Jamodio Audio Engine" à gauche,
-     en collision directe avec le titre — captures 11/06/2026.) -->
+     MSI dessine le titre de page (x≈11) + sous-titre (x≈19) en GRIS FONCÉ
+     non recolorable → fond CLAIR obligatoire (captures 11/06/2026, ×2).
+     Marque = glyphe sur tuile sombre à droite (style icône app), hors de
+     la zone titre. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 58" width="493" height="58">
-  <rect width="493" height="58" fill="#0e0f11"/>
-  <!-- glyphe à droite, hors de la zone titre -->
-  <g transform="translate(458 29) scale(0.44)">
-    <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(-50 -50)">
-      <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.5"/>
-      <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
+  <rect width="493" height="58" fill="#f7f8f9"/>
+  <!-- tuile de marque à droite (glyphe jaune sur sombre, comme l'icône app) -->
+  <g transform="translate(437 8)">
+    <rect width="42" height="42" rx="9" fill="#0e0f11"/>
+    <g transform="translate(21 21) scale(0.36)">
+      <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(-50 -50)">
+        <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.5"/>
+        <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
+      </g>
+      <circle r="15" fill="#0e0f11" stroke="#e8ff3a" stroke-width="2.5"/>
+      <circle r="9" fill="#e8ff3a"/>
+      <circle r="4" fill="#0e0f11"/>
     </g>
-    <circle r="15" fill="#0e0f11" stroke="#e8ff3a" stroke-width="2.5"/>
-    <circle r="9" fill="#e8ff3a"/>
-    <circle r="4" fill="#0e0f11"/>
   </g>
   <!-- liseré bas discret pour séparer le bandeau du corps du dialog -->
-  <rect y="57" width="493" height="1" fill="#262a31"/>
+  <rect y="57" width="493" height="1" fill="#d8dadd"/>
 </svg>

@@ -1,24 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- WiX MSI dialog — 493×312, fond des écrans Welcome + Exit.
-     LAYOUT WiX (vérifié sur captures 11/06/2026) : MSI dessine titre +
-     corps de texte à partir de x≈170, et l'ExitDlg pose la bande blanche
-     du checkbox "Launch" vers y≈210-245. La marque vit donc dans la
-     BANDE GAUCHE (0-160px, au-dessus de y≈200) — tout le reste doit
-     rester un fond uni pour que le texte MSI soit lisible. -->
+     LAYOUT WiX (vérifié sur captures 11/06/2026,×2) : MSI dessine titre +
+     corps de texte à partir de x≈170, en GRIS FONCÉ non recolorable →
+     cette zone doit être CLAIRE. La marque vit dans la bande gauche
+     sombre (0-160px) ; l'ExitDlg pose sa bande blanche de checkbox vers
+     y≈210-245 côté droit → elle se fond dans le fond clair. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 312" width="493" height="312">
-  <rect width="493" height="312" fill="#0e0f11"/>
-  <!-- subtle gradient overlay -->
+  <!-- zone texte MSI : claire (texte WiX = gris foncé) -->
+  <rect width="493" height="312" fill="#f7f8f9"/>
+  <!-- bande de marque gauche : sombre, identité Jamodio -->
+  <rect width="160" height="312" fill="#0e0f11"/>
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#1a1d22" stop-opacity="0.7"/>
+      <stop offset="0" stop-color="#1a1d22" stop-opacity="0.8"/>
       <stop offset="1" stop-color="#0e0f11" stop-opacity="1"/>
     </linearGradient>
   </defs>
-  <rect width="493" height="312" fill="url(#g)"/>
-  <!-- bande de marque gauche -->
-  <rect width="160" height="312" fill="#15171b"/>
-  <rect x="159" width="1" height="312" fill="#262a31"/>
-  <!-- glyphe waveform centré dans la bande, au-dessus de la zone checkbox -->
+  <rect width="160" height="312" fill="url(#g)"/>
+  <rect x="159" width="1" height="312" fill="#d8dadd"/>
+  <!-- glyphe waveform centré dans la bande -->
   <g transform="translate(80 100) scale(0.95)">
     <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(-50 -50)">
       <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="2.5" opacity="0.5"/>
@@ -28,7 +28,7 @@
     <circle r="12" fill="#e8ff3a"/>
     <circle r="5" fill="#0e0f11"/>
   </g>
-  <!-- wordmark sous le glyphe, toujours dans la bande gauche -->
+  <!-- wordmark sous le glyphe, dans la bande gauche -->
   <text x="80" y="178" font-family="Segoe UI, system-ui, sans-serif" font-size="20" font-weight="700" fill="#ffffff" text-anchor="middle">JAMODIO</text>
   <text x="80" y="196" font-family="Segoe UI, system-ui, sans-serif" font-size="11" font-weight="400" fill="#9ca3af" text-anchor="middle">Audio Engine</text>
 </svg>
