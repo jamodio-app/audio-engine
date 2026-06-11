@@ -6,6 +6,44 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.25] — 2026-06-11
+
+### Fixed — VST3 editor hang (Windows)
+
+`IPlugView::attached()` hangait systématiquement sur tous les plugins VST3
+commerciaux testés (Valhalla FutureVerb, Surge XT) — fenêtre éditeur blanche,
+statut "NOT RESPONDING", aucun log après `calling attached…`. Reproduit
+sur VM Windows 11 ARM emul ET sur PC Windows x64 natif → bug dans notre
+host, pas un quirk émulation comme initialement supposé.
+
+**Cause** : on connectait directement les 2 `IConnectionPoint` du plugin
+(component ↔ controller) sans wrapper. Cela permettait à un `notify()`
+depuis l'audio thread RT de marshalize cross-thread vers notre éditeur STA
+qui était assis dans `attached()` → **deadlock circulaire**.
+
+**Fix** : nouveau module `conn_proxy.rs` qui implémente le pattern
+`ConnectionProxy` du SDK Steinberg (`public.sdk/source/vst/hosting/connectionproxy.cpp`).
+Le proxy stocke `GetCurrentThreadId()` à la création (= sur le thread
+éditeur STA), et `notify()` retourne `kResultFalse` si l'appel vient
+d'un autre thread. Asymétrique : seul le UI thread peut envoyer des
+notify ; les notify depuis l'audio thread sont silencieusement droppés —
+exactement comme dans le SDK officiel.
+
+Branché dans `editor.rs::connect_component_to_controller_via_proxies()`
+appelé sur le thread éditeur juste avant `setComponentHandler` et
+`createView`. Les 2 ComWrappers de proxies sont keep-alive locaux au
+thread (le plugin garde les pointeurs en cache).
+
+### Notes
+
+- Le code éditeur (HWND, msg pump, COM STA, IHostApplication,
+  IComponentHandler, IPlugFrame, IBStream state sync, setFrame) était
+  déjà conforme à la spec — il manquait juste ce wrapping crucial des
+  `IConnectionPoint`. Pris du SDK officiel.
+- Aucun changement comportemental côté audio path (process_stereo, MIDI
+  dispatch, etc.).
+- Aucun impact mac (le code éditeur est `#[cfg(target_os = "windows")]`).
+
 ## [0.4.24] — 2026-06-10
 
 ### Added — Sample rate natif exposé dans la liste des devices
