@@ -8,6 +8,22 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.4.32] — 2026-06-11
 
+### Security — P0 review pré-beta (3 quick-wins)
+
+Suite à la code review senior du 11/06 (`internal-docs/audits/REVIEW-AGENT-2026-06-11.md`) :
+- **Anti-replay SRTP activé sur Windows** (`net/srtp_webrtc.rs`) : le
+  backend webrtc-srtp tournait SANS protection anti-replay (`Context::new`
+  options à `None` → `srtp_no_replay_protection()`), alors que le backend
+  macOS (libsrtp2) l'a par défaut. Fenêtre 128 posée sur le contexte
+  entrant (srtp + srtcp) → parité de sécurité mac/Windows.
+- **Plus de panic sur message WS non-UTF8-aligné** (`ws_server.rs`) : le
+  log d'erreur tronquait par octets (`&text[..120]`) → panic possible au
+  milieu d'un char multioctet, tuant la connexion avant son cleanup.
+  Tronque désormais par chars.
+- **Origin Vercel restreint** (`ws_server.rs`) : `ends_with(".vercel.app")`
+  whitelistait TOUS les déploiements vercel.app (drive-by possible depuis
+  `evil.vercel.app`). Exige maintenant le nom de projet Jamodio.
+
 ### Changed — tray Windows : version diagnostique + match de chemin robuste
 
 Les promotions v1/v2 échouent pour une cause invisible côté dev (Mac).

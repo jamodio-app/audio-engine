@@ -13,7 +13,12 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use webrtc_srtp::context::Context;
+use webrtc_srtp::option::{srtcp_replay_protection, srtp_replay_protection};
 use webrtc_srtp::protection_profile::ProtectionProfile;
+
+/// Taille de la fenêtre anti-replay (paquets). 128 = défaut libsrtp2 (backend
+/// mac) → parité de sécurité entre les deux plateformes.
+const SRTP_REPLAY_WINDOW: usize = 128;
 
 pub const AEAD_AES_256_GCM: &str = "AEAD_AES_256_GCM";
 const MASTER_KEY_LEN: usize = 32;
@@ -86,12 +91,17 @@ impl SrtpContext {
         )
         .map_err(|e| format!("create outbound SRTP context: {e}"))?;
 
+        // Anti-replay sur le contexte ENTRANT : sans ces options,
+        // webrtc-srtp installe `srtp_no_replay_protection()` (cf. sources
+        // 0.17.1) → un attaquant on-path pourrait rejouer des paquets SRTP
+        // capturés. Le backend mac (libsrtp2) a sa fenêtre replay active par
+        // défaut ; on aligne Windows dessus pour une sécurité identique.
         let rx = Context::new(
             &remote_key,
             &remote_salt,
             ProtectionProfile::AeadAes256Gcm,
-            None,
-            None,
+            Some(srtp_replay_protection(SRTP_REPLAY_WINDOW)),
+            Some(srtcp_replay_protection(SRTP_REPLAY_WINDOW)),
         )
         .map_err(|e| format!("create inbound SRTP context: {e}"))?;
 

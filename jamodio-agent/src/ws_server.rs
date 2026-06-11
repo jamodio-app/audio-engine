@@ -48,7 +48,12 @@ fn origin_allowed(origin: Option<&str>) -> bool {
     };
     origin == "https://jamodio.com"
         || origin == "https://www.jamodio.com"
-        || origin.ends_with(".vercel.app")
+        // Previews Vercel : on EXIGE le nom de projet Jamodio dans le sous-
+        // domaine. Avant, `ends_with(".vercel.app")` whitelistait TOUT
+        // vercel.app — n'importe qui déploie `evil.vercel.app` (gratuit) et
+        // pilote l'agent depuis une page drive-by. Les URLs de preview Vercel
+        // sont de la forme `jamodio-<hash|git-branch>-<scope>.vercel.app`.
+        || (origin.starts_with("https://jamodio") && origin.ends_with(".vercel.app"))
         || origin.starts_with("http://localhost:")
         || origin.starts_with("http://127.0.0.1:")
         || is_internal_client_origin(origin)
@@ -219,7 +224,11 @@ async fn handle_one_message(
     let browser_msg = match serde_json::from_str::<BrowserMessage>(&text) {
         Ok(m) => m,
         Err(e) => {
-            let truncated = &text[..text.len().min(120)];
+            // Tronque par CHARS, pas par octets : `&text[..120]` paniquerait
+            // si l'octet 120 tombe au milieu d'un char multioctet (accents) —
+            // ce panic tuerait la future handle_connection AVANT son cleanup
+            // (slot/pipeline zombie).
+            let truncated: String = text.chars().take(120).collect();
             tracing::warn!(
                 target: "jamodio::ws",
                 error = %e,
