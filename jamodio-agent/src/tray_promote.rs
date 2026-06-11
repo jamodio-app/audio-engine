@@ -13,13 +13,21 @@
 //! - `ExecutablePath` (REG_SZ) — chemin de l'exe propriétaire
 //! - `IsPromoted` (REG_DWORD) — 1 = visible dans la barre, 0 = overflow
 //!
-//! # Politique (respect du choix utilisateur)
+//! # Politique (respect du choix utilisateur) — v2
 //!
-//! On n'écrit `IsPromoted = 1` QUE si la valeur est ABSENTE (= première
-//! apparition de notre icône, jamais arbitrée par l'utilisateur). Si elle
-//! existe — y compris `0` posé via les Paramètres Windows — on ne touche à
-//! rien : re-forcer une icône masquée volontairement est un comportement
-//! de malware, pas d'app sérieuse.
+//! Constat test Ben 11/06/2026 : Explorer crée l'entrée NotifyIconSettings
+//! avec `IsPromoted = 0` D'OFFICE → lire la valeur ne permet PAS de
+//! distinguer « défaut Explorer » d'un « choix utilisateur ». La v1 (qui ne
+//! promouvait que si la valeur était absente) ne promouvait donc jamais.
+//!
+//! v2 : un marqueur à nous (`HKCU\Software\Jamodio\AudioEngine\
+//! TrayPromotedOnce`) fait foi :
+//! - marqueur ABSENT  = première promotion jamais faite → on force
+//!   `IsPromoted = 1` (même si Explorer l'a mis à 0) puis on pose le
+//!   marqueur. C'est le seul et unique moment où on touche la visibilité.
+//! - marqueur PRÉSENT = on ne touche PLUS JAMAIS l'icône. Si l'utilisateur
+//!   la masque ensuite via les Paramètres Windows, son choix est définitif
+//!   (re-forcer une icône masquée volontairement = comportement de malware).
 //!
 //! L'entrée est créée par Explorer de façon asynchrone après la création
 //! du tray → on poll avec quelques retries espacés, sur un thread détaché
@@ -83,14 +91,28 @@ enum Outcome {
     EntryNotFoundYet,
 }
 
+/// Marqueur "promotion déjà faite" — survit aux updates ET aux
+/// désinstall/réinstall (HKCU n'est pas nettoyé par le MSI) : on ne
+/// re-force jamais une icône chez un utilisateur qui a déjà eu sa
+/// promotion une fois.
+const MARKER_KEY: &str = r"Software\Jamodio\AudioEngine";
+const MARKER_VALUE: &str = "TrayPromotedOnce";
+
 fn try_promote() -> Result<Outcome, std::io::Error> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
     use winreg::RegKey;
 
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    // Déjà promu une fois dans la vie de ce profil → ne plus rien toucher.
+    let (marker, _) = hkcu.create_subkey(MARKER_KEY)?;
+    if marker.get_raw_value(MARKER_VALUE).is_ok() {
+        return Ok(Outcome::AlreadyDecided);
+    }
+
     let exe = std::env::current_exe()?;
     let exe_lower = exe.to_string_lossy().to_lowercase();
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let root = hkcu.open_subkey_with_flags(r"Control Panel\NotifyIconSettings", KEY_READ)?;
 
     for name in root.enum_keys().flatten() {
@@ -103,11 +125,17 @@ fn try_promote() -> Result<Outcome, std::io::Error> {
         if path.to_lowercase() != exe_lower {
             continue;
         }
-        // Notre icône. IsPromoted déjà arbitré → ne JAMAIS écraser.
-        if sub.get_raw_value("IsPromoted").is_ok() {
-            return Ok(Outcome::AlreadyDecided);
-        }
+        // Notre icône, première promotion : on force la visibilité MÊME si
+        // Explorer a déjà posé IsPromoted=0 (son défaut), puis on grave le
+        // marqueur — tout réglage utilisateur ultérieur sera définitif.
+        let previous: Option<u32> = sub.get_value("IsPromoted").ok();
         sub.set_value("IsPromoted", &1u32)?;
+        marker.set_value(MARKER_VALUE, &1u32)?;
+        tracing::info!(
+            target: "jamodio::tray",
+            previous = ?previous,
+            "IsPromoted forcé à 1 (première promotion, valeur précédente loggée)"
+        );
         return Ok(Outcome::Promoted);
     }
     Ok(Outcome::EntryNotFoundYet)

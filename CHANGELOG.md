@@ -6,6 +6,19 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.31] — 2026-06-11
+
+### Fixed — tray Windows : promotion qui fonctionne vraiment (v2)
+
+Constat (test Ben sur Win11) : Explorer crée l'entrée
+`NotifyIconSettings` avec `IsPromoted=0` D'OFFICE → la v1, qui ne
+promouvait que si la valeur était absente, ne promouvait jamais. v2 :
+marqueur dédié `HKCU\Software\Jamodio\AudioEngine\TrayPromotedOnce` —
+absent = première promotion → `IsPromoted=1` forcé (même sur le 0 par
+défaut d'Explorer) puis marqueur gravé ; présent = on ne touche plus
+jamais (un masquage utilisateur ultérieur est définitif). La valeur
+précédente est loggée pour diagnostic.
+
 ## [0.4.30] — 2026-06-11
 
 ### Fixed — installeur MSI : texte enfin lisible (v2 des BMPs)
