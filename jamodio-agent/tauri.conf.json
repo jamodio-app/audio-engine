@@ -64,7 +64,9 @@
     },
     "windows": {
       "wix": {
-        "language": "fr-FR"
+        "language": "fr-FR",
+        "bannerPath": "icons/wix/banner.bmp",
+        "dialogImagePath": "icons/wix/dialog.bmp"
       }
     }
   },
