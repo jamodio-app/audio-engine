@@ -66,6 +66,7 @@ use windows_sys::Win32::{
     },
 };
 
+use crate::conn_proxy::ConnectionProxy;
 use crate::host::Instance;
 use crate::host_app::MinimalHost;
 use crate::loader::LoadedModule;
@@ -270,8 +271,13 @@ fn editor_thread_main(
         }
     };
 
-    // 4. IConnectionPoint bidirectionnel.
-    connect_component_to_controller(&component, &controller);
+    // 4. IConnectionPoint bidirectionnel — VIA proxies thread-checked (pattern
+    //    SDK Steinberg). Sans ces proxies, le plugin marshalize des notify()
+    //    cross-thread depuis l'audio thread vers ce thread STA assis dans
+    //    `attached()` → deadlock. Les proxies sont keep-alive dans
+    //    `_conn_proxies` jusqu'à la fin du thread (le plugin garde les ptr
+    //    en cache, dropping = use-after-free).
+    let _conn_proxies = connect_component_to_controller_via_proxies(&component, &controller);
 
     // 5. State sync via stream (toléré E_NOTIMPL).
     sync_component_state(&component, &controller);
@@ -469,23 +475,60 @@ fn sync_component_state(component: &ComPtr<IComponent>, controller: &ComPtr<IEdi
     tracing::info!(target: "jamodio::vst3::editor", "state sync component→controller ok");
 }
 
-/// Connecte composant et controller via `IConnectionPoint` bidirectionnel.
-fn connect_component_to_controller(component: &ComPtr<IComponent>, controller: &ComPtr<IEditController>) {
-    let comp_cp = match component.cast::<IConnectionPoint>() {
-        Some(c) => c,
-        None => return,
-    };
-    let ctrl_cp = match controller.cast::<IConnectionPoint>() {
-        Some(c) => c,
-        None => return,
-    };
-    let r1 = unsafe { comp_cp.connect(ctrl_cp.as_ptr()) };
-    let r2 = unsafe { ctrl_cp.connect(comp_cp.as_ptr()) };
+/// Connecte composant et controller via `IConnectionPoint` **avec des proxies
+/// ThreadChecker** (= pattern Steinberg SDK `connectionproxy.cpp`).
+///
+/// Sans proxy, brancher directement les 2 IConnectionPoint du plugin permet
+/// à un notify() depuis l'audio thread de se faire marshalize vers l'UI
+/// thread STA qui est assis dans `IPlugView::attached()` → **deadlock
+/// circulaire** observé sur Valhalla, Surge XT, et probablement tous les
+/// plugins commerciaux. C'est ce qui causait la fenêtre blanche +
+/// "NOT RESPONDING" en S1.
+///
+/// Le proxy stocke le `thread_id` au moment de sa création (= ce thread
+/// éditeur STA). Quand le component (depuis l'audio thread RT) tente un
+/// notify via le proxy, le ThreadChecker drop le message → pas de marshaling
+/// → pas de deadlock.
+///
+/// Retourne les 2 ComWrappers pour les garder vivants (= dans
+/// `EditorThreadData.connection_proxies`) — sinon refcount à 0 = use-after-
+/// free dès que le plugin tente un notify.
+fn connect_component_to_controller_via_proxies(
+    component: &ComPtr<IComponent>,
+    controller: &ComPtr<IEditController>,
+) -> Option<(ComWrapper<ConnectionProxy>, ComWrapper<ConnectionProxy>)> {
+    let comp_cp = component.cast::<IConnectionPoint>()?;
+    let ctrl_cp = controller.cast::<IConnectionPoint>()?;
+
+    // Proxy côté component : peer du component sera ce proxy. Quand component
+    // notifie son peer, le proxy filtre par thread puis forward vers ctrl_cp.
+    let proxy_for_comp = ComWrapper::new(ConnectionProxy::new());
+    proxy_for_comp.set_dst(ctrl_cp.clone());
+    let proxy_for_comp_ptr = proxy_for_comp.to_com_ptr::<IConnectionPoint>()?;
+
+    // Proxy côté controller : peer du controller sera ce proxy. Quand
+    // controller notifie son peer (depuis l'UI thread = ce thread), le proxy
+    // forward vers comp_cp.
+    let proxy_for_ctrl = ComWrapper::new(ConnectionProxy::new());
+    proxy_for_ctrl.set_dst(comp_cp.clone());
+    let proxy_for_ctrl_ptr = proxy_for_ctrl.to_com_ptr::<IConnectionPoint>()?;
+
+    let r1 = unsafe { comp_cp.connect(proxy_for_comp_ptr.as_ptr()) };
+    let r2 = unsafe { ctrl_cp.connect(proxy_for_ctrl_ptr.as_ptr()) };
     if r1 == kResultOk && r2 == kResultOk {
-        tracing::info!(target: "jamodio::vst3::editor", "IConnectionPoint connect component↔controller ok");
+        tracing::info!(
+            target: "jamodio::vst3::editor",
+            "IConnectionPoint proxies installed (thread-checked, mirror SDK pattern)"
+        );
     } else {
-        tracing::warn!(target: "jamodio::vst3::editor", r1, r2, "IConnectionPoint connect partiel");
+        tracing::warn!(
+            target: "jamodio::vst3::editor",
+            r1,
+            r2,
+            "IConnectionPoint connect via proxy partiel"
+        );
     }
+    Some((proxy_for_comp, proxy_for_ctrl))
 }
 
 /// Récupère un `IEditController` pour le composant. Si le composant l'expose

@@ -12,6 +12,7 @@
 
 mod discovery;
 mod editor;
+mod conn_proxy;
 mod events;
 mod host;
 mod host_app;
