@@ -6,6 +6,25 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.32] — 2026-06-11
+
+### Changed — tray Windows : version diagnostique + match de chemin robuste
+
+Les promotions v1/v2 échouent pour une cause invisible côté dev (Mac).
+v0.4.32 logge systématiquement (`target: jamodio::tray`) TOUTES les
+entrées `NotifyIconSettings` vues, leur `ExecutablePath` et leur
+`IsPromoted`, plus le bilan (exe courant, match exact/par nom de fichier).
+Améliorations de robustesse au passage :
+- **match par nom de fichier** en fallback du match par chemin exact
+  (gère 8.3 / `\\?\` / casse d'un composant — causes classiques d'un
+  match strict qui échoue) ;
+- **read-back** après écriture : le marqueur `TrayPromotedOnce` n'est
+  gravé que si `IsPromoted` est relu à 1 → si une écriture ne « prend »
+  pas, on re-tente au prochain lancement au lieu de rester bloqué.
+
+À retester : installer, lancer, ouvrir `%APPDATA%\Jamodio\logs` et
+chercher `jamodio::tray` → le log dira exactement ce qui se passe.
+
 ## [0.4.31] — 2026-06-11
 
 ### Fixed — tray Windows : promotion qui fonctionne vraiment (v2)

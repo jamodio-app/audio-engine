@@ -104,17 +104,22 @@ fn try_promote() -> Result<Outcome, std::io::Error> {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-    // Déjà promu une fois dans la vie de ce profil → ne plus rien toucher.
-    let (marker, _) = hkcu.create_subkey(MARKER_KEY)?;
-    if marker.get_raw_value(MARKER_VALUE).is_ok() {
-        return Ok(Outcome::AlreadyDecided);
-    }
-
     let exe = std::env::current_exe()?;
     let exe_lower = exe.to_string_lossy().to_lowercase();
+    let exe_file = exe
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
 
+    // DIAGNOSTIC (v0.4.32) : les 2 tentatives registre précédentes ont échoué
+    // pour une cause invisible côté Mac. On énumère et LOGGE systématiquement
+    // tout ce qu'Explorer a réellement écrit, pour diagnostiquer sur faits
+    // (mismatch de chemin ? entrée jamais créée ? valeur qui ne prend pas ?).
     let root = hkcu.open_subkey_with_flags(r"Control Panel\NotifyIconSettings", KEY_READ)?;
 
+    let mut exact_match: Option<(String, Option<u32>)> = None;
+    let mut file_match: Option<(String, Option<u32>)> = None;
+    let mut seen = 0usize;
     for name in root.enum_keys().flatten() {
         let Ok(sub) = root.open_subkey_with_flags(&name, KEY_READ | KEY_SET_VALUE) else {
             continue;
@@ -122,21 +127,63 @@ fn try_promote() -> Result<Outcome, std::io::Error> {
         let Ok(path) = sub.get_value::<String, _>("ExecutablePath") else {
             continue;
         };
-        if path.to_lowercase() != exe_lower {
-            continue;
+        seen += 1;
+        let promoted: Option<u32> = sub.get_value("IsPromoted").ok();
+        let p_lower = path.to_lowercase();
+        tracing::info!(target: "jamodio::tray", entry = %path, is_promoted = ?promoted, "NotifyIconSettings entry");
+        if p_lower == exe_lower {
+            exact_match = Some((name.clone(), promoted));
+        } else if !exe_file.is_empty() && p_lower.ends_with(&exe_file) {
+            // Même exe, chemin stocké différemment (8.3, \\?\, casse d'un
+            // composant…) — c'est exactement le genre de mismatch qui ferait
+            // échouer un match strict. On le retient comme fallback.
+            file_match = Some((name.clone(), promoted));
         }
-        // Notre icône, première promotion : on force la visibilité MÊME si
-        // Explorer a déjà posé IsPromoted=0 (son défaut), puis on grave le
-        // marqueur — tout réglage utilisateur ultérieur sera définitif.
-        let previous: Option<u32> = sub.get_value("IsPromoted").ok();
-        sub.set_value("IsPromoted", &1u32)?;
+    }
+    tracing::info!(
+        target: "jamodio::tray",
+        our_exe = %exe.to_string_lossy(),
+        entries_seen = seen,
+        exact = exact_match.is_some(),
+        by_filename = file_match.is_some(),
+        "tray promote: bilan énumération"
+    );
+
+    let Some((key_name, previous)) = exact_match.or(file_match) else {
+        return Ok(Outcome::EntryNotFoundYet);
+    };
+
+    // Marqueur : on respecte un choix utilisateur DÉJÀ exprimé — mais
+    // seulement si la promotion a réellement pris une fois (IsPromoted lu à 1
+    // au moment où on a gravé le marqueur). Si une tentative précédente a posé
+    // le marqueur sans que l'icône soit devenue visible (le bug qu'on
+    // diagnostique), on NE reste PAS bloqué : on re-tente tant que la valeur
+    // effective n'est pas 1.
+    let (marker, _) = hkcu.create_subkey(MARKER_KEY)?;
+    let marker_set = marker.get_raw_value(MARKER_VALUE).is_ok();
+    if marker_set && previous == Some(1) {
+        return Ok(Outcome::AlreadyDecided);
+    }
+
+    let sub = root.open_subkey_with_flags(&key_name, KEY_READ | KEY_SET_VALUE)?;
+    sub.set_value("IsPromoted", &1u32)?;
+    let readback: Option<u32> = sub.get_value("IsPromoted").ok();
+    if readback == Some(1) {
         marker.set_value(MARKER_VALUE, &1u32)?;
         tracing::info!(
             target: "jamodio::tray",
-            previous = ?previous,
-            "IsPromoted forcé à 1 (première promotion, valeur précédente loggée)"
+            key = %key_name, previous = ?previous,
+            "IsPromoted=1 écrit ET relu OK — icône promue"
         );
-        return Ok(Outcome::Promoted);
+        Ok(Outcome::Promoted)
+    } else {
+        // Écriture refusée / écrasée immédiatement : on ne grave PAS le
+        // marqueur → on re-tentera au prochain lancement.
+        tracing::warn!(
+            target: "jamodio::tray",
+            key = %key_name, readback = ?readback,
+            "IsPromoted écrit mais relu ≠ 1 — la valeur ne prend pas (à diagnostiquer)"
+        );
+        Ok(Outcome::EntryNotFoundYet)
     }
-    Ok(Outcome::EntryNotFoundYet)
 }
