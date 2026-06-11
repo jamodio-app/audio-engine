@@ -1704,6 +1704,14 @@ fn process_stage_loop(
         output_device_name.as_deref(),
     );
 
+    // Marque ce thread comme "audio RT" pour que le ConnectionProxy du
+    // host VST3 drop les `IConnectionPoint::notify()` venant d'ici. Sans
+    // ça, le plugin peut marshalize un notify cross-thread vers l'éditeur
+    // STA en plein dans `attached()` → deadlock (cause confirmée du hang
+    // éditeur en v0.4.0..v0.4.24, fixé en v0.4.26).
+    #[cfg(target_os = "windows")]
+    jamodio_vst3_host::register_audio_thread();
+
     // Buffers L/R préalloués pour passer le bloc à travers le plugin par
     // sous-blocs de PLUGIN_BLOCK samples. Capacité fixée à 128 (la frame
     // Opus stéréo fait 120, et les buffers post-resample ne dépassent

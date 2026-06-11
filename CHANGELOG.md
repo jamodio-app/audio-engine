@@ -6,6 +6,41 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.26] — 2026-06-11
+
+### Fixed — VST3 editor createView null
+
+v0.4.25 a éliminé le hang `attached()` via ConnectionProxy (= pattern
+Steinberg) mais déplacé le problème : `createView` retournait désormais
+null. Cause : le ThreadChecker du SDK (strict "thread créateur uniquement")
+est trop restrictif pour notre modèle multi-thread. Il droppait aussi les
+notify() venant du thread WS load (= initialisation du controller par
+le component) → controller jamais sync → `createView` null.
+
+Fix : filtre asymétrique inversé. Au lieu de bloquer tout sauf le thread
+éditeur STA, on **autorise tout SAUF le thread audio RT** (= seul cas où
+le marshaling cross-thread vers editor STA pendant `attached()` cause un
+deadlock). Le thread audio se marque explicitement via
+`jamodio_vst3_host::register_audio_thread()` appelé au start du
+`process_stage_loop`.
+
+- Notify depuis WS load thread (= component → controller initial sync) :
+  autorisé → controller reçoit son état → `createView` peut succeed.
+- Notify depuis editor STA thread (= UI knob change → component) :
+  autorisé → param changes UI fonctionnent.
+- Notify depuis audio RT thread (= component send param during process) :
+  drop → pas de deadlock pendant `attached()`.
+
+Coût : on perd les param-change notifications générées DEPUIS le thread
+audio (rare en pratique, l\'utilisateur tourne les knobs depuis l\'UI).
+
+### Notes
+
+Le pattern Steinberg SDK est correct pour un host single-threaded (= leur
+`editorhost` sample). Pour Jamodio qui est multi-thread (WS tokio + audio
+RT + editor STA), il fallait adapter le filtre — c\'est ce que fait
+v0.4.26.
+
 ## [0.4.25] — 2026-06-11
 
 ### Fixed — VST3 editor hang (Windows)

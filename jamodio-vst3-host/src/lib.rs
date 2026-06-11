@@ -19,6 +19,14 @@ mod host_app;
 mod loader;
 mod state;
 
+/// Doit être appelé UNE fois au démarrage du thread audio RT (encoder_thread)
+/// pour permettre au ConnectionProxy de filtrer les notify() venant de ce
+/// thread. Sans ce marquage, le proxy ne sait pas qui est le thread audio
+/// et laisse passer les notify, ce qui peut deadlock pendant `attached()`.
+pub fn register_audio_thread() {
+    crate::conn_proxy::register_audio_thread();
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
