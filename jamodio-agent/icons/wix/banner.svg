@@ -1,19 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- WiX MSI top banner — 493×58, shown on intermediate install screens -->
+<!-- WiX MSI top banner — 493×58, écrans intermédiaires.
+     MSI dessine le titre de page (x≈11) + sous-titre (x≈19) sur la
+     GAUCHE du bandeau → la marque vit à DROITE (glyphe seul), le reste
+     est un fond uni. (Avant : glyphe + "Jamodio Audio Engine" à gauche,
+     en collision directe avec le titre — captures 11/06/2026.) -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 58" width="493" height="58">
   <rect width="493" height="58" fill="#0e0f11"/>
-  <!-- icon on left, ~40px -->
-  <g transform="translate(16 9)">
-    <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(20 20) scale(0.4) translate(-50 -50)">
+  <!-- glyphe à droite, hors de la zone titre -->
+  <g transform="translate(458 29) scale(0.44)">
+    <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(-50 -50)">
       <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.5"/>
       <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
     </g>
-    <g transform="translate(20 20)">
-      <circle r="6" fill="#0e0f11" stroke="#e8ff3a" stroke-width="1.5"/>
-      <circle r="3.5" fill="#e8ff3a"/>
-      <circle r="1.5" fill="#0e0f11"/>
-    </g>
+    <circle r="15" fill="#0e0f11" stroke="#e8ff3a" stroke-width="2.5"/>
+    <circle r="9" fill="#e8ff3a"/>
+    <circle r="4" fill="#0e0f11"/>
   </g>
-  <text x="68" y="36" font-family="Segoe UI, system-ui, sans-serif" font-size="18" font-weight="700" fill="#ffffff">Jamodio</text>
-  <text x="146" y="36" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="400" fill="#9ca3af">Audio Engine</text>
+  <!-- liseré bas discret pour séparer le bandeau du corps du dialog -->
+  <rect y="57" width="493" height="1" fill="#262a31"/>
 </svg>

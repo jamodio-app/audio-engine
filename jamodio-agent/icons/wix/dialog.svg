@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- WiX MSI dialog sidebar — 493×312, shown on Welcome + Exit screens -->
+<!-- WiX MSI dialog — 493×312, fond des écrans Welcome + Exit.
+     LAYOUT WiX (vérifié sur captures 11/06/2026) : MSI dessine titre +
+     corps de texte à partir de x≈170, et l'ExitDlg pose la bande blanche
+     du checkbox "Launch" vers y≈210-245. La marque vit donc dans la
+     BANDE GAUCHE (0-160px, au-dessus de y≈200) — tout le reste doit
+     rester un fond uni pour que le texte MSI soit lisible. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 493 312" width="493" height="312">
   <rect width="493" height="312" fill="#0e0f11"/>
   <!-- subtle gradient overlay -->
@@ -10,19 +15,20 @@
     </linearGradient>
   </defs>
   <rect width="493" height="312" fill="url(#g)"/>
-  <!-- centered V5 waveform icon, ~160px -->
-  <g transform="translate(176 76)">
-    <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(70 70) scale(1.35) translate(-50 -50)">
+  <!-- bande de marque gauche -->
+  <rect width="160" height="312" fill="#15171b"/>
+  <rect x="159" width="1" height="312" fill="#262a31"/>
+  <!-- glyphe waveform centré dans la bande, au-dessus de la zone checkbox -->
+  <g transform="translate(80 100) scale(0.95)">
+    <g fill="none" stroke="#e8ff3a" stroke-linecap="round" transform="translate(-50 -50)">
       <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="2.5" opacity="0.5"/>
       <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="5"/>
     </g>
-    <g transform="translate(70 70)">
-      <circle r="20" fill="#0e0f11" stroke="#e8ff3a" stroke-width="3"/>
-      <circle r="12" fill="#e8ff3a"/>
-      <circle r="5" fill="#0e0f11"/>
-    </g>
+    <circle r="20" fill="#0e0f11" stroke="#e8ff3a" stroke-width="3"/>
+    <circle r="12" fill="#e8ff3a"/>
+    <circle r="5" fill="#0e0f11"/>
   </g>
-  <!-- product name + tagline -->
-  <text x="246" y="252" font-family="Segoe UI, system-ui, sans-serif" font-size="32" font-weight="700" fill="#ffffff" text-anchor="middle">JAMODIO</text>
-  <text x="246" y="280" font-family="Segoe UI, system-ui, sans-serif" font-size="14" font-weight="400" fill="#9ca3af" text-anchor="middle">Audio Engine</text>
+  <!-- wordmark sous le glyphe, toujours dans la bande gauche -->
+  <text x="80" y="178" font-family="Segoe UI, system-ui, sans-serif" font-size="20" font-weight="700" fill="#ffffff" text-anchor="middle">JAMODIO</text>
+  <text x="80" y="196" font-family="Segoe UI, system-ui, sans-serif" font-size="11" font-weight="400" fill="#9ca3af" text-anchor="middle">Audio Engine</text>
 </svg>
