@@ -8,17 +8,18 @@ use jamodio_audio_core::plugin_host::MidiEvent;
 use vst3::{
     ComPtr, ComWrapper,
     Steinberg::{
-        IPluginBaseTrait, IPluginFactoryTrait, PClassInfo, PFactoryInfo, TUID,
+        FUnknown, IPluginBaseTrait, IPluginFactoryTrait, PClassInfo, PFactoryInfo, TUID,
         Vst::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, IAudioProcessor,
             IAudioProcessorTrait, IComponent, IComponentTrait, IComponent_iid, IEventList,
-            MediaTypes_, ProcessData, ProcessModes_, ProcessSetup, SpeakerArr, SpeakerArrangement,
-            SymbolicSampleSizes_,
+            IHostApplication, MediaTypes_, ProcessData, ProcessModes_, ProcessSetup, SpeakerArr,
+            SpeakerArrangement, SymbolicSampleSizes_,
         },
     },
 };
 
 use crate::events::MidiEventList;
+use crate::host_app::MinimalHost;
 use crate::loader::LoadedModule;
 
 /// Catégorie standard VST3 pour les plugins audio (synthés + effets).
@@ -144,6 +145,10 @@ pub struct Instance {
     /// Cache du `ComPtr<IEventList>` pour ne pas refaire `to_com_ptr` à chaque
     /// bloc audio (= éviterait un refcount inc/dec inutile sur le hot path).
     event_list_ptr: ComPtr<IEventList>,
+    /// Host context passé à `IComponent::initialize` — le plugin peut garder
+    /// le pointeur pendant toute sa vie, donc keep-alive jusqu'au drop
+    /// (déclaré APRÈS component/audio = droppé après leur release).
+    _host_app: ComPtr<IHostApplication>,
 }
 
 impl Instance {
@@ -173,10 +178,15 @@ impl Instance {
         let component = unsafe { ComPtr::<IComponent>::from_raw(comp_raw as *mut IComponent) }
             .ok_or_else(|| "createInstance retourne non-null mais ComPtr a refusé".to_string())?;
 
-        // IPluginBase::initialize(hostContext=null). On passe null pour le MVP
-        // (suffisant pour les plugins testés). Les plugins exigeants demandent
-        // une `IHostApplication` — à fournir en sprint S1.5 si nécessaire.
-        let init_ok = unsafe { component.initialize(std::ptr::null_mut()) };
+        // IPluginBase::initialize(hostContext). Le host context fournit
+        // getName + createInstance(IMessage/IAttributeList) — requis pour que
+        // le component puisse allouer des messages (`ComponentBase::
+        // allocateMessage` des plugins JUCE jassert hostContext != null).
+        let host_app_wrapper = ComWrapper::new(MinimalHost);
+        let host_app = host_app_wrapper
+            .to_com_ptr::<IHostApplication>()
+            .ok_or_else(|| "ComWrapper::to_com_ptr<IHostApplication> a échoué".to_string())?;
+        let init_ok = unsafe { component.initialize(host_app.as_ptr() as *mut FUnknown) };
         if init_ok != 0 {
             return Err(format!("IComponent::initialize tresult={init_ok}"));
         }
@@ -203,6 +213,7 @@ impl Instance {
             processing: false,
             event_list,
             event_list_ptr,
+            _host_app: host_app,
         })
     }
 

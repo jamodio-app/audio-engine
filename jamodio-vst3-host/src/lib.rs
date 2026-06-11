@@ -17,6 +17,7 @@ mod events;
 mod host;
 mod host_app;
 mod loader;
+mod main_thread;
 mod state;
 
 /// Doit être appelé UNE fois au démarrage du thread audio RT (encoder_thread)
@@ -61,8 +62,9 @@ pub struct Vst3Host {
 
 struct Entry {
     instance: Instance,
-    /// `Arc` car l'editor thread l'utilise aussi (sa propre référence garde
-    /// la DLL en vie pendant la durée de vie de la window).
+    /// `Arc` car la registry éditeur sur vst3-main en garde aussi une
+    /// référence (la DLL doit rester en vie pendant la durée de vie de la
+    /// window).
     module: Arc<LoadedModule>,
     #[allow(dead_code)]
     plugin_ref: PluginRef,
@@ -184,13 +186,19 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
 
 impl PluginHost for Vst3Host {
     fn scan(&self) -> Vec<PluginInfo> {
-        let mut out = Vec::new();
-        for dir in discovery::system_paths() {
-            for path in discovery::scan_directory(&dir) {
-                scan_plugin_file(&path, &mut out);
+        // Sur vst3-main : le PREMIER chargement d'un module JUCE lie son
+        // MessageManager au thread courant — ce doit être vst3-main (= le
+        // thread qui pompe), sinon l'éditeur deadlock plus tard (cf.
+        // main_thread.rs).
+        main_thread::run(|| {
+            let mut out = Vec::new();
+            for dir in discovery::system_paths() {
+                for path in discovery::scan_directory(&dir) {
+                    scan_plugin_file(&path, &mut out);
+                }
             }
-        }
-        out
+            out
+        })
     }
 
     fn load(
@@ -210,33 +218,38 @@ impl PluginHost for Vst3Host {
             PluginError::Init(format!("UID hex invalide : {uid_hex}"))
         })?;
 
-        let module =
-            Arc::new(LoadedModule::load(&PathBuf::from(path_str)).map_err(PluginError::Init)?);
-        let mut instance =
-            Instance::create_by_uid(&module, &cid).map_err(PluginError::Init)?;
-        instance
-            .setup_stereo(SAMPLE_RATE, max_frames as i32)
-            .map_err(PluginError::Init)?;
-        let latency = instance.latency_samples();
+        // Load + setup + pre-warm sur vst3-main (cf. scan() pour le pourquoi).
+        let path_buf = PathBuf::from(path_str);
+        let (module, instance, latency) = main_thread::run(move || -> Result<_, PluginError> {
+            let module =
+                Arc::new(LoadedModule::load(&path_buf).map_err(PluginError::Init)?);
+            let mut instance =
+                Instance::create_by_uid(&module, &cid).map_err(PluginError::Init)?;
+            instance
+                .setup_stereo(SAMPLE_RATE, max_frames as i32)
+                .map_err(PluginError::Init)?;
+            let latency = instance.latency_samples();
 
-        // Pre-warm : passe N blocs de silence pour absorber le coût du 1er
-        // process() (cache cold + allocation interne du plugin). Sans ça, le
-        // 1er bloc audio capturé après load() peut dépasser le budget temps
-        // et glitcher. Mesuré POC : 1er bloc = ~3000 µs, suivants = ~75 µs.
-        let block = max_frames as usize;
-        let mut left = vec![0.0f32; block];
-        let mut right = vec![0.0f32; block];
-        for i in 0..PRE_WARM_BLOCKS {
-            if let Err(e) = instance.process_stereo(&mut left, &mut right, &[]) {
-                tracing::warn!(
-                    target: "jamodio::vst3",
-                    block = i,
-                    error = %e,
-                    "pre-warm block failed (ignoré)"
-                );
-                break;
+            // Pre-warm : passe N blocs de silence pour absorber le coût du 1er
+            // process() (cache cold + allocation interne du plugin). Sans ça, le
+            // 1er bloc audio capturé après load() peut dépasser le budget temps
+            // et glitcher. Mesuré POC : 1er bloc = ~3000 µs, suivants = ~75 µs.
+            let block = max_frames as usize;
+            let mut left = vec![0.0f32; block];
+            let mut right = vec![0.0f32; block];
+            for i in 0..PRE_WARM_BLOCKS {
+                if let Err(e) = instance.process_stereo(&mut left, &mut right, &[]) {
+                    tracing::warn!(
+                        target: "jamodio::vst3",
+                        block = i,
+                        error = %e,
+                        "pre-warm block failed (ignoré)"
+                    );
+                    break;
+                }
             }
-        }
+            Ok((module, instance, latency))
+        })?;
 
         let handle_id = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
         self.entries.insert(
@@ -254,9 +267,20 @@ impl PluginHost for Vst3Host {
     }
 
     fn unload(&mut self, handle: PluginHandle) -> Result<(), PluginError> {
-        if self.entries.remove(&handle.0).is_none() {
+        let Some(entry) = self.entries.remove(&handle.0) else {
             return Err(PluginError::InvalidHandle);
-        }
+        };
+        // Teardown sur vst3-main, SANS bloquer le caller (qui tient le lock
+        // plugin_host). Ordre critique : fermer l'éditeur d'abord (DestroyWindow
+        // synchrone sur vst3-main → view.removed() + release controller/view),
+        // PUIS dropper l'Instance (setActive(false) + terminate). L'ancien code
+        // droppait l'Entry telle quelle = terminate AVANT la fermeture de
+        // l'éditeur (use-after-terminate latent).
+        main_thread::post(move || {
+            let mut entry = entry;
+            drop(entry.editor.take());
+            drop(entry);
+        });
         Ok(())
     }
 
@@ -296,6 +320,11 @@ impl PluginHost for Vst3Host {
             .entries
             .get_mut(&handle.0)
             .ok_or(PluginError::InvalidHandle)?;
+        // Fenêtre fermée par l'utilisateur (X) ou setup échoué → autorise la
+        // réouverture au lieu de retourner Ok sur un handle mort.
+        if entry.editor.as_ref().is_some_and(|e| e.is_closed()) {
+            entry.editor = None;
+        }
         if entry.editor.is_some() {
             return Ok(());
         }

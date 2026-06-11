@@ -1,22 +1,23 @@
 //! `ConnectionProxy` — wrapper `IConnectionPoint` qui bloque uniquement les
-//! notify() venant du thread audio RT (= le seul thread où un marshaling
-//! COM vers l'éditeur STA causerait un deadlock pendant `attached()`).
+//! notify() venant du thread audio RT.
 //!
-//! Adapté du pattern Steinberg SDK (`public.sdk/source/vst/hosting/connectionproxy.cpp`)
-//! mais avec un filtre différent : Steinberg autorise UNIQUEMENT le thread
-//! créateur (= main UI thread dans leur modèle single-threaded) à envoyer.
-//! Pour nous (multi-thread : WS load, audio RT, editor STA), ce filtre est
-//! trop strict — il bloquait aussi les notify d'initialisation depuis le
-//! thread de load, donc le controller ne recevait jamais son état initial
-//! et `createView()` retournait null (symptôme observé en v0.4.25).
+//! Adapté du pattern Steinberg SDK (`public.sdk/source/vst/hosting/connectionproxy.cpp`),
+//! que les vrais hosts (Cubase…) insèrent systématiquement entre component et
+//! controller. Conséquence connue : les plugins JUCE ne peuvent plus faire
+//! leur cast direct privé à travers la connexion et basculent sur un
+//! handshake par message (`sendIntMessage`) — qui exige que le host
+//! implémente `IHostApplication::createInstance(IMessage)` (cf. host_app.rs).
+//! C'était la VRAIE cause du `createView() == null` en v0.4.25/26 — pas le
+//! filtre de threads.
 //!
-//! Notre filtre asymétrique :
+//! Notre filtre (plus permissif que celui du SDK, qui n'autorise que le
+//! thread créateur) :
 //! - Notify depuis le thread audio RT (= encoder_thread, marqué via
-//!   `register_audio_thread()`) → drop (kResultFalse) pour éviter le
-//!   marshaling deadlock vers editor STA.
-//! - Notify depuis n'importe quel autre thread (WS load, editor STA, etc.)
-//!   → forward vers le peer. Permet l'initialisation du controller pendant
-//!   le setup, et les param changes de l'UI vers le composant.
+//!   `register_audio_thread()`) → drop (kResultFalse) : un plugin qui
+//!   notifie depuis `process()` ne doit pas toucher des objets UI.
+//! - Notify depuis n'importe quel autre thread → forward vers le peer.
+//!   Depuis le refactor vst3-main (v0.4.27), component ET controller vivent
+//!   sur le même thread qui pompe — le forward est donc toujours direct.
 //!
 //! Coût : on perd les notify component → controller émis pendant `process()`
 //! (param changes générés par l'audio thread, rare en pratique : l'utilisateur

@@ -6,6 +6,49 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.27] — 2026-06-11
+
+### Fixed — VST3 editor Windows : fix racine (thread vst3-main unique)
+
+Cause racine ENFIN identifiée en lisant les sources JUCE (Surge XT et
+Valhalla sont des plugins JUCE) — elle explique les DEUX symptômes
+précédents d'un coup :
+
+1. **Hang `attached()` (v0.4.24)** : JUCE lie son MessageManager au thread
+   qui construit la `JucePluginFactory` (= le thread qui appelle
+   `GetPluginFactory` après le dlopen — chez nous le thread WS/scan, qui ne
+   pompe jamais de messages Win32). `attached()` → `addToDesktop` →
+   constructeur `HWNDComponentPeer` → `callFunctionIfNotLocked` : si le
+   thread appelant n'est pas le message thread JUCE, la création de fenêtre
+   est marshalée vers lui via `callFunctionOnMessageThread` et **bloque pour
+   toujours** (fenêtre blanche "NOT RESPONDING").
+
+2. **`createView` null (v0.4.25/26)** : avec un ConnectionProxy entre
+   component et controller (pattern SDK), les plugins JUCE ne peuvent plus
+   faire leur cast direct privé et basculent sur un handshake par message
+   (`JuceVST3EditController::connect` → `sendIntMessage`). Ce fallback
+   alloue le message via `hostContext->createInstance(IMessage)` — que notre
+   `IHostApplication` ne fournissait pas (`kNotImplemented`). Handshake mort
+   en silence → le controller n'a jamais son AudioProcessor → `createView`
+   retourne null. Le filtre de threads du proxy n'y était pour rien.
+
+Fix (refactor interne `jamodio-vst3-host`, API publique inchangée) :
+
+- **Nouveau thread `vst3-main` persistant** (`main_thread.rs`) : STA + pump
+  Win32 permanente. TOUT le non-RT y vit désormais : scan, dlopen/factory,
+  createInstance, initialize, setup, controller, connect, createView,
+  attached, fenêtres d'éditeur (plus de thread par fenêtre — registry
+  HWND→état nettoyée sur WM_DESTROY). C'est la règle "single main thread"
+  de la spec VST3, et ce que font tous les DAW. `process()` reste sur le
+  thread audio RT (conforme spec).
+- **`IHostApplication::createInstance` implémente `IMessage` +
+  `IAttributeList`** (`host_app.rs`, équivalent `hostclasses.cpp` du SDK) →
+  le handshake JUCE à travers le ConnectionProxy fonctionne.
+- **Host context passé à `IComponent::initialize`** (était null).
+- Bonus : `unload` ferme l'éditeur AVANT `terminate()` du component
+  (use-after-terminate latent corrigé), et une fenêtre fermée par
+  l'utilisateur (X) peut être réouverte.
+
 ## [0.4.26] — 2026-06-11
 
 ### Fixed — VST3 editor createView null

@@ -1,46 +1,44 @@
-//! Éditeur natif Win32 — fenêtre HWND + msg pump dédié pour héberger
-//! l'`IPlugView` du plugin VST3.
+//! Éditeur natif Win32 — fenêtre HWND hébergée sur le thread vst3-main.
 //!
-//! # Architecture COM consolidée (v2)
+//! # Architecture (v3 — single main thread)
 //!
-//! TOUS les appels COM liés à l'éditeur s'exécutent sur le **thread STA dédié**
-//! `ui-vst3-{title}`. C'est essentiel parce que beaucoup de plugins marquent
-//! leurs objets COM thread-affined à leur thread d'origine (= STA). Si le host
-//! crée le controller sur le thread WS tokio (qui n'est dans aucun apartment
-//! COM) et appelle `attached` depuis le thread STA, le plugin essaie de
-//! notifier ses callbacks à travers les threads, ce qui marshalize vers le
-//! thread d'origine — sans msg pump là-bas, deadlock garanti.
+//! TOUT le cycle de vie de l'éditeur (resolve controller, connect, createView,
+//! HWND, setFrame, attached, removed) s'exécute sur le thread **vst3-main**
+//! (cf. `main_thread.rs`) — le MÊME thread qui a chargé le module et créé le
+//! component. C'est la règle "single main thread" de la spec VST3, et c'est
+//! ce qu'attendent les plugins JUCE : leur MessageManager est lié au thread
+//! qui a construit la factory ; un `attached()` venant d'un autre thread
+//! marshale la création de fenêtre vers ce thread via
+//! `callFunctionOnMessageThread` et bloque pour toujours si personne n'y
+//! pompe (= le hang v0.4.24).
 //!
-//! En consolidant tout (createInstance du controller, setComponentHandler,
-//! IConnectionPoint::connect, createView, setFrame, attached) sur un unique
-//! thread STA, on garantit que toutes les références sont thread-affined au
-//! même apartment → pas de marshaling → pas de deadlock.
+//! Plus de thread par fenêtre : les messages des fenêtres d'éditeur sont
+//! dispatchés par la pump centrale de vst3-main. L'état de chaque fenêtre
+//! (ComPtrs keep-alive) vit dans une registry thread-local indexée par HWND,
+//! nettoyée dans le wnd_proc sur WM_DESTROY (→ `view.removed()` + release
+//! dans l'ordre correct, AVANT tout terminate du component).
 //!
-//! # Séquence du thread éditeur
-//! 1. `CoInitializeEx(STA)`
-//! 2. Crée `IHostApplication` minimal
-//! 3. `resolve_controller` (cast IComponent → IEditController, ou createInstance
+//! # Séquence du job d'ouverture (sur vst3-main)
+//! 1. Crée `IHostApplication` (avec IMessage/IAttributeList, cf. host_app.rs)
+//! 2. `resolve_controller` (cast IComponent → IEditController, ou createInstance
 //!    de la classe controller séparée + initialize avec hostContext)
-//! 4. `IConnectionPoint::connect` bidirectionnel component↔controller
-//! 5. `IComponent::getState` → `IEditController::setComponentState` (toléré E_NOTIMPL)
-//! 6. Crée `IComponentHandler` minimal, `controller.setComponentHandler()`
-//! 7. `controller.createView("editor")`
-//! 8. `view.isPlatformTypeSupported("HWND")`, `view.getSize()`
-//! 9. Crée la HWND parent Win32 (cachée, WS_OVERLAPPEDWINDOW)
-//! 10. Crée `IPlugFrame` minimal, `view.setFrame()`
-//! 11. `pump_pending_messages()` (drain WM_CREATE etc.)
-//! 12. `view.attached(hwnd, "HWND")` ← le moment de vérité
-//! 13. `view.onSize()`
-//! 14. `ShowWindow(SW_SHOW)`
-//! 15. Msg pump `GetMessageW` jusqu'à WM_DESTROY
-//! 16. `view.removed()`, drop des ComPtrs locaux, `CoUninitialize`
+//! 3. `IConnectionPoint::connect` via ConnectionProxy (le handshake JUCE
+//!    passe par sendIntMessage → host_app.createInstance(IMessage))
+//! 4. `IComponent::getState` → `IEditController::setComponentState` (toléré E_NOTIMPL)
+//! 5. `controller.setComponentHandler()` (IComponentHandler minimal)
+//! 6. `controller.createView("editor")`
+//! 7. `view.isPlatformTypeSupported("HWND")`, `view.getSize()`
+//! 8. Crée la HWND parent Win32
+//! 9. `view.setFrame()`, `view.attached(hwnd, "HWND")`, `view.onSize()`
+//! 10. Enregistre l'état dans la registry — la pump centrale prend le relais
 
 #![cfg(target_os = "windows")]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use vst3::{
     Class, ComPtr, ComWrapper,
@@ -57,11 +55,9 @@ use vst3::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PeekMessageW,
-        PostMessageW, RegisterClassExW, SetWindowTextW, ShowWindow, TranslateMessage, MSG,
-        PM_REMOVE, SW_SHOW, WM_CLOSE, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowTextW,
+        ShowWindow, SW_SHOW, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
         WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     },
 };
@@ -70,10 +66,16 @@ use crate::conn_proxy::ConnectionProxy;
 use crate::host::Instance;
 use crate::host_app::MinimalHost;
 use crate::loader::LoadedModule;
+use crate::main_thread;
 use crate::state::MemoryStream;
 
 const HOST_NAMESPACE: &str = "JAMOEDITOR";
 const PLATFORM_HWND: &[u8] = b"HWND\0";
+
+/// États de `EditorShared::state`.
+const STATE_PENDING: u8 = 0;
+const STATE_OPEN: u8 = 1;
+const STATE_CLOSED: u8 = 2;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -116,53 +118,103 @@ impl IPlugFrameTrait for PlugFrame {
     }
 }
 
+// ---------- Registry des fenêtres ouvertes (thread-local vst3-main) ----------
+
+/// Keep-alives d'une fenêtre d'éditeur ouverte. Tout est droppé dans le
+/// wnd_proc sur WM_DESTROY, dans l'ordre de déclaration : frame → view →
+/// handler → proxies → controller → host_app → component → module. Le plugin
+/// cache les pointeurs des proxies / du handler → les release trop tôt =
+/// use-after-free.
+struct EditorState {
+    #[allow(dead_code)]
+    frame: ComPtr<IPlugFrame>,
+    view: ComPtr<IPlugView>,
+    #[allow(dead_code)]
+    handler: ComPtr<IComponentHandler>,
+    #[allow(dead_code)]
+    proxies: Option<(ComWrapper<ConnectionProxy>, ComWrapper<ConnectionProxy>)>,
+    #[allow(dead_code)]
+    controller: ComPtr<IEditController>,
+    #[allow(dead_code)]
+    host_app: ComPtr<IHostApplication>,
+    #[allow(dead_code)]
+    component: ComPtr<IComponent>,
+    #[allow(dead_code)]
+    module: Arc<LoadedModule>,
+    shared: Arc<EditorShared>,
+}
+
+thread_local! {
+    /// HWND (as isize) → état. Uniquement touché sur vst3-main.
+    static OPEN_EDITORS: RefCell<HashMap<isize, EditorState>> = RefCell::new(HashMap::new());
+}
+
 // ---------- EditorWindow ----------
 
-/// Handle public exposé au `Vst3Host`. Détient le thread + un slot atomique
-/// vers la HWND (pour PostMessage WM_CLOSE depuis l'extérieur).
+/// État partagé entre le handle public (côté Vst3Host) et vst3-main.
+struct EditorShared {
+    /// HWND de la fenêtre — null tant que le setup n'a pas abouti, re-null
+    /// après destruction.
+    hwnd: AtomicPtr<c_void>,
+    /// STATE_PENDING → STATE_OPEN → STATE_CLOSED (ou PENDING → CLOSED si le
+    /// setup échoue).
+    state: AtomicU8,
+}
+
+/// Handle public exposé au `Vst3Host`. L'ouverture est asynchrone (job posté
+/// sur vst3-main) pour ne pas bloquer le caller (qui tient le lock
+/// plugin_host pendant que l'encoder thread en a besoin).
 pub struct EditorWindow {
-    join: Option<JoinHandle<()>>,
-    hwnd_slot: Arc<AtomicPtr<c_void>>,
+    shared: Arc<EditorShared>,
 }
 
 impl EditorWindow {
-    /// Spawn le thread éditeur — retourne immédiatement, le thread fait tout
-    /// le setup COM en interne. Les erreurs du setup sont loggées dans le
-    /// thread (pas remontées au caller) parce que le caller (WS handler) ne
-    /// peut rien en faire de toute façon.
+    /// Poste le job d'ouverture sur vst3-main — retourne immédiatement.
+    /// Les erreurs du setup sont loggées sur vst3-main (le caller WS ne peut
+    /// rien en faire de toute façon).
     pub fn open(
         instance: &Instance,
         module: Arc<LoadedModule>,
         title: &str,
     ) -> Result<Self, String> {
-        let hwnd_slot: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
-        let hwnd_slot_thread = hwnd_slot.clone();
+        let shared = Arc::new(EditorShared {
+            hwnd: AtomicPtr::new(std::ptr::null_mut()),
+            state: AtomicU8::new(STATE_PENDING),
+        });
+        let shared_job = shared.clone();
         let component = instance.component.clone();
         let title = title.to_string();
 
-        let join = std::thread::Builder::new()
-            .name(format!("ui-vst3-{title}"))
-            .spawn(move || {
-                editor_thread_main(component, module, title, hwnd_slot_thread);
-            })
-            .map_err(|e| format!("spawn editor thread: {e}"))?;
+        main_thread::post(move || {
+            if let Err(e) = open_editor_on_main_thread(component, module, &title, &shared_job) {
+                tracing::error!(target: "jamodio::vst3::editor", error = %e, "editor setup failed");
+                shared_job.state.store(STATE_CLOSED, Ordering::SeqCst);
+            }
+        });
 
-        Ok(Self {
-            join: Some(join),
-            hwnd_slot,
-        })
+        Ok(Self { shared })
     }
 
+    /// `true` si la fenêtre a été fermée (X utilisateur, échec de setup,
+    /// close explicite) — permet au Vst3Host d'autoriser une réouverture.
+    pub fn is_closed(&self) -> bool {
+        self.shared.state.load(Ordering::SeqCst) == STATE_CLOSED
+    }
+
+    /// Détruit la fenêtre. Posté en FIFO sur vst3-main : si le job
+    /// d'ouverture est encore en queue, il s'exécute d'abord — pas de race.
+    /// Depuis vst3-main, exécution inline (synchrone) — utilisé par unload
+    /// pour garantir `view.removed()` AVANT `component.terminate()`.
     pub fn close(&mut self) {
-        let hwnd = self.hwnd_slot.load(Ordering::SeqCst);
-        if !hwnd.is_null() {
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        let shared = self.shared.clone();
+        main_thread::post(move || {
+            let hwnd = shared.hwnd.load(Ordering::SeqCst);
+            if !hwnd.is_null() {
+                unsafe {
+                    DestroyWindow(hwnd as HWND);
+                }
             }
-        }
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        });
     }
 }
 
@@ -172,25 +224,27 @@ impl Drop for EditorWindow {
     }
 }
 
-// ---------- Thread main ----------
+// ---------- wnd_proc + setup (vst3-main uniquement) ----------
 
-/// Pump tous les messages Win32 en attente dans la queue du thread courant.
-fn pump_pending_messages() {
-    let mut msg: MSG = unsafe { std::mem::zeroed() };
-    while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
-        unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-unsafe extern "system" fn wnd_proc(
+unsafe extern "system" fn editor_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_DESTROY {
+        // Retire l'état AVANT de dropper : view.removed() pendant que la
+        // HWND existe encore, puis release des ComPtrs (ordre des champs).
+        let state = OPEN_EDITORS.with(|m| m.borrow_mut().remove(&(hwnd as isize)));
+        if let Some(st) = state {
+            let _ = st.view.removed();
+            st.shared.hwnd.store(std::ptr::null_mut(), Ordering::SeqCst);
+            st.shared.state.store(STATE_CLOSED, Ordering::SeqCst);
+            tracing::info!(target: "jamodio::vst3::editor", "editor window destroyed, plugin view removed");
+            // drop(st) → release frame/view/handler/proxies/controller/…
+        }
+        return 0;
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -204,7 +258,7 @@ fn ensure_window_class() {
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: 0,
-            lpfnWndProc: Some(wnd_proc),
+            lpfnWndProc: Some(editor_wnd_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
@@ -221,76 +275,45 @@ fn ensure_window_class() {
     });
 }
 
-fn editor_thread_main(
+/// Tout le setup COM + fenêtre — s'exécute sur vst3-main.
+fn open_editor_on_main_thread(
     component: ComPtr<IComponent>,
     module: Arc<LoadedModule>,
-    title: String,
-    hwnd_slot: Arc<AtomicPtr<c_void>>,
-) {
+    title: &str,
+    shared: &Arc<EditorShared>,
+) -> Result<(), String> {
+    debug_assert!(main_thread::on_main_thread());
     tracing::info!(
         target: "jamodio::vst3::editor",
         title = %title,
-        "editor thread starting"
+        "opening editor on vst3-main"
     );
 
-    // 1. COM apartment STA OBLIGATOIRE pour le thread UI VST3.
-    let com_init =
-        unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
-    tracing::info!(
-        target: "jamodio::vst3::editor",
-        hresult = format!("0x{com_init:08X}"),
-        "CoInitializeEx STA"
-    );
-
-    // RAII : CoUninitialize sera appelé au scope exit même si on early-return.
-    struct ComGuard;
-    impl Drop for ComGuard {
-        fn drop(&mut self) {
-            unsafe { CoUninitialize() };
-        }
-    }
-    let _com_guard = ComGuard;
-
-    // 2. IHostApplication minimal — context du controller.
+    // 1. IHostApplication — context du controller. Fournit IMessage et
+    //    IAttributeList (handshake JUCE via ConnectionProxy, cf. host_app.rs).
     let host_app_wrapper = ComWrapper::new(MinimalHost);
-    let host_app: ComPtr<IHostApplication> = match host_app_wrapper.to_com_ptr::<IHostApplication>() {
-        Some(h) => h,
-        None => {
-            tracing::error!(target: "jamodio::vst3::editor", "ComWrapper::to_com_ptr<IHostApplication> a échoué");
-            return;
-        }
-    };
+    let host_app: ComPtr<IHostApplication> = host_app_wrapper
+        .to_com_ptr::<IHostApplication>()
+        .ok_or("ComWrapper::to_com_ptr<IHostApplication> a échoué")?;
 
-    // 3. Resolve le controller (sur CE thread = STA, donc le plugin va le
-    //    thread-affiner ici).
-    let controller = match resolve_controller(&component, &module, &host_app) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(target: "jamodio::vst3::editor", error = %e, "resolve_controller failed");
-            return;
-        }
-    };
+    // 2. Resolve le controller sur CE thread (= le thread de la factory, le
+    //    seul que les plugins considèrent comme "main").
+    let controller = resolve_controller(&component, &module, &host_app)?;
 
-    // 4. IConnectionPoint bidirectionnel — VIA proxies thread-checked (pattern
-    //    SDK Steinberg). Sans ces proxies, le plugin marshalize des notify()
-    //    cross-thread depuis l'audio thread vers ce thread STA assis dans
-    //    `attached()` → deadlock. Les proxies sont keep-alive dans
-    //    `_conn_proxies` jusqu'à la fin du thread (le plugin garde les ptr
-    //    en cache, dropping = use-after-free).
-    let _conn_proxies = connect_component_to_controller_via_proxies(&component, &controller);
+    // 3. IConnectionPoint bidirectionnel via proxies thread-checked (pattern
+    //    SDK Steinberg, cf. conn_proxy.rs). Les notify du thread audio RT
+    //    sont droppés, tout le reste est forwardé. Le handshake JUCE
+    //    controller→component (sendIntMessage) passe ici, pendant connect().
+    let proxies = connect_component_to_controller_via_proxies(&component, &controller);
 
-    // 5. State sync via stream (toléré E_NOTIMPL).
+    // 4. State sync via stream (toléré E_NOTIMPL).
     sync_component_state(&component, &controller);
 
-    // 6. IComponentHandler.
+    // 5. IComponentHandler.
     let handler_wrapper = ComWrapper::new(MinimalHandler);
-    let handler: ComPtr<IComponentHandler> = match handler_wrapper.to_com_ptr::<IComponentHandler>() {
-        Some(h) => h,
-        None => {
-            tracing::error!(target: "jamodio::vst3::editor", "ComWrapper::to_com_ptr<IComponentHandler> a échoué");
-            return;
-        }
-    };
+    let handler: ComPtr<IComponentHandler> = handler_wrapper
+        .to_com_ptr::<IComponentHandler>()
+        .ok_or("ComWrapper::to_com_ptr<IComponentHandler> a échoué")?;
     let set_ok = unsafe { controller.setComponentHandler(handler.as_ptr()) };
     tracing::info!(
         target: "jamodio::vst3::editor",
@@ -298,36 +321,24 @@ fn editor_thread_main(
         "setComponentHandler"
     );
 
-    // 7. createView (sur ce thread = STA).
+    // 6. createView.
     let view_ptr = unsafe {
         let cstr = b"editor\0";
         controller.createView(cstr.as_ptr() as *const i8)
     };
     if view_ptr.is_null() {
-        tracing::error!(
-            target: "jamodio::vst3::editor",
-            "createView('editor') retourne null — le plugin refuse de fournir une UI"
-        );
-        return;
+        return Err("createView('editor') retourne null — le plugin refuse de fournir une UI".into());
     }
-    let view = match unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) } {
-        Some(v) => v,
-        None => {
-            tracing::error!(target: "jamodio::vst3::editor", "ComPtr::from_raw(view) NULL");
-            return;
-        }
-    };
+    let view = unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) }
+        .ok_or("ComPtr::from_raw(view) NULL")?;
     tracing::info!(target: "jamodio::vst3::editor", "createView ok");
 
-    // 8. Platform check + size.
+    // 7. Platform check + size.
     let plat_ok = unsafe { view.isPlatformTypeSupported(PLATFORM_HWND.as_ptr() as *const i8) };
     if plat_ok != kResultOk {
-        tracing::error!(
-            target: "jamodio::vst3::editor",
-            tresult = plat_ok,
-            "plugin ne supporte pas la plateforme HWND"
-        );
-        return;
+        return Err(format!(
+            "plugin ne supporte pas la plateforme HWND (tresult={plat_ok})"
+        ));
     }
     let mut size = ViewRect { left: 0, top: 0, right: 800, bottom: 600 };
     let _ = unsafe { view.getSize(&mut size) };
@@ -339,12 +350,9 @@ fn editor_thread_main(
         "size demandée par le plugin"
     );
 
-    // 9. HWND parent — visible directement avec WS_VISIBLE. Tests précédents :
-    //    cacher la window pour attached() ne change rien au hang, on revient
-    //    à WS_VISIBLE pour voir la window immédiatement et confirmer qu'elle
-    //    apparaît avant attached().
+    // 8. HWND parent.
     ensure_window_class();
-    let title_w = wide(&title);
+    let title_w = wide(title);
     let class_w = wide(HOST_NAMESPACE);
     let hinst = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
@@ -366,78 +374,66 @@ fn editor_thread_main(
         )
     };
     if hwnd.is_null() {
-        tracing::error!(target: "jamodio::vst3::editor", "CreateWindowExW returned null");
-        return;
+        return Err("CreateWindowExW returned null".into());
     }
     unsafe {
         SetWindowTextW(hwnd, title_w.as_ptr());
         ShowWindow(hwnd, SW_SHOW);
     }
-    hwnd_slot.store(hwnd, Ordering::SeqCst);
     tracing::info!(target: "jamodio::vst3::editor", "HWND créée et affichée");
 
-    // 10. IPlugFrame.
+    // 9. IPlugFrame + attached. Sur CE thread (= message thread JUCE), la
+    //    création du peer JUCE est directe — pas de marshaling cross-thread.
     let frame_wrapper = ComWrapper::new(PlugFrame);
     let frame: ComPtr<IPlugFrame> = match frame_wrapper.to_com_ptr::<IPlugFrame>() {
         Some(f) => f,
         None => {
-            tracing::error!(target: "jamodio::vst3::editor", "ComWrapper::to_com_ptr<IPlugFrame> a échoué");
-            return;
+            unsafe { DestroyWindow(hwnd) };
+            return Err("ComWrapper::to_com_ptr<IPlugFrame> a échoué".into());
         }
     };
     let set_frame_ok = unsafe { view.setFrame(frame.as_ptr()) };
     tracing::info!(target: "jamodio::vst3::editor", tresult = set_frame_ok, "setFrame");
 
-    // 11. Drain les messages WM_CREATE initiaux.
-    pump_pending_messages();
-
-    // 12. attached — le moment de vérité.
     tracing::info!(target: "jamodio::vst3::editor", "calling attached…");
     let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
     if att_ok != kResultOk {
-        tracing::error!(
-            target: "jamodio::vst3::editor",
-            tresult = att_ok,
-            "IPlugView::attached failed"
-        );
-        return;
+        unsafe { DestroyWindow(hwnd) };
+        return Err(format!("IPlugView::attached failed (tresult={att_ok})"));
     }
     tracing::info!(target: "jamodio::vst3::editor", "IPlugView::attached ok");
 
-    // 13. onSize après attach.
+    // 10. onSize après attach.
     let _ = unsafe {
         view.onSize(&ViewRect {
             left: 0, top: 0, right: width, bottom: height,
         } as *const _ as *mut ViewRect)
     };
 
-    // 14. Msg pump.
-    let mut msg: MSG = unsafe { std::mem::zeroed() };
-    loop {
-        let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
-        if r <= 0 {
-            break;
-        }
-        unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        if msg.message == WM_DESTROY {
-            break;
-        }
-    }
-
-    // 15. Cleanup côté plugin.
-    let _ = unsafe { view.removed() };
-    hwnd_slot.store(std::ptr::null_mut(), Ordering::SeqCst);
-
-    // Keepalives droppent en sortie de scope (frame → view → handler → controller
-    // → host_app → component → module). CoUninitialize via ComGuard::drop.
-    let _ = (frame, view, handler, controller, host_app, component, module);
-    tracing::info!(target: "jamodio::vst3::editor", "editor thread exiting");
+    // 11. Publie l'état — la pump centrale de vst3-main dispatch désormais
+    //     les messages de cette fenêtre ; cleanup sur WM_DESTROY.
+    shared.hwnd.store(hwnd as *mut c_void, Ordering::SeqCst);
+    shared.state.store(STATE_OPEN, Ordering::SeqCst);
+    OPEN_EDITORS.with(|m| {
+        m.borrow_mut().insert(
+            hwnd as isize,
+            EditorState {
+                frame,
+                view,
+                handler,
+                proxies,
+                controller,
+                host_app,
+                component,
+                module,
+                shared: shared.clone(),
+            },
+        )
+    });
+    Ok(())
 }
 
-// ---------- Helpers (tournent sur le thread éditeur) ----------
+// ---------- Helpers (tournent sur vst3-main) ----------
 
 /// Synchronise l'état du `IComponent` vers le `IEditController` via un
 /// `IBStream` mémoire éphémère. Tolérant à E_NOTIMPL.
@@ -478,21 +474,15 @@ fn sync_component_state(component: &ComPtr<IComponent>, controller: &ComPtr<IEdi
 /// Connecte composant et controller via `IConnectionPoint` **avec des proxies
 /// ThreadChecker** (= pattern Steinberg SDK `connectionproxy.cpp`).
 ///
-/// Sans proxy, brancher directement les 2 IConnectionPoint du plugin permet
-/// à un notify() depuis l'audio thread de se faire marshalize vers l'UI
-/// thread STA qui est assis dans `IPlugView::attached()` → **deadlock
-/// circulaire** observé sur Valhalla, Surge XT, et probablement tous les
-/// plugins commerciaux. C'est ce qui causait la fenêtre blanche +
-/// "NOT RESPONDING" en S1.
-///
-/// Le proxy stocke le `thread_id` au moment de sa création (= ce thread
-/// éditeur STA). Quand le component (depuis l'audio thread RT) tente un
-/// notify via le proxy, le ThreadChecker drop le message → pas de marshaling
-/// → pas de deadlock.
+/// Le proxy drop les notify() venant du thread audio RT (= le seul cas où un
+/// notify pourrait surprendre un plugin pendant que vst3-main est occupé) et
+/// forward tout le reste. Le handshake JUCE controller→component passe par
+/// `host_app.createInstance(IMessage)` + notify à travers le proxy — les deux
+/// côtés tournent sur vst3-main, donc le filtre laisse passer.
 ///
 /// Retourne les 2 ComWrappers pour les garder vivants (= dans
-/// `EditorThreadData.connection_proxies`) — sinon refcount à 0 = use-after-
-/// free dès que le plugin tente un notify.
+/// `EditorState.proxies`) — sinon refcount à 0 = use-after-free dès que le
+/// plugin tente un notify.
 fn connect_component_to_controller_via_proxies(
     component: &ComPtr<IComponent>,
     controller: &ComPtr<IEditController>,
@@ -507,8 +497,8 @@ fn connect_component_to_controller_via_proxies(
     let proxy_for_comp_ptr = proxy_for_comp.to_com_ptr::<IConnectionPoint>()?;
 
     // Proxy côté controller : peer du controller sera ce proxy. Quand
-    // controller notifie son peer (depuis l'UI thread = ce thread), le proxy
-    // forward vers comp_cp.
+    // controller notifie son peer (depuis vst3-main), le proxy forward vers
+    // comp_cp.
     let proxy_for_ctrl = ComWrapper::new(ConnectionProxy::new());
     proxy_for_ctrl.set_dst(comp_cp.clone());
     let proxy_for_ctrl_ptr = proxy_for_ctrl.to_com_ptr::<IConnectionPoint>()?;
@@ -577,7 +567,7 @@ fn resolve_controller(
     }
     tracing::info!(
         target: "jamodio::vst3::editor",
-        "controller = separate class instance, initialized on STA thread"
+        "controller = separate class instance, initialized on vst3-main"
     );
     Ok(controller)
 }
