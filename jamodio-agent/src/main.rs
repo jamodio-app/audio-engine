@@ -7,6 +7,8 @@
 mod audio;
 mod logging;
 mod pipeline;
+#[cfg(target_os = "windows")]
+mod tray_promote;
 mod ws_server;
 
 use jamodio_audio_core::mixer::mixer::AudioMixer;
@@ -53,6 +55,30 @@ fn get_log_dir() -> String {
 #[tauri::command]
 fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Quitte proprement l'agent : informe les browsers connectés
+/// (`Shutdown { reason }`) puis termine le process après un court délai
+/// (le temps que la frame WS parte). Utilisé par le bouton « Quitter
+/// l'agent » de la fenêtre ET par le menu tray — un seul chemin de sortie.
+fn graceful_quit(app: &tauri::AppHandle, reason: &'static str) {
+    tracing::info!(target: "jamodio::lifecycle", reason, "quit requested");
+    if let Some(ws) = app.try_state::<WsServerHandle>() {
+        ws.broadcast_shutdown(reason);
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.exit(0);
+    });
+}
+
+/// Bouton « Quitter l'agent » de la fenêtre agent (ui/index.html).
+/// Filet indispensable sur Windows quand l'icône tray est masquée par
+/// l'OS (overflow Win11) — cf. tray_promote.rs pour la promotion d'icône.
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    graceful_quit(&app, "quit");
 }
 
 /// Vérifie une éventuelle update via l'endpoint configuré dans
@@ -157,7 +183,7 @@ fn main() {
         ))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version])
+        .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version, quit_app])
         .setup(|app| {
             tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
 
@@ -195,7 +221,10 @@ fn main() {
                 }
                 let _ = tray.set_menu(Some(menu));
                 tray.on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => app.exit(0),
+                    // Même chemin de sortie que le bouton de la fenêtre :
+                    // broadcast Shutdown aux browsers AVANT de quitter
+                    // (l'ancien app.exit(0) direct coupait la WS sans prévenir).
+                    "quit" => graceful_quit(app, "quit"),
                     "show" => {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.show();
@@ -207,6 +236,12 @@ fn main() {
             } else {
                 tracing::warn!(target: "jamodio::tray", "no tray icon found");
             }
+
+            // Windows 11 masque les nouvelles icônes tray dans l'overflow
+            // « ^ » — on promeut la nôtre (IsPromoted=1) au premier run,
+            // sans jamais écraser un choix utilisateur. Cf. tray_promote.rs.
+            #[cfg(target_os = "windows")]
+            tray_promote::spawn_promotion();
 
             // ─── Deep link handler (jamodio://) ────────────
             // Quand l'user clique "Lancer" dans le browser jamodio.com et que
@@ -249,6 +284,9 @@ fn main() {
             pipeline.spawn_virtual_midi();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
             let ws_handle = WsServerHandle::new(pipeline);
+            // State managé : permet à graceful_quit (commande quit_app +
+            // menu tray) de broadcaster Shutdown aux browsers connectés.
+            app.manage(ws_handle.clone());
             let ws_handle_for_server = ws_handle.clone();
 
             tauri::async_runtime::spawn(async move {

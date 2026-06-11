@@ -6,6 +6,40 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.29] — 2026-06-11
+
+### Added — ASIO par défaut sur Windows (chantier A, bloquant v0.5.0)
+
+L'agent était compilé avec la feature cpal `asio` mais utilisait
+`cpal::default_host()` partout = **WASAPI shared toujours** (+10-20 ms
+évitables, silencieux). Cf. `internal-docs/plans/PLAN-ASIO-WINDOWS.md`.
+
+- **`audio/host.rs` (nouveau)** : sélection du host UNE fois au boot —
+  ASIO si un driver expose ≥ 1 device d'entrée, sinon WASAPI (macOS :
+  CoreAudio, inchangé). Choix + raison loggés. Les 7 duplications de
+  `default_host()` dans device.rs passent par ce point unique.
+- **Wire** : `Devices.audioHost` (`"asio"|"wasapi"|"coreaudio"`, additif
+  rétro-compatible) → le browser affiche badge vert ASIO / badge orange
+  WASAPI + toast unique au join + lien support optimiser-latence.
+- **Pas de fallback silencieux** : échec d'ouverture sur host ASIO
+  (driver mono-client tenu par un DAW) → `CaptureError` dédiée
+  `asio-open-failed` avec message UI explicite, PAS de bascule WASAPI
+  cachée qui mentirait sur la latence.
+- Buffers : `buffer_size.rs` gérait déjà les Range ASIO (16-4096) →
+  Fixed(128) négocié comme avant.
+
+### Added — Quit UX Windows (chantier C)
+
+- **Tray auto-épinglé Windows 11** (`tray_promote.rs`) : écrit
+  `IsPromoted=1` dans `HKCU\Control Panel\NotifyIconSettings\<id>`
+  UNIQUEMENT si la valeur est absente (premier run) — un masquage
+  volontaire par l'utilisateur n'est jamais écrasé. Win10 : no-op loggé.
+- **Bouton « Quitter l'agent »** dans la fenêtre agent (filet quand
+  l'icône tray est masquée). Sortie unifiée `graceful_quit` : broadcast
+  `Shutdown{reason:"quit"}` aux browsers connectés puis exit — le menu
+  tray Quitter passait par `app.exit(0)` sec sans prévenir personne,
+  corrigé au passage.
+
 ## [0.4.28] — 2026-06-11
 
 ### Fixed — polish éditeur VST3 Windows (suite v0.4.27, qui OUVRE la fenêtre ✅)

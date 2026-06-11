@@ -260,6 +260,13 @@ pub enum AgentMessage {
     Devices {
         inputs: Vec<AudioDevice>,
         outputs: Vec<AudioDevice>,
+        /// Backend audio actif côté agent : `"asio"` | `"wasapi"` |
+        /// `"coreaudio"`. Décidé une fois au boot (cf. `audio::host`).
+        /// Le browser s'en sert pour informer l'utilisateur : WASAPI sur
+        /// Windows = latence non optimale → badge orange + lien support.
+        /// Optionnel pour rétro-compat (vieux agents ne l'envoient pas).
+        #[serde(rename = "audioHost", skip_serializing_if = "Option::is_none")]
+        audio_host: Option<String>,
     },
     Status {
         state: AgentState,

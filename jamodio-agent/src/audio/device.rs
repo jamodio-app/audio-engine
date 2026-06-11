@@ -36,7 +36,7 @@ fn parse_id(id: &str) -> Option<(usize, &str)> {
 
 /// List all available audio input devices.
 pub fn list_inputs() -> Vec<AudioDevice> {
-    let host = cpal::default_host();
+    let host = super::host::active();
     let default = host.default_input_device().and_then(|d| d.name().ok());
 
     let Ok(devices) = host.input_devices() else { return vec![] };
@@ -63,7 +63,7 @@ pub fn list_inputs() -> Vec<AudioDevice> {
 
 /// List all available audio output devices.
 pub fn list_outputs() -> Vec<AudioDevice> {
-    let host = cpal::default_host();
+    let host = super::host::active();
     let default = host.default_output_device().and_then(|d| d.name().ok());
 
     let Ok(devices) = host.output_devices() else { return vec![] };
@@ -90,7 +90,7 @@ pub fn list_outputs() -> Vec<AudioDevice> {
 /// (premier lancement). Une fois une sélection persistée côté browser,
 /// elle est l'unique source de vérité.
 pub fn default_input_id() -> Option<String> {
-    let host = cpal::default_host();
+    let host = super::host::active();
     let default_name = host.default_input_device().and_then(|d| d.name().ok())?;
     let devices = host.input_devices().ok()?;
     for (idx, d) in devices.enumerate() {
@@ -105,7 +105,7 @@ pub fn default_input_id() -> Option<String> {
 /// sample rate par défaut, flag default. Aide le debug des cas où le nom d'un device
 /// est surprenant (aggregate device, virtuel, UID numérique CoreAudio, etc.).
 pub fn log_devices() {
-    let host = cpal::default_host();
+    let host = super::host::active();
     let def_in = host.default_input_device().and_then(|d| d.name().ok()).unwrap_or_default();
     let def_out = host.default_output_device().and_then(|d| d.name().ok()).unwrap_or_default();
     tracing::info!(target: "jamodio::devices", default_input = %def_in, default_output = %def_out, "CPAL devices");
@@ -153,7 +153,7 @@ pub fn log_devices() {
 /// utilisateur explicite (CaptureError côté wire).
 pub fn get_input_device(id: &str) -> Option<cpal::Device> {
     let (idx, expected_name) = parse_id(id)?;
-    let host = cpal::default_host();
+    let host = super::host::active();
     let devices: Vec<cpal::Device> = host.input_devices().ok()?.collect();
     let dev = devices.into_iter().nth(idx)?;
     let actual_name = dev.name().ok()?;
@@ -174,7 +174,7 @@ pub fn get_input_device(id: &str) -> Option<cpal::Device> {
 /// Résolution stricte output : même logique que `get_input_device`.
 pub fn get_output_device(id: &str) -> Option<cpal::Device> {
     let (idx, expected_name) = parse_id(id)?;
-    let host = cpal::default_host();
+    let host = super::host::active();
     let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
     let dev = devices.into_iter().nth(idx)?;
     let actual_name = dev.name().ok()?;
@@ -197,7 +197,7 @@ pub fn get_output_device(id: &str) -> Option<cpal::Device> {
 /// pas l'output dans le flow actuel — sortie déléguée à l'OS, cf. décision
 /// audio_output_decision). Renvoie le device + son nom pour log.
 pub fn default_output_device() -> Option<(cpal::Device, String)> {
-    let host = cpal::default_host();
+    let host = super::host::active();
     let dev = host.default_output_device()?;
     let name = dev.name().ok()?;
     Some((dev, name))

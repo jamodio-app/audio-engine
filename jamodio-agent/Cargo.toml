@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.4.28"
+version = "0.4.29"
 edition = "2021"
 description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
 
@@ -56,6 +56,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
 ] }
+# Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
+# HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
+winreg = "0.52"
 
 # Hôte AU plugins — macOS uniquement.
 [target.'cfg(target_os = "macos")'.dependencies]

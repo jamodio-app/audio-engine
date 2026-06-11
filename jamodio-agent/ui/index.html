@@ -51,6 +51,9 @@
     </div>
     <div class="actions">
       <button id="export-logs" type="button">Exporter les logs</button>
+      <!-- Filet quit OS-agnostic : indispensable sur Windows quand l'icône
+           tray est rangée dans l'overflow (cf. tray_promote.rs). -->
+      <button id="quit-app" type="button" title="Ferme l'Audio Engine (les studios ouverts seront prévenus)">Quitter l'agent</button>
     </div>
     <div class="ws-status" id="ws-status">ws://localhost:9876 — en attente</div>
     <div class="version" id="version">—</div>
@@ -104,6 +107,18 @@
           exportBtn.title = String(err);
           setTimeout(() => { exportBtn.textContent = 'Exporter les logs'; }, 2500);
         }
+      });
+    }
+
+    // ─── Bouton "Quitter l'agent" ──────────────────────────────
+    // Sortie propre : la commande quit_app broadcast Shutdown aux browsers
+    // connectés avant de terminer le process (même chemin que le menu tray).
+    const quitBtn = $('quit-app');
+    if (quitBtn) {
+      quitBtn.addEventListener('click', () => {
+        quitBtn.textContent = 'Fermeture…';
+        quitBtn.disabled = true;
+        tauriInvoke('quit_app');
       });
     }
 

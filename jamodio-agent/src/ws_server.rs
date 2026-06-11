@@ -1069,7 +1069,8 @@ async fn handle_message(
         BrowserMessage::GetDevices => {
             let inputs = device::list_inputs();
             let outputs = device::list_outputs();
-            vec![AgentMessage::Devices { inputs, outputs }]
+            let audio_host = Some(crate::audio::host::kind().wire_name().to_string());
+            vec![AgentMessage::Devices { inputs, outputs, audio_host }]
         }
 
         BrowserMessage::SelectDevices { input_id, output_id } => {
@@ -1144,7 +1145,25 @@ async fn handle_message(
                     }]
                 }
                 Err(crate::pipeline::CaptureStartError::Other(msg)) => {
-                    vec![AgentMessage::Error { message: msg }]
+                    // ASIO est mono-client : l'échec d'ouverture n°1 est un
+                    // driver déjà tenu par une autre app (DAW). On le dit
+                    // EXPLICITEMENT au browser (reason dédiée) au lieu d'un
+                    // Error générique — jamais de fallback WASAPI silencieux
+                    // qui mentirait sur la latence (cf. PLAN-ASIO-WINDOWS A5).
+                    if crate::audio::host::kind() == crate::audio::host::HostKind::Asio {
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            detail = %msg,
+                            "StartCapture failed on ASIO host (driver occupé ?)"
+                        );
+                        vec![AgentMessage::CaptureError {
+                            reason: "asio-open-failed".into(),
+                            requested_device: input_device,
+                            detail: Some(msg),
+                        }]
+                    } else {
+                        vec![AgentMessage::Error { message: msg }]
+                    }
                 }
             }
         }
