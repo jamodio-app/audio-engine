@@ -6,6 +6,18 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.37] — 2026-06-12
+
+### Added
+- **Redémarrage à la demande depuis le navigateur** (`protocol.rs`,
+  `ws_server.rs`, `main.rs`) : nouveau message browser→agent `Restart`,
+  déclenché par le bouton « Relancer mon agent » du banner d'update. L'agent
+  rejoue le flux d'auto-update (download + install de la version dispo),
+  broadcaste `Shutdown` aux clients connectés, puis `app.restart()`. Avant,
+  le bouton ne faisait que masquer le banner côté navigateur — il ne relançait
+  rien. `WsServerHandle` porte désormais le `AppHandle` (injecté au `setup`)
+  pour pouvoir déclencher `check_for_update` hors du boot.
+
 ## [0.4.36] — 2026-06-12
 
 ### Security — durcissement pré-BETA (audit adversarial)

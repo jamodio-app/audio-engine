@@ -132,6 +132,11 @@ pub struct WsServerHandle {
     /// pratique avec single-client) qu'un shutdown est imminent (auto-update).
     /// Capacité 4 : largement suffisant pour les ~quelques events de cycle de vie.
     shutdown_tx: broadcast::Sender<&'static str>,
+    /// Handle Tauri — permet de déclencher le flux d'auto-update + restart à la
+    /// demande (message browser `Restart`, bouton « Relancer mon agent »).
+    /// `OnceLock` car le handle n'est connu qu'au `setup()` (après `new`), mais
+    /// on veut garder `new` testable sans environnement Tauri.
+    app: Arc<OnceLock<tauri::AppHandle>>,
 }
 
 impl WsServerHandle {
@@ -142,7 +147,14 @@ impl WsServerHandle {
             client_active: Arc::new(AtomicBool::new(false)),
             active_client_killer: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_tx,
+            app: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Injecte le `AppHandle` Tauri (appelé une fois au `setup()`). Idempotent :
+    /// un 2e appel est ignoré (OnceLock). Requis avant `trigger_restart`.
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        let _ = self.app.set(app);
     }
 
     /// Diffuse un message Shutdown à tous les clients WS actuellement connectés.
@@ -151,6 +163,23 @@ impl WsServerHandle {
     pub fn broadcast_shutdown(&self, reason: &'static str) {
         // send() retourne Err si aucun receiver — pas grave, on s'en fiche.
         let _ = self.shutdown_tx.send(reason);
+    }
+
+    /// Déclenche le redémarrage de l'agent à la demande du browser (bouton
+    /// « Relancer mon agent »). Réutilise exactement le flux d'auto-update du
+    /// boot : `check_for_update` télécharge + installe la version dispo,
+    /// broadcaste `Shutdown`, puis `app.restart()`. Fire-and-forget (spawn) pour
+    /// ne pas bloquer la receive loop WS pendant le download. No-op + warn si le
+    /// `AppHandle` n'a pas été injecté (ne devrait pas arriver en prod).
+    pub fn trigger_restart(&self) {
+        let Some(app) = self.app.get().cloned() else {
+            tracing::warn!(target: "jamodio::ws", "Restart requested but AppHandle not set — ignoring");
+            return;
+        };
+        let me = self.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::check_for_update(app, me).await;
+        });
     }
 }
 
@@ -254,6 +283,16 @@ async fn handle_one_message(
             return true;
         }
     };
+
+    // Restart : intercepté ici (pas dans handle_message) car il a besoin du
+    // AppHandle porté par `handle`, pas seulement du pipeline. Fire-and-forget
+    // côté trigger_restart → on rend la main immédiatement (la WS tombera quand
+    // le Shutdown sera broadcasté puis app.restart()).
+    if matches!(browser_msg, BrowserMessage::Restart) {
+        tracing::info!(target: "jamodio::ws", "browser requested agent restart (update banner)");
+        handle.trigger_restart();
+        return true;
+    }
 
     let responses = handle_message(browser_msg, &handle.pipeline).await;
     for resp in responses {
@@ -1769,5 +1808,10 @@ async fn handle_message(
                 }],
             }
         }
+
+        // Restart est intercepté en amont dans handle_one_message (il a besoin
+        // du AppHandle, pas seulement du pipeline) et n'atteint jamais ce match.
+        // Bras défensif pour l'exhaustivité — no-op si jamais routé ici.
+        BrowserMessage::Restart => vec![],
     }
 }

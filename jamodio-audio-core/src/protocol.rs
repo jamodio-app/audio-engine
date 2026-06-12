@@ -208,6 +208,14 @@ pub enum BrowserMessage {
     /// REC-2/REC-3 — stop l'enregistrement courant. L'agent répond avec
     /// `RecordingDone` contenant les fichiers Ogg/Opus en base64.
     StopRecording,
+    /// Demande explicite de redémarrage de l'agent, déclenchée par le bouton
+    /// « Relancer mon agent » du banner d'update browser (agent-version-check.js).
+    /// L'agent relance le flux d'auto-update (download+install si une version
+    /// est disponible sur l'endpoint configuré), broadcaste `Shutdown` aux
+    /// clients connectés, puis `app.restart()`. Pas de réponse directe :
+    /// le browser voit la WS tomber (Shutdown puis close) et bascule en
+    /// fallback, puis reconnecte sur l'agent relancé/à jour.
+    Restart,
 }
 
 /// Spec d'un stem à enregistrer, transmise par le browser au start.

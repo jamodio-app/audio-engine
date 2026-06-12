@@ -87,7 +87,7 @@ fn quit_app(app: tauri::AppHandle) {
 /// `app.restart()` pour que le browser puisse afficher un toast et
 /// préparer un fallback gracieux (au lieu de voir un TCP close brutal
 /// + watchdog timeout 3 s).
-async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerHandle) {
+pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerHandle) {
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
@@ -284,6 +284,10 @@ fn main() {
             pipeline.spawn_virtual_midi();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
             let ws_handle = WsServerHandle::new(pipeline);
+            // Injecte le AppHandle pour que le message browser `Restart`
+            // (bouton « Relancer mon agent ») puisse déclencher check_for_update
+            // + app.restart() depuis la receive loop WS.
+            ws_handle.set_app_handle(app.handle().clone());
             // State managé : permet à graceful_quit (commande quit_app +
             // menu tray) de broadcaster Shutdown aux browsers connectés.
             app.manage(ws_handle.clone());
