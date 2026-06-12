@@ -2,6 +2,8 @@
 name = "jamodio-audio-core"
 version = "0.4.32"
 edition = "2021"
+license = "LicenseRef-Jamodio-Proprietary"
+publish = false
 description = "Jamodio audio engine core — Opus codec, RTP, UDP, mixer, jitter buffer"
 
 [dependencies]

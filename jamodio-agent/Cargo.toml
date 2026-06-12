@@ -2,6 +2,8 @@
 name = "jamodio-agent"
 version = "0.4.32"
 edition = "2021"
+license = "LicenseRef-Jamodio-Proprietary"
+publish = false
 description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
 
 [build-dependencies]

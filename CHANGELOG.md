@@ -10,7 +10,7 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ### Security — P0 review pré-beta (3 quick-wins)
 
-Suite à la code review senior du 11/06 (`internal-docs/audits/REVIEW-AGENT-2026-06-11.md`) :
+Suite à la code review senior du 11/06 :
 - **Anti-replay SRTP activé sur Windows** (`net/srtp_webrtc.rs`) : le
   backend webrtc-srtp tournait SANS protection anti-replay (`Context::new`
   options à `None` → `srtp_no_replay_protection()`), alors que le backend
@@ -45,7 +45,7 @@ chercher `jamodio::tray` → le log dira exactement ce qui se passe.
 
 ### Fixed — tray Windows : promotion qui fonctionne vraiment (v2)
 
-Constat (test Ben sur Win11) : Explorer crée l'entrée
+Constat (test sur Win11) : Explorer crée l'entrée
 `NotifyIconSettings` avec `IsPromoted=0` D'OFFICE → la v1, qui ne
 promouvait que si la valeur était absente, ne promouvait jamais. v2 :
 marqueur dédié `HKCU\Software\Jamodio\AudioEngine\TrayPromotedOnce` —
@@ -59,7 +59,7 @@ précédente est loggée pour diagnostic.
 ### Fixed — installeur MSI : texte enfin lisible (v2 des BMPs)
 
 Le texte des dialogs MSI est rendu par Windows en GRIS FONCÉ, non
-recolorable (captures Ben ×2). La v1 (v0.4.29) avait dégagé les zones de
+recolorable (captures ×2). La v1 (v0.4.29) avait dégagé les zones de
 texte mais en les laissant sombres → texte foncé sur fond foncé. v2 :
 - `dialog.bmp` : bande de marque sombre à gauche (glyphe + JAMODIO),
   zone de texte DROITE en clair (#f7f8f9) — la bande blanche du checkbox
@@ -73,7 +73,7 @@ texte mais en les laissant sombres → texte foncé sur fond foncé. v2 :
 
 L'agent était compilé avec la feature cpal `asio` mais utilisait
 `cpal::default_host()` partout = **WASAPI shared toujours** (+10-20 ms
-évitables, silencieux). Cf. `internal-docs/plans/PLAN-ASIO-WINDOWS.md`.
+évitables, silencieux).
 
 - **`audio/host.rs` (nouveau)** : sélection du host UNE fois au boot —
   ASIO si un driver expose ≥ 1 device d'entrée, sinon WASAPI (macOS :
@@ -429,7 +429,7 @@ chemin audio chaud (`voiceTrack.enabled` uniquement, zero-latence).
 
 ### Reverted — Variante A (ticker silencieux mode MIDI)
 
-Rapport BETA Yannick (v0.4.18 → v0.4.20) : craquement numérique
+Rapport BETA (v0.4.18 → v0.4.20) : craquement numérique
 reproductible sur swaps successifs MIDI↔AUDIO. 3 tentatives de fix
 (probe_input_format v0.4.19, drain 80 ms v0.4.20) n'ont pas résolu en
 pratique. La Variante A introduisait un swap de source CPAL↔ticker au
@@ -492,7 +492,7 @@ Net : **−825 lignes**. Code simpler, plus sûr. 58 tests workspace OK
 
 ### Fixed — Craquement numérique sur swaps successifs MIDI↔AUDIO
 
-Rapport BETA Yannick v0.4.19 :
+Rapport BETA v0.4.19 :
 - Entrée studio en MIDI : OK
 - Bascule AUDIO : OK (1er swap propre)
 - Re-bascule MIDI : **craquement numérique**
@@ -539,7 +539,7 @@ courant reste actif.
 
 ### Fixed — Swap MIDI→AUDIO échouait sur devices > 2ch (régression v0.4.18)
 
-Reproduction (rapport BETA Yannick) :
+Reproduction (rapport BETA) :
 1. Entrer en studio en mode MIDI (clavier + plugin instrument INSERT chargé)
 2. Commuter en mode AUDIO depuis l'UI (panneau Source d'entrée)
 3. Toast bloquant :
@@ -1057,7 +1057,7 @@ Côté agent :
   instable, l'agent renvoie périodiquement pour signaler la situation
   continue ; sinon le badge UI disparaît après 60 s sans message).
 - Seuil retenu : **> 16 drift drains sur fenêtre 30 s** (= ~1 par 2 s,
-  cohérent avec le pattern Yannick observé en baseline 22/05).
+  cohérent avec le pattern observé en baseline 22/05).
 - Log warn `jamodio::mixer` (= visible dans agent.log).
 
 Côté browser :
@@ -1680,15 +1680,14 @@ workgroup, thread déjà dans un workgroup) :
   `[target.'cfg(...)']` donc le Mac ne link pas Windows et inversement.
 - Pas de changement de protocole WS : 100 % compatible browser v0.4.1.
 - Préreq mesure post-merge : `node scripts/agent-latency-baseline.js
-  --compare internal-docs/baselines/agent-v0.4.1-baseline.json <session-v0.4.2.txt>`
+  --compare <baseline.json> <session-v0.4.2.txt>` (outillage interne)
   doit exit 0.
 
 ## [0.4.1] — 2026-05-23
 
 ### Added — Sprint S1 stabilité : instrumentation profonde
 
-Premier sprint du chantier "Fondations stabilité agent" (cf.
-`internal-docs/PLAN-EXECUTION-AGENT-STABILITE.md`). Pas de changement
+Premier sprint du chantier "Fondations stabilité agent". Pas de changement
 comportemental visible utilisateur — purement instrumentation pour
 diagnostiquer les futures sessions et établir une baseline chiffrée
 avant les refactors S2 (thread priority) et S3 (split encoder).
@@ -1760,7 +1759,7 @@ avant les refactors S2 (thread priority) et S3 (split encoder).
   (16 tests audio-core, dont les 7 nouveaux). Build release Mac OK.
 - Préreq pour PR-2 (S3+S4) : exécuter `agent-latency-baseline.js --save`
   sur une session test 10 min Mac+Win, committer le résultat dans
-  `internal-docs/baselines/agent-v0.4.1-baseline.json`.
+  la baseline interne v0.4.1.
 
 ## [0.4.0] — 2026-05-17
 
@@ -1924,8 +1923,7 @@ collègues sur Mac avec leurs AU.
 v0.2.24 a introduit les entitlements `disable-library-validation` +
 `allow-jit` qui permettent de charger les plugins AU 3rd party. Effet de
 bord : ces plugins se chargent maintenant **in-process** dans notre agent,
-au lieu d'être rejetés. Et certains plugins (FIN-NEO d'UJAM observé chez
-Yannick) ont des destructeurs C++ buggés qui throw une exception
+au lieu d'être rejetés. Et certains plugins (FIN-NEO d'UJAM observé en beta) ont des destructeurs C++ buggés qui throw une exception
 (`std::thread::~thread()` quand le thread n'a pas été join), ce qui
 déclenche `std::terminate()` → crash de l'agent.
 
@@ -1954,7 +1952,7 @@ et la majorité des plugins fonctionneront.
 
 ## [0.2.24] — 2026-05-13
 
-### Entitlements AU host — vraie cause du bug Yannick (v0.2.23 ne suffisait pas)
+### Entitlements AU host — vraie cause du bug AU (v0.2.23 ne suffisait pas)
 
 Bug toujours présent en v0.2.23 malgré le main-thread dispatch + fallback
 v3↔v2 : sur Mac M-series macOS 15.7.5, **TOUS** les plugins 3rd party
@@ -1989,11 +1987,11 @@ Bitwig, Reaper, MainStage utilisent tous ces entitlements).
 ### Tests
 
 Pas de nouveau test unitaire (entitlements ne s'appliquent qu'au binaire
-signé). Validation manuelle Yannick au déploiement v0.2.24.
+signé). Validation manuelle au déploiement v0.2.24.
 
 ## [0.2.23] — 2026-05-13
 
-### Sprint robustesse plugin AU — fix bug Yannick (BFD + AmpliTube `-1`)
+### Sprint robustesse plugin AU — fix bug plugin AU (BFD + AmpliTube `-1`)
 
 Plusieurs plugins lourds (BFD Player, AmpliTube 5, Kontakt, etc.) plantaient
 silencieusement avec `v2 InstanceNew failed: -1` chez certains utilisateurs,
@@ -2374,7 +2372,7 @@ chaque `consumer.rtpReceiver.playoutDelayHint`. Mais en **mode agent**,
 le RTP arrive direct SFU → agent CPAL → mixer → playback, et le delay
 n'était **jamais transmis à l'agent**. Donc à 3+ peers ou avec un peer
 distant, on perdait l'alignement automatique qui fonctionne en mode
-browser. Invisible à 2 peers FR-FR fibre (test Ben+Yannick 22 ms reste
+browser. Invisible à 2 peers FR-FR fibre (test interne 2 musiciens 22 ms reste
 22 ms), critique dès qu'on passe à 3+ peers ou qu'un peer est sur un
 continent différent.
 
@@ -2418,7 +2416,7 @@ delay d'alignement), V2 : séparer `align_delay` du target adaptatif
 
 ### Self-monitor via agent — 25 ms → ≈10 ms ear-to-ear
 
-Yannick puis Ben rapportaient s'entendre « légèrement décalé » dans leur
+Des testeurs rapportaient s'entendre « légèrement décalé » dans leur
 casque pendant les sessions, même avec un setup correctement configuré
 (Scarlett bien matchée, agent v0.2.3, DSCP EF en place, ping 22 ms peer).
 Diagnostic : en mode agent, **deux captures simultanées** du même device

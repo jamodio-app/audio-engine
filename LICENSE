@@ -1,0 +1,39 @@
+Jamodio Audio Engine — Licence propriétaire (source-available)
+
+Copyright © 2026 Jamodio. Tous droits réservés.
+JAMODIO™ est une marque déposée (INPI).
+
+------------------------------------------------------------------------
+
+Ce dépôt est PUBLIC mais N'EST PAS un logiciel libre ni open-source.
+
+Le code source est rendu visible uniquement pour des raisons techniques
+(distribution des binaires et fonctionnement de l'updater automatique de
+l'application). Sa publication ne confère AUCUN droit d'utilisation,
+de copie, de modification ou de redistribution.
+
+Vous ÊTES autorisé à :
+  - consulter le code source à des fins d'information personnelle ;
+  - télécharger et exécuter les binaires officiels distribués par Jamodio
+    via les releases de ce dépôt, dans le cadre normal d'utilisation du
+    service Jamodio.
+
+Vous N'ÊTES PAS autorisé, sans accord écrit préalable de Jamodio, à :
+  - copier, reproduire ou redistribuer tout ou partie du code source ;
+  - modifier, adapter, traduire ou créer des œuvres dérivées ;
+  - réutiliser le code dans un autre projet, commercial ou non ;
+  - retirer ou altérer les mentions de copyright et de marque.
+
+LE LOGICIEL EST FOURNI « EN L'ÉTAT », SANS GARANTIE D'AUCUNE SORTE,
+EXPRESSE OU IMPLICITE, Y COMPRIS NOTAMMENT LES GARANTIES DE QUALITÉ
+MARCHANDE, D'ADÉQUATION À UN USAGE PARTICULIER ET D'ABSENCE DE
+CONTREFAÇON. EN AUCUN CAS LES AUTEURS OU TITULAIRES DES DROITS NE
+SAURAIENT ÊTRE TENUS RESPONSABLES D'UNE QUELCONQUE RÉCLAMATION, D'UN
+DOMMAGE OU AUTRE RESPONSABILITÉ.
+
+Composants tiers : ce logiciel inclut des bibliothèques open-source
+tierces, chacune régie par sa propre licence (voir les fichiers de
+dépendances et leurs licences respectives).
+
+Mentions légales complètes : https://jamodio.com/legal
+Contact : support@jamodio.com
