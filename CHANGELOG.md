@@ -6,6 +6,56 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.34] — 2026-06-12
+
+### Fixed — LOT 2 review pré-beta : MAJEURS robustesse
+
+- **Enregistrement — plus de panic Ogg** (`record/opus_ogg.rs`,
+  `record/ogg.rs`) : une page Ogg ne peut contenir que 255 segments de
+  lacing ; sur un transitoire VBR à gros packets, l'ancien `assert!`
+  crashait le thread record (fichiers perdus). On flushe désormais la page
+  AVANT débordement (batching par segments) ; l'assert devient debug-only.
+- **Enregistrement — plus de blocage au stop** (`record/mod.rs`) : si le
+  finalize timeout (thread record figé), on ne `join()` plus le thread
+  (laissé détaché) — sinon le thread de contrôle de l'agent se bloquait
+  indéfiniment.
+- **StopRecording ne gèle plus le pipeline** (`ws_server.rs`,
+  `pipeline.rs`) : on extrait le handle d'enregistrement sous un lock COURT
+  puis on finalise (jusqu'à 30s) HORS lock — avant, tous les autres
+  handlers voyaient « overloaded » pendant tout le finalize.
+- **PlayMidiNote ne bloque plus le runtime** (`ws_server.rs`) : `try_lock`
+  du plugin_host au lieu de `lock` bloquant — une note de clavier HTML est
+  abandonnée si un load/unload est en cours plutôt que de bloquer un worker.
+
+### Fixed — VST3 cycle de vie (Windows)
+
+- **`Instance::drop` appelle toujours `terminate()`** si `initialize` a
+  réussi (`host.rs`) — avant, seulement si `setup_stereo` avait réussi →
+  une instance qui échoue au setup (fréquent au scan) fuyait sans terminate
+  (contrat IPluginBase violé).
+- **Ordre de teardown au shutdown** (`lib.rs`) : champ `editor` déclaré
+  avant `instance` + `Drop for Vst3Host` qui route la fermeture des
+  éditeurs et les `terminate()` via vst3-main (règle single-main-thread).
+- **`ExitDll` appelé avant `FreeLibrary`** (`loader.rs`) — contrat SDK
+  VST3 ; release de la factory puis ExitDll puis dlclose, dans l'ordre.
+- **Ouverture d'éditeur en échec** (`editor.rs`) : si `createView`/`attached`
+  échoue, on déconnecte les IConnectionPoint et on terminate le controller
+  séparé (sinon réouverture cassée + leak).
+
+### Changed — clarté du dashboard fenêtre agent
+
+Étiquettes et infobulles réécrites, lambda-friendly et HONNÊTES :
+« Latence » → **« Latence locale »** (tooltip explicite : N'INCLUT PAS le
+réseau ; la latence réelle avec un partenaire est dans le studio).
+« Jitter » → « Gigue réseau », « CPAL » → « Buffer carte »,
+« Streams » → « Musiciens reçus », « Underruns » → « Coupures ».
+(L'ancien tooltip « Latence end-to-end » était trompeur.)
+
+### Internal
+- perfstats/levels : un seul flusher par agent (gate `!is_internal`). Le
+  dashboard de la fenêtre agent (alimenté par GetStats, pull non-destructif)
+  est inchangé.
+
 ## [0.4.33] — 2026-06-12
 
 ### Fixed — LOT 1 review pré-beta : 2 CRITIQUE teardown plugins

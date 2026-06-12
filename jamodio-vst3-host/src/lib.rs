@@ -61,15 +61,20 @@ pub struct Vst3Host {
 }
 
 struct Entry {
+    /// Déclaré AVANT `instance` → droppé AVANT elle : la fenêtre éditeur
+    /// (view.removed) doit être fermée avant le `terminate()` du component.
+    /// (Le teardown propre passe de toute façon par vst3-main : cf. `unload`
+    /// et `Drop for Vst3Host` ; cet ordre de champs est une défense en plus.)
+    editor: Option<EditorWindow>,
     instance: Instance,
     /// `Arc` car la registry éditeur sur vst3-main en garde aussi une
     /// référence (la DLL doit rester en vie pendant la durée de vie de la
-    /// window).
+    /// window). Déclaré APRÈS `instance` → droppé après elle (la DLL reste
+    /// chargée tant que l'Instance tient ses ComPtr).
     module: Arc<LoadedModule>,
     #[allow(dead_code)]
     plugin_ref: PluginRef,
     latency: u32,
-    editor: Option<EditorWindow>,
     /// Queue d'events MIDI poussés par `dispatch_midi_only` (= clavier HTML
     /// via WS PlayMidiNote). Drainée au prochain `process_stereo`.
     /// Concurrence : push depuis le thread WS, drain depuis l'encoder thread.
@@ -89,6 +94,26 @@ impl Vst3Host {
 impl Default for Vst3Host {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Vst3Host {
+    fn drop(&mut self) {
+        // Au shutdown agent, le Vst3Host peut être droppé depuis n'importe
+        // quel thread. Or fermer les éditeurs (view.removed) et `terminate()`
+        // les composants DOIVENT se faire sur vst3-main (règle single-main-
+        // thread VST3). On route donc tout le teardown via `main_thread::run`,
+        // éditeur fermé AVANT le drop de l'Instance.
+        if self.entries.is_empty() {
+            return;
+        }
+        let entries: Vec<Entry> = self.entries.drain().map(|(_, e)| e).collect();
+        crate::main_thread::run(move || {
+            for mut e in entries {
+                drop(e.editor.take()); // close éditeur (inline car on est sur vst3-main)
+                drop(e); // Instance::drop → terminate sur vst3-main
+            }
+        });
     }
 }
 

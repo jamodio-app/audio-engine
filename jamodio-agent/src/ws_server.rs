@@ -335,6 +335,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     let levels_pipeline = handle.pipeline.clone();
     let levels_tx = out_tx.clone();
     let levels_task = tokio::spawn(async move {
+        // SEUL le client externe (jamodio.com) reçoit les StreamLevels (VU
+        // mètres). La webview interne n'a pas de VU → inutile pour elle. Son
+        // dashboard est nourri par GetStats (pull, non-destructif), pas par
+        // cette task. Gate sur !is_internal pour ne pas dupliquer le travail.
+        if is_internal {
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
@@ -382,6 +389,17 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     let perfstats_tx = out_tx.clone();
     let perfstats_start = Instant::now();
     let perfstats_task = tokio::spawn(async move {
+        // CRITIQUE (review 11/06) : un seul flusher de perfstats par agent.
+        // Le flush des histogrammes + swap(0) des atomics est DESTRUCTIF :
+        // deux tasks (webview interne + browser externe) se partageraient les
+        // données → overload detection sur demi-fenêtres → bypass plugin auto
+        // faussé/silencieux. La webview interne ne consomme PAS « perf-stats »
+        // (son dashboard utilise GetStats, pull non-destructif), donc gater
+        // sur !is_internal ne change rien à son affichage et garantit un seul
+        // flusher pendant les sessions (toujours pilotées par le client externe).
+        if is_internal {
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         // Skip le 1er tick immédiat (sinon flush vide juste après connect).
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1612,7 +1630,14 @@ async fn handle_message(
                     // Mac (AuHost) ET Win (Vst3Host) implémentent tous deux
                     // `dispatch_midi_only` avec la même signature → call
                     // OS-agnostic via le champ `plugin_host` aliasé.
-                    let _ = pl.plugin_host.lock().dispatch_midi_only(handle, &[event]);
+                    // try_lock (pas lock) : si le plugin_host est tenu par un
+                    // load/unload en cours (jusqu'à plusieurs secondes), on NE
+                    // bloque PAS le worker tokio — on abandonne la note. Une
+                    // note de clavier HTML perdue pendant un chargement de
+                    // plugin est acceptable ; bloquer le runtime ne l'est pas.
+                    if let Some(mut host) = pl.plugin_host.try_lock() {
+                        let _ = host.dispatch_midi_only(handle, &[event]);
+                    }
                 }
                 vec![]
             }
@@ -1657,10 +1682,18 @@ async fn handle_message(
             // pendant l'encodage final + lock pipeline.
             let pipeline = pipeline.clone();
             let files_opt = tokio::task::spawn_blocking(move || {
-                // Le blocking thread prend le lock pipeline en sync via
-                // blocking_lock (Tokio Mutex supporte blocking_lock).
-                let mut pl = pipeline.blocking_lock();
-                pl.stop_recording()
+                // Lock COURT : on extrait juste le handle, puis on RELÂCHE le
+                // lock pipeline avant le finalize (jusqu'à 30s). Sinon tous les
+                // autres handlers (heartbeat GetStats…) voient "overloaded"
+                // pendant tout le finalize. Le handle.stop() tourne hors lock.
+                let handle = {
+                    let mut pl = pipeline.blocking_lock();
+                    pl.take_recorder()
+                };
+                match handle {
+                    Some(h) => h.stop(),
+                    None => Vec::new(),
+                }
             })
             .await;
             let files = match files_opt {

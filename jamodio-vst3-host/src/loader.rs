@@ -57,9 +57,31 @@ pub struct LoadedModule {
     /// Chemin binaire interne au bundle / DLL flat. Gardé pour le diag log.
     #[allow(dead_code)]
     pub binary_path: PathBuf,
-    factory: ComPtr<IPluginFactory>,
-    #[allow(dead_code)] // kept alive for the lifetime of the factory
+    /// `Option` pour pouvoir release la factory EXPLICITEMENT dans `Drop`
+    /// (avant `ExitDll`), dans le bon ordre SDK : release objets → ExitDll →
+    /// FreeLibrary. Toujours `Some` entre `load()` et `drop()`.
+    factory: Option<ComPtr<IPluginFactory>>,
+    /// `true` si `InitDll` a été appelé avec succès → `ExitDll` DOIT l'être
+    /// avant `FreeLibrary` (contrat SDK VST3 ; certains plugins fuient ou
+    /// crashent au dlclose sinon).
+    init_dll_called: bool,
     lib: Library,
+}
+
+impl Drop for LoadedModule {
+    fn drop(&mut self) {
+        // Ordre SDK VST3 : (1) release tous les objets COM (la factory),
+        // (2) ExitDll, (3) FreeLibrary (= drop de `lib`, après ce Drop).
+        self.factory = None; // release la factory tant que la DLL est chargée
+        if self.init_dll_called {
+            unsafe {
+                if let Ok(exit) = self.lib.get::<unsafe extern "system" fn() -> bool>(b"ExitDll\0")
+                {
+                    let _ = exit();
+                }
+            }
+        }
+    }
 }
 
 impl LoadedModule {
@@ -68,7 +90,9 @@ impl LoadedModule {
         let lib = unsafe { Library::new(&binary_path) }
             .map_err(|e| format!("dlopen failed for {} : {e}", binary_path.display()))?;
 
-        // Per-OS init (optional but standard).
+        // Per-OS init (optional but standard). On mémorise si InitDll a été
+        // appelé pour appeler ExitDll au drop (contrat SDK).
+        let mut init_dll_called = false;
         unsafe {
             if let Ok(init) = lib.get::<unsafe extern "system" fn() -> bool>(b"InitDll\0") {
                 if !init() {
@@ -77,6 +101,7 @@ impl LoadedModule {
                         binary_path.display()
                     ));
                 }
+                init_dll_called = true;
             }
         }
 
@@ -93,13 +118,15 @@ impl LoadedModule {
         Ok(Self {
             plugin_path: plugin_path.to_path_buf(),
             binary_path,
-            factory,
+            factory: Some(factory),
+            init_dll_called,
             lib,
         })
     }
 
     pub fn factory(&self) -> &ComPtr<IPluginFactory> {
-        &self.factory
+        // Toujours `Some` durant la vie de l'objet (mis à None seulement dans Drop).
+        self.factory.as_ref().expect("factory present until drop")
     }
 }
 

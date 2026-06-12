@@ -135,6 +135,12 @@ pub struct Instance {
     pub class: ClassInfo,
     pub component: ComPtr<IComponent>,
     pub audio: ComPtr<IAudioProcessor>,
+    /// `true` dès que `IPluginBase::initialize` a réussi. Sépare l'init du
+    /// composant (qui DOIT être balancée par `terminate()`) de `setup_done`
+    /// (= setupProcessing/setActive). Un plugin dont `initialize` réussit mais
+    /// `setup_stereo` échoue (fréquent au scan : pas de bus out) doit quand
+    /// même être `terminate()` au drop — sinon contrat IPluginBase violé + leak.
+    pub initialized: bool,
     pub setup_done: bool,
     pub active: bool,
     pub processing: bool,
@@ -208,6 +214,7 @@ impl Instance {
             class,
             component,
             audio,
+            initialized: true, // component.initialize() a réussi ci-dessus
             setup_done: false,
             active: false,
             processing: false,
@@ -457,7 +464,9 @@ impl Drop for Instance {
             if self.active {
                 let _ = self.component.setActive(0);
             }
-            if self.setup_done {
+            // terminate() balance initialize() — indépendant de setup_done
+            // (sinon une instance initialize-ok/setup-fail fuit, cf. scan).
+            if self.initialized {
                 let _ = self.component.terminate();
             }
         }

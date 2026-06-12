@@ -116,7 +116,11 @@ impl OggWriter {
             // dernier segment est 0 (= explicit end marker requis par Ogg).
             // Couvert par le push du `len as u8 = 0` ci-dessus quand len == 0.
         }
-        assert!(segment_table.len() <= 255, "Ogg : max 255 segments par page");
+        // Le caller (opus_ogg.rs) garantit ≤255 segments par page en flushant
+        // avant débordement (et un seul packet Opus ≤ ~16 segments) → invariant
+        // structurel. debug_assert en dev ; plus de panic en prod (l'ancien
+        // assert! crashait le thread record sur un transitoire VBR).
+        debug_assert!(segment_table.len() <= 255, "Ogg : max 255 segments par page");
 
         let header_size = 27 + segment_table.len();
         let data_size: usize = packets.iter().map(|p| p.len()).sum();

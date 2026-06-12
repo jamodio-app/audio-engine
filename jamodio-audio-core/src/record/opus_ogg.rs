@@ -37,6 +37,11 @@ pub struct OpusOggRecorder {
     opus_out: Vec<u8>,
     /// Packets Opus encodés en attente d'écriture dans une page Ogg.
     pending_packets: Vec<Vec<u8>>,
+    /// Nombre de segments de lacing que représentent `pending_packets`.
+    /// Une page Ogg ne peut en contenir que 255 (table de segments = 1 octet).
+    /// On flushe AVANT d'en ajouter un qui dépasserait — sinon panic / page
+    /// corrompue sur un transitoire VBR (gros packets = plusieurs segments).
+    pending_segments: usize,
     /// Granule cumulée (samples décodés à 48kHz depuis le début).
     granule: u64,
     ogg: OggWriter,
@@ -77,6 +82,7 @@ impl OpusOggRecorder {
             frame_buf: Vec::with_capacity(FRAME_SAMPLES_INTERLEAVED * 2),
             opus_out: vec![0u8; OPUS_MAX_PACKET_BYTES],
             pending_packets: Vec::with_capacity(PACKETS_PER_PAGE),
+            pending_segments: 0,
             granule: 0,
             ogg,
             headers_written: true,
@@ -99,7 +105,18 @@ impl OpusOggRecorder {
             let frame: Vec<f32> = self.frame_buf.drain(..FRAME_SAMPLES_INTERLEAVED).collect();
             match self.encoder.encode_float(&frame, &mut self.opus_out) {
                 Ok(n) => {
+                    // Lacing Ogg : un packet de `n` octets occupe (n/255 + 1)
+                    // segments. Une page en contient 255 MAX. On flushe AVANT
+                    // d'ajouter un packet qui ferait déborder (sinon panic /
+                    // page corrompue sur un transitoire VBR à gros packets).
+                    let segs = n / 255 + 1;
+                    if !self.pending_packets.is_empty()
+                        && self.pending_segments + segs > 255
+                    {
+                        self.flush_page(false);
+                    }
                     self.pending_packets.push(self.opus_out[..n].to_vec());
+                    self.pending_segments += segs;
                     self.granule += FRAME_SAMPLES_PER_CHANNEL as u64;
                     if self.pending_packets.len() >= PACKETS_PER_PAGE {
                         self.flush_page(false);
@@ -126,6 +143,7 @@ impl OpusOggRecorder {
         let refs: Vec<&[u8]> = self.pending_packets.iter().map(|p| p.as_slice()).collect();
         self.ogg.write_audio_page(&refs, self.granule, is_last);
         self.pending_packets.clear();
+        self.pending_segments = 0;
     }
 
     /// Écrit la dernière page (EOS) + retourne les bytes Ogg complets.

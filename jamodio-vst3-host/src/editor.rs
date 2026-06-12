@@ -376,15 +376,22 @@ fn open_editor_on_main_thread(
         controller.createView(cstr.as_ptr() as *const i8)
     };
     if view_ptr.is_null() {
+        teardown_partial(&conn, &controller, controller_separate);
         return Err("createView('editor') retourne null — le plugin refuse de fournir une UI".into());
     }
-    let view = unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) }
-        .ok_or("ComPtr::from_raw(view) NULL")?;
+    let view = match unsafe { ComPtr::<IPlugView>::from_raw(view_ptr) } {
+        Some(v) => v,
+        None => {
+            teardown_partial(&conn, &controller, controller_separate);
+            return Err("ComPtr::from_raw(view) NULL".into());
+        }
+    };
     tracing::info!(target: "jamodio::vst3::editor", "createView ok");
 
     // 7. Platform check + size.
     let plat_ok = unsafe { view.isPlatformTypeSupported(PLATFORM_HWND.as_ptr() as *const i8) };
     if plat_ok != kResultOk {
+        teardown_partial(&conn, &controller, controller_separate);
         return Err(format!(
             "plugin ne supporte pas la plateforme HWND (tresult={plat_ok})"
         ));
@@ -423,6 +430,7 @@ fn open_editor_on_main_thread(
         )
     };
     if hwnd.is_null() {
+        teardown_partial(&conn, &controller, controller_separate);
         return Err("CreateWindowExW returned null".into());
     }
     unsafe {
@@ -447,6 +455,7 @@ fn open_editor_on_main_thread(
         Some(f) => f,
         None => {
             unsafe { DestroyWindow(hwnd) };
+            teardown_partial(&conn, &controller, controller_separate);
             return Err("ComWrapper::to_com_ptr<IPlugFrame> a échoué".into());
         }
     };
@@ -457,6 +466,7 @@ fn open_editor_on_main_thread(
     let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
     if att_ok != kResultOk {
         unsafe { DestroyWindow(hwnd) };
+        teardown_partial(&conn, &controller, controller_separate);
         return Err(format!("IPlugView::attached failed (tresult={att_ok})"));
     }
     tracing::info!(target: "jamodio::vst3::editor", "IPlugView::attached ok");
@@ -493,6 +503,34 @@ fn open_editor_on_main_thread(
 }
 
 // ---------- Helpers (tournent sur vst3-main) ----------
+
+/// Annule un wiring partiel quand l'ouverture échoue APRÈS le `connect`
+/// (createView null, attached échoué…). Sans ça : le component reste branché
+/// à l'ancien proxy → la réouverture suivante redonne `createView == null`
+/// (le bug corrigé en v0.4.28 réapparaîtrait sur ce chemin) + leak du
+/// controller initialisé. Miroir du teardown WM_DESTROY.
+fn teardown_partial(
+    conn: &Option<ConnState>,
+    controller: &ComPtr<IEditController>,
+    controller_separate: bool,
+) {
+    if let Some(c) = conn {
+        if let (Some(p1), Some(p2)) = (
+            c.proxy_for_comp.to_com_ptr::<IConnectionPoint>(),
+            c.proxy_for_ctrl.to_com_ptr::<IConnectionPoint>(),
+        ) {
+            unsafe {
+                let _ = c.comp_cp.disconnect(p1.as_ptr());
+                let _ = c.ctrl_cp.disconnect(p2.as_ptr());
+            }
+        }
+    }
+    if controller_separate {
+        unsafe {
+            let _ = controller.terminate();
+        }
+    }
+}
 
 /// Synchronise l'état du `IComponent` vers le `IEditController` via un
 /// `IBStream` mémoire éphémère. Tolérant à E_NOTIMPL.

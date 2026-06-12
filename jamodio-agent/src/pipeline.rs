@@ -706,13 +706,24 @@ impl PipelineState {
         Ok(armed)
     }
 
-    /// REC-3 : stop l'enregistrement et retourne les fichiers Ogg/Opus.
-    /// Bloque jusqu'à finalize (timeout 30s côté handle).
-    pub fn stop_recording(&mut self) -> Vec<RecordedFile> {
+    /// Détache l'enregistreur et retourne son handle SANS finaliser (rapide).
+    /// Le caller appelle ensuite `handle.stop()` HORS du lock pipeline — le
+    /// finalize peut prendre jusqu'à 30s et ne doit pas geler le pipeline
+    /// (sinon tous les autres handlers voient "overloaded" pendant ce temps).
+    pub fn take_recorder(&mut self) -> Option<RecorderHandle> {
         // Détache le tx du mixer d'abord — les tap sites deviennent no-op
         // immédiatement, plus aucune nouvelle commande n'arrive au thread.
         self.mixer.lock().set_record_tx(None);
-        let Some(handle) = self.recorder.take() else {
+        self.recorder.take()
+    }
+
+    /// REC-3 : stop l'enregistrement et retourne les fichiers Ogg/Opus.
+    /// Bloque jusqu'à finalize (timeout 30s côté handle). Tient le lock
+    /// pipeline pendant le finalize → réservé aux callers internes déjà
+    /// dans un contexte de teardown (ex. `stop_capture`). Le handler WS
+    /// StopRecording utilise `take_recorder` + `stop()` hors lock.
+    pub fn stop_recording(&mut self) -> Vec<RecordedFile> {
+        let Some(handle) = self.take_recorder() else {
             return Vec::new();
         };
         let files = handle.stop();

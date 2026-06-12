@@ -28,24 +28,24 @@
         <span class="label">Device</span>
         <span class="value" id="device">—</span>
       </div>
-      <div class="row" title="Latence end-to-end estimée : capture + encode + decode + jitter + playback">
-        <span class="label">Latence</span>
+      <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
+        <span class="label">Latence locale</span>
         <span class="value" id="latency">—</span>
       </div>
-      <div class="row" title="Cible adaptative du jitter buffer (moyenne sur les streams actifs)">
-        <span class="label">Jitter</span>
+      <div class="row" title="Buffer de gigue : marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. « — » quand tu es seul (aucun flux reçu).">
+        <span class="label">Gigue réseau</span>
         <span class="value" id="jitter">—</span>
       </div>
-      <div class="row" title="Buffer matériel CPAL (capture/playback) — fixe à 128 samples">
-        <span class="label">CPAL</span>
+      <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
+        <span class="label">Buffer carte</span>
         <span class="value" id="buffer">—</span>
       </div>
-      <div class="row" title="Nombre de flux audio reçus des autres musiciens">
-        <span class="label">Streams</span>
+      <div class="row" title="Nombre de musiciens dont tu reçois l'audio. 0 = tu es seul dans le studio.">
+        <span class="label">Musiciens reçus</span>
         <span class="value" id="streams">0</span>
       </div>
-      <div class="row" title="Underruns du jitter buffer depuis le démarrage — doit rester proche de 0">
-        <span class="label">Underruns</span>
+      <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard) depuis le démarrage. Doit rester proche de 0.">
+        <span class="label">Coupures</span>
         <span class="value" id="underruns">0</span>
       </div>
     </div>

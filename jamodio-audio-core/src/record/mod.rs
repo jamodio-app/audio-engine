@@ -177,16 +177,29 @@ impl RecorderHandle {
     /// Consomme le handle.
     pub fn stop(mut self) -> Vec<RecordedFile> {
         let _ = self.tx.send(RecordCmd::Finalize);
-        let files = self.finalize_rx
+        match self
+            .finalize_rx
             .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap_or_else(|e| {
-                tracing::error!(target: "jamodio::record", error = ?e, "finalize timeout/disconnect");
+        {
+            Ok(files) => {
+                // Finalize OK → le thread a fini son travail, on peut le join
+                // sans risque de blocage.
+                if let Some(t) = self.thread.take() {
+                    let _ = t.join();
+                }
+                files
+            }
+            Err(e) => {
+                // Timeout/disconnect : le thread record est probablement bloqué
+                // (I/O disque, encodeur figé). On NE join PAS — sinon le thread
+                // de contrôle de l'agent se bloquerait indéfiniment. On le laisse
+                // détaché (il sera nettoyé à la fin du process). Mieux vaut une
+                // fuite de thread bornée qu'un agent wedgé.
+                tracing::error!(target: "jamodio::record", error = ?e, "finalize timeout/disconnect — thread record laissé détaché (pas de join)");
+                let _ = self.thread.take(); // drop le JoinHandle sans join
                 Vec::new()
-            });
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            }
         }
-        files
     }
 }
 
