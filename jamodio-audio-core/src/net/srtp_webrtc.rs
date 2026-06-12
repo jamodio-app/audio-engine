@@ -46,21 +46,26 @@ impl SrtpParameters {
 
     /// Décode les 44 octets en (master_key 32, master_salt 12) — webrtc-srtp
     /// veut les deux séparés (libsrtp les concatène en interne).
-    fn decode(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+    /// Clé + salt décodés dans des `Zeroizing` → effacés de la mémoire au drop
+    /// (le `Context` a copié/dérivé le matériel en interne).
+    fn decode(
+        &self,
+    ) -> Result<(zeroize::Zeroizing<Vec<u8>>, zeroize::Zeroizing<Vec<u8>>), String> {
         if self.crypto_suite != AEAD_AES_256_GCM {
             return Err(format!("unsupported SRTP suite: {}", self.crypto_suite));
         }
-        let bytes = B64
-            .decode(&self.key_base64)
-            .map_err(|e| format!("invalid base64: {e}"))?;
+        let bytes = zeroize::Zeroizing::new(
+            B64.decode(&self.key_base64)
+                .map_err(|e| format!("invalid base64: {e}"))?,
+        );
         if bytes.len() != COMBINED_LEN {
             return Err(format!(
                 "expected {COMBINED_LEN} bytes, got {}",
                 bytes.len()
             ));
         }
-        let key = bytes[..MASTER_KEY_LEN].to_vec();
-        let salt = bytes[MASTER_KEY_LEN..].to_vec();
+        let key = zeroize::Zeroizing::new(bytes[..MASTER_KEY_LEN].to_vec());
+        let salt = zeroize::Zeroizing::new(bytes[MASTER_KEY_LEN..].to_vec());
         Ok((key, salt))
     }
 }
@@ -83,8 +88,8 @@ impl SrtpContext {
         let (remote_key, remote_salt) = remote.decode()?;
 
         let tx = Context::new(
-            &local_key,
-            &local_salt,
+            &local_key[..],
+            &local_salt[..],
             ProtectionProfile::AeadAes256Gcm,
             None,
             None,
@@ -97,8 +102,8 @@ impl SrtpContext {
         // capturés. Le backend mac (libsrtp2) a sa fenêtre replay active par
         // défaut ; on aligne Windows dessus pour une sécurité identique.
         let rx = Context::new(
-            &remote_key,
-            &remote_salt,
+            &remote_key[..],
+            &remote_salt[..],
             ProtectionProfile::AeadAes256Gcm,
             Some(srtp_replay_protection(SRTP_REPLAY_WINDOW)),
             Some(srtcp_replay_protection(SRTP_REPLAY_WINDOW)),

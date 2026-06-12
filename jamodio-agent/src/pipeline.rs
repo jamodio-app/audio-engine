@@ -371,6 +371,24 @@ impl PluginControl {
     /// wet une fois le handle posé. Retourne (name, latency_samples, has_editor)
     /// pour l'ack browser. À appeler hors du lock `PipelineState`.
     pub fn load(&self, plugin_ref: &PluginRef) -> Result<(String, u32, bool), String> {
+        // SÉCURITÉ (audit pré-beta) : n'accepter QUE des plugins présents dans
+        // le cache de scan. Le `path` d'un `PluginRef::Vst3` vient du browser et
+        // arrive jusqu'à `LoadLibrary` (exécution de code natif au chargement).
+        // Sans cette garde, une page autorisée pourrait faire charger une DLL
+        // arbitraire (RCE Windows). Le browser ne propose que des plugins issus
+        // du scan → cette validation est transparente en usage normal. Refus
+        // AVANT unload pour ne pas décharger le plugin courant sur un refus.
+        {
+            let scan = self.plugin_scan_cache.lock();
+            let known = matches!(&*scan, PluginScanCache::Ready(items)
+                if items.iter().any(|p| p.plugin_ref == *plugin_ref));
+            if !known {
+                return Err(
+                    "plugin inconnu (absent du scan) — chargement refusé".to_string(),
+                );
+            }
+        }
+
         // Décharger d'abord (pose handle=None → dry immédiat).
         self.unload();
 

@@ -46,30 +46,42 @@ fn origin_allowed(origin: Option<&str>) -> bool {
         // Origin absent : clients non-browser (tests). On tolère mais on log.
         return true;
     };
-    origin == "https://jamodio.com"
+    // Origins de PRODUCTION (build release ET debug).
+    if origin == "https://jamodio.com"
         || origin == "https://www.jamodio.com"
         // Previews Vercel : on EXIGE le nom de projet Jamodio dans le sous-
-        // domaine. Avant, `ends_with(".vercel.app")` whitelistait TOUT
+        // domaine. `ends_with(".vercel.app")` seul whitelisterait TOUT
         // vercel.app — n'importe qui déploie `evil.vercel.app` (gratuit) et
         // pilote l'agent depuis une page drive-by. Les URLs de preview Vercel
         // sont de la forme `jamodio-<hash|git-branch>-<scope>.vercel.app`.
         || (origin.starts_with("https://jamodio") && origin.ends_with(".vercel.app"))
-        || origin.starts_with("http://localhost:")
-        || origin.starts_with("http://127.0.0.1:")
         || is_internal_client_origin(origin)
         || origin == "file://"
+    {
+        return true;
+    }
+    // Origins de DEV uniquement (serveur web local) : EXCLUS du build release.
+    // En prod, une page sur http://localhost:* (autre app locale, malware,
+    // iframe vers un serveur local) pourrait sinon piloter l'agent
+    // (StartCapture, GetLogsArchive, LoadInstrumentPlugin). Les beta-testeurs
+    // passent par jamodio.com → aucun impact.
+    #[cfg(debug_assertions)]
+    if origin.starts_with("http://localhost:") || origin.starts_with("http://127.0.0.1:") {
+        return true;
+    }
+    false
 }
 
 /// Vrai si l'origin correspond à la webview interne de l'agent Tauri.
 /// Ces clients sont en LECTURE SEULE (UI dashboard) et bypass la
 /// single-client policy : la webview reste connectée même si le browser
 /// jamodio.com l'est aussi. Tauri 2 utilise des schemes différents selon
-/// l'OS, on accepte les variantes courantes.
+/// l'OS (macOS WKWebView `tauri://localhost`, Windows WebView2
+/// `http://tauri.localhost`). Comparaisons EXACTES : un `starts_with`
+/// laisserait passer `tauri://localhost.attacker` / `http://tauri.localhost.evil`
+/// → bypass de la single-client policy par un client local forgeant l'Origin.
 fn is_internal_client_origin(origin: &str) -> bool {
-    origin == "tauri://localhost"
-        || origin == "http://tauri.localhost"
-        || origin.starts_with("tauri://")
-        || origin.starts_with("http://tauri.localhost")
+    origin == "tauri://localhost" || origin == "http://tauri.localhost"
 }
 
 /// Construit un `AgentMessage::Status` avec la version + OS + arch de l'agent.

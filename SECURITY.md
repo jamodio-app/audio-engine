@@ -22,9 +22,9 @@ Si tu préfères l'email :
 Inclure si possible :
 - Une description du problème et de son impact potentiel
 - Les étapes pour reproduire (PoC minimal apprécié)
-- La version concernée (`Jamodio Audio Engine 0.2.x` — visible dans le
-  menu de l'app ou via le banner browser)
-- Ton OS, ta version macOS, et le device audio utilisé si pertinent
+- La version concernée (visible dans la fenêtre de l'agent ou via le
+  banner du navigateur)
+- Ton OS (macOS ou Windows) et le device audio utilisé si pertinent
 
 ## Engagements côté Jamodio
 

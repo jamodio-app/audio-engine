@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.4.35"
+version = "0.4.36"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -16,6 +16,7 @@ serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
 base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
 getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres
+zeroize = "1"              # Efface les clés SRTP décodées de la mémoire au drop
 tracing = "0.1"            # Logging structuré (façade) — init côté binaire jamodio-agent
 thiserror = "1"            # Dérive Error proprement (utilisé par plugin_host)
 

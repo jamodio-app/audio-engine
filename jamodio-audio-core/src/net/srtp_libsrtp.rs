@@ -33,13 +33,16 @@ impl SrtpParameters {
         }
     }
 
-    fn decode(&self) -> Result<Vec<u8>, String> {
+    /// Retourne la clé décodée dans un `Zeroizing` → le buffer est effacé de
+    /// la mémoire au drop (la Session SRTP a copié le matériel en interne).
+    fn decode(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         if self.crypto_suite != AEAD_AES_256_GCM {
             return Err(format!("unsupported SRTP suite: {}", self.crypto_suite));
         }
-        let bytes = B64
-            .decode(&self.key_base64)
-            .map_err(|e| format!("invalid base64: {e}"))?;
+        let bytes = zeroize::Zeroizing::new(
+            B64.decode(&self.key_base64)
+                .map_err(|e| format!("invalid base64: {e}"))?,
+        );
         if bytes.len() != AEAD_AES_256_GCM_KEY_LEN {
             return Err(format!(
                 "expected {AEAD_AES_256_GCM_KEY_LEN} bytes, got {}",
@@ -69,14 +72,14 @@ impl SrtpContext {
         let remote_key = remote.decode()?;
         let policy = CryptoPolicy::aes_gcm_256_16_auth();
         let tx = Session::with_outbound_template(StreamPolicy {
-            key: &local_key,
+            key: &local_key[..],
             rtp: policy,
             rtcp: policy,
             ..Default::default()
         })
         .map_err(|e| format!("create outbound SRTP session: {e:?}"))?;
         let rx = Session::with_inbound_template(StreamPolicy {
-            key: &remote_key,
+            key: &remote_key[..],
             rtp: policy,
             rtcp: policy,
             ..Default::default()

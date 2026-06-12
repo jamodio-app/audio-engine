@@ -23,8 +23,10 @@ Repo : [github.com/jamodio-app/audio-engine](https://github.com/jamodio-app/audi
 
 ```
 .
-├── Cargo.toml                   # Workspace Cargo (2 crates)
-├── jamodio-audio-core/          # Crate lib (Opus, RTP, UDP, mixer, jitter)
+├── Cargo.toml                   # Workspace Cargo (4 crates)
+├── jamodio-audio-core/          # Crate lib (Opus, RTP, UDP, SRTP, mixer, jitter, record)
+├── jamodio-au-host/             # Hôte plugins AudioUnit (macOS uniquement, FFI ObjC++)
+├── jamodio-vst3-host/           # Hôte plugins VST3 (Windows uniquement, COM)
 ├── jamodio-agent/               # Binaire Tauri (UI + orchestration)
 │   ├── tauri.conf.json          # Configuration Tauri (updater, deep-link, tray)
 │   ├── Cargo.toml
@@ -37,6 +39,10 @@ Repo : [github.com/jamodio-app/audio-engine](https://github.com/jamodio-app/audi
 ├── deps/opus-arm64/             # libopus ARM pré-compilée (local uniquement, .gitignore)
 └── .github/workflows/release.yml # CI multi-plateforme (GitHub Actions)
 ```
+
+> `jamodio-au-host` ne compile que sur macOS, `jamodio-vst3-host` que sur
+> Windows (chacun est vide sur l'autre OS) — ils exposent le même trait
+> `PluginHost` de `jamodio-audio-core`.
 
 ---
 

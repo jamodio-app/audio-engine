@@ -475,7 +475,7 @@ fn open_editor_on_main_thread(
     tracing::info!(target: "jamodio::vst3::editor", tresult = set_frame_ok, "setFrame");
 
     tracing::info!(target: "jamodio::vst3::editor", "calling attached…");
-    let att_ok = unsafe { view.attached(hwnd as *mut c_void, PLATFORM_HWND.as_ptr() as *const i8) };
+    let att_ok = unsafe { view.attached(hwnd, PLATFORM_HWND.as_ptr() as *const i8) };
     if att_ok != kResultOk {
         unsafe { DestroyWindow(hwnd) };
         teardown_partial(&conn, &controller, controller_separate);
@@ -492,7 +492,7 @@ fn open_editor_on_main_thread(
 
     // 11. Publie l'état — la pump centrale de vst3-main dispatch désormais
     //     les messages de cette fenêtre ; cleanup sur WM_DESTROY.
-    shared.hwnd.store(hwnd as *mut c_void, Ordering::SeqCst);
+    shared.hwnd.store(hwnd, Ordering::SeqCst);
     shared.state.store(STATE_OPEN, Ordering::SeqCst);
     OPEN_EDITORS.with(|m| {
         m.borrow_mut().insert(
@@ -563,7 +563,7 @@ fn sync_component_state(component: &ComPtr<IComponent>, controller: &ComPtr<IEdi
     }
     let mut dummy: i64 = 0;
     let seek_ok = unsafe {
-        stream.seek(0, IStreamSeekMode_::kIBSeekSet as i32, &mut dummy)
+        stream.seek(0, IStreamSeekMode_::kIBSeekSet, &mut dummy)
     };
     if seek_ok != kResultOk {
         return;
@@ -665,8 +665,8 @@ fn resolve_controller(
     let mut raw: *mut c_void = std::ptr::null_mut();
     let cr_ok = unsafe {
         module.factory().createInstance(
-            cid.as_ptr() as *const i8,
-            IEditController_iid.as_ptr() as *const i8,
+            cid.as_ptr(),
+            IEditController_iid.as_ptr(),
             &mut raw,
         )
     };

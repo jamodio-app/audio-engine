@@ -6,6 +6,37 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.36] — 2026-06-12
+
+### Security — durcissement pré-BETA (audit adversarial)
+
+Suite à 2 audits sécurité dédiés (surface réseau/IPC + robustesse
+mémoire/concurrence) avant le lancement beta public :
+
+- **RCE Windows bloqué** (`pipeline.rs`) : `LoadInstrumentPlugin` n'accepte
+  plus QUE des plugins présents dans le cache de scan. Le `path` d'un
+  `PluginRef::Vst3` venait du navigateur et arrivait jusqu'à `LoadLibrary`
+  (exécution de code natif au chargement) — une page autorisée aurait pu
+  faire charger une DLL arbitraire. Validation transparente (le navigateur
+  ne propose que des plugins scannés).
+- **Origin WS durci** (`ws_server.rs`) : webview interne reconnue par
+  comparaison EXACTE (`tauri://localhost` / `http://tauri.localhost`) au
+  lieu d'un préfixe (un client local pouvait forger `tauri://...evil`). Les
+  origins de DEV (`http://localhost:*`, `127.0.0.1`) ne sont autorisées
+  qu'en build debug → en release, seuls jamodio.com / previews Jamodio /
+  webview interne / file:// passent.
+- **Clés SRTP effacées de la mémoire** (`net/srtp_*.rs`) : les clés
+  décodées sont en `Zeroizing` → zeroées au drop (les deux backends).
+- **Checksum SDK ASIO épinglé en CI** (`release.yml`) : SHA256 vérifié
+  avant compilation dans le binaire signé (supply-chain).
+
+### Changed
+- VST3 : `has_input_bus` est mis en cache à `setup_stereo` — plus d'appel
+  COM `getBusCount` cross-DLL à chaque bloc audio temps-réel (risque de
+  priority-inversion si le plugin verrouille en interne).
+- Hygiène : README à jour (4 crates + hôtes AU/VST3), SECURITY.md (versions
+  génériques mac/Windows). Workspace clippy 100 % propre (mac + Windows).
+
 ## [0.4.35] — 2026-06-12
 
 ### Fixed — LOT 3 review pré-beta : hot-path audio (qualité + RT-safety)

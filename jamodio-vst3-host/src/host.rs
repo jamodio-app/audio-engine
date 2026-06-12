@@ -144,6 +144,12 @@ pub struct Instance {
     pub setup_done: bool,
     pub active: bool,
     pub processing: bool,
+    /// Cache de `getBusCount(kAudio, kInput) > 0`, figé à `setup_stereo`.
+    /// La topologie de bus ne change pas après setup (sauf
+    /// `restartComponent(kIoChanged)`, non géré) → on évite un appel COM
+    /// `getBusCount` cross-DLL à CHAQUE bloc RT (`process_stereo`), qui
+    /// pouvait prendre un lock interne au plugin (priority-inversion).
+    has_input: bool,
     /// Liste d'events VST3 partagée entre nous (push via `set_batch`) et le
     /// plugin (lit via `IEventList` pendant `process()`). Allouée une fois
     /// au load, ré-utilisée à chaque bloc audio (= alloc-free dans le hot path).
@@ -173,8 +179,8 @@ impl Instance {
         let mut comp_raw: *mut c_void = std::ptr::null_mut();
         let ok = unsafe {
             module.factory().createInstance(
-                class.cid.as_ptr() as *const i8,
-                IComponent_iid.as_ptr() as *const i8,
+                class.cid.as_ptr(),
+                IComponent_iid.as_ptr(),
                 &mut comp_raw,
             )
         };
@@ -221,6 +227,8 @@ impl Instance {
             event_list,
             event_list_ptr,
             _host_app: host_app,
+            // Renseigné à setup_stereo (avant tout process_stereo).
+            has_input: false,
         })
     }
 
@@ -230,7 +238,7 @@ impl Instance {
         // canProcessSampleSize(kSample32) — float32 = 99% des plugins modernes.
         let can_32 = unsafe {
             self.audio
-                .canProcessSampleSize(SymbolicSampleSizes_::kSample32 as i32)
+                .canProcessSampleSize(SymbolicSampleSizes_::kSample32)
         };
         if can_32 != 0 {
             return Err(format!(
@@ -241,11 +249,13 @@ impl Instance {
 
         let n_in = unsafe {
             self.component
-                .getBusCount(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32)
+                .getBusCount(MediaTypes_::kAudio, BusDirections_::kInput)
         };
+        // Cache pour le hot path RT (cf. champ `has_input`).
+        self.has_input = n_in > 0;
         let n_out = unsafe {
             self.component
-                .getBusCount(MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32)
+                .getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput)
         };
         tracing::debug!(
             target: "jamodio::vst3",
@@ -299,12 +309,12 @@ impl Instance {
         for media in [MediaTypes_::kAudio, MediaTypes_::kEvent] {
             for dir in [BusDirections_::kInput, BusDirections_::kOutput] {
                 let n = unsafe {
-                    self.component.getBusCount(media as i32, dir as i32)
+                    self.component.getBusCount(media, dir)
                 };
                 for idx in 0..n {
                     let state: u8 = if idx == 0 { 1 } else { 0 };
                     let act_ok = unsafe {
-                        self.component.activateBus(media as i32, dir as i32, idx, state)
+                        self.component.activateBus(media, dir, idx, state)
                     };
                     if act_ok != 0 {
                         tracing::warn!(
@@ -331,8 +341,8 @@ impl Instance {
         }
 
         let mut setup = ProcessSetup {
-            processMode: ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+            processMode: ProcessModes_::kRealtime,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             maxSamplesPerBlock: max_samples,
             sampleRate: sample_rate,
         };
@@ -365,12 +375,10 @@ impl Instance {
         unsafe { self.audio.getLatencySamples() }
     }
 
+    /// `true` si le plugin a ≥ 1 bus audio d'entrée. Valeur CACHÉE (figée à
+    /// `setup_stereo`) — pas d'appel COM sur le hot path RT.
     pub fn has_input_bus(&self) -> bool {
-        let n = unsafe {
-            self.component
-                .getBusCount(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32)
-        };
-        n > 0
+        self.has_input
     }
 
     /// Process un bloc stéréo float32 IN-PLACE, avec dispatch optionnel d'events MIDI.
@@ -429,8 +437,8 @@ impl Instance {
             self.event_list_ptr.as_ptr()
         };
         let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+            processMode: ProcessModes_::kRealtime,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
             numSamples: n,
             numInputs: num_inputs,
             numOutputs: 1,

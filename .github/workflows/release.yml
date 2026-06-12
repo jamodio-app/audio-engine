@@ -115,6 +115,12 @@ jobs:
         run: |
           choco install llvm -y --no-progress
           Invoke-WebRequest -Uri "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip" -OutFile asiosdk.zip
+          # Supply-chain : on PIN le SHA256 du SDK ASIO. Sans ça, un téléchargement
+          # compromis (MITM, compromission du miroir Steinberg) serait compilé dans
+          # le binaire signé distribué aux beta-testeurs. Build interrompu si mismatch.
+          $expected = "bc425d9b98701af74b43639798566c48bc005af7328a2251cff722c1885076b2"
+          $actual = (Get-FileHash asiosdk.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Error "ASIO SDK checksum mismatch: $actual (attendu $expected)"; exit 1 }
           Expand-Archive asiosdk.zip -DestinationPath C:\
           "CPAL_ASIO_DIR=C:\asiosdk_2.3.3_2019-06-14" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
