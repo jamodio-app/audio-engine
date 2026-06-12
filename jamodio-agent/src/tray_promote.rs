@@ -130,7 +130,9 @@ fn try_promote() -> Result<Outcome, std::io::Error> {
         seen += 1;
         let promoted: Option<u32> = sub.get_value("IsPromoted").ok();
         let p_lower = path.to_lowercase();
-        tracing::info!(target: "jamodio::tray", entry = %path, is_promoted = ?promoted, "NotifyIconSettings entry");
+        // On NE logge PAS chaque entrée (le file layer tourne en debug → un
+        // bug report partagé listerait tous les logiciels tray de l'user). Le
+        // bilan ci-dessous + le log de résultat suffisent au diagnostic.
         if p_lower == exe_lower {
             exact_match = Some((name.clone(), promoted));
         } else if !exe_file.is_empty() && p_lower.ends_with(&exe_file) {

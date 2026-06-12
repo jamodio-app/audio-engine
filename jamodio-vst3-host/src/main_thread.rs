@@ -129,6 +129,12 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+thread_local! {
+    /// Garde anti-réentrance du drain de jobs. Uniquement touché sur
+    /// vst3-main → un `Cell` thread-local suffit (pas d'atomique).
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 unsafe extern "system" fn hidden_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -136,6 +142,19 @@ unsafe extern "system" fn hidden_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_APP_JOB {
+        // CRITIQUE (review 11/06) : interdire le drain RÉENTRANT. Un job
+        // comme `open_editor` appelle `IPlugView::attached()`, et beaucoup de
+        // plugins y font tourner une pompe de messages imbriquée (splash,
+        // dialog de licence). Cette pompe re-livre WM_APP_JOB → sans cette
+        // garde, on exécuterait un job `unload` IMBRIQUÉ dans attached() →
+        // `component.terminate()` pendant qu'attached() est sur la pile =
+        // use-after-terminate. On re-poste et on sort : les jobs en attente
+        // seront drainés quand le job courant aura rendu la main.
+        if DRAINING.with(|d| d.get()) {
+            PostMessageW(hwnd, WM_APP_JOB, 0, 0);
+            return 0;
+        }
+        DRAINING.with(|d| d.set(true));
         // Draine TOUS les jobs en attente (plusieurs posts peuvent coalescer).
         loop {
             let job = match MAIN.get() {
@@ -158,6 +177,7 @@ unsafe extern "system" fn hidden_wnd_proc(
                 None => break,
             }
         }
+        DRAINING.with(|d| d.set(false));
         return 0;
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)

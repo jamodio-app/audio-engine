@@ -6,6 +6,27 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.33] — 2026-06-12
+
+### Fixed — LOT 1 review pré-beta : 2 CRITIQUE teardown plugins
+
+- **Use-after-free AU corrigé** (`au_host.mm`) : `openEditor` (v2 et v3)
+  capturait un pointeur `Entry*` brut dans des blocks async à délai non
+  borné (`requestViewController`) + un observer de fermeture jamais
+  retiré ; un `unload` entre-temps libérait l'Entry → écriture sur mémoire
+  libérée. Désormais : capture du `handle_id` + re-résolution sous lock au
+  moment de l'exécution (skip si déchargé), et `removeObserver` au teardown.
+- **Réentrance pump VST3 corrigée** (`main_thread.rs`) : si un plugin fait
+  tourner une pompe de messages imbriquée pendant `attached()`, le drain
+  de jobs ne s'exécute plus de façon réentrante (re-post si déjà en cours)
+  → plus de `component.terminate()` pendant qu'`attached()` est sur la pile
+  (use-after-terminate).
+
+### Changed
+- Tray : l'énumération `NotifyIconSettings` n'est plus loggée par entrée
+  (un bug report ne liste plus les logiciels tray de l'utilisateur) ; seuls
+  le bilan et le résultat de promotion restent loggés.
+
 ## [0.4.32] — 2026-06-11
 
 ### Security — P0 review pré-beta (3 quick-wins)

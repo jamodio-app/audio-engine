@@ -79,6 +79,10 @@ struct Entry {
     AURenderBlock render_block_v3;      // nullptr en v2
     // Commun
     __strong NSWindow *editor_window;   // nil tant que pas ouvert
+    // Token de l'observer NSWindowWillCloseNotification — conservé pour le
+    // retirer au teardown (sinon l'observer survit à l'unload). nil si pas
+    // d'éditeur ouvert.
+    __strong id editor_close_observer;
     AudioComponentDescription desc;
     std::vector<float> in_l, in_r;      // copie de l'input par bloc (callback)
     uint32_t max_frames;
@@ -652,6 +656,13 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     // fonctions `#[test]` Rust tournent sur des threads worker, pas le main.
     Entry *e = entry.get();
     jmo_run_on_main_sync(^{
+        // Retirer l'observer AVANT de fermer la window : sinon il survit à
+        // l'Entry (et son block re-résoudrait par handle_id, désormais absent
+        // — bénin mais inutile). On le retire explicitement par hygiène.
+        if (e->editor_close_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:e->editor_close_observer];
+            e->editor_close_observer = nil;
+        }
         if (e->editor_window) {
             [e->editor_window close];
             e->editor_window = nil; // ARC
@@ -788,9 +799,23 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     AudioComponentDescription desc = e->desc;
     if (e->is_v3) {
         __strong AUAudioUnit *au_v3 = e->au_v3;
+        // CRITIQUE (review 11/06) : NE PAS capturer le pointeur brut `e`.
+        // `requestViewController` est async à délai NON borné (secondes pour
+        // AmpliTube) ; un `unload` entre-temps libère l'Entry → le completion
+        // handler écrirait `e->editor_window` sur de la mémoire libérée
+        // (use-after-free). On capture `handle_id` (Copy) + `self`, et on
+        // re-résout l'Entry sous `lock` au moment de l'exécution.
+        uint32_t hid = handle_id;
         dispatch_async(dispatch_get_main_queue(), ^{
             [au_v3 requestViewControllerWithCompletionHandler:^(AUViewControllerBase * _Nullable vc) {
                 dispatch_async(dispatch_get_main_queue(), ^{
+                    // L'Entry a-t-elle survécu à l'attente async ?
+                    os_unfair_lock_lock(&self->lock);
+                    bool alive = self->entries.find(hid) != self->entries.end();
+                    os_unfair_lock_unlock(&self->lock);
+                    if (!alive) {
+                        return; // plugin déchargé pendant le gap → on abandonne
+                    }
                     NSView *view = vc ? vc.view : nil;
                     CGSize prefSize = view ? view.frame.size : CGSizeMake(800, 600);
                     if (prefSize.width < 200 || prefSize.height < 100) {
@@ -825,14 +850,33 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
                     [win center];
                     [NSApp activateIgnoringOtherApps:YES];
                     [win makeKeyAndOrderFront:nil];
-                    e->editor_window = win;
-                    [[NSNotificationCenter defaultCenter]
+                    // Observer de fermeture : re-résout aussi par handle_id sous
+                    // lock (l'unload peut survenir après l'ouverture).
+                    id observer = [[NSNotificationCenter defaultCenter]
                         addObserverForName:NSWindowWillCloseNotification
                                     object:win
                                      queue:nil
                                 usingBlock:^(NSNotification *_Nonnull __unused note) {
-                        e->editor_window = nil;
+                        os_unfair_lock_lock(&self->lock);
+                        auto it2 = self->entries.find(hid);
+                        if (it2 != self->entries.end()) {
+                            it2->second->editor_window = nil;
+                        }
+                        os_unfair_lock_unlock(&self->lock);
                     }];
+                    // Assignation finale sous lock + re-check (l'unload a pu
+                    // passer pendant la construction de la window).
+                    os_unfair_lock_lock(&self->lock);
+                    auto it = self->entries.find(hid);
+                    if (it != self->entries.end()) {
+                        it->second->editor_window = win;
+                        it->second->editor_close_observer = observer;
+                        os_unfair_lock_unlock(&self->lock);
+                    } else {
+                        os_unfair_lock_unlock(&self->lock);
+                        [[NSNotificationCenter defaultCenter] removeObserver:observer];
+                        [win close];
+                    }
                 });
             }];
         });
@@ -845,7 +889,17 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     // restés en v2 legacy malgré leur modernité). Fallback sur AUGenericView
     // (sliders bruts) si le plugin ne fournit pas de Cocoa UI.
     AudioComponentInstance inst = e->au_inst;
+    // Même protection que le path v3 : le block tourne APRÈS le retour de
+    // openEditor → un unload a pu disposer `inst` entre-temps. On capture
+    // handle_id et on vérifie que l'Entry vit AVANT de toucher `inst`.
+    uint32_t hid = handle_id;
     dispatch_async(dispatch_get_main_queue(), ^{
+        os_unfair_lock_lock(&self->lock);
+        bool alive = self->entries.find(hid) != self->entries.end();
+        os_unfair_lock_unlock(&self->lock);
+        if (!alive) {
+            return; // plugin déchargé → `inst` disposé, ne pas le déréférencer
+        }
         CFStringRef cf_name = nullptr;
         AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
         if (comp) AudioComponentCopyName(comp, &cf_name);
@@ -936,24 +990,45 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
         [win center];
         [NSApp activateIgnoringOtherApps:YES];
         [win makeKeyAndOrderFront:nil];
-        e->editor_window = win;
-        [[NSNotificationCenter defaultCenter]
+        id observer = [[NSNotificationCenter defaultCenter]
             addObserverForName:NSWindowWillCloseNotification
                         object:win
                          queue:nil
                     usingBlock:^(NSNotification *_Nonnull __unused note) {
-            e->editor_window = nil;
+            os_unfair_lock_lock(&self->lock);
+            auto it2 = self->entries.find(hid);
+            if (it2 != self->entries.end()) {
+                it2->second->editor_window = nil;
+            }
+            os_unfair_lock_unlock(&self->lock);
         }];
+        os_unfair_lock_lock(&self->lock);
+        auto it = self->entries.find(hid);
+        if (it != self->entries.end()) {
+            it->second->editor_window = win;
+            it->second->editor_close_observer = observer;
+            os_unfair_lock_unlock(&self->lock);
+        } else {
+            os_unfair_lock_unlock(&self->lock);
+            [[NSNotificationCenter defaultCenter] removeObserver:observer];
+            [win close];
+        }
     });
     return 0;
 }
 
 - (int)closeEditor:(uint32_t)handle_id {
+    // Lookup sous lock (cohérent avec unload qui erase sous lock) + capture
+    // forte de la window avant de la fermer en async.
+    os_unfair_lock_lock(&lock);
     auto it = entries.find(handle_id);
-    if (it == entries.end()) return -1;
-    Entry *e = it->second.get();
-    if (!e->editor_window) return 0;
-    NSWindow *w = e->editor_window;
+    if (it == entries.end()) {
+        os_unfair_lock_unlock(&lock);
+        return -1;
+    }
+    NSWindow *w = it->second->editor_window;
+    os_unfair_lock_unlock(&lock);
+    if (!w) return 0;
     dispatch_async(dispatch_get_main_queue(), ^{
         [w close];
     });
