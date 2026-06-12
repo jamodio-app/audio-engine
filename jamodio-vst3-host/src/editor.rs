@@ -100,7 +100,19 @@ impl IComponentHandlerTrait for MinimalHandler {
     unsafe fn endEdit(&self, _id: ParamID) -> tresult {
         kResultOk
     }
-    unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
+        // kLatencyChanged (review 11/06) : un plugin qui change sa latence
+        // en session (toggle oversampling/lookahead) fausse la compensation
+        // calculée au load. La propagation complète (re-read getLatencySamples
+        // + notification wire au browser) = backlog post-beta ; en attendant,
+        // on rend l'événement VISIBLE dans les logs au lieu de l'avaler.
+        if flags & vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged != 0 {
+            tracing::warn!(
+                target: "jamodio::vst3",
+                flags,
+                "plugin a signalé kLatencyChanged — latence de compensation figée au load (re-sync = backlog)"
+            );
+        }
         kResultOk
     }
 }

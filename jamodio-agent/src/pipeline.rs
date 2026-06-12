@@ -1773,8 +1773,12 @@ fn process_stage_loop(
                 // MIDI. Coût : 1 fill(0) par bloc audio = négligeable.
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
-                    let src = input_source.lock().clone();
-                    if matches!(src, InputSource::Midi(_)) {
+                    // matches! sous le lock, sans clone : l'ancien
+                    // `.lock().clone()` clonait la String du device MIDI à
+                    // CHAQUE bloc audio en mode MIDI (alloc hot path,
+                    // review 11/06).
+                    let is_midi = matches!(&*input_source.lock(), InputSource::Midi(_));
+                    if is_midi {
                         stereo.fill(0.0);
                     }
                 }
@@ -2095,9 +2099,11 @@ fn encode_stage_loop(
                 accumulator.extend_from_slice(&stereo);
 
                 while accumulator.len() >= frame_len {
-                    let frame: Vec<f32> = accumulator.drain(..frame_len).collect();
-
-                    match encoder.encode(&frame, &mut opus_buf) {
+                    // Encode directement depuis le slice de l'accumulateur —
+                    // l'ancien `drain(..).collect()` allouait un Vec par frame
+                    // Opus (~400/s) sur le hot path (review 11/06). Le drain
+                    // sans collect (après encode) ne réalloue pas.
+                    match encoder.encode(&accumulator[..frame_len], &mut opus_buf) {
                         Ok(encoded_len) => {
                             let header = RtpHeader {
                                 payload_type,
@@ -2155,6 +2161,10 @@ fn encode_stage_loop(
                             );
                         }
                     }
+                    // Consomme la frame encodée (ou ratée — comportement
+                    // identique à l'ancien drain-avant-encode) : drain pur,
+                    // sans collect → pas d'allocation.
+                    accumulator.drain(..frame_len);
                 }
 
                 // Sprint S1/S3 — pipeline_latency end-to-end. Le timestamp

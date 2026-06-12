@@ -23,8 +23,13 @@ pub struct RtpHeader {
 }
 
 /// Build an RTP packet: 12-byte header + payload.
+///
+/// La capacité réserve +24 octets de headroom : `SrtpContext::protect`
+/// ajoute le tag d'authentification AEAD (16 octets) au paquet — sans ce
+/// headroom, chaque protect() réallouait le Vec (≈400 fois/s sur le hot
+/// path d'envoi, review 11/06).
 pub fn build_packet(header: &RtpHeader, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + payload.len());
+    let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + payload.len() + 24);
 
     // Byte 0: V=2, P=0, X=0, CC=0 → 0x80
     buf.push(0x80);

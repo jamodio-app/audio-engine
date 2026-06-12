@@ -49,9 +49,9 @@ struct StreamState {
     jitter: JitterBuffer,
     volume: f32,
     /// Pan range [-1.0, 1.0]. -1 = full left, 0 = center, +1 = full right.
-    /// Applique constant-power panning dans `mix_into` (gain_L = cos(θ),
-    /// gain_R = sin(θ) avec θ = (pan+1)·π/4). Le DAW classique pour un
-    /// signal stéréo entrant = balance L/R. Default 0.0 (centré).
+    /// Loi de BALANCE stéréo linéaire dans `mix_into` (0 dB au centre :
+    /// gain_L = min(1, 1−pan), gain_R = min(1, 1+pan)) — la loi standard
+    /// DAW pour un signal stéréo entrant. Default 0.0 (centré).
     pan: f32,
     rms: f32,
     /// Snapshot du `overflow_drops` du jitter au précédent push, pour ne
@@ -202,8 +202,11 @@ impl AudioMixer {
 
     /// Set per-stream volume (0.0 to 1.5).
     pub fn set_volume(&mut self, producer_id: &str, volume: f32) {
+        // Garde NaN alignée sur set_pan/set_dim/set_master_gain :
+        // NaN.clamp() = NaN → silence définitif du stream sinon.
+        let v = if volume.is_finite() { volume.clamp(0.0, 1.5) } else { 1.0 };
         if let Some(stream) = self.streams.get_mut(producer_id) {
-            stream.volume = volume.clamp(0.0, 1.5);
+            stream.volume = v;
         }
     }
 
@@ -213,8 +216,9 @@ impl AudioMixer {
     }
 
     /// Set per-stream pan, range [-1.0, 1.0]. -1=full left, 0=center, +1=full right.
-    /// Applique constant-power panning dans `mix_into`. Pour SELF_MONITOR_ID,
-    /// fonctionne pareil — le browser envoie producer_id="self".
+    /// Applique une loi de balance stéréo linéaire (0 dB au centre) dans
+    /// `mix_into`. Pour SELF_MONITOR_ID, fonctionne pareil — le browser
+    /// envoie producer_id="self".
     /// No-op si le stream n'existe pas (peer parti, race).
     pub fn set_pan(&mut self, producer_id: &str, pan: f32) {
         let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
@@ -325,19 +329,22 @@ impl AudioMixer {
             stream.jitter.pull(&mut self.temp_buf);
 
             let vol = stream.volume;
-            // Constant-power panning : pour pan ≈ 0, fast path sans cos/sin
-            // (skip un test). Sinon angle = (pan+1) · π/4 ∈ [0, π/2],
-            // gain_L = cos(angle), gain_R = sin(angle) — total power constant.
-            // Le temp_buf est stéréo interleaved (L, R, L, R, ...) ; on
-            // applique gain_L sur les samples pairs et gain_R sur les impairs.
+            // Balance stéréo — loi LINÉAIRE 0 dB au centre. Les streams sont
+            // STÉRÉO interleaved (L,R,L,R…) : ce contrôle est un *balance*,
+            // pas un pan mono → la loi correcte atténue un canal sans toucher
+            // l'autre (standard DAW pour pistes stéréo). Continue partout :
+            // centre = 1.0/1.0 (identique au fast-path), extrêmes = 1.0/0.0.
+            // L'ancienne constant-power (cos/sin de (pan+1)·π/4) n'était pas
+            // normalisée au centre → saut de −3 dB sur les DEUX canaux dès
+            // que le fader quittait pan=0 exact (bug audible, review 11/06).
             if stream.pan.abs() < f32::EPSILON {
                 for (out, &sample) in output.iter_mut().zip(self.temp_buf.iter()) {
                     *out += sample * vol;
                 }
             } else {
-                let angle = (stream.pan + 1.0) * std::f32::consts::FRAC_PI_4;
-                let gain_l = vol * angle.cos();
-                let gain_r = vol * angle.sin();
+                let p = stream.pan;
+                let gain_l = vol * (1.0 - p).min(1.0);
+                let gain_r = vol * (1.0 + p).min(1.0);
                 let mut i = 0;
                 while i + 1 < self.temp_buf.len() && i + 1 < output.len() {
                     output[i]   += self.temp_buf[i]   * gain_l;
@@ -502,12 +509,100 @@ impl AudioMixer {
         sum as f32 / targets.len() as f32
     }
 
-    /// Override la target_ms de tous les streams existants ET stocke la valeur
-    /// comme défaut pour les futurs streams. Appelé par le handler SetBuffer.
+    /// Override la target_ms de tous les streams PEERS existants ET stocke la
+    /// valeur comme défaut pour les futurs streams. Appelé par le handler
+    /// SetBuffer.
+    ///
+    /// EXCLUT le self-monitor : son buffer est local (pas de réseau → pas de
+    /// gigue) et plafonné bas (latence d'écoute de son propre instrument).
+    /// L'inclure faisait passer le monitoring de ~5 ms à la target réseau
+    /// (ex. 40 ms = 8×) + un trou audible au re-prime (review 11/06).
     pub fn set_target_ms_all(&mut self, target_ms: usize) {
         self.default_target_ms = Some(target_ms);
-        for stream in self.streams.values_mut() {
+        for (id, stream) in self.streams.iter_mut() {
+            if id == SELF_MONITOR_ID {
+                continue;
+            }
             stream.jitter.set_target_ms(target_ms);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper : pousse un signal constant 1.0 dans un stream et mixe un bloc,
+    /// retourne (gain_L_effectif, gain_R_effectif) mesurés sur la sortie.
+    fn measure_gains(pan: f32) -> (f32, f32) {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1");
+        m.set_pan("p1", pan);
+        // Remplit le jitter buffer au-delà de sa target pour que pull()
+        // rende le signal (et pas du silence de prime).
+        let ones = vec![1.0f32; 48_000]; // 500 ms stéréo @ 48 kHz
+        m.push_samples("p1", &ones);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        // Gain mesuré = valeur des samples (entrée constante à 1.0).
+        (out[0], out[1])
+    }
+
+    /// LOT 3 (review 11/06) — la loi de balance doit être CONTINUE au centre :
+    /// l'ancienne constant-power non normalisée sautait de 1.0 à ~0.707 sur
+    /// les deux canaux dès pan = ±ε (−3 dB audibles d'un cran de fader).
+    #[test]
+    fn pan_law_continuous_at_center() {
+        let (l0, r0) = measure_gains(0.0);
+        let (le, re) = measure_gains(0.001);
+        assert!((l0 - 1.0).abs() < 1e-3, "centre L = unity, got {l0}");
+        assert!((r0 - 1.0).abs() < 1e-3, "centre R = unity, got {r0}");
+        assert!((le - l0).abs() < 0.01, "L continu au centre : {l0} vs {le}");
+        assert!((re - r0).abs() < 0.01, "R continu au centre : {r0} vs {re}");
+    }
+
+    /// Extrêmes de la loi de balance : côté plein = unity, côté opposé = 0
+    /// (identique à l'ancienne loi aux extrêmes → pas de changement perçu).
+    #[test]
+    fn pan_law_endpoints() {
+        let (l, r) = measure_gains(1.0); // full right
+        assert!(l.abs() < 1e-3, "full right : L muet, got {l}");
+        assert!((r - 1.0).abs() < 1e-3, "full right : R unity, got {r}");
+        let (l, r) = measure_gains(-1.0); // full left
+        assert!((l - 1.0).abs() < 1e-3, "full left : L unity, got {l}");
+        assert!(r.abs() < 1e-3, "full left : R muet, got {r}");
+    }
+
+    /// LOT 3 (review 11/06) — SetBuffer (target jitter réseau) ne doit PAS
+    /// toucher le self-monitor : son buffer est local (5 ms), l'inclure
+    /// multipliait la latence de monitoring par 8 (ex. target 40 ms).
+    #[test]
+    fn set_target_ms_all_excludes_self_monitor() {
+        let mut m = AudioMixer::new();
+        m.add_local_stream();
+        m.add_stream("peer");
+        m.set_target_ms_all(40);
+        let (self_target, _) = m.self_monitor_stats();
+        assert_eq!(self_target, SELF_MONITOR_TARGET_MS, "self-monitor préservé");
+        let peers = m.stream_perf_stats();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].3, 40, "peer prend bien la nouvelle target");
+    }
+
+    /// Garde NaN sur set_volume (alignée sur set_pan) : NaN.clamp() = NaN
+    /// aurait silencé le stream définitivement.
+    #[test]
+    fn set_volume_rejects_nan() {
+        let (l, _r) = {
+            let mut m = AudioMixer::new();
+            m.add_stream("p1");
+            m.set_volume("p1", f32::NAN);
+            let ones = vec![1.0f32; 48_000];
+            m.push_samples("p1", &ones);
+            let mut out = vec![0.0f32; 512];
+            m.mix_into(&mut out);
+            (out[0], out[1])
+        };
+        assert!(l.is_finite() && l > 0.5, "volume NaN → fallback 1.0, got {l}");
     }
 }

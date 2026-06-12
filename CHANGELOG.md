@@ -6,6 +6,43 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.35] — 2026-06-12
+
+### Fixed — LOT 3 review pré-beta : hot-path audio (qualité + RT-safety)
+
+Deux bugs AUDIBLES du mixer corrigés (avec tests unitaires) :
+- **Pan/balance continu** (`mixer.rs`) : l'ancienne loi constant-power non
+  normalisée sautait de **−3 dB sur les deux canaux** dès que le fader pan
+  quittait le centre exact. Remplacée par la loi de balance stéréo
+  linéaire 0 dB au centre (standard DAW pour pistes stéréo) : identique au
+  centre (unity) et aux extrêmes (côté plein = unity), continue partout.
+  Tests : continuité au centre + extrêmes.
+- **SetBuffer ne touche plus le self-monitor** (`mixer.rs`) : régler le
+  buffer réseau (ex. 40 ms) multipliait par 8 la latence d'écoute de son
+  propre instrument (5 ms → 40 ms) + un trou audible. Le self-monitor est
+  local, il garde sa cible de 5 ms. Test : exclusion vérifiée.
+
+Allocations supprimées du hot path (review 11/06) :
+- encode stage : plus de `Vec` alloué par frame Opus (~400/s) — encode
+  direct depuis l'accumulateur + drain sans collect.
+- process stage : plus de clone de String par bloc audio en mode MIDI.
+- `rtp::build_packet` : +24 octets de headroom → `SrtpContext::protect`
+  (tag AEAD 16 o) ne réalloue plus chaque paquet (~400/s).
+- `set_volume` : garde NaN alignée sur set_pan (NaN aurait silencé le
+  stream définitivement).
+
+### Changed
+- VST3 : `restartComponent(kLatencyChanged)` est désormais loggé en WARN
+  (latence de compensation figée au load — re-sync complet = backlog) au
+  lieu d'être avalé silencieusement.
+
+### Notes (différé, chantier mesuré post-beta)
+Le pool de buffers cross-stage (to_vec du callback CPAL, remap, taps
+record pendant REC) et le confinement thread des `cpal::Stream` sont
+VOLONTAIREMENT différés : ils touchent la sémantique de shutdown des
+3 stages pour un gain non mesuré (allocations amorties, zéro drop dans
+les baselines). À faire avec mesures avant/après sur matériel réel.
+
 ## [0.4.34] — 2026-06-12
 
 ### Fixed — LOT 2 review pré-beta : MAJEURS robustesse
