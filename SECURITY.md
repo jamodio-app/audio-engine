@@ -17,7 +17,7 @@ recommandée par GitHub pour la divulgation responsable.
 ### Canal email
 
 Si tu préfères l'email :
-**security@jamodio.com**
+**support@jamodio.com**
 
 Inclure si possible :
 - Une description du problème et de son impact potentiel
@@ -63,7 +63,7 @@ host) qui tourne en local sur la machine de l'user et expose :
 L'infrastructure serveur Jamodio (SFU, web app, base de données,
 auth) **n'est pas hébergée dans ce repo** et ne fait pas partie du
 scope de cette politique. Pour ces composants, le même contact
-`security@jamodio.com` reste valide.
+`support@jamodio.com` reste valide.
 
 ## Signature et chaîne d'update
 
