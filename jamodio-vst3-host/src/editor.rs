@@ -43,7 +43,7 @@ use std::sync::Arc;
 use vst3::{
     Class, ComPtr, ComWrapper,
     Steinberg::{
-        int32, kResultOk, tresult, FUnknown, IBStream, IBStreamTrait,
+        int32, kInvalidArgument, kResultOk, kResultTrue, tresult, FUnknown, IBStream, IBStreamTrait,
         IBStream_::IStreamSeekMode_, IPluginBaseTrait, IPluginFactoryTrait, TUID,
         Vst::{
             IComponent, IComponentHandler, IComponentHandlerTrait, IComponentTrait,
@@ -54,12 +54,14 @@ use vst3::{
     },
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetForegroundWindow,
-        SetWindowPos, SetWindowTextW, ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WM_DESTROY, WNDCLASSEXW, WS_EX_DLGMODALFRAME,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
+        RegisterClassExW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, GWL_EXSTYLE,
+        GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SW_SHOW, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+        WM_DESTROY, WM_SIZE, WM_SIZING, WNDCLASSEXW, WS_CAPTION, WS_EX_DLGMODALFRAME, WS_MINIMIZEBOX,
+        WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE,
     },
 };
 
@@ -117,18 +119,89 @@ impl IComponentHandlerTrait for MinimalHandler {
     }
 }
 
-// ---------- IPlugFrame minimal ----------
+// ---------- IPlugFrame ----------
 
-struct PlugFrame;
+/// `IPlugFrame` est le callback par lequel un plugin demande à l'hôte de
+/// redimensionner SA fenêtre (UI scalable, bascule de skin, bouton « agrandir »…).
+/// Le no-op précédent ignorait ces demandes → la fenêtre ne suivait jamais le
+/// plugin. On garde le HWND parent (set après `CreateWindowExW`) pour pouvoir
+/// le redimensionner. `AtomicPtr` car COM peut théoriquement appeler depuis
+/// n'importe quel thread — en pratique toujours vst3-main.
+struct PlugFrame {
+    hwnd: AtomicPtr<c_void>,
+}
+
+impl PlugFrame {
+    fn new() -> Self {
+        Self {
+            hwnd: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    fn set_hwnd(&self, hwnd: HWND) {
+        self.hwnd.store(hwnd, Ordering::SeqCst);
+    }
+}
 
 impl Class for PlugFrame {
     type Interfaces = (IPlugFrame,);
 }
 
 impl IPlugFrameTrait for PlugFrame {
-    unsafe fn resizeView(&self, _view: *mut IPlugView, _new_size: *mut ViewRect) -> tresult {
+    /// Le plugin réclame une nouvelle taille de vue. On redimensionne la HWND
+    /// parente pour que sa zone CLIENT vaille exactement `new_size` (calcul
+    /// exact via `AdjustWindowRectEx`, pas de marge magique). `SetWindowPos`
+    /// émet `WM_SIZE` de façon synchrone → `editor_wnd_proc` rappelle
+    /// `view.onSize()` : c'est la source unique qui confirme la taille au
+    /// plugin, donc pas de double `onSize` ici.
+    unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
+        let hwnd: HWND = self.hwnd.load(Ordering::SeqCst);
+        if hwnd.is_null() || new_size.is_null() {
+            return kInvalidArgument;
+        }
+        let rect = &*new_size;
+        let client_w = rect.right - rect.left;
+        let client_h = rect.bottom - rect.top;
+        if client_w <= 0 || client_h <= 0 {
+            return kInvalidArgument;
+        }
+        let (outer_w, outer_h) = outer_size_for_client(hwnd, client_w, client_h);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            outer_w,
+            outer_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         kResultOk
     }
+}
+
+/// Taille EXTÉRIEURE (fenêtre) nécessaire pour obtenir une zone client de
+/// `client_w × client_h`, d'après le style RÉEL de la fenêtre (bordure + barre
+/// de titre, DPI/thème inclus). Remplace les marges codées en dur `+16/+40`.
+fn outer_size_for_client(hwnd: HWND, client_w: i32, client_h: i32) -> (i32, i32) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        outer_size_for_style(client_w, client_h, style, exstyle)
+    }
+}
+
+/// Variante utilisable AVANT que la fenêtre existe : le style est fourni
+/// explicitement (au moment du `CreateWindowExW`).
+fn outer_size_for_style(client_w: i32, client_h: i32, style: u32, exstyle: u32) -> (i32, i32) {
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    };
+    // bmenu = 0 : pas de menu. Modifie `r` pour englober le non-client.
+    unsafe { AdjustWindowRectEx(&mut r, style, 0, exstyle) };
+    (r.right - r.left, r.bottom - r.top)
 }
 
 // ---------- Registry des fenêtres ouvertes (thread-local vst3-main) ----------
@@ -251,12 +324,81 @@ impl Drop for EditorWindow {
 
 // ---------- wnd_proc + setup (vst3-main uniquement) ----------
 
+/// Clone le `IPlugView` associé à une HWND SANS garder le borrow de la
+/// registry pendant l'appel COM qui suit (le plugin pourrait ré-entrer via
+/// `resizeView` → `borrow_mut` → panic). Le clone = un simple AddRef.
+fn view_for_hwnd(hwnd: HWND) -> Option<ComPtr<IPlugView>> {
+    OPEN_EDITORS.with(|m| m.borrow().get(&(hwnd as isize)).map(|s| s.view.clone()))
+}
+
 unsafe extern "system" fn editor_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // L'utilisateur (ou le plugin via resizeView/SetWindowPos) a redimensionné
+    // la fenêtre → propage la nouvelle zone client au plugin. Sans ça, la vue
+    // gardait sa taille d'origine et se faisait rogner (bug fenêtre éditeur).
+    // À la création, WM_SIZE arrive AVANT l'insertion en registry → ignoré
+    // (la taille initiale est posée explicitement après `attached`).
+    if msg == WM_SIZE {
+        let client_w = (lparam & 0xFFFF) as i32;
+        let client_h = ((lparam >> 16) & 0xFFFF) as i32;
+        // Minimisation (client 0×0) → ne pas infliger une taille dégénérée au
+        // plugin ; sa taille sera re-posée au restore (nouveau WM_SIZE).
+        if client_w > 0 && client_h > 0 {
+            if let Some(view) = view_for_hwnd(hwnd) {
+                let mut rect = ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: client_w,
+                    bottom: client_h,
+                };
+                let _ = view.onSize(&mut rect);
+            }
+        }
+        return 0;
+    }
+
+    // Pendant le drag d'un bord (plugins redimensionnables uniquement : les
+    // plugins fixes n'ont pas WS_THICKFRAME, ce message n'arrive jamais). On
+    // demande au plugin de contraindre la taille (min/max/ratio) via
+    // `checkSizeConstraint`, puis on réécrit le rectangle proposé en gardant
+    // ancré le bord qui n'est PAS tiré.
+    if msg == WM_SIZING {
+        if let Some(view) = view_for_hwnd(hwnd) {
+            let proposed = &mut *(lparam as *mut RECT);
+            // Marge non-client (bord + titre) = taille fenêtre pour un client nul.
+            let (nc_w, nc_h) = outer_size_for_client(hwnd, 0, 0);
+            let client_w = (proposed.right - proposed.left - nc_w).max(1);
+            let client_h = (proposed.bottom - proposed.top - nc_h).max(1);
+            let mut want = ViewRect {
+                left: 0,
+                top: 0,
+                right: client_w,
+                bottom: client_h,
+            };
+            // `want` contient la taille acceptée par le plugin (inchangée s'il
+            // accepte telle quelle, corrigée sinon) — on l'utilise dans tous les cas.
+            let _ = view.checkSizeConstraint(&mut want);
+            let new_w = (want.right - want.left) + nc_w;
+            let new_h = (want.bottom - want.top) + nc_h;
+            let edge = wparam as u32;
+            if edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT {
+                proposed.left = proposed.right - new_w;
+            } else {
+                proposed.right = proposed.left + new_w;
+            }
+            if edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT {
+                proposed.top = proposed.bottom - new_h;
+            } else {
+                proposed.bottom = proposed.top + new_h;
+            }
+        }
+        return 1; // TRUE — rectangle traité.
+    }
+
     if msg == WM_DESTROY {
         // Teardown complet, dans l'ordre du plugprovider SDK :
         // 1. view.removed() pendant que la HWND existe encore
@@ -412,9 +554,26 @@ fn open_editor_on_main_thread(
     let _ = unsafe { view.getSize(&mut size) };
     let width = (size.right - size.left).max(100);
     let height = (size.bottom - size.top).max(100);
+
+    // `canResize` décide si l'UTILISATEUR peut redimensionner la fenêtre. La
+    // grande majorité des plugins (Valhalla, etc.) ont une UI à taille fixe :
+    // leur offrir un cadre redimensionnable ne fait que permettre de rogner le
+    // GUI (le bug). On ne met WS_THICKFRAME/WS_MAXIMIZEBOX (via
+    // WS_OVERLAPPEDWINDOW) que si le plugin le déclare redimensionnable ;
+    // sinon fenêtre fixe (caption + system menu + minimize), qui épouse
+    // exactement la vue.
+    let resizable = unsafe { view.canResize() } == kResultTrue;
+    let exstyle = WS_EX_DLGMODALFRAME;
+    let style = WS_VISIBLE
+        | if resizable {
+            WS_OVERLAPPEDWINDOW
+        } else {
+            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+        };
+    let (outer_w, outer_h) = outer_size_for_style(width, height, style, exstyle);
     tracing::info!(
         target: "jamodio::vst3::editor",
-        width, height,
+        width, height, resizable,
         "size demandée par le plugin"
     );
 
@@ -427,14 +586,14 @@ fn open_editor_on_main_thread(
     };
     let hwnd: HWND = unsafe {
         CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            exstyle,
             class_w.as_ptr(),
             title_w.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             -2_147_483_648,
             -2_147_483_648,
-            width + 16,
-            height + 40,
+            outer_w,
+            outer_h,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -462,7 +621,8 @@ fn open_editor_on_main_thread(
 
     // 9. IPlugFrame + attached. Sur CE thread (= message thread JUCE), la
     //    création du peer JUCE est directe — pas de marshaling cross-thread.
-    let frame_wrapper = ComWrapper::new(PlugFrame);
+    let frame_wrapper = ComWrapper::new(PlugFrame::new());
+    frame_wrapper.set_hwnd(hwnd);
     let frame: ComPtr<IPlugFrame> = match frame_wrapper.to_com_ptr::<IPlugFrame>() {
         Some(f) => f,
         None => {

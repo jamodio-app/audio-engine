@@ -6,6 +6,26 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.38] — 2026-06-22
+
+### Fixed
+- **Fenêtre d'éditeur de plugin VST3 redimensionnable rognait le GUI**
+  (`jamodio-vst3-host/src/editor.rs`, Windows) : la fenêtre hôte était
+  toujours créée en `WS_OVERLAPPEDWINDOW` (donc `WS_THICKFRAME` +
+  `WS_MAXIMIZEBOX`), et aucun `WM_SIZE` ne propageait la nouvelle taille à la
+  vue du plugin — redimensionner laissait du vide ou **coupait le plugin**
+  (Valhalla, etc.). Correctif aligné sur les hôtes pro (Reaper/Cubase) :
+  - La redimensionnabilité *utilisateur* suit `IPlugView::canResize()` : les
+    plugins à UI fixe obtiennent une fenêtre non redimensionnable qui épouse
+    exactement la vue ; seuls les plugins redimensionnables gardent le cadre.
+  - `WM_SIZE` → `IPlugView::onSize()` : la vue suit désormais la zone client.
+  - `WM_SIZING` → `IPlugView::checkSizeConstraint()` : le plugin contraint le
+    drag (min/max/ratio), bord ancré respecté.
+  - `IPlugFrame::resizeView` implémenté (était un no-op) : une demande de
+    resize côté plugin redimensionne réellement la fenêtre hôte.
+  - Dimensionnement exact via `AdjustWindowRectEx` (style/DPI/thème réels) au
+    lieu des marges codées en dur `+16/+40`.
+
 ## [0.4.37] — 2026-06-12
 
 ### Added
