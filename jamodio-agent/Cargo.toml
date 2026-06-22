@@ -57,6 +57,10 @@ jamodio-vst3-host = { path = "../jamodio-vst3-host" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # Énumération ASIO : `asio-sys` charge les drivers via CoCreateInstance sans
+    # initialiser COM lui-même → l'énumération doit tourner sur un thread STA.
+    # Cf. device.rs::enumerate_with_com.
+    "Win32_System_Com",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
