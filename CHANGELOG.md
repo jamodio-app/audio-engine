@@ -6,6 +6,22 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.39] — 2026-06-22
+
+### Fixed
+- **Carte audio (interface ASIO) non détectée par l'agent sur Windows**
+  (`jamodio-agent/src/audio/device.rs`) : `asio-sys` charge les drivers ASIO
+  via `CoCreateInstance` (ASIO SDK `loadAsioDriver`) sans initialiser COM ; sur
+  un thread sans COM (les workers tokio qui traitent `GetDevices`),
+  `load_driver` échoue et cpal **saute silencieusement** le device → liste
+  d'entrées **vide** renvoyée au browser (« Aucune entrée audio détectée »),
+  alors que l'énumération au boot (thread principal Tauri/WebView2, COM STA
+  déjà initialisé) voyait bien la carte. `list_inputs`/`list_outputs`
+  s'exécutent désormais sur un thread frais avec `CoInitializeEx(STA)`.
+  macOS (CoreAudio, pas de COM) : exécution inline inchangée → zéro impact.
+  *(Étape 1/2 — énumération. La capture suivra : elle ouvre aussi le device
+  sur un worker tokio et requiert le même contexte COM.)*
+
 ## [0.4.38] — 2026-06-22
 
 ### Fixed
