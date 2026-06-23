@@ -6,6 +6,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.41] — 2026-06-23
+
+### Fixed
+- **ASIO : « stream configuration not supported » / aucun son** (suite des
+  Étapes 1-2). Une fois la carte trouvée et le stream ouvert sur le thread
+  COM-STA, `build_input_stream` échouait : cpal **ne convertit pas** les formats
+  ASIO et exige que le type demandé == type natif du driver
+  (`host/asio/stream.rs`). On ouvrait un callback `f32` alors que les interfaces
+  ASIO (Focusrite, Scarlett, MOTU…) sont en **Int32** → rejet (faux toast
+  « carte utilisée par une autre app »). `capture.rs`/`playback.rs` ouvrent
+  désormais le stream au **format natif** du driver (f32/i32/i16) et convertissent
+  vers/depuis f32 nous-mêmes (entrée : i32/i16 → f32 normalisé ; sortie : mix f32
+  → type natif via scratch, sans alloc par bloc). CoreAudio/WASAPI (f32 natif) :
+  branche F32, comportement inchangé.
+
 ## [0.4.40] — 2026-06-23
 
 ### Fixed
