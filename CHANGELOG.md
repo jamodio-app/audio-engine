@@ -6,6 +6,27 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-23
+
+> **Jalon — première release validée Windows + macOS, plugins opérationnels.**
+
+Cette version marque la **parité fonctionnelle Windows ↔ macOS** : l'agent est
+désormais testé et validé de bout en bout sur les deux plateformes, plugins
+inclus. Pas de nouvelle fonctionnalité depuis `0.4.41` — c'est la promotion d'un
+état stable en jalon mineur. Acquis consolidés depuis `0.4.x` :
+
+- **Plugins INSERT opérationnels sur les deux OS** : hôte AudioUnit (macOS) et
+  hôte VST3 (Windows). Scan, load, process, bypass, MIDI, éditeur natif.
+- **Éditeur de plugin VST3 (Windows)** : ouverture/réouverture fiables et
+  **fenêtre qui suit le plugin au redimensionnement** sans rogner le GUI
+  (`canResize`/`onSize`/`checkSizeConstraint`/`resizeView`, cf. `0.4.38`),
+  validé sur plugin scalable (ValhallaFutureVerb).
+- **Carte audio ASIO (Windows)** : énumération, capture et playback fonctionnels
+  via un thread COM-STA dédié, au format natif du driver (Int32/Int16/F32),
+  latence validée sur interface réelle (cf. `0.4.39` → `0.4.41`).
+- **macOS Apple Silicon + Windows x64** comme cibles de release officielles
+  (macOS Intel abandonné).
+
 ## [0.4.41] — 2026-06-23
 
 ### Fixed
