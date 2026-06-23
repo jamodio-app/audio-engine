@@ -6,6 +6,27 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.4.40] — 2026-06-23
+
+### Fixed
+- **Capture/playback ASIO impossibles sur Windows (« ENTRÉE AUDIO
+  INTROUVABLE », aucun son)** — suite de l'Étape 1 (v0.4.39, énumération).
+  L'ouverture du stream CPAL (`StartCapture` → `get_input_device` +
+  `build_input_stream`) tournait sur un worker tokio sans COM → `load_driver`
+  ASIO (CoCreateInstance) échouait → device « introuvable » à l'entrée studio.
+  Nouveau module `audio/com_exec.rs` : **thread COM-STA persistant** qui exécute
+  toutes les opérations CPAL/ASIO (énumération, résolution, ouverture ET
+  fermeture des streams). Un objet driver ASIO étant lié à son apartment, il est
+  désormais créé, utilisé et détruit sur le même thread STA. L'énumération
+  (Étape 1) est rebranchée dessus (un seul apartment pour tout l'ASIO).
+  - ASIO mono-client : en capture on ferme l'ancien stream avant d'ouvrir le
+    nouveau ; résolution + ouverture atomiques sur le thread STA (le
+    `cpal::Device`/`Stream` !Send ne traverse jamais les threads).
+  - Ouverture de la **sortie** rendue non-fatale sur échec de *build* : un edge
+    ASIO (duplex) ne rend plus l'utilisateur muet pour les autres — la capture
+    prime, le playback est juste indisponible jusqu'à nouvelle sélection.
+  - macOS (CoreAudio, pas de COM) : exécution inline, comportement inchangé.
+
 ## [0.4.39] — 2026-06-22
 
 ### Fixed
