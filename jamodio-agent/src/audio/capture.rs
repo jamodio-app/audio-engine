@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, SampleRate, StreamConfig, BufferSize};
+use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,6 +68,46 @@ fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_
     super::buffer_size::configs_support_fixed_buffer(supported, channels, sr, target_buf)
 }
 
+/// Error-callback CPAL (identique pour tous les formats d'entrée).
+fn on_capture_err(err: cpal::StreamError) {
+    tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
+}
+
+/// Pousse un bloc de samples f32 entrelacés vers le thread encoder. Factorisé
+/// pour être réutilisé par chaque callback typé (f32/i32/i16) — seule la
+/// conversion vers f32 diffère, la comptabilité des drops est commune.
+#[inline]
+fn forward_samples(samples: Vec<f32>, sample_tx: &Sender<Vec<f32>>, capture_drops: &AtomicU64) {
+    let n = samples.len();
+    match sample_tx.try_send(samples) {
+        Ok(_) => {}
+        Err(TrySendError::Full(_)) => {
+            // Sprint S1 — métrique partagée (lue+reset 1 Hz par ws_server).
+            capture_drops.fetch_add(1, Ordering::Relaxed);
+            static FULLS: AtomicU64 = AtomicU64::new(0);
+            let c = FULLS.fetch_add(1, Ordering::Relaxed);
+            if c == 0 || c.is_power_of_two() {
+                tracing::warn!(
+                    target: "jamodio::capture",
+                    drop_count = c + 1,
+                    samples_dropped = n,
+                    "sample channel full — encoder thread saturé (CPU overload?)"
+                );
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            static DISCONNECTS: AtomicU64 = AtomicU64::new(0);
+            let c = DISCONNECTS.fetch_add(1, Ordering::Relaxed);
+            if c == 0 {
+                tracing::debug!(
+                    target: "jamodio::capture",
+                    "sample channel disconnected — CPAL still pushing post stop_capture (will stop soon)"
+                );
+            }
+        }
+    }
+}
+
 /// Start capturing audio from the given device.
 /// Returns `(stream, channels_captured, native_sample_rate, fixed_buffer)`.
 /// `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`, `None`
@@ -105,6 +145,15 @@ pub fn start_capture(
         .map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
     let channels = default_cfg.channels().max(1);
     let native_sr = default_cfg.sample_rate().0;
+    // Format natif du driver. CRITIQUE sur ASIO : cpal n'y fait AUCUNE
+    // conversion de format — il exige que le type demandé == type natif du
+    // driver (cf. cpal `host/asio/stream.rs` : `if sample_format !=
+    // expected_sample_format { return StreamConfigNotSupported }`). La plupart
+    // des interfaces ASIO (Focusrite, Scarlett, MOTU…) sont en Int32 → ouvrir
+    // un callback `f32` échouait avec « stream configuration not supported ».
+    // On ouvre donc au format natif et on convertit en f32 nous-mêmes.
+    // (CoreAudio/WASAPI : f32 natif → la branche F32 est prise, inchangé.)
+    let sample_format = default_cfg.sample_format();
 
     // Buffer size : on essaye Fixed(128) (= ~2.7ms low-latency, accepté par
     // CoreAudio mac + ASIO Windows + parfois WASAPI exclusive Win 11) et on
@@ -138,53 +187,47 @@ pub fn start_capture(
         attempts.set(attempt);
         let sample_tx = sample_tx.clone();
         let capture_drops = capture_drops.clone();
-        let result = device.build_input_stream(
-            &config,
-            move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                // Send a copy of the audio samples to the encoder thread.
-                // Deux cas d'erreur distincts à ne PAS confondre :
-                // - Full       : encoder saturé (CPU/IO surchargé) → vrai signal
-                //                d'overload qu'on veut voir → warn power-of-2.
-                // - Disconnected : l'encoder thread a quitté (stop_capture) →
-                //                attendu, mais le callback CPAL peut continuer à
-                //                pousser pendant quelques centaines de ms (drop
-                //                cpal::Stream est asynchrone côté CoreAudio) →
-                //                debug only, pas de pollution dans les logs.
-                match sample_tx.try_send(data.to_vec()) {
-                    Ok(_) => {}
-                    Err(TrySendError::Full(_)) => {
-                        // Sprint S1 — métrique partagée (lue+reset 1 Hz par ws_server)
-                        capture_drops.fetch_add(1, Ordering::Relaxed);
-                        // Compteur statique inchangé : sert au throttle de logs
-                        // (un warn par puissance de 2) — indépendant de la métrique.
-                        static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let n = FULLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 || n.is_power_of_two() {
-                            tracing::warn!(
-                                target: "jamodio::capture",
-                                drop_count = n + 1,
-                                samples_dropped = data.len(),
-                                "sample channel full — encoder thread saturé (CPU overload?)"
-                            );
-                        }
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        static DISCONNECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let n = DISCONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 {
-                            tracing::debug!(
-                                target: "jamodio::capture",
-                                "sample channel disconnected — CPAL still pushing post stop_capture (will stop soon)"
-                            );
-                        }
-                    }
-                }
-            },
-            |err| {
-                tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
-            },
-            None, // No timeout côté callback CPAL (la stratégie retry concerne l'init, pas la run).
-        );
+        // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
+        // On ouvre le stream au format NATIF du driver puis on convertit chaque
+        // bloc en f32 normalisé [-1,1] (ce que la pipeline encoder attend).
+        let result = match sample_format {
+            SampleFormat::F32 => device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    forward_samples(data.to_vec(), &sample_tx, &capture_drops);
+                },
+                on_capture_err,
+                None,
+            ),
+            SampleFormat::I32 => device.build_input_stream(
+                &config,
+                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
+                    forward_samples(f, &sample_tx, &capture_drops);
+                },
+                on_capture_err,
+                None,
+            ),
+            SampleFormat::I16 => device.build_input_stream(
+                &config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
+                    let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
+                    forward_samples(f, &sample_tx, &capture_drops);
+                },
+                on_capture_err,
+                None,
+            ),
+            other => {
+                tracing::warn!(
+                    target: "jamodio::capture",
+                    ?other,
+                    "format d'entrée non supporté (attendu f32/i32/i16)"
+                );
+                return Err(cpal::BuildStreamError::StreamConfigNotSupported);
+            }
+        };
         if let Err(ref e) = result {
             // Logué à chaque essai pour tracer la séquence de retry dans agent.log.
             // Le warn final (essai épuisé) reste émis par le caller via ws_server.

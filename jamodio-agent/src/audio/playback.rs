@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, SampleRate, StreamConfig, BufferSize};
+use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -23,6 +23,11 @@ fn device_supports_fixed_buffer(device: &Device, channels: u16, sr: u32, target_
     super::buffer_size::configs_support_fixed_buffer(supported, channels, sr, target_buf)
 }
 
+/// Error-callback CPAL (identique pour tous les formats de sortie).
+fn on_playback_err(err: cpal::StreamError) {
+    tracing::error!(target: "jamodio::playback", error = %err, "CPAL playback error");
+}
+
 /// Start audio playback on the given device.
 /// Pulls mixed audio from the shared AudioMixer.
 /// Returns `(stream, fixed_buffer)` — le stream doit rester vivant (RAII)
@@ -38,19 +43,27 @@ pub fn start_playback(
     // un resampling implicite de qualité variable → potentielles distortions.
     // Warn explicite pour aider le diag user (recommander un device 48k natif
     // dans Sound Settings : Scarlett, Focusrite, MOTU, BlackHole 16ch…).
-    if let Ok(default_cfg) = device.default_output_config() {
-        let native_sr = default_cfg.sample_rate().0;
-        if native_sr != TARGET_SR {
-            let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-            tracing::warn!(
-                target: "jamodio::playback",
-                device = %device_name,
-                native_sr,
-                target_sr = TARGET_SR,
-                "device sample rate ≠ 48 kHz — CoreAudio fera un resampling implicite (recommander à l'user un device 48k natif si glitches)"
-            );
+    // Format natif du driver. CRITIQUE sur ASIO : cpal n'y fait AUCUNE
+    // conversion (cf. capture.rs). Les sorties ASIO (Focusrite…) sont en Int32
+    // → on ouvre au format natif et on convertit le mix f32 → type natif dans
+    // le callback. CoreAudio/WASAPI : f32 natif → branche F32, inchangé.
+    let sample_format = match device.default_output_config() {
+        Ok(default_cfg) => {
+            let native_sr = default_cfg.sample_rate().0;
+            if native_sr != TARGET_SR {
+                let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+                tracing::warn!(
+                    target: "jamodio::playback",
+                    device = %device_name,
+                    native_sr,
+                    target_sr = TARGET_SR,
+                    "device sample rate ≠ 48 kHz — CoreAudio fera un resampling implicite (recommander à l'user un device 48k natif si glitches)"
+                );
+            }
+            default_cfg.sample_format()
         }
-    }
+        Err(_) => SampleFormat::F32,
+    };
 
     // Buffer size : symétrique de capture.rs. On essaye Fixed(128) (= ~2.7 ms
     // low-latency) si le device output l'expose dans son SupportedBufferSize::Range
@@ -78,17 +91,59 @@ pub fn start_playback(
         buffer_size,
     };
 
-    let stream = device.build_output_stream(
-        &config,
-        move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-            let mut mx = mixer.lock();
-            mx.mix_into(data);
-        },
-        |err| {
-            tracing::error!(target: "jamodio::playback", error = %err, "CPAL playback error");
-        },
-        None,
-    )?;
+    // Le mixer produit du f32 ; pour les formats entiers (ASIO Int32/Int16) on
+    // mixe dans un scratch f32 puis on convertit. Le scratch est capturé par le
+    // callback (pas d'alloc par bloc après warmup).
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                mixer.lock().mix_into(data);
+            },
+            on_playback_err,
+            None,
+        )?,
+        SampleFormat::I32 => {
+            let mut scratch: Vec<f32> = Vec::new();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                    scratch.clear();
+                    scratch.resize(data.len(), 0.0);
+                    mixer.lock().mix_into(&mut scratch);
+                    for (o, s) in data.iter_mut().zip(scratch.iter()) {
+                        *o = (s.clamp(-1.0, 1.0) * 2_147_483_647.0) as i32; // 2^31 - 1
+                    }
+                },
+                on_playback_err,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let mut scratch: Vec<f32> = Vec::new();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    scratch.clear();
+                    scratch.resize(data.len(), 0.0);
+                    mixer.lock().mix_into(&mut scratch);
+                    for (o, s) in data.iter_mut().zip(scratch.iter()) {
+                        *o = (s.clamp(-1.0, 1.0) * 32_767.0) as i16; // 2^15 - 1
+                    }
+                },
+                on_playback_err,
+                None,
+            )?
+        }
+        other => {
+            tracing::warn!(
+                target: "jamodio::playback",
+                ?other,
+                "format de sortie non supporté (attendu f32/i32/i16)"
+            );
+            return Err(cpal::BuildStreamError::StreamConfigNotSupported);
+        }
+    };
 
     stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
     Ok((stream, fixed_buffer))
