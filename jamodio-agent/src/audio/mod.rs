@@ -1,4 +1,5 @@
 pub mod buffer_size;
+pub mod com_exec;
 pub mod device;
 pub mod host;
 pub mod capture;

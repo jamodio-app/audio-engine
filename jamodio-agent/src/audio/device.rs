@@ -34,51 +34,15 @@ fn parse_id(id: &str) -> Option<(usize, &str)> {
     Some((idx, name))
 }
 
-/// Exécute une énumération CPAL sur un thread au contexte COM correct.
-///
-/// # Pourquoi (bug Windows/ASIO, 22/06/2026)
-///
-/// `asio-sys` charge chaque driver ASIO via `CoCreateInstance` (ASIO SDK
-/// `loadAsioDriver`) mais **n'initialise jamais COM lui-même** — il compte sur
-/// le thread appelant. Sur un thread où COM n'est pas initialisé (les workers
-/// tokio qui traitent `GetDevices`), `load_driver` échoue et cpal **saute
-/// silencieusement** le device (`host/asio/device.rs` : `Err(_) => continue`)
-/// → liste VIDE, sans erreur. Au boot, `log_devices()` marchait uniquement
-/// parce que le thread principal Tauri/WebView2 a déjà fait `OleInitialize`
-/// (STA). On reproduit donc un STA propre sur un thread frais dédié.
-///
-/// Thread FRAIS = état COM vierge → `CoInitializeEx(STA)` réussit toujours
-/// (pas de `RPC_E_CHANGED_MODE` comme sur un worker tokio déjà passé en MTA
-/// via le réseau/l'updater). On joint et on récupère le `Vec` (données pures,
-/// `Send`). Sur macOS (CoreAudio, pas de COM) → exécution inline, inchangée.
-#[cfg(target_os = "windows")]
-fn enumerate_with_com(f: fn() -> Vec<AudioDevice>) -> Vec<AudioDevice> {
-    use windows_sys::Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
-    };
-    std::thread::spawn(move || {
-        // SAFETY : thread neuf, on apparie strictement init/uninit. S_OK (0) ou
-        // S_FALSE (1) ⇒ on possède une initialisation à libérer ; un HRESULT
-        // négatif (échec) ⇒ rien à libérer.
-        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
-        let devices = f();
-        if hr >= 0 {
-            unsafe { CoUninitialize() };
-        }
-        devices
-    })
-    .join()
-    .unwrap_or_default()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn enumerate_with_com(f: fn() -> Vec<AudioDevice>) -> Vec<AudioDevice> {
-    f()
-}
+// Énumération ASIO : voir `super::com_exec` pour le « pourquoi » (asio-sys
+// charge les drivers via CoCreateInstance sans initialiser COM → l'énumération
+// DOIT tourner sur un thread STA). On passe par le thread COM-STA persistant
+// partagé avec l'ouverture/fermeture des streams (`pipeline.rs`) : un seul
+// apartment pour tout l'ASIO. macOS (CoreAudio) : exécution inline.
 
 /// List all available audio input devices.
 pub fn list_inputs() -> Vec<AudioDevice> {
-    enumerate_with_com(list_inputs_inner)
+    super::com_exec::run(list_inputs_inner)
 }
 
 fn list_inputs_inner() -> Vec<AudioDevice> {
@@ -109,7 +73,7 @@ fn list_inputs_inner() -> Vec<AudioDevice> {
 
 /// List all available audio output devices.
 pub fn list_outputs() -> Vec<AudioDevice> {
-    enumerate_with_com(list_outputs_inner)
+    super::com_exec::run(list_outputs_inner)
 }
 
 fn list_outputs_inner() -> Vec<AudioDevice> {

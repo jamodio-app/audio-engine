@@ -41,9 +41,64 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 /// Wrapper to make cpal::Stream Send — we only hold it alive (RAII), never use across threads.
 struct SendStream(#[allow(dead_code)] cpal::Stream);
-// SAFETY: cpal::Stream on CoreAudio/ASIO is effectively thread-safe for keep-alive.
-// We never call methods on it from another thread, only drop it.
+// SAFETY: on ne fait que le garder en vie (RAII) et le dropper. Sur Windows,
+// l'OUVERTURE et la FERMETURE du stream ASIO se font sur le thread COM-STA
+// dédié (cf. `com_exec` + `close_stream_on_com`) — l'apartment STA qui a créé
+// le driver est donc aussi celui qui le détruit. On ne fait que transférer le
+// handle entre ce thread et la task tokio qui le stocke (jamais d'appel de
+// méthode hors-thread ; le callback temps réel tourne sur le thread du driver).
 unsafe impl Send for SendStream {}
+
+/// Résultat de l'ouverture du stream d'entrée (résolution + build) effectuée
+/// atomiquement sur le thread COM-STA — le `cpal::Device`/`cpal::Stream` !Send
+/// ne quitte jamais ce thread, seules ces données `Send` reviennent.
+struct BuiltInput {
+    stream: SendStream,
+    name: String,
+    resolved_id: String,
+    channels: u16,
+    native_sr: u32,
+    input_buf: Option<u32>,
+}
+
+/// Résultat de l'ouverture d'un stream de sortie sur le thread COM-STA.
+enum OutputOpen {
+    Opened { stream: SendStream, buffer: Option<u32>, name: String },
+    NotFound,
+    BuildFailed(String),
+}
+
+/// Résout le device de sortie + ouvre le stream playback **sur le thread
+/// COM-STA** (Windows) / inline (macOS). Voir `com_exec` pour le pourquoi :
+/// ASIO charge le driver via CoCreateInstance, qui exige COM initialisé et
+/// le même apartment pour toute la vie de l'objet. Résolution et build sont
+/// atomiques (le `cpal::Device` !Send ne traverse pas les threads).
+fn open_output_on_com(output_id: Option<String>, mixer: Arc<Mutex<AudioMixer>>) -> OutputOpen {
+    crate::audio::com_exec::run(move || {
+        use cpal::traits::DeviceTrait;
+        let device_opt = match output_id.as_deref() {
+            Some(id) => crate::audio::device::get_output_device(id),
+            None => crate::audio::device::default_output_device().map(|(d, _)| d),
+        };
+        let Some(device) = device_opt else {
+            return OutputOpen::NotFound;
+        };
+        let name = device.name().unwrap_or_default();
+        match crate::audio::playback::start_playback(&device, mixer) {
+            Ok((stream, buffer)) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
+            Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
+        }
+    })
+}
+
+/// Ferme (drop) un `cpal::Stream` **sur le thread COM-STA** (Windows) / inline
+/// (macOS). Indispensable pour ASIO : `IASIO::stop`/`Release` doivent tourner
+/// sur l'apartment qui a créé le driver, sinon corruption COM.
+fn close_stream_on_com(stream: Option<SendStream>) {
+    if let Some(s) = stream {
+        crate::audio::com_exec::run(move || drop(s));
+    }
+}
 
 /// Erreur typée renvoyée par `start_capture`. Permet à `ws_server` de
 /// différencier un device introuvable (= `CaptureError` côté wire) d'une
@@ -773,44 +828,34 @@ impl PipelineState {
     /// Le mixer est conservé (Arc partagé), aucun audio en cours n'est perdu :
     /// le ring buffer continue d'accumuler côté décodeur pendant la transition.
     fn restart_playback(&mut self) {
-        use cpal::traits::DeviceTrait;
-        // Output : si un id est sélectionné, on l'utilise strictement. Sinon
-        // (browser n'a jamais sélectionné — flow normal vu qu'on délègue à
-        // l'OS) on prend le default système. Pas de hybrid id-then-default :
-        // un id explicite échoué = erreur claire, pas de silent fallback.
-        let out_device_opt = match self.output_device_id.as_deref() {
-            Some(id) => crate::audio::device::get_output_device(id),
-            None => crate::audio::device::default_output_device().map(|(d, _)| d),
-        };
-        let Some(out_device) = out_device_opt else {
-            tracing::warn!(
-                target: "jamodio::pipeline",
-                requested = ?self.output_device_id,
-                "output device introuvable — playback désactivé jusqu'à nouvelle sélection"
-            );
-            self.playback_stream.take();
-            return;
-        };
-        let resolved_name = out_device.name().unwrap_or_default();
-
-        // mem::replace : crée le nouveau stream AVANT de drop l'ancien
-        // → minimise le gap audio (sinon brève silence → jitter buffer
-        // overflow → crackles au resume).
-        match crate::audio::playback::start_playback(&out_device, self.mixer.clone()) {
-            Ok((stream, output_buf)) => {
-                // .replace() : crée le nouveau stream AVANT de drop l'ancien
-                // → minimise le gap audio (sinon brève silence → jitter buffer
-                // overflow → crackles au resume). L'Option<> retournée est
-                // droppée en fin de scope = CPAL stoppe l'ancien stream.
-                let _old = self.playback_stream.replace(SendStream(stream));
-                self.output_buffer_samples = output_buf;
-                tracing::info!(target: "jamodio::pipeline", device = %resolved_name, "output device switched");
+        // ASIO mono-client : sur Windows, impossible d'ouvrir un 2e stream sur
+        // le driver tant que l'ancien le tient → on FERME l'ancien (sur le
+        // thread COM-STA) AVANT d'ouvrir le nouveau. Le ring buffer décodeur
+        // côté mixer couvre le court gap (changement de sortie = action rare).
+        // Résolution + ouverture atomiques sur le thread COM-STA (cf. com_exec).
+        close_stream_on_com(self.playback_stream.take());
+        match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
+            OutputOpen::Opened { stream, buffer, name } => {
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+                tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
             }
-            Err(e) => tracing::error!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "restart_playback échoué — on garde l'ancien"
-            ),
+            OutputOpen::NotFound => {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested = ?self.output_device_id,
+                    "output device introuvable — playback désactivé jusqu'à nouvelle sélection"
+                );
+                self.output_buffer_samples = None;
+            }
+            OutputOpen::BuildFailed(e) => {
+                tracing::error!(
+                    target: "jamodio::pipeline",
+                    error = %e,
+                    "restart_playback échoué — playback désactivé jusqu'à nouvelle sélection"
+                );
+                self.output_buffer_samples = None;
+            }
         }
     }
 
@@ -840,40 +885,16 @@ impl PipelineState {
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
         use cpal::traits::DeviceTrait;
 
-        // 1. RÉSOUDRE LE DEVICE D'ABORD — avant de toucher quoi que ce soit
-        // d'autre. Si le device demandé n'existe pas, on échoue tout de suite,
-        // proprement, sans avoir stoppé une capture en cours ni alloué un
-        // socket UDP. Comportement strict : l'id du browser DOIT pointer sur
-        // un device courant. Aucun fallback default.
-        //
-        // CPAL est ouvert dans TOUS les modes (AUDIO et MIDI). En mode MIDI,
-        // ses samples sont écrasés par 0 côté `process_stage` — le plugin
-        // instrument INSERT génère l'audio depuis les events MIDI. Cette
-        // stratégie évite tout swap de source pendant les bascules
-        // MIDI↔AUDIO et donc tout risque de craquement.
-        let input_id = self.input_device_id.clone();
-        let input_device = match input_id.as_deref() {
-            Some(id) => crate::audio::device::get_input_device(id),
-            None => {
-                // Premier lancement, browser n'a rien sélectionné : on prend
-                // le default système (uniquement dans ce cas-là).
-                crate::audio::device::default_input_id()
-                    .as_deref()
-                    .and_then(crate::audio::device::get_input_device)
-            }
-        };
-        let Some(device) = input_device else {
-            return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
-        };
-        let in_name = device.name().unwrap_or_default();
-        // L'id qu'on rapporte est celui demandé (si présent) ou celui du
-        // default résolu — toujours au format `{idx}:{name}` pour cohérence.
-        let resolved_input_id = input_id.unwrap_or_else(|| {
-            crate::audio::device::default_input_id().unwrap_or_else(|| in_name.clone())
-        });
-
-        // Stop any existing capture (only after device resolved successfully)
+        // 1. STOP toute capture en cours D'ABORD. ASIO est mono-client :
+        // impossible d'ouvrir un second stream tant que l'ancien tient le
+        // driver ; et la fermeture doit se faire sur le thread COM-STA (cf.
+        // stop_capture → close_stream_on_com). Sur macOS, sans effet de bord.
+        // (Le build du nouveau stream, plus bas, EST la validation du device :
+        // on n'alloue le socket UDP qu'ensuite mais un échec retombe proprement
+        // via `?`, RAII relâche tout.)
         self.stop_capture();
+
+        let input_id = self.input_device_id.clone();
 
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -899,28 +920,57 @@ impl PipelineState {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
-        // 5. Start CPAL input stream (le device est déjà résolu, ici on
-        //    ouvre seulement le stream — toute erreur ici est technique
-        //    pure (driver, sample-rate impossible, etc.), pas une erreur
-        //    de sélection user).
+        // 5. RÉSOLUTION + OUVERTURE DU STREAM CPAL, atomiquement sur le thread
+        //    COM-STA (cf. `com_exec`). Le `cpal::Device` est !Send et ne doit
+        //    pas quitter ce thread : on résout l'id, on ouvre le stream, et on
+        //    ne renvoie que des données `Send` (+ le handle `SendStream`).
+        //    Résolution STRICTE : l'id du browser DOIT pointer sur un device
+        //    courant (pas de fallback default, sauf AUCUN id sélectionné =
+        //    premier lancement). Une erreur de build (driver, sample-rate) est
+        //    technique pure, pas une erreur de sélection user.
         //
-        //    CPAL est ouvert même en mode MIDI : ses samples sont écrasés
-        //    par 0 côté `process_stage` (le plugin instrument génère son
-        //    propre audio depuis les events MIDI). Cette stratégie évite
-        //    tout swap de source pendant les bascules MIDI↔AUDIO et donc
-        //    tout risque de craquement à la frontière des buffers audio.
-        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        // Sprint S1 — partage du compteur de drops avec le callback CPAL : il
-        // incrémente quand `sample_tx` est plein, ws_server le lit + reset au
-        // flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
+        //    CPAL est ouvert dans TOUS les modes (AUDIO et MIDI) : en MIDI ses
+        //    samples sont écrasés par 0 côté `process_stage` (le plugin
+        //    instrument génère l'audio depuis les events MIDI) → aucun swap de
+        //    source pendant les bascules MIDI↔AUDIO, donc aucun craquement.
+        //
+        //    Sprint S1 — `capture_drops` partagé avec le callback CPAL :
+        //    incrémenté quand `sample_tx` est plein, lu+reset par ws_server au
+        //    flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
         let capture_drops_for_callback = self.perfstats.capture_drops.clone();
-        let (stream, channels_in, native_sr, input_buf) = crate::audio::capture::start_capture(
-            &device,
-            sample_tx,
-            capture_drops_for_callback,
-        )
-            .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
-        self.capture_stream = Some(SendStream(stream));
+        let built = crate::audio::com_exec::run(move || -> Result<BuiltInput, CaptureStartError> {
+            let device = match input_id.as_deref() {
+                Some(id) => crate::audio::device::get_input_device(id),
+                None => crate::audio::device::default_input_id()
+                    .as_deref()
+                    .and_then(crate::audio::device::get_input_device),
+            };
+            let Some(device) = device else {
+                return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
+            };
+            let name = device.name().unwrap_or_default();
+            // Id rapporté : celui demandé, sinon le default résolu ({idx}:{name}).
+            let resolved_id = input_id
+                .unwrap_or_else(|| crate::audio::device::default_input_id().unwrap_or_else(|| name.clone()));
+            let (stream, channels, native_sr, input_buf) =
+                crate::audio::capture::start_capture(&device, sample_tx, capture_drops_for_callback)
+                    .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
+            Ok(BuiltInput {
+                stream: SendStream(stream),
+                name,
+                resolved_id,
+                channels,
+                native_sr,
+                input_buf,
+            })
+        })?;
+        let in_name = built.name;
+        let resolved_input_id = built.resolved_id;
+        let channels_in = built.channels;
+        let native_sr = built.native_sr;
+        let input_buf = built.input_buf;
+        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
+        self.capture_stream = Some(built.stream);
         tracing::info!(
             target: "jamodio::pipeline",
             channels_in, native_sr, ?channel_index,
@@ -1008,23 +1058,30 @@ impl PipelineState {
         });
 
         // 8. Start CPAL output stream (playback) if not already running.
-        //    Output : id explicite si défini, sinon default système (pas de
-        //    fallback hybrid : un id explicite échoué est une erreur claire).
+        //    Ouvert sur le thread COM-STA (ASIO) comme l'input.
+        //    - device introuvable (sélection sortie disparue) → erreur claire ;
+        //    - échec de BUILD (ex. driver ASIO en duplex, edge non testé) → NON
+        //      FATAL : on ne rend pas l'utilisateur muet pour les autres. La
+        //      capture (entrée) prime ; le playback/self-monitor sera juste
+        //      indisponible jusqu'à une nouvelle sélection. On le voit au log.
         if self.playback_stream.is_none() {
-            let out_id = self.output_device_id.clone();
-            let out_device_opt = match out_id.as_deref() {
-                Some(id) => crate::audio::device::get_output_device(id),
-                None => crate::audio::device::default_output_device().map(|(d, _)| d),
-            };
-            let Some(out_device) = out_device_opt else {
-                return Err(CaptureStartError::OutputDeviceNotFound { requested: out_id });
-            };
-            let out_name = out_device.name().unwrap_or_default();
-            tracing::info!(target: "jamodio::pipeline", device = %out_name, "output device opened");
-            let (out_stream, output_buf) = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
-                .map_err(|e| CaptureStartError::Other(format!("CPAL output: {}", e)))?;
-            self.playback_stream = Some(SendStream(out_stream));
-            self.output_buffer_samples = output_buf;
+            match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
+                OutputOpen::Opened { stream, buffer, name } => {
+                    tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                    self.playback_stream = Some(stream);
+                    self.output_buffer_samples = buffer;
+                }
+                OutputOpen::NotFound => {
+                    return Err(CaptureStartError::OutputDeviceNotFound {
+                        requested: self.output_device_id.clone(),
+                    });
+                }
+                OutputOpen::BuildFailed(e) => tracing::warn!(
+                    target: "jamodio::pipeline",
+                    error = %e,
+                    "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+                ),
+            }
         }
 
         self.state = AgentState::Capturing;
@@ -1098,19 +1155,18 @@ impl PipelineState {
             recv_decode_task(receiver, sfu_addr, producer_id, mixer, drift_ppm_handle, stop_rx).await;
         });
 
-        // Start playback if not running. Output : id explicite si défini,
-        // sinon default système. Pas de fallback silencieux sur le default
-        // si un id explicite échoue.
+        // Start playback if not running. Résolution + ouverture sur le thread
+        // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
+        // un id explicite échoue.
         if self.playback_stream.is_none() {
-            let out_device_opt = match self.output_device_id.as_deref() {
-                Some(id) => crate::audio::device::get_output_device(id),
-                None => crate::audio::device::default_output_device().map(|(d, _)| d),
-            };
-            let out_device = out_device_opt.ok_or("output device introuvable")?;
-            let (out_stream, output_buf) = crate::audio::playback::start_playback(&out_device, self.mixer.clone())
-                .map_err(|e| format!("CPAL output: {}", e))?;
-            self.playback_stream = Some(SendStream(out_stream));
-            self.output_buffer_samples = output_buf;
+            match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
+                OutputOpen::Opened { stream, buffer, .. } => {
+                    self.playback_stream = Some(stream);
+                    self.output_buffer_samples = buffer;
+                }
+                OutputOpen::NotFound => return Err("output device introuvable".into()),
+                OutputOpen::BuildFailed(e) => return Err(format!("CPAL output: {}", e)),
+            }
         }
 
         tracing::info!(
@@ -1130,7 +1186,9 @@ impl PipelineState {
     }
 
     fn stop_capture(&mut self) {
-        self.capture_stream.take(); // Drop stops CPAL stream
+        // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
+        // tourner sur l'apartment qui a créé le driver). macOS : inline.
+        close_stream_on_com(self.capture_stream.take());
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
@@ -1164,7 +1222,7 @@ impl PipelineState {
         for id in ids {
             self.remove_stream(&id);
         }
-        self.playback_stream.take();
+        close_stream_on_com(self.playback_stream.take()); // drop sur le thread COM-STA (ASIO)
         self.output_buffer_samples = None;
         self.state = AgentState::Idle;
         if was_active {
