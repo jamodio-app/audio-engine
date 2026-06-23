@@ -1,8 +1,9 @@
 name: Release
 
-# Déclenché par un push de tag `vX.Y.Z` (ex: git tag v0.1.0 && git push --tags).
-# Build en parallèle sur 3 runners → 3 artefacts (macOS ARM, macOS Intel,
+# Déclenché par un push de tag `vX.Y.Z` (ex: git tag v0.5.0 && git push origin v0.5.0).
+# Build en parallèle sur 2 runners → 2 artefacts (macOS Apple Silicon,
 # Windows x64), signés pour l'updater Tauri, publiés en draft.
+# (macOS Intel abandonné — cf. matrice plus bas.)
 # Puis un job `publish` renomme les assets en noms stables
 # (Jamodio-Audio-Engine-macOS-AppleSilicon.dmg, etc.) et passe le draft en
 # release publiée.
@@ -81,8 +82,8 @@ jobs:
       # pkg-config. Chaque runner doit fournir libopus + pkg-config pour
       # l'architecture ciblée.
 
-      # macOS : Homebrew fournit libopus + pkg-config natifs sur les 2 archs
-      # (macos-14 = ARM, macos-13 = Intel). Pas de cross-compile.
+      # macOS : Homebrew fournit libopus + pkg-config natifs sur le runner ARM
+      # (macos-14 = Apple Silicon). Pas de cross-compile.
       - name: Install libopus (macOS native)
         if: runner.os == 'macOS'
         run: brew install opus pkg-config

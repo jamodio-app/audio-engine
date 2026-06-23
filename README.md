@@ -129,10 +129,9 @@ cargo tauri dev
 cargo tauri build
 ```
 
-Les artefacts :
-- macOS : `target/release/bundle/dmg/Jamodio Audio Engine_0.1.0_aarch64.dmg`
-- macOS Intel : `target/x86_64-apple-darwin/release/bundle/dmg/Jamodio Audio Engine_0.1.0_x64.dmg`
-- Windows : `target/release/bundle/nsis/Jamodio Audio Engine_0.1.0_x64-setup.exe`
+Les artefacts (la version dans le nom suit `tauri.conf.json`) :
+- macOS Apple Silicon : `target/release/bundle/dmg/Jamodio Audio Engine_<version>_aarch64.dmg`
+- Windows : `target/release/bundle/msi/Jamodio Audio Engine_<version>_x64_en-US.msi`
 
 ---
 
@@ -152,8 +151,8 @@ Toute release est **déclenchée par un tag Git** `vX.Y.Z`. Le workflow
    - `Jamodio-Audio-Engine-Windows.msi`
 4. Le draft devient une release publiée.
 
-**Tu n'as besoin que de ta machine de dev** — GitHub fournit les 3 runners.
-Temps total : ~10–15 min après le `git push --tags`. 0 € pour les repos publics.
+**Tu n'as besoin que de ta machine de dev** — GitHub fournit les 2 runners.
+Temps total : ~10–15 min après le push du tag. 0 € pour les repos publics.
 
 ### Setup initial (une seule fois)
 
@@ -187,18 +186,26 @@ Le CLI affiche la **public key** (longue chaîne base64). Copie-la dans
 
 ### Publier une version
 
-1. **Bump version** dans 2 endroits :
-   - [`jamodio-agent/Cargo.toml`](./jamodio-agent/Cargo.toml) — ligne `version = "X.Y.Z"`
-   - [`jamodio-agent/tauri.conf.json`](./jamodio-agent/tauri.conf.json) — clé `version`
+1. **Bump version** — la version vit dans **5 fichiers** (les 4 `Cargo.toml` du
+   workspace + [`jamodio-agent/tauri.conf.json`](./jamodio-agent/tauri.conf.json)).
+   Le script du monorepo parent les met à jour en lockstep et abort si elles ne
+   sont pas déjà cohérentes :
+   ```bash
+   # depuis la racine du monorepo jamodio (parent de ce repo)
+   node scripts/bump-agent-version.js patch    # ou minor | major | X.Y.Z
+   ```
+   Puis rafraîchir `Cargo.lock` (les 4 crates du workspace).
 
 2. **Ajouter une entrée au [CHANGELOG.md](./CHANGELOG.md)** (voir format plus bas).
 
-3. **Commit + tag + push** :
+3. **Commit + tag + push** (nommer la branche/tag explicitement évite l'erreur
+   « no upstream branch ») :
    ```bash
-   git add Cargo.toml jamodio-agent/Cargo.toml jamodio-agent/tauri.conf.json CHANGELOG.md
-   git commit -m "Release vX.Y.Z"
+   git add -A
+   git commit -m "chore(agent): bump to vX.Y.Z"
    git tag vX.Y.Z
-   git push && git push --tags
+   git push origin main
+   git push origin vX.Y.Z
    ```
 
 4. **Monitoring du build** : onglet **Actions** du repo. En cas d'échec sur
