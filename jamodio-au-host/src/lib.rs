@@ -155,11 +155,17 @@ unsafe extern "C" fn scan_thunk(
         None => (String::new(), raw),
     };
 
+    let au_type_fcc = u32_to_fourcc(au_type);
+    // Un AU est un instrument ssi son composant est de type MusicDevice
+    // (`aumu`). Reproduit à l'identique l'ancienne détection côté browser
+    // (`format==='au' && auType==='aumu'`) — désormais autoritaire côté agent.
+    let is_instrument = au_type_fcc == "aumu";
+
     ctx.out.push(PluginInfo {
         name: plugin_name,
         manufacturer,
         plugin_ref: PluginRef::Au {
-            au_type: u32_to_fourcc(au_type),
+            au_type: au_type_fcc,
             subtype: u32_to_fourcc(au_subtype),
             manufacturer: u32_to_fourcc(au_manuf),
         },
@@ -167,6 +173,7 @@ unsafe extern "C" fn scan_thunk(
         has_editor: has_editor != 0,
         incompatible: latency_samples > MAX_PLUGIN_LATENCY_SAMPLES,
         has_input_bus: has_input_bus != 0,
+        is_instrument,
     });
 }
 

@@ -171,6 +171,11 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
         }
         let latency = instance.latency_samples();
         let has_input_bus = instance.has_input_bus();
+        // Classification instrument : la sous-catégorie VST3 fait foi quand elle
+        // est disponible (cas d'un synthé à sidechain audio type Surge XT, qui a
+        // un bus d'entrée mais reste un instrument MIDI). Fallback historique
+        // `!has_input_bus` pour les plugins sans `IPluginFactory2`/subCategories.
+        let is_instrument = class.is_instrument().unwrap_or(!has_input_bus);
 
         // has_editor : best-effort. On considère qu'un plugin avec un
         // IEditController (= cast succès ou getControllerClassId valide) a un
@@ -201,6 +206,7 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
             has_editor,
             incompatible: latency > MAX_PLUGIN_LATENCY_SAMPLES,
             has_input_bus,
+            is_instrument,
         });
         // Drop instance ici (Drop::drop → setActive(false) + terminate + release).
     }
@@ -427,5 +433,26 @@ mod tests {
         let mut h = Vst3Host::new();
         let r = h.unload(PluginHandle(999));
         assert!(matches!(r, Err(PluginError::InvalidHandle)));
+    }
+
+    #[test]
+    fn subcategory_instrument_detection() {
+        use crate::host::subcategory_is_instrument as is_inst;
+        // Instruments : le 1er token pipe-délimité est exactement "Instrument".
+        assert!(is_inst("Instrument"));
+        assert!(is_inst("Instrument|Synth"));
+        assert!(is_inst("Instrument|Drum"));
+        assert!(is_inst("Instrument|Synth|Stereo"));
+        // Effets : 1er token "Fx".
+        assert!(!is_inst("Fx|Reverb"));
+        assert!(!is_inst("Fx|Guitar")); // AmpliTube
+        // Piège : "Fx|Instrument" est un EFFET (1er token "Fx"), pas un instrument.
+        assert!(!is_inst("Fx|Instrument"));
+        // Robustesse : casse / espaces.
+        assert!(is_inst("instrument|synth"));
+        assert!(is_inst(" Instrument | Synth "));
+        // Vide → non-instrument (l'appelant `ClassInfo::is_instrument` renvoie
+        // None en amont pour déclencher le fallback has_input_bus).
+        assert!(!is_inst(""));
     }
 }

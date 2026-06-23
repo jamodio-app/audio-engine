@@ -27,6 +27,17 @@ inclus. Pas de nouvelle fonctionnalité depuis `0.4.41` — c'est la promotion d
 - **macOS Apple Silicon + Windows x64** comme cibles de release officielles
   (macOS Intel abandonné).
 
+### Fixed
+- **VST3 (Windows) : instruments détectés comme tels.** Le scan lit désormais la
+  sous-catégorie VST3 (`PClassInfo2::subCategories` via `IPluginFactory2`) et
+  expose un champ autoritaire `isInstrument` au browser. Avant ce correctif, un
+  instrument VST3 doté d'un bus d'entrée audio (sidechain — Surge XT, BFD,
+  Kontakt…) était classé comme effet via la seule heuristique `has_input_bus`,
+  et la tranche **basculait à tort en AUDIO** au lieu de MIDI. La classification
+  est unifiée AU/VST3 (`is_instrument` = `aumu` côté AU, premier token
+  `"Instrument"` côté VST3) ; fallback `!has_input_bus` pour les plugins sans
+  `IPluginFactory2`. **Aucun changement de comportement sur macOS.**
+
 ## [0.4.41] — 2026-06-23
 
 ### Fixed

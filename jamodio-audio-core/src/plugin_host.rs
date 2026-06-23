@@ -59,6 +59,14 @@ pub struct PluginInfo {
     /// source d'entrée MIDI pour produire du son.
     #[serde(default = "default_true")]
     pub has_input_bus: bool,
+    /// Classification AUTORITAIRE instrument (synthé/sampler) vs effet, calculée
+    /// côté agent : AU = composant `aumu`, VST3 = sous-catégorie `"Instrument|…"`.
+    /// Le browser s'en sert pour basculer la source en MIDI au chargement. Un
+    /// instrument peut avoir `has_input_bus = true` (sidechain audio, ex. Surge
+    /// XT / BFD) : c'est CE champ qui tranche, pas le bus d'entrée.
+    /// `#[serde(default)]` = false → rétro-compat browser/agents pré-0.5.0.
+    #[serde(default)]
+    pub is_instrument: bool,
 }
 
 fn default_true() -> bool {
@@ -196,16 +204,19 @@ mod serde_tests {
             has_editor: true,
             incompatible: false,
             has_input_bus: true,
+            is_instrument: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains(r#""pluginRef":"#), "json was {json}");
         assert!(json.contains(r#""latencySamples":0"#), "json was {json}");
         assert!(json.contains(r#""hasEditor":true"#), "json was {json}");
         assert!(json.contains(r#""hasInputBus":true"#), "json was {json}");
+        assert!(json.contains(r#""isInstrument":false"#), "json was {json}");
         // Sanity : aucun champ snake_case ne doit fuir.
         assert!(!json.contains("plugin_ref"), "snake_case leaked: {json}");
         assert!(!json.contains("latency_samples"), "snake_case leaked: {json}");
         assert!(!json.contains("has_editor"), "snake_case leaked: {json}");
         assert!(!json.contains("has_input_bus"), "snake_case leaked: {json}");
+        assert!(!json.contains("is_instrument"), "snake_case leaked: {json}");
     }
 }

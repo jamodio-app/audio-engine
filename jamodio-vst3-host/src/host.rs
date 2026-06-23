@@ -8,7 +8,8 @@ use jamodio_audio_core::plugin_host::MidiEvent;
 use vst3::{
     ComPtr, ComWrapper,
     Steinberg::{
-        FUnknown, IPluginBaseTrait, IPluginFactoryTrait, PClassInfo, PFactoryInfo, TUID,
+        FUnknown, IPluginBaseTrait, IPluginFactory2, IPluginFactory2Trait, IPluginFactoryTrait,
+        PClassInfo, PClassInfo2, PFactoryInfo, TUID,
         Vst::{
             AudioBusBuffers, AudioBusBuffers__type0, BusDirections_, IAudioProcessor,
             IAudioProcessorTrait, IComponent, IComponentTrait, IComponent_iid, IEventList,
@@ -25,6 +26,21 @@ use crate::loader::LoadedModule;
 /// Catégorie standard VST3 pour les plugins audio (synthés + effets).
 /// Les "Component Controller Class" et "Test Class" sont ignorées.
 pub const AUDIO_EFFECT_CATEGORY: &str = "Audio Module Class";
+
+/// `true` si la sous-catégorie VST3 désigne un INSTRUMENT (synthé, sampler,
+/// drum machine…) plutôt qu'un effet.
+///
+/// Convention Steinberg (`PlugType`) : la catégorie principale est le PREMIER
+/// token pipe-délimité de `PClassInfo2::subCategories`. Un instrument est
+/// `"Instrument"`, `"Instrument|Synth"`, `"Instrument|Drum"`, etc. On teste donc
+/// le premier token EXACTEMENT — `"Fx|Instrument"` (un effet pensé pour les
+/// instruments, ex. vocoder) ne doit PAS être classé instrument.
+pub fn subcategory_is_instrument(subcategories: &str) -> bool {
+    subcategories
+        .split('|')
+        .next()
+        .is_some_and(|main| main.trim().eq_ignore_ascii_case("Instrument"))
+}
 
 /// VST3 SDK fixed-size cstring fields use `char8` (i8) padded with nulls.
 /// Decode stops at the first 0 byte or buffer end.
@@ -53,11 +69,26 @@ pub struct ClassInfo {
     pub cid: TUID,
     pub category: String,
     pub name: String,
+    /// `PClassInfo2::subCategories` (ex: `"Instrument|Synth"`, `"Fx|Reverb"`).
+    /// Vide si le plugin n'expose que `IPluginFactory` (SDK < 3.0) → on retombe
+    /// alors sur l'heuristique `has_input_bus` côté `scan_plugin_file`.
+    pub subcategories: String,
 }
 
 impl ClassInfo {
     pub fn is_audio_effect(&self) -> bool {
         self.category == AUDIO_EFFECT_CATEGORY
+    }
+
+    /// `true` si la sous-catégorie désigne un instrument. `None` quand
+    /// l'information n'est pas disponible (`subCategories` vide) — l'appelant
+    /// doit alors retomber sur l'heuristique du bus d'entrée audio.
+    pub fn is_instrument(&self) -> Option<bool> {
+        if self.subcategories.trim().is_empty() {
+            None
+        } else {
+            Some(subcategory_is_instrument(&self.subcategories))
+        }
     }
 
     /// Représentation hex 32-chars de l'UID de classe — utilisée dans
@@ -91,26 +122,60 @@ pub fn factory_info(module: &LoadedModule) -> Result<FactoryInfo, String> {
 
 pub fn enumerate_classes(module: &LoadedModule) -> Vec<ClassInfo> {
     let factory = module.factory();
+    // `IPluginFactory2` (SDK ≥ 3.0) ajoute `getClassInfo2` → `PClassInfo2` qui
+    // porte `subCategories` (= "Instrument|Synth", "Fx|Reverb"…), indispensable
+    // pour distinguer instrument et effet. Cast une seule fois ; fallback sur
+    // `IPluginFactory::getClassInfo` (sans subCategories) si le module est trop
+    // ancien.
+    let factory2 = factory.cast::<IPluginFactory2>();
     let count = unsafe { factory.countClasses() };
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let mut info = PClassInfo {
-            cid: [0; 16],
-            cardinality: 0,
-            category: [0; 32],
-            name: [0; 64],
+        let class = if let Some(f2) = &factory2 {
+            let mut info = PClassInfo2 {
+                cid: [0; 16],
+                cardinality: 0,
+                category: [0; 32],
+                name: [0; 64],
+                classFlags: 0,
+                subCategories: [0; 128],
+                vendor: [0; 64],
+                version: [0; 64],
+                sdkVersion: [0; 64],
+            };
+            let ok = unsafe { f2.getClassInfo2(i, &mut info) };
+            if ok != 0 {
+                tracing::warn!(target: "jamodio::vst3", index = i, tresult = ok, "getClassInfo2 failed");
+                continue;
+            }
+            ClassInfo {
+                index: i,
+                cid: info.cid,
+                category: decode_cstr_i8(&info.category),
+                name: decode_cstr_i8(&info.name),
+                subcategories: decode_cstr_i8(&info.subCategories),
+            }
+        } else {
+            let mut info = PClassInfo {
+                cid: [0; 16],
+                cardinality: 0,
+                category: [0; 32],
+                name: [0; 64],
+            };
+            let ok = unsafe { factory.getClassInfo(i, &mut info) };
+            if ok != 0 {
+                tracing::warn!(target: "jamodio::vst3", index = i, tresult = ok, "getClassInfo failed");
+                continue;
+            }
+            ClassInfo {
+                index: i,
+                cid: info.cid,
+                category: decode_cstr_i8(&info.category),
+                name: decode_cstr_i8(&info.name),
+                subcategories: String::new(),
+            }
         };
-        let ok = unsafe { factory.getClassInfo(i, &mut info) };
-        if ok != 0 {
-            tracing::warn!(target: "jamodio::vst3", index = i, tresult = ok, "getClassInfo failed");
-            continue;
-        }
-        out.push(ClassInfo {
-            index: i,
-            cid: info.cid,
-            category: decode_cstr_i8(&info.category),
-            name: decode_cstr_i8(&info.name),
-        });
+        out.push(class);
     }
     out
 }

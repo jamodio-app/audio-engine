@@ -167,7 +167,13 @@ jobs:
             - macOS Apple Silicon (M1+) : [Jamodio-Audio-Engine-macOS-AppleSilicon.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg)
             - Windows : [Jamodio-Audio-Engine-Windows.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.msi)
           releaseDraft: true      # chaque matrix complète le draft
-          prerelease: false
+          # Tag semver de pré-release (contient un '-', ex. v0.5.0-rc.1) →
+          # publié en pre-release GitHub, donc JAMAIS marqué "latest". L'updater
+          # Tauri lit releases/latest/download/latest.json → les testeurs en
+          # prod ne se voient PAS proposer la rc ; on installe le .msi à la main
+          # depuis la page de pré-release. Tag final v0.5.0 (sans '-') = release
+          # normale diffusée à tous.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
@@ -223,6 +229,15 @@ jobs:
           done
 
           echo "▸ Publication (draft → published)"
-          gh release edit "$TAG" -R "$REPO" --draft=false
+          # Tag de pré-release (semver avec '-', ex. v0.5.0-rc.1) → on publie en
+          # prerelease ET on force --latest=false : la release "latest" (donc
+          # l'updater Tauri) reste sur la dernière version stable. Tag final
+          # (sans '-') → release normale marquée latest.
+          if [[ "$TAG" == *-* ]]; then
+            echo "  ↳ pré-release détectée → --prerelease --latest=false"
+            gh release edit "$TAG" -R "$REPO" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" -R "$REPO" --draft=false --latest=true
+          fi
 
           echo "✓ Release $TAG publiée"
