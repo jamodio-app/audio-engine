@@ -1,11 +1,32 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Jamodio tray icon — 32x32 template-style (monochrome noir, macOS menubar
-     rend en blanc/gris selon thème). Fond transparent. -->
+<!-- Jamodio tray icon — template macOS (monochrome : seul l'alpha compte, macOS
+     recolore selon le thème de la barre de menus). Fond transparent.
+
+     Objectif (25/06/2026) : LISIBILITÉ à ~18px dans la barre de menus.
+     - Ondes pleines et plus épaisses, amplitude élargie (remplit ~72% de la
+       hauteur au lieu de ~56%) → masse d'encre plus grande, plus visible.
+     - Studio = anneau net + point central, avec un masque qui retire les ondes
+       sous le studio : le jour entre l'anneau et le point reste franc (sinon,
+       en template, les remplissages fusionnent en pâté illisible).
+     NB : on ne peut pas empêcher l'encoche des MacBook Pro de masquer l'icône
+     (limite OS) ; l'entrée fiable reste l'icône Dock (cf. main.rs Reopen). -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="32" height="32">
-  <g fill="none" stroke="#000000" stroke-linecap="round">
-    <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.55"/>
-    <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
+  <defs>
+    <!-- Découpe : les ondes sont retirées dans un disque central → le studio
+         (anneau + point + jour transparent) reste propre. -->
+    <mask id="studio-cut">
+      <rect width="100" height="100" fill="#fff"/>
+      <circle cx="50" cy="50" r="19" fill="#000"/>
+    </mask>
+  </defs>
+
+  <g fill="none" stroke="#000000" stroke-linecap="round" mask="url(#studio-cut)">
+    <path d="M 6 50 Q 30 14 50 50 Q 70 86 94 50" stroke-width="7" opacity="0.5"/>
+    <path d="M 6 50 Q 30 30 50 50 Q 70 70 94 50" stroke-width="11"/>
   </g>
-  <circle cx="50" cy="50" r="15" fill="#ffffff" stroke="#000000" stroke-width="4"/>
-  <circle cx="50" cy="50" r="9" fill="#000000"/>
+
+  <!-- Studio : anneau (cercle tracé, intérieur transparent) + point central.
+       Le jour entre les deux reste vide (ondes masquées) = brand net. -->
+  <circle cx="50" cy="50" r="15" fill="none" stroke="#000000" stroke-width="7"/>
+  <circle cx="50" cy="50" r="5" fill="#000000"/>
 </svg>

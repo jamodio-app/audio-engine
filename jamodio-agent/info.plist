@@ -2,8 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>LSUIElement</key>
-  <true/>
+  <!-- Option B (macOS UX, 25/06/2026) : app Regular ASSUMÉE — l'icône Dock est
+       l'entrée fiable vers la fenêtre d'infos de l'Agent (clic Dock géré via
+       RunEvent::Reopen dans main.rs). On NE met PLUS LSUIElement=true : il était
+       de toute façon ignoré par Tauri (politique Regular par défaut), ce qui
+       donnait une icône Dock présente mais morte. Le tray reste un bonus, pas
+       l'unique porte d'entrée (fragile sous l'encoche des MacBook Pro). -->
   <key>NSMicrophoneUsageDescription</key>
   <string>Jamodio Audio Engine needs microphone access to capture your instrument audio for low-latency streaming.</string>
 </dict>

@@ -318,6 +318,25 @@ fn main() {
                 api.prevent_close();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("Failed to run Jamodio Audio Engine");
+        // `build` + `run` (plutôt que `run(generate_context!())`) pour pouvoir
+        // intercepter les RunEvent — notamment `Reopen` (macOS).
+        .build(tauri::generate_context!())
+        .expect("Failed to run Jamodio Audio Engine")
+        .run(|app_handle, event| {
+            // macOS : clic sur l'icône Dock → `applicationShouldHandleReopen`.
+            // Option B : la fenêtre principale est `visible:false` + masquée à
+            // la fermeture ; sans ce handler, cliquer l'icône Dock ne faisait
+            // RIEN (porte d'entrée morte). On (re)montre + focus la fenêtre
+            // d'infos de l'Agent — entrée fiable, jamais masquée par l'encoche.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = &event {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                }
+            }
+            // Évite les warnings unused sur les autres OS / variantes.
+            let _ = (app_handle, &event);
+        });
 }
