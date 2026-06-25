@@ -79,10 +79,18 @@ struct Entry {
     AURenderBlock render_block_v3;      // nullptr en v2
     // Commun
     __strong NSWindow *editor_window;   // nil tant que pas ouvert
+    // View du plugin actuellement affichée (sous-vue du contentView). Conservée
+    // pour pouvoir retirer son observer de frame au teardown. nil si pas
+    // d'éditeur ouvert.
+    __strong NSView *editor_view;
     // Token de l'observer NSWindowWillCloseNotification — conservé pour le
     // retirer au teardown (sinon l'observer survit à l'unload). nil si pas
     // d'éditeur ouvert.
     __strong id editor_close_observer;
+    // Token de l'observer NSViewFrameDidChangeNotification sur editor_view —
+    // permet à la fenêtre de SUIVRE la taille réelle du plugin (layout async,
+    // chargement différé, resize interne). nil si pas d'éditeur ouvert.
+    __strong id editor_frame_observer;
     AudioComponentDescription desc;
     std::vector<float> in_l, in_r;      // copie de l'input par bloc (callback)
     uint32_t max_frames;
@@ -386,6 +394,9 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     entry->au_v3 = nil;
     entry->render_block_v3 = nullptr;
     entry->editor_window = nil;
+    entry->editor_view = nil;
+    entry->editor_close_observer = nil;
+    entry->editor_frame_observer = nil;
     entry->desc = desc;
     entry->in_l.assign(max_frames, 0.0f);
     entry->in_r.assign(max_frames, 0.0f);
@@ -663,6 +674,11 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
             [[NSNotificationCenter defaultCenter] removeObserver:e->editor_close_observer];
             e->editor_close_observer = nil;
         }
+        if (e->editor_frame_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:e->editor_frame_observer];
+            e->editor_frame_observer = nil;
+        }
+        e->editor_view = nil; // ARC
         if (e->editor_window) {
             [e->editor_window close];
             e->editor_window = nil; // ARC
@@ -774,6 +790,146 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     }
 }
 
+// Recale `win` sur une taille de contenu `size`, en gardant le coin
+// HAUT-GAUCHE fixe (les fenêtres macOS ont leur origine en bas-gauche : on
+// déplace donc origin.y pour que le bord supérieur ne bouge pas). Verrouille
+// aussi min == max == size pour empêcher tout resize manuel (qui recréerait
+// des marges vides autour d'une UI plugin à taille fixe). Main thread only.
++ (void)sizeWindow:(NSWindow *)win toContent:(NSSize)size {
+    if (!win || size.width < 1 || size.height < 1) return;
+    NSRect oldFrame = win.frame;
+    NSRect newFrame = [win frameRectForContentRect:NSMakeRect(0, 0, size.width, size.height)];
+    newFrame.origin.x = oldFrame.origin.x;
+    newFrame.origin.y = NSMaxY(oldFrame) - newFrame.size.height;
+    win.contentMinSize = size;
+    win.contentMaxSize = size;
+    [win setFrame:newFrame display:YES animate:NO];
+}
+
+// Construit et présente la fenêtre d'éditeur pour `view` (UI du plugin, ou nil
+// si aucun éditeur). MAIN THREAD only ; l'Entry `hid` a déjà été vérifiée vive
+// par l'appelant, et est re-résolue sous lock pour l'assignation finale.
+//
+// Principe (conforme aux hôtes pro : sample Apple AUv3Host, JUCE) : c'est la
+// view du plugin qui PILOTE la taille de la fenêtre. La view est posée en
+// sous-vue d'un conteneur (jamais étirée), la fenêtre est dimensionnée à sa
+// taille naturelle, puis SUIT chaque NSViewFrameDidChangeNotification — ce qui
+// couvre le layout asynchrone (fenêtre coupée au 1er affichage), le chargement
+// différé de l'UI, et les plugins qui redimensionnent leur propre view.
+- (void)presentEditorView:(NSView *)view
+                    title:(NSString *)title
+              defaultSize:(NSSize)defaultSize
+                forHandle:(uint32_t)hid {
+    // Taille initiale : on force un layout puis on lit la taille réelle de la
+    // view (sa frame si plausible, sinon son fittingSize Auto Layout), avec un
+    // défaut sûr en dernier recours. L'observer corrigera de toute façon dès
+    // que le plugin aura fini de se mettre en page.
+    NSSize content = defaultSize;
+    if (view) {
+        [view layoutSubtreeIfNeeded];
+        NSSize fr = view.frame.size;
+        NSSize fit = view.fittingSize;
+        if (fr.width >= 100 && fr.height >= 50) {
+            content = fr;
+        } else if (fit.width >= 100 && fit.height >= 50) {
+            content = fit;
+        }
+    }
+
+    NSRect rect = NSMakeRect(0, 0, content.width, content.height);
+    // Fenêtre NON redimensionnable (convention DAW Logic/Ableton/Reaper) — mais
+    // désormais TOUJOURS à la bonne taille et auto-suiveuse (cf. observer).
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:rect
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    [win setTitle:(title ?: @"AU Plugin")];
+    [win setReleasedWhenClosed:NO];
+    win.contentMinSize = content;
+    win.contentMaxSize = content;
+
+    id frameObserver = nil;
+    if (view) {
+        // Conteneur neutre = contentView (épinglé à la fenêtre par AppKit). La
+        // view du plugin est une sous-vue à sa taille propre : on n'étire JAMAIS
+        // l'UI du plugin (source des marges noires sur les UI à taille fixe).
+        NSView *container = [[NSView alloc] initWithFrame:rect];
+        [win setContentView:container];
+        view.translatesAutoresizingMaskIntoConstraints = YES;
+        view.autoresizingMask = NSViewNotSizable;
+        view.frame = rect;
+        [container addSubview:view];
+
+        // Suivi de la taille du plugin : il poste cette notification quand sa
+        // view change de frame (layout async, chargement, resize interne).
+        view.postsFrameChangedNotifications = YES;
+        NSWindow *winRef = win;
+        frameObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSViewFrameDidChangeNotification
+                        object:view
+                         queue:nil
+                    usingBlock:^(NSNotification *_Nonnull note) {
+            NSView *v = note.object;
+            [JmoAuHost sizeWindow:winRef toContent:v.frame.size];
+        }];
+    } else {
+        NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
+        [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
+        [label setEditable:NO];
+        [label setBezeled:NO];
+        [label setDrawsBackground:NO];
+        [label setAlignment:NSTextAlignmentCenter];
+        label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [win setContentView:label];
+    }
+
+    [win center];
+    [NSApp activateIgnoringOtherApps:YES];
+    [win makeKeyAndOrderFront:nil];
+
+    // Observer de fermeture : nettoie l'état éditeur dans l'Entry (re-résolu
+    // sous lock — un unload peut survenir entre-temps).
+    id closeObserver = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSWindowWillCloseNotification
+                    object:win
+                     queue:nil
+                usingBlock:^(NSNotification *_Nonnull __unused note) {
+        os_unfair_lock_lock(&self->lock);
+        auto it2 = self->entries.find(hid);
+        if (it2 != self->entries.end()) {
+            Entry *e2 = it2->second.get();
+            if (e2->editor_frame_observer) {
+                [[NSNotificationCenter defaultCenter] removeObserver:e2->editor_frame_observer];
+                e2->editor_frame_observer = nil;
+            }
+            e2->editor_view = nil;
+            e2->editor_window = nil;
+        }
+        os_unfair_lock_unlock(&self->lock);
+    }];
+
+    // Assignation finale sous lock + re-check : l'unload a pu passer pendant la
+    // construction de la window → dans ce cas on défait tout proprement.
+    os_unfair_lock_lock(&self->lock);
+    auto it = self->entries.find(hid);
+    if (it != self->entries.end()) {
+        Entry *e = it->second.get();
+        e->editor_window = win;
+        e->editor_view = view;
+        e->editor_close_observer = closeObserver;
+        e->editor_frame_observer = frameObserver;
+        os_unfair_lock_unlock(&self->lock);
+    } else {
+        os_unfair_lock_unlock(&self->lock);
+        [[NSNotificationCenter defaultCenter] removeObserver:closeObserver];
+        if (frameObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:frameObserver];
+        }
+        [win close];
+    }
+}
+
 - (int)openEditor:(uint32_t)handle_id {
     auto it = entries.find(handle_id);
     if (it == entries.end()) return -1;
@@ -817,66 +973,10 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
                         return; // plugin déchargé pendant le gap → on abandonne
                     }
                     NSView *view = vc ? vc.view : nil;
-                    CGSize prefSize = view ? view.frame.size : CGSizeMake(800, 600);
-                    if (prefSize.width < 200 || prefSize.height < 100) {
-                        prefSize = CGSizeMake(800, 600);
-                    }
-                    NSRect rect = NSMakeRect(120, 120, prefSize.width, prefSize.height);
-                    // S1.11 — Window NON resizable (convention DAW Logic/Ableton/Reaper).
-                    // Les UI plugins ont une taille fixe imposée par le plugin (AmpliTube,
-                    // TONEX et 95% des plugins commerciaux). Laisser le user resize la
-                    // window créait une zone vide trompeuse autour de l'UI fixe.
-                    NSWindow *win = [[NSWindow alloc]
-                        initWithContentRect:rect
-                                  styleMask:(NSWindowStyleMaskTitled |
-                                             NSWindowStyleMaskClosable)
-                                    backing:NSBackingStoreBuffered
-                                      defer:NO];
-                    [win setTitle:(au_v3.audioUnitName ?: @"AU Plugin")];
-                    [win setReleasedWhenClosed:NO];
-                    if (view) {
-                        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-                        [win setContentView:view];
-                    } else {
-                        NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
-                        [label setStringValue:@"Ce plugin v3 ne fournit pas d'éditeur."];
-                        [label setEditable:NO];
-                        [label setBezeled:NO];
-                        [label setDrawsBackground:NO];
-                        [label setAlignment:NSTextAlignmentCenter];
-                        label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-                        [win setContentView:label];
-                    }
-                    [win center];
-                    [NSApp activateIgnoringOtherApps:YES];
-                    [win makeKeyAndOrderFront:nil];
-                    // Observer de fermeture : re-résout aussi par handle_id sous
-                    // lock (l'unload peut survenir après l'ouverture).
-                    id observer = [[NSNotificationCenter defaultCenter]
-                        addObserverForName:NSWindowWillCloseNotification
-                                    object:win
-                                     queue:nil
-                                usingBlock:^(NSNotification *_Nonnull __unused note) {
-                        os_unfair_lock_lock(&self->lock);
-                        auto it2 = self->entries.find(hid);
-                        if (it2 != self->entries.end()) {
-                            it2->second->editor_window = nil;
-                        }
-                        os_unfair_lock_unlock(&self->lock);
-                    }];
-                    // Assignation finale sous lock + re-check (l'unload a pu
-                    // passer pendant la construction de la window).
-                    os_unfair_lock_lock(&self->lock);
-                    auto it = self->entries.find(hid);
-                    if (it != self->entries.end()) {
-                        it->second->editor_window = win;
-                        it->second->editor_close_observer = observer;
-                        os_unfair_lock_unlock(&self->lock);
-                    } else {
-                        os_unfair_lock_unlock(&self->lock);
-                        [[NSNotificationCenter defaultCenter] removeObserver:observer];
-                        [win close];
-                    }
+                    [self presentEditorView:view
+                                      title:(au_v3.audioUnitName ?: @"AU Plugin")
+                                defaultSize:NSMakeSize(800, 600)
+                                  forHandle:hid];
                 });
             }];
         });
@@ -950,69 +1050,21 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
             }
         }
 
-        // Taille window adaptée à la view fournie (sinon 640x480).
-        NSSize prefSize = customView ? customView.frame.size : NSMakeSize(640, 480);
-        if (prefSize.width < 200 || prefSize.height < 100) {
-            prefSize = NSMakeSize(640, 480);
-        }
-        NSRect rect = NSMakeRect(120, 120, prefSize.width, prefSize.height);
-        // S1.11 — Window NON resizable (convention DAW). Cf. path v3 ci-dessus.
-        NSWindow *win = [[NSWindow alloc]
-            initWithContentRect:rect
-                      styleMask:(NSWindowStyleMaskTitled |
-                                 NSWindowStyleMaskClosable)
-                        backing:NSBackingStoreBuffered
-                          defer:NO];
-        [win setTitle:title];
-        [win setReleasedWhenClosed:NO];
-
-        if (customView) {
-            customView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            [win setContentView:customView];
-        } else {
-            AUGenericView *view = [[AUGenericView alloc] initWithAudioUnit:inst];
-            if (view) {
-                view.showsExpertParameters = YES;
-                view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-                [win setContentView:view];
-            } else {
-                NSTextField *label = [[NSTextField alloc] initWithFrame:rect];
-                [label setStringValue:@"Ce plugin ne fournit pas d'éditeur."];
-                [label setEditable:NO];
-                [label setBezeled:NO];
-                [label setDrawsBackground:NO];
-                [label setAlignment:NSTextAlignmentCenter];
-                label.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-                [win setContentView:label];
+        // View à présenter : Cocoa UI custom du plugin si dispo, sinon
+        // AUGenericView (sliders bruts) sur la MÊME instance que le processing
+        // (params sync GUI ↔ son). nil → la fenêtre affichera un libellé.
+        NSView *editorView = customView;
+        if (!editorView) {
+            AUGenericView *generic = [[AUGenericView alloc] initWithAudioUnit:inst];
+            if (generic) {
+                generic.showsExpertParameters = YES;
+                editorView = generic;
             }
         }
-
-        [win center];
-        [NSApp activateIgnoringOtherApps:YES];
-        [win makeKeyAndOrderFront:nil];
-        id observer = [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowWillCloseNotification
-                        object:win
-                         queue:nil
-                    usingBlock:^(NSNotification *_Nonnull __unused note) {
-            os_unfair_lock_lock(&self->lock);
-            auto it2 = self->entries.find(hid);
-            if (it2 != self->entries.end()) {
-                it2->second->editor_window = nil;
-            }
-            os_unfair_lock_unlock(&self->lock);
-        }];
-        os_unfair_lock_lock(&self->lock);
-        auto it = self->entries.find(hid);
-        if (it != self->entries.end()) {
-            it->second->editor_window = win;
-            it->second->editor_close_observer = observer;
-            os_unfair_lock_unlock(&self->lock);
-        } else {
-            os_unfair_lock_unlock(&self->lock);
-            [[NSNotificationCenter defaultCenter] removeObserver:observer];
-            [win close];
-        }
+        [self presentEditorView:editorView
+                          title:title
+                    defaultSize:NSMakeSize(640, 480)
+                      forHandle:hid];
     });
     return 0;
 }
