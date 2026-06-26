@@ -1080,21 +1080,15 @@ impl PipelineState {
         tokio::spawn({
             let sender = sender.clone();
             async move {
-                let base = tokio::time::Instant::now();
-                let mut deadline_us: u64 = 0;
+                // Envoi IMMÉDIAT (comportement sain validé ≤ 0.5.2-4). Le pacing
+                // par sommeil-par-paquet a été retiré (v0.5.2-7) : la granularité
+                // du timer tokio (~1 ms, arrondi au-dessus) faisait drainer le
+                // pacer plus lentement que la production (2,5 ms/paquet) → la file
+                // RTP saturait à 64 paquets = ~160 ms de latence d'émission +
+                // instabilité (backpressure). L'instrumentation `send_path_latency`
+                // est CONSERVÉE (doit lire ~0 ici) pour garder la visibilité.
                 while let Some((produced_at, packet)) = rtp_rx.recv().await {
-                    let now_us = base.elapsed().as_micros() as u64;
-                    let (send_at_us, next_us) = paced_send_time_us(deadline_us, now_us);
-                    if send_at_us > now_us {
-                        tokio::time::sleep_until(
-                            base + std::time::Duration::from_micros(send_at_us),
-                        )
-                        .await;
-                    }
                     let _ = sender.send(packet).await;
-                    deadline_us = next_us;
-                    // Délai d'émission réel (file + pacing) = vérité déterministe
-                    // sur la latence ajoutée côté envoi. Observé après le send.
                     let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
                     send_path_latency.lock().observe(send_delay_ms);
                 }
@@ -2174,35 +2168,6 @@ fn process_stage_loop(
 // Coût observé : ~50-100 µs par frame (Opus encode est constant). Spike
 // rarissime (Opus interne).
 
-/// Période d'émission temps-réel d'un paquet RTP = une frame Opus (120 samples
-/// @ 48 kHz). Le pacing espace les envois sur cette cadence.
-const SEND_FRAME_PERIOD_US: u64 = 2_500;
-/// **Borne dure de rétention** : un paquet n'est JAMAIS retenu plus de ce délai
-/// au-delà de son arrivée. 10 ms ≈ un buffer WASAPI Windows → suffit à étaler
-/// une rafale complète, tout en garantissant mathématiquement que le pacer ne
-/// peut **pas accumuler** de latence (le deadline ne peut pas s'envoler devant
-/// `now`). Remplace l'ancien garde-fou par backlog (trop permissif : 20 ms).
-const SEND_MAX_HOLD_US: u64 = 10_000;
-
-/// Décision de pacing PURE (testable sans runtime) pour lisser les rafales
-/// d'émission : Windows/ASIO livre plusieurs frames Opus par callback audio, que
-/// `encode_stage_loop` encode et envoie d'affilée → le récepteur subit des
-/// grappes. On réétale l'émission à la cadence temps-réel. Donne l'instant
-/// d'émission du paquet courant et le deadline du suivant, en µs depuis une
-/// origine monotone commune.
-///
-/// Le `send_at` est le deadline **clampé dans `[now, now + MAX_HOLD]`** :
-/// - `deadline < now` (en retard) → `now` : envoi immédiat (pas de latence
-///   négative accumulée).
-/// - `deadline ∈ [now, now+MAX_HOLD]` → on attend le créneau (étalement de rafale).
-/// - `deadline > now + MAX_HOLD` (le pacer prendrait trop d'avance, p.ex. horloge
-///   de capture plus rapide) → plafonné à `now + MAX_HOLD` : **rétention bornée**,
-///   impossible d'accumuler. Flux régulier (Mac) ≈ no-op.
-fn paced_send_time_us(deadline_us: u64, now_us: u64) -> (u64, u64) {
-    let send_at = deadline_us.clamp(now_us, now_us + SEND_MAX_HOLD_US);
-    (send_at, send_at + SEND_FRAME_PERIOD_US)
-}
-
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
     rtp_tx: tokio_mpsc::Sender<(std::time::Instant, Vec<u8>)>,
@@ -2688,69 +2653,6 @@ mod plugin_control_tests {
 // ═══════════════════════════════════════════════════════════════════
 // Chantier C (v0.4.14) — tests soft-clip de sécurité (cross-platform)
 // ═══════════════════════════════════════════════════════════════════
-#[cfg(test)]
-mod pacing_tests {
-    use super::{paced_send_time_us, SEND_FRAME_PERIOD_US, SEND_MAX_HOLD_US};
-
-    #[test]
-    fn even_stream_waits_for_its_slot() {
-        // Paquet en avance (deadline dans [now, now+MAX_HOLD]) → on attend le créneau.
-        let (send_at, next) = paced_send_time_us(10_000, 8_000);
-        assert_eq!(send_at, 10_000, "on attend le deadline");
-        assert_eq!(next, 10_000 + SEND_FRAME_PERIOD_US);
-    }
-
-    #[test]
-    fn behind_schedule_sends_now() {
-        // Deadline déjà passé → envoi immédiat (pas de latence négative accumulée).
-        let (send_at, next) = paced_send_time_us(5_000, 9_000);
-        assert_eq!(send_at, 9_000);
-        assert_eq!(next, 9_000 + SEND_FRAME_PERIOD_US);
-    }
-
-    #[test]
-    fn hold_is_hard_bounded_no_accumulation() {
-        // Deadline très en avance (le pacer prendrait trop d'avance : horloge de
-        // capture rapide, etc.) → plafonné à now + MAX_HOLD. Garantit qu'on ne
-        // peut JAMAIS accumuler de latence d'émission (la régression du 0.5.2-5).
-        let now = 8_000;
-        let (send_at, next) = paced_send_time_us(now + 5 * SEND_MAX_HOLD_US, now);
-        assert_eq!(send_at, now + SEND_MAX_HOLD_US, "rétention plafonnée à MAX_HOLD");
-        assert_eq!(next, now + SEND_MAX_HOLD_US + SEND_FRAME_PERIOD_US);
-    }
-
-    #[test]
-    fn steady_cadence_holds_one_period_per_packet() {
-        // Flux arrivant pile à l'heure : le deadline avance d'exactement une
-        // période par paquet (pas de dérive du pacer), rétention nulle.
-        let mut deadline = 0u64;
-        let mut now = 0u64;
-        for _ in 0..100 {
-            let (send_at, next) = paced_send_time_us(deadline, now);
-            assert!(send_at <= now + SEND_MAX_HOLD_US, "rétention bornée");
-            deadline = next;
-            now = send_at + SEND_FRAME_PERIOD_US; // paquet suivant à l'heure pile.
-        }
-        assert_eq!(deadline, 100 * SEND_FRAME_PERIOD_US);
-    }
-
-    #[test]
-    fn burst_is_spread_within_hold_bound() {
-        // Rafale : 4 paquets "arrivent" au même instant (now=0). Le pacer les
-        // étale à la cadence, tant que la rétention reste sous MAX_HOLD.
-        let now = 0u64;
-        let mut deadline = 0u64;
-        let mut sends = Vec::new();
-        for _ in 0..4 {
-            let (send_at, next) = paced_send_time_us(deadline, now);
-            sends.push(send_at);
-            deadline = next;
-        }
-        assert_eq!(sends, vec![0, 2_500, 5_000, 7_500], "rafale étalée à 2,5 ms");
-        assert!(*sends.last().unwrap() <= now + SEND_MAX_HOLD_US);
-    }
-}
-
 #[cfg(test)]
 mod dsp_tests {
     use super::soft_clip_block;

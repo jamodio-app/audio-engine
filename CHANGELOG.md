@@ -6,6 +6,30 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-7] — 2026-06-26
+
+> **REVERT du pacing d'émission (régression grave) — retour au comportement
+> sain. L'instrumentation est conservée.**
+
+### Fixed
+- **Pacing d'émission RETIRÉ.** L'instrumentation `send_path_latency` (0.5.2-6) a
+  révélé que le pacer injectait **~160 ms** de latence d'émission (mesuré p50 sur
+  les deux postes) + instabilité agent (backpressure). **Cause racine** : le pacer
+  dormait ~2,5 ms/paquet via `tokio::sleep_until`, dont la granularité (~1 ms,
+  arrondi au-dessus) faisait drainer **plus lentement** (~3-4 ms/paquet) que la
+  production (2,5 ms/paquet) → la file RTP **saturait à 64 paquets = ~160 ms** et y
+  restait. Le sommeil-par-paquet est fondamentalement incompatible avec la cadence
+  2,5 ms. La tâche UDP **renvoie désormais immédiatement** (comportement validé
+  ≤ 0.5.2-4). Opus LowDelay + jitter buffer adaptatif (A/B/C) **conservés**.
+- **Instrumentation `send_path_latency` CONSERVÉE** (le canal RTP porte l'instant
+  de production) : doit lire ~0 ms en envoi immédiat. Garde la visibilité
+  déterministe sur la latence d'émission pour toute future tentative de lissage.
+
+### Notes
+- La **rafale d'émission Windows/ASIO** (cause des bursts) reste donc à traiter,
+  mais par une approche saine (thread de pacing haute résolution dédié, ou buffer
+  ASIO plus petit côté Windows) — décidée sur la base de `send_path_latency`.
+
 ## [0.5.2-6] — 2026-06-26
 
 > **Observabilité latence d'émission + durcissement du pacer (anti-accumulation).**
