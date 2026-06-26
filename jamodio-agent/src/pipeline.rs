@@ -1059,13 +1059,30 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 7. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to)
+        // 7. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to).
+        //    Pacing d'émission : on lisse les rafales (Windows/ASIO produit
+        //    plusieurs frames Opus par callback → encode_stage les envoie
+        //    d'affilée) en réétalant les paquets à la cadence temps-réel
+        //    (cf. `paced_send_time_us`). Flux régulier (Mac) ≈ no-op ; flux en
+        //    rafale (Windows) → étalé → le récepteur peut tenir un buffer bas.
         let sender = Arc::new(sender);
         tokio::spawn({
             let sender = sender.clone();
             async move {
+                let base = tokio::time::Instant::now();
+                let mut deadline_us: u64 = 0;
                 while let Some(packet) = rtp_rx.recv().await {
+                    let now_us = base.elapsed().as_micros() as u64;
+                    let (send_at_us, next_us) =
+                        paced_send_time_us(deadline_us, now_us, rtp_rx.len());
+                    if send_at_us > now_us {
+                        tokio::time::sleep_until(
+                            base + std::time::Duration::from_micros(send_at_us),
+                        )
+                        .await;
+                    }
                     let _ = sender.send(packet).await;
+                    deadline_us = next_us;
                 }
             }
         });
@@ -2143,6 +2160,35 @@ fn process_stage_loop(
 // Coût observé : ~50-100 µs par frame (Opus encode est constant). Spike
 // rarissime (Opus interne).
 
+/// Période d'émission temps-réel d'un paquet RTP = une frame Opus (120 samples
+/// @ 48 kHz). Le pacing espace les envois sur cette cadence.
+const SEND_FRAME_PERIOD_US: u64 = 2_500;
+/// Backlog max de la file RTP avant de couper le pacing (drainage) — ~20 ms.
+/// Au-delà, le producteur dépasse la cadence (drift d'horloge / surcharge) → on
+/// envoie sans attendre pour ne JAMAIS accumuler de latence ni dropper de paquet.
+const SEND_MAX_BACKLOG: usize = 8;
+
+/// Décision de pacing PURE (testable sans runtime) pour lisser les rafales
+/// d'émission : Windows/ASIO livre plusieurs frames Opus par callback audio, que
+/// `encode_stage_loop` encode et envoie d'affilée → le récepteur subit des
+/// grappes. On réétale l'émission à la cadence temps-réel. Donne l'instant
+/// d'émission du paquet courant et le deadline du suivant, en µs depuis une
+/// origine monotone commune.
+///
+/// - Flux régulier (Mac, buffer ≈ 1 frame) : `deadline` ≈ `now` → envoi à
+///   l'heure, délai ~nul (quasi no-op).
+/// - Rafale (Windows) : les paquets en avance attendent leur créneau → étalés.
+/// - En retard (`deadline < now`) ou file pleine (`backlog > MAX`) : on resync
+///   sur `now` → envoi immédiat, latence bornée, zéro drop.
+fn paced_send_time_us(deadline_us: u64, now_us: u64, backlog: usize) -> (u64, u64) {
+    let send_at = if deadline_us < now_us || backlog > SEND_MAX_BACKLOG {
+        now_us
+    } else {
+        deadline_us
+    };
+    (send_at, send_at + SEND_FRAME_PERIOD_US)
+}
+
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
     rtp_tx: tokio_mpsc::Sender<Vec<u8>>,
@@ -2626,6 +2672,49 @@ mod plugin_control_tests {
 // ═══════════════════════════════════════════════════════════════════
 // Chantier C (v0.4.14) — tests soft-clip de sécurité (cross-platform)
 // ═══════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod pacing_tests {
+    use super::{paced_send_time_us, SEND_FRAME_PERIOD_US, SEND_MAX_BACKLOG};
+
+    #[test]
+    fn even_stream_waits_for_its_slot() {
+        // Paquet en avance (deadline futur), file vide → on attend le créneau.
+        let (send_at, next) = paced_send_time_us(10_000, 8_000, 0);
+        assert_eq!(send_at, 10_000, "on attend le deadline");
+        assert_eq!(next, 10_000 + SEND_FRAME_PERIOD_US);
+    }
+
+    #[test]
+    fn behind_schedule_sends_now() {
+        // Deadline déjà passé → envoi immédiat (pas de latence accumulée).
+        let (send_at, next) = paced_send_time_us(5_000, 9_000, 0);
+        assert_eq!(send_at, 9_000);
+        assert_eq!(next, 9_000 + SEND_FRAME_PERIOD_US);
+    }
+
+    #[test]
+    fn deep_backlog_drains_immediately() {
+        // File trop pleine (producteur plus rapide / drift) → envoi maintenant
+        // même si le deadline est futur → jamais d'accumulation ni de drop.
+        let (send_at, _) = paced_send_time_us(20_000, 8_000, SEND_MAX_BACKLOG + 1);
+        assert_eq!(send_at, 8_000, "backlog profond → drain immédiat");
+    }
+
+    #[test]
+    fn steady_cadence_holds_one_period_per_packet() {
+        // Sur un flux arrivant pile à l'heure, le deadline avance d'exactement
+        // une période par paquet (pas de dérive du pacer).
+        let mut deadline = 0u64;
+        let mut now = 0u64;
+        for _ in 0..100 {
+            let (send_at, next) = paced_send_time_us(deadline, now, 0);
+            deadline = next;
+            now = send_at + SEND_FRAME_PERIOD_US; // paquet suivant à l'heure pile.
+        }
+        assert_eq!(deadline, 100 * SEND_FRAME_PERIOD_US);
+    }
+}
+
 #[cfg(test)]
 mod dsp_tests {
     use super::soft_clip_block;

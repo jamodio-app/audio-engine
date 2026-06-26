@@ -6,6 +6,24 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-5] — 2026-06-26
+
+> **Pacing d'émission : lisse les rafales de paquets (Windows/ASIO) pour que le
+> récepteur tienne un buffer bas.**
+
+### Fixed
+- **Émission des paquets RTP réétalée à la cadence temps-réel (2,5 ms).** Sur
+  Windows/ASIO, un callback audio livre plusieurs frames Opus d'un coup que
+  `encode_stage` encode et envoie **en rafale** ; la tâche UDP les forwardait
+  immédiatement → le pair récepteur recevait des grappes → buffer de gigue forcé
+  à monter (20-30 ms mesuré) + drift-drains. La tâche UDP **pace** désormais les
+  envois sur la période d'une frame (fonction pure `paced_send_time_us`), avec
+  garde-fou backlog (drainage immédiat si la file s'accumule → zéro drop, latence
+  bornée). **Flux déjà régulier (Mac) ≈ no-op** ; flux en rafale (Windows) → étalé
+  → le récepteur peut enfin tenir le buffer bas que les Phases B/C visent.
+  C'est le **goulot d'émission Windows** identifié en mesurant une session
+  Mac↔PC réelle. Calcul pur → mac+win.
+
 ## [0.5.2-4] — 2026-06-26
 
 > **Jitter buffer adaptatif — Phase C : compensation de drift continue
