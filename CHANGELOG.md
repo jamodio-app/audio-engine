@@ -6,6 +6,31 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-6] — 2026-06-26
+
+> **Observabilité latence d'émission + durcissement du pacer (anti-accumulation).**
+
+### Added
+- **Mesure déterministe du délai d'émission** (`send_path_latency`) : temps réel
+  de la production d'un paquet (sortie encodeur) à son envoi socket = attente
+  file RTP + sommeil du pacer. C'était l'**angle mort** de la latence d'émission.
+  Le canal RTP transporte désormais l'instant de production ; la tâche UDP mesure
+  le délai après envoi. Loggué à 1 Hz (`send_path_p50/p99/max_ms` dans le perfstats).
+  → On juge le pacing sur des chiffres **déterministes et répétables**, plus sur
+  l'acoustique (dont le bruit ±15-20 ms — I/O intégré du Mac, setup — masque nos
+  variations de ~5 ms).
+
+### Fixed
+- **Pacer : rétention bornée (anti-accumulation de latence).** L'ancien garde-fou
+  par backlog (`SEND_MAX_BACKLOG=8` ≈ 20 ms) pouvait laisser la file s'accumuler
+  en dents de scie jusqu'à ~20 ms (selon l'horloge de capture) → latence
+  d'émission injectée (régression suspectée du 0.5.2-5). Remplacé par une **borne
+  dure de rétention** : `send_at = deadline.clamp(now, now + SEND_MAX_HOLD_US)`
+  avec `SEND_MAX_HOLD_US = 10 ms`. Un paquet n'est **jamais** retenu plus de 10 ms
+  → le deadline ne peut pas s'envoler devant `now` → **accumulation
+  mathématiquement impossible**. Étale toujours une rafale complète (1 buffer),
+  no-op sur flux régulier (Mac).
+
 ## [0.5.2-5] — 2026-06-26
 
 > **Pacing d'émission : lisse les rafales de paquets (Windows/ASIO) pour que le

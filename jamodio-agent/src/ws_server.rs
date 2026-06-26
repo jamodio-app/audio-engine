@@ -600,6 +600,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let capture_snap = pl.perfstats.capture_latency.lock().flush();
             let process_snap = pl.perfstats.process_latency.lock().flush();
             let encode_snap = pl.perfstats.encode_latency.lock().flush();
+            let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -855,6 +856,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 process_max_ms = process_snap.max_ms,
                 encode_p99_ms = encode_snap.p99_ms,
                 encode_max_ms = encode_snap.max_ms,
+                send_path_p50_ms = send_path_snap.p50_ms,
+                send_path_p99_ms = send_path_snap.p99_ms,
+                send_path_max_ms = send_path_snap.max_ms,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,
