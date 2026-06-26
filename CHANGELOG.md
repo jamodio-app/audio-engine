@@ -6,6 +6,25 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-1] — 2026-06-26
+
+> **Latence : −4 ms note→oreille sur le flux musique (encodeur Opus).**
+
+### Changed
+- **Encodeur Opus passé en `RESTRICTED_LOWDELAY`** (était `AUDIO`). À 2,5 ms de
+  frame, Opus opère déjà en CELT-only (SILK exige des frames ≥ 10 ms) : le mode
+  `AUDIO` réservait inutilement le lookahead du resampler SILK — du **délai mort**.
+  Mesuré via `OPUS_GET_LOOKAHEAD` (test de régression `lowdelay_lookahead_vs_audio`) :
+  lookahead **312 → 120 samples**, soit **6,5 → 2,5 ms**. Gain **−4 ms** par sens,
+  **qualité CELT identique** (rien n'est retiré au signal, seulement le délai mort).
+
+### Fixed
+- **Télémétrie de latence Opus corrigée.** Le calcul `totalLatencyMs` modélisait
+  la part Opus à 2,5 ms alors que le lookahead réel en mode `AUDIO` était de
+  6,5 ms — la latence affichée **sous-estimait donc de 4 ms**. Avec
+  `RESTRICTED_LOWDELAY` le lookahead vaut exactement une frame (2,5 ms) :
+  la constante est désormais **exacte** (invariant verrouillé par test).
+
 ## [0.5.1] — 2026-06-26
 
 > **Confort & robustesse : éditeurs de plugins macOS, détection ASIO sans
