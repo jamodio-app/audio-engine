@@ -6,6 +6,56 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-06-26
+
+> **Confort & robustesse : éditeurs de plugins macOS, détection ASIO sans
+> redémarrage manuel, identité visuelle de l'agent.**
+
+### Added
+- **Détection ASIO sans relancer l'agent à la main (Windows).** Quand l'agent
+  démarre AVANT que l'interface soit branchée (cas fréquent avec le lancement au
+  login), il reste figé en WASAPI (+10-20 ms) jusqu'à un redémarrage — le choix
+  du host audio est décidé une fois au boot. Un bouton **« Redémarrer l'agent »**
+  apparaît désormais sur le badge WASAPI des Réglages audio (Windows, hors
+  session live) : un clic relance l'agent, qui re-sonde le host → ASIO détecté,
+  bascule automatique, badge vert. Le badge ASIO/WASAPI et l'état du bouton se
+  mettent à jour tout seuls au retour de l'agent. Nouveau message protocole
+  `relaunch-now`. **Décision : pas de re-probe du host « à chaud »** (trop
+  risqué : ids device, thread COM-STA ASIO) — un redémarrage propre, comme un DAW.
+
+### Fixed
+- **Éditeurs de plugins AU mal dimensionnés (macOS).** La fenêtre d'un éditeur
+  AudioUnit pouvait s'ouvrir trop petite, trop grande (marges vides autour d'une
+  UI à taille fixe), ou tronquée le temps du chargement (il fallait fermer/
+  rouvrir). La fenêtre **suit désormais la taille réelle du plugin** et s'adapte
+  à son layout asynchrone (observation de `NSViewFrameDidChangeNotification`,
+  fenêtre verrouillée sur la taille de la vue). **Aucun impact sur le VST3
+  Windows** (crate séparé).
+- **Agent injoignable après « Redémarrer l'agent » (Windows).** Deux causes
+  empilées, isolées via les logs agent : (1) `app.restart()` relançait la
+  nouvelle instance pendant que l'ancienne tenait encore le verrou
+  single-instance → elle était tuée comme « 2e instance » → plus aucun agent.
+  Corrigé par un **relanceur détaché** (`--awaited-relaunch`) qui attend la mort
+  de l'ancien process avant de démarrer. (2) Le port WS restait ~30 s en
+  `TIME_WAIT` → bind refusé (`WSAEADDRINUSE`). Corrigé par **`SO_REUSEADDR`**
+  (via `socket2`, que tokio ne pose pas sur Windows). Reconnexion désormais
+  immédiate (~2-3 s).
+- **Clignotement de l'icône dans la barre des tâches (Windows).** L'icône
+  affichait brièvement le badge puis une autre tuile au démarrage (override
+  runtime hérité du tray monochrome). Override supprimé → une seule icône.
+
+### Changed
+- **Identité visuelle de l'agent.** Icône du Dock / de l'app alignée sur la
+  marque (logo complet avec les points extérieurs aux extrémités des ondes) ;
+  icône de la barre de menus (macOS) / barre des tâches (Windows) = **badge
+  jaune Jamodio**, lisible et cohérent sur les deux OS.
+- **Icône du Dock cliquable (macOS).** Cliquer l'icône du Dock affiche désormais
+  la fenêtre d'infos de l'agent (au lieu de ne rien faire). L'agent assume une
+  présence Dock (app « Regular ») ; le tray reste un bonus.
+- **Publication des releases (CI) fiabilisée** : upload des assets idempotent
+  (delete-then-upload) + verrou de concurrence par tag (corrige un échec
+  `422 already exists` quand deux runs se chevauchaient).
+
 ## [0.5.0] — 2026-06-23
 
 > **Jalon — première release validée Windows + macOS, plugins opérationnels.**
