@@ -258,11 +258,40 @@ pub async fn start(handle: WsServerHandle) {
         }),
     );
 
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:9876").await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "jamodio::ws", error = %e, "port 9876 already in use — another instance running?");
-            return;
+    // Bind avec retry/back-off. Raison (Windows, refresh ASIO 26/06) : sur
+    // `app.restart()` (bouton « Redémarrer l'agent »), le NOUVEAU process démarre
+    // avant que l'ANCIEN ait libéré le port 9876 → le bind échouait, `start`
+    // retournait, et l'agent relancé tournait SANS WS (sourd : le browser ne
+    // pouvait plus se reconnecter, il fallait tuer l'agent à la main). On
+    // retente jusqu'à ce que l'ancien process meure (~1 s en pratique). 10×500ms
+    // = 5 s de marge ; au-delà, c'est probablement une autre instance → on logue
+    // et on abandonne (le single-instance plugin gère le vrai doublon).
+    let listener = {
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt: u32 = 0;
+        loop {
+            match tokio::net::TcpListener::bind("127.0.0.1:9876").await {
+                Ok(l) => break l,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        tracing::error!(
+                            target: "jamodio::ws",
+                            error = %e,
+                            attempts = attempt,
+                            "port 9876 toujours occupé — abandon (autre instance ?)"
+                        );
+                        return;
+                    }
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        error = %e,
+                        attempt,
+                        "port 9876 occupé (ancien process en cours de fermeture ?) — retry dans 500ms"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
         }
     };
 
@@ -1361,7 +1390,12 @@ async fn handle_message(
             let output_buf_ms_opt: Option<f32> = pl.output_buffer_samples.map(|n| n as f32 / 48.0);
             let input_buf_ms_est = input_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             let output_buf_ms_est = output_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
-            let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz
+            // Latence algorithmique Opus = lookahead encodeur. En mode
+            // RESTRICTED_LOWDELAY (cf. MusicEncoder) le lookahead vaut
+            // exactement une frame de 120 samples = 2,5 ms — invariant verrouillé
+            // par le test `lowdelay_lookahead_vs_audio`. (En mode Audio il valait
+            // 6,5 ms : la télémétrie d'avant sous-estimait donc la latence.)
+            let opus_ms: f32 = 2.5;
 
             let mixer = pl.mixer.lock();
             let underruns = mixer.total_underruns();

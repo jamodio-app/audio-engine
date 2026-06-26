@@ -209,16 +209,13 @@ fn main() {
             }
 
             if let Some(tray) = app.tray_by_id("main") {
-                // Windows : tray.png est un glyphe "template" gris foncé —
-                // macOS le recolore selon le thème (iconAsTemplate), Windows
-                // l'affiche tel quel → quasi invisible sur la barre des
-                // tâches sombre par défaut (= "pas d'icône" rapporté en
-                // v0.4.x). On remplace par l'icône couleur de l'app (tuile
-                // noire + glyphe jaune, lisible sur thème sombre ET clair).
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = tray.set_icon(Some(tauri::include_image!("icons/32x32.png")));
-                }
+                // tray.png est désormais un BADGE COULEUR (disque jaune marque +
+                // logo sombre, cf. icons/src/jamodio-tray.svg), visible sur Mac
+                // ET Windows. On NE le remplace plus par 32x32.png au runtime sur
+                // Windows : cet override datait du tray template monochrome
+                // (invisible sur barre sombre) et provoquait désormais un flash
+                // (badge jaune chargé par la config → remplacé par la tuile
+                // noire). Une seule icône de marque partout, pas de flash.
                 let _ = tray.set_menu(Some(menu));
                 tray.on_menu_event(|app, event| match event.id.as_ref() {
                     // Même chemin de sortie que le bouton de la fenêtre :
