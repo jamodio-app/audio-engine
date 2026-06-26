@@ -6,6 +6,30 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-3] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase B : cible pilotée par la gigue mesurée.**
+
+### Changed
+- **La cible du jitter buffer réseau est désormais dérivée de la gigue mesurée**
+  (Phase A) au lieu d'un ratchet purement réactif. Modèle :
+  `target = clamp(MIN, plancher + filet_réactif, MAX)` où
+  `plancher = clamp(MIN, k·gigue + headroom, MAX)` (`k=3`, `headroom=2,5 ms`).
+  Sur réseau propre (gigue ~0,7–1 ms mesurée), la cible tient **~5 ms** au lieu
+  de ~15 ms de médiane observée → **~10 ms de latence de réception en moins**,
+  sans surprovisionner. La cible s'adapte **par peer** à sa propre gigue.
+- **Garantie anti-régression** : le filet réactif (+5 ms à l'underrun, décroît
+  au calme) est **conservé** et s'ajoute au plancher. Le système ne peut jamais
+  être durablement moins bufferisé que le comportement historique — il descend
+  seulement quand la gigue mesurée ET l'absence d'underrun le confirment.
+  L'override manuel (slider UI) et le self-monitor (mode local) sont respectés
+  (pilotage gigue désactivé, comportement inchangé).
+
+### Added
+- `JitterBuffer::observe_jitter()` + warmup `JitterEstimator::is_warm()` (≥100
+  paquets) pour ne jamais abaisser la cible sur une estimation non stabilisée.
+  Câblage `recv_decode_task` → `AudioMixer::observe_jitter` throttlé ~10×/s.
+
 ## [0.5.2-2] — 2026-06-26
 
 > **Jitter buffer adaptatif — Phase A : instrumentation (mesure pure, aucun

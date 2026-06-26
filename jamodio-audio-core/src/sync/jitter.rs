@@ -26,6 +26,13 @@ const SAMPLE_RATE_HZ: f64 = 48_000.0;
 /// Gain de l'EWMA RFC 3550. 1/16 = compromis standard réactivité/stabilité.
 const EWMA_GAIN: f64 = 1.0 / 16.0;
 
+/// Nombre de paquets observés avant que l'estimation soit jugée fiable. À ~400
+/// paquets/s (frame 2,5 ms), 100 paquets = ~250 ms — assez pour que l'EWMA
+/// (gain 1/16) ait convergé (~95 % après 48 échantillons). Avant ce seuil,
+/// `is_warm()` renvoie `false` : un consommateur (le jitter buffer) ne doit PAS
+/// abaisser sa cible sur une valeur encore sous-estimée (l'EWMA rampe depuis 0).
+const WARMUP_PACKETS: u64 = 100;
+
 #[derive(Default)]
 pub struct JitterEstimator {
     /// Instant d'arrivée du 1er paquet — origine commune pour exprimer les
@@ -35,6 +42,8 @@ pub struct JitterEstimator {
     prev_transit: Option<f64>,
     /// Gigue lissée `J`, en samples.
     jitter_samples: f64,
+    /// Nombre de paquets observés (pour le warmup).
+    observations: u64,
 }
 
 impl JitterEstimator {
@@ -48,6 +57,7 @@ impl JitterEstimator {
     /// * `rtp_ts` — timestamp RTP du paquet (unités samples @48k).
     /// * `instant` — instant d'arrivée local du paquet.
     pub fn observe(&mut self, rtp_ts: u32, instant: Instant) {
+        self.observations += 1;
         let first = *self.first_instant.get_or_insert(instant);
 
         // Arrivée locale exprimée en samples @48k depuis le 1er paquet, dans la
@@ -71,6 +81,12 @@ impl JitterEstimator {
     /// Gigue lissée en millisecondes.
     pub fn jitter_ms(&self) -> f64 {
         self.jitter_samples / SAMPLE_RATE_HZ * 1000.0
+    }
+
+    /// `true` une fois l'estimation stabilisée (≥ `WARMUP_PACKETS` paquets).
+    /// Tant que `false`, ne pas utiliser `jitter_ms()` pour abaisser une cible.
+    pub fn is_warm(&self) -> bool {
+        self.observations >= WARMUP_PACKETS
     }
 }
 

@@ -4,7 +4,26 @@ use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
 pub struct JitterBuffer {
     producer: ringbuf::HeapProd<f32>,
     consumer: ringbuf::HeapCons<f32>,
+    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Valeur dérivée, recalculée par `recompute_target()` à chaque changement de
+    /// `floor_samples` ou `reactive_extra_samples`. Lue par `pull` (pre-fill +
+    /// seuil de drift-drain).
     target_samples: usize,
+    /// Plancher PRÉDICTIF (samples). En mode auto : piloté par la gigue réseau
+    /// mesurée (`observe_jitter`) ≈ `k·gigue + headroom`. En mode manuel / local :
+    /// valeur figée par `set_target_ms`. Init = `INITIAL_TARGET_MS` (sûr avant la
+    /// 1re mesure de gigue fiable).
+    floor_samples: usize,
+    /// Marge RÉACTIVE temporaire (samples) ajoutée au plancher : +5 ms à chaque
+    /// underrun (`adapt_up`), décroît vers 0 au calme (`adapt_down`). C'est le
+    /// FILET de sécurité — il garantit qu'on n'est jamais durablement moins
+    /// bufferisé que le comportement réactif historique, quelle que soit la
+    /// justesse de l'estimation de gigue.
+    reactive_extra_samples: usize,
+    /// `true` : le plancher suit la gigue mesurée (réseau). `false` : plancher
+    /// figé par l'utilisateur (slider UI) ou le self-monitor — `observe_jitter`
+    /// devient alors un no-op (on respecte l'override).
+    jitter_auto: bool,
     underruns: u64,
     last_adapt: std::time::Instant,
     /// Pre-fill gate : on n'autorise le playout qu'une fois `target_samples`
@@ -47,7 +66,17 @@ const SAMPLE_RATE: usize = 48000;
 const CHANNELS: usize = 2;
 const MIN_TARGET_MS: usize = 5;
 const MAX_TARGET_MS: usize = 40;
+/// Plancher auto avant que la gigue mesurée soit fiable (warmup JitterEstimator).
+/// Valeur sûre et conservatrice ; `observe_jitter` la fait ensuite descendre/monter.
 const INITIAL_TARGET_MS: usize = 10;
+/// Phase B — calibration du plancher prédictif : `floor = k·gigue + headroom`.
+/// `k = 3` sur la gigue EWMA (RFC 3550, ≈ déviation absolue moyenne) couvre
+/// largement la queue de distribution (≈ 3,7σ) ; `headroom` ajoute une marge
+/// fixe pour la granularité de mesure. Calibré sur réseaux réels (gigue ethernet
+/// mesurée ~0,7–1 ms → plancher ~5 ms ; gigue 3 ms → ~11 ms). Le filet réactif
+/// (`reactive_extra`) couvre ce que l'EWMA sous-estime (rafales Wi-Fi).
+const JITTER_TARGET_K: f64 = 3.0;
+const JITTER_HEADROOM_MS: f64 = 2.5;
 /// Capacité du ring buffer, en ms d'audio stéréo. Marge confortable au-dessus
 /// de MAX_TARGET_MS (40) pour absorber les bursts SFU sans truncation
 /// même quand le buffer est proche de sa cible haute. Coût RAM : ~115 KB / stream.
@@ -78,6 +107,11 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 const CONCEAL_FADE_MS: usize = 2;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 
+/// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
+fn ms_f64_to_samples(ms: f64) -> usize {
+    (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
+}
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -90,10 +124,14 @@ impl JitterBuffer {
         let rb = HeapRb::<f32>::new(capacity);
         let (producer, consumer) = rb.split();
 
+        let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
         Self {
             producer,
             consumer,
-            target_samples: INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000,
+            target_samples: initial,
+            floor_samples: initial,
+            reactive_extra_samples: 0,
+            jitter_auto: true,
             underruns: 0,
             last_adapt: std::time::Instant::now(),
             primed: false,
@@ -274,9 +312,39 @@ impl JitterBuffer {
     /// avant de reprendre le playout.
     pub fn set_target_ms(&mut self, target_ms: usize) {
         let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
-        self.target_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
+        // Override manuel (slider UI) ou pin du self-monitor : on fige le
+        // plancher sur cette valeur et on COUPE le pilotage par la gigue
+        // (`observe_jitter` devient no-op). Le filet réactif reste actif.
+        self.jitter_auto = false;
+        self.floor_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
+        self.reactive_extra_samples = 0;
+        self.recompute_target();
         self.last_adapt = std::time::Instant::now();
         self.primed = false;
+    }
+
+    /// Phase B — alimente le plancher prédictif avec la gigue réseau mesurée
+    /// (RFC 3550, ms). No-op si la cible est en override manuel (`jitter_auto`
+    /// = false) ou si l'estimation n'est pas encore fiable (appelant garde
+    /// `JitterEstimator::is_warm()`). Le plancher = `clamp(MIN, k·gigue +
+    /// headroom, MAX)` ; le filet réactif s'ajoute par-dessus.
+    pub fn observe_jitter(&mut self, jitter_ms: f64) {
+        if !self.jitter_auto {
+            return;
+        }
+        let floor_ms =
+            (JITTER_TARGET_K * jitter_ms + JITTER_HEADROOM_MS).clamp(MIN_TARGET_MS as f64, MAX_TARGET_MS as f64);
+        self.floor_samples = ms_f64_to_samples(floor_ms);
+        self.recompute_target();
+    }
+
+    /// Recalcule la cible effective = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// `cap` = `LOCAL_MAX_TARGET_MS` en mode self-monitor, sinon `MAX_TARGET_MS`.
+    fn recompute_target(&mut self) {
+        let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
+        let min_s = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
+        self.target_samples = (self.floor_samples + self.reactive_extra_samples).clamp(min_s, cap_s);
     }
 
     pub fn underruns(&self) -> u64 {
@@ -299,20 +367,25 @@ impl JitterBuffer {
         // Chantier C — en mode local la cible est plafonnée à LOCAL_MAX_TARGET_MS
         // (latence de monitoring bornée, priorité absolue). Les streams réseau
         // gardent MAX_TARGET_MS (40 ms).
-        let max_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
-        let max = max_ms * SAMPLE_RATE * CHANNELS / 1000;
-        self.target_samples = (self.target_samples + grow).min(max);
+        let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
+        let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
+        // Borne le filet pour que `floor + extra` ne dépasse jamais le cap :
+        // sinon une accumulation sans effet rendrait la redescente lente.
+        let max_extra = cap_s.saturating_sub(self.floor_samples);
+        self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
+        self.recompute_target();
         self.last_adapt = std::time::Instant::now();
     }
 
     fn adapt_down(&mut self) {
         // Mode local : hold plus long (évite d'osciller entre deux spikes
-        // plugin) — mais on redescend bien vers 5 ms dès le calme installé.
+        // plugin) — mais on redescend bien vers le plancher dès le calme installé.
         let hold = if self.local_mode { LOCAL_ADAPT_DOWN_SECS } else { 5 };
         if self.last_adapt.elapsed().as_secs() >= hold {
             let shrink = 2 * SAMPLE_RATE * CHANNELS / 1000 + SAMPLE_RATE * CHANNELS / 2000;
-            let min = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
-            self.target_samples = self.target_samples.saturating_sub(shrink).max(min);
+            // Décroît le filet réactif vers 0 (le plancher prédictif fournit la base).
+            self.reactive_extra_samples = self.reactive_extra_samples.saturating_sub(shrink);
+            self.recompute_target();
             self.last_adapt = std::time::Instant::now();
         }
     }
@@ -494,6 +567,62 @@ mod tests {
         assert!(
             jb.target_ms() > 5,
             "la cible a bien grandi sous underruns répétés: {} ms",
+            jb.target_ms()
+        );
+    }
+
+    // ── Phase B — cible pilotée par la gigue mesurée ───────────────────────
+
+    #[test]
+    fn observe_jitter_low_gives_low_target() {
+        let mut jb = JitterBuffer::new();
+        // gigue 0,7 ms → floor = 3·0,7 + 2,5 = 4,6 → clamp MIN = 5 ms.
+        jb.observe_jitter(0.7);
+        assert_eq!(jb.target_ms(), 5);
+    }
+
+    #[test]
+    fn observe_jitter_high_gives_proportional_target() {
+        let mut jb = JitterBuffer::new();
+        // gigue 5 ms → floor = 3·5 + 2,5 = 17,5 ms.
+        jb.observe_jitter(5.0);
+        let t = jb.target_ms();
+        assert!((16..=18).contains(&t), "target attendu ~17 ms, obtenu {t}");
+    }
+
+    #[test]
+    fn observe_jitter_clamps_to_max() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(100.0); // énorme → borné à MAX_TARGET_MS.
+        assert_eq!(jb.target_ms(), MAX_TARGET_MS);
+    }
+
+    #[test]
+    fn manual_override_disables_jitter_targeting() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(20); // slider UI : override manuel.
+        jb.observe_jitter(0.5); // doit être ignoré.
+        assert_eq!(jb.target_ms(), 20);
+    }
+
+    #[test]
+    fn underrun_raises_target_above_jitter_floor_then_floor_holds() {
+        // Garantie anti-régression : même avec un plancher gigue bas (5 ms),
+        // le filet réactif remonte la cible à l'underrun (jamais moins sûr que
+        // l'historique).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher → 5 ms.
+        assert_eq!(jb.target_ms(), 5);
+
+        let five_ms = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        // Prime puis vide → un pull à vide déclenche l'underrun + adapt_up.
+        jb.push(&vec![0.1_f32; five_ms]);
+        let mut out = vec![0.0_f32; five_ms];
+        jb.pull(&mut out); // prime + consomme tout.
+        jb.pull(&mut out); // buffer vide → underrun → +5 ms réactif.
+        assert!(
+            jb.target_ms() > 5,
+            "le filet réactif doit remonter la cible: {} ms",
             jb.target_ms()
         );
     }

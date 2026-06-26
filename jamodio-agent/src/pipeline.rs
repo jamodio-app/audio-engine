@@ -2379,6 +2379,16 @@ async fn recv_decode_task(
                                     .insert(producer_id.clone(), current);
                                 last_pushed = current;
                             }
+                            // Phase B — pilote la cible du jitter buffer avec la
+                            // gigue mesurée, ~10×/s (1 paquet sur 40, pas à chaque
+                            // paquet : limite la contention du lock mixer) et
+                            // uniquement une fois l'estimateur fiable (warmup).
+                            if jitter.is_warm() && pkt_count.is_multiple_of(40) {
+                                let jitter_ms = jitter.jitter_ms();
+                                tokio::task::block_in_place(|| {
+                                    mixer.lock().observe_jitter(&producer_id, jitter_ms);
+                                });
+                            }
                             // Detect packet loss → PLC
                             if let Some(prev) = last_seq {
                                 let expected = prev.wrapping_add(1);
