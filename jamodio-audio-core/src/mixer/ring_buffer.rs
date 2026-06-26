@@ -60,6 +60,25 @@ pub struct JitterBuffer {
     /// Nombre de samples de fondu d'ENTRÉE restant à appliquer à la reprise
     /// après un trou (concealment). 0 = pas de fondu en cours.
     conceal_fade_in_remaining: usize,
+    /// Phase C — compensation de drift continue (streams RÉSEAU uniquement).
+    /// `false` en mode local (self-monitor : pas de drift réseau).
+    resample_enabled: bool,
+    /// Vitesse de lecture du flux entrant : input frames consommées par output
+    /// frame. ≈ 1,0, piloté par un servo sur le remplissage : > 1 si le buffer
+    /// est trop plein (sender plus rapide) → on produit MOINS de samples → le
+    /// buffer draine en douceur ; < 1 sinon. Borné à ±`RESAMPLE_MAX_ADJ`
+    /// (pitch inaudible). Remplace les drift-drains discrets par un ajustement continu.
+    rs_speed: f64,
+    /// Position fractionnaire de lecture, continuité inter-push. ∈ [0, 1).
+    rs_frac: f64,
+    /// Frame d'entrée précédente, pour l'interpolation linéaire (continuité).
+    rs_prev: [f32; CHANNELS],
+    /// `false` tant que `rs_prev` n'est pas amorcée (1er push, ou reprise après
+    /// un trou de playout → on ré-amorce pour éviter une interpolation sur une
+    /// frame périmée).
+    rs_has_prev: bool,
+    /// Buffer de sortie réutilisé du resampler (zéro-alloc en régime).
+    rs_scratch: Vec<f32>,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -106,6 +125,17 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 /// ~2 ms = assez pour tuer le clic, assez court pour rester transparent.
 const CONCEAL_FADE_MS: usize = 2;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
+/// Phase C — gain proportionnel du servo de drift (erreur de remplissage relative
+/// → écart de vitesse). Un simple P suffit : la correction stationnaire requise
+/// (~7 ppm de drift) est minuscule, l'erreur résiduelle de remplissage est < 1 frame.
+const RESAMPLE_KP: f64 = 0.01;
+/// Borne dure du ratio : ±0,5 % = ~8 cents en transitoire extrême, inaudible.
+/// Le drift réel (~7 ppm = 0,0007 %) laisse une marge de sécurité énorme ;
+/// le clamp protège contre un emballement du servo sur un burst.
+const RESAMPLE_MAX_ADJ: f64 = 0.005;
+/// Slew-rate du ratio par push (~400/s) : 2e-5/push ⇒ ~0,008/s. Le ratio bouge
+/// lentement (faible bande passante, façon DLL) → aucun wobble de hauteur audible.
+const RESAMPLE_SLEW_PER_PUSH: f64 = 0.00002;
 
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
@@ -141,6 +171,12 @@ impl JitterBuffer {
             crossfade_pos: 0,
             local_mode: false,
             conceal_fade_in_remaining: 0,
+            resample_enabled: true,
+            rs_speed: 1.0,
+            rs_frac: 0.0,
+            rs_prev: [0.0; CHANNELS],
+            rs_has_prev: false,
+            rs_scratch: Vec::with_capacity(2048),
         }
     }
 
@@ -148,6 +184,8 @@ impl JitterBuffer {
     /// adaptation bornée à `LOCAL_MAX_TARGET_MS`). Appelé par `add_local_stream`.
     pub fn set_local_mode(&mut self, on: bool) {
         self.local_mode = on;
+        // Le self-monitor local n'a pas de drift réseau → pas de resampling Phase C.
+        self.resample_enabled = !on;
     }
 
     /// Push decoded PCM samples (interleaved stereo f32).
@@ -163,14 +201,83 @@ impl JitterBuffer {
     /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
     /// audiblement moins violent qu'une coupure mid-paquet.
     pub fn push(&mut self, samples: &[f32]) {
-        let needed = samples.len();
+        // Phase C — en régime établi (primed) et pour les streams réseau, on
+        // resample le flux entrant en continu pour tenir le remplissage sur la
+        // cible (compensation de drift d'horloge sender↔nous). Hors régime
+        // (pre-fill / reprise) ou self-monitor : push direct, chemin historique.
+        if self.resample_enabled && self.primed {
+            self.update_resample_speed();
+            // `scratch` sorti du `self` (mem::take préserve la capacité) pour
+            // satisfaire l'emprunteur : resample_into emprunte `self` en mut.
+            let mut scratch = std::mem::take(&mut self.rs_scratch);
+            scratch.clear();
+            self.resample_into(samples, &mut scratch);
+            self.push_to_ring(&scratch);
+            self.rs_scratch = scratch; // restitué (capacité conservée → zéro-alloc).
+        } else {
+            self.push_to_ring(samples);
+        }
+    }
+
+    /// Écrit `data` dans le ring avec politique drop-oldest sur overflow.
+    fn push_to_ring(&mut self, data: &[f32]) {
+        let needed = data.len();
         let vacant = self.producer.vacant_len();
         if vacant < needed {
             let to_drop = needed - vacant;
             let dropped = self.consumer.skip(to_drop);
             self.overflow_drops += dropped as u64;
         }
-        self.producer.push_slice(samples);
+        self.producer.push_slice(data);
+    }
+
+    /// Servo de drift (Phase C) : ajuste `rs_speed` pour ramener le remplissage
+    /// vers `target_samples`. Proportionnel + slew-rate limité + clamp dur.
+    fn update_resample_speed(&mut self) {
+        let fill = self.consumer.occupied_len() as f64;
+        let target = self.target_samples.max(1) as f64;
+        let err = (fill - target) / target; // > 0 : trop plein → accélérer (drainer).
+        let speed_target =
+            (1.0 + RESAMPLE_KP * err).clamp(1.0 - RESAMPLE_MAX_ADJ, 1.0 + RESAMPLE_MAX_ADJ);
+        let delta = (speed_target - self.rs_speed).clamp(-RESAMPLE_SLEW_PER_PUSH, RESAMPLE_SLEW_PER_PUSH);
+        self.rs_speed = (self.rs_speed + delta).clamp(1.0 - RESAMPLE_MAX_ADJ, 1.0 + RESAMPLE_MAX_ADJ);
+    }
+
+    /// Resampler linéaire streaming : lit `input` (stéréo interleaved) à la
+    /// vitesse `rs_speed` et écrit ~`in_frames / rs_speed` frames dans `out`.
+    /// État (`rs_prev`, `rs_frac`, `rs_has_prev`) assure la continuité entre
+    /// pushes. Interpolation linéaire = transparente à un ratio ≈ 1 (≤ 0,5 %).
+    fn resample_into(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let in_frames = input.len() / CHANNELS;
+        if in_frames == 0 {
+            return;
+        }
+        let speed = self.rs_speed;
+        let mut i = 0; // prochaine frame d'entrée à charger comme "cur".
+        if !self.rs_has_prev {
+            // Amorçage : la 1re frame devient `prev`, on interpole à partir d'elle.
+            self.rs_prev.copy_from_slice(&input[0..CHANNELS]);
+            self.rs_has_prev = true;
+            self.rs_frac = 0.0;
+            i = 1;
+        }
+        while i < in_frames {
+            let base = i * CHANNELS;
+            // Produit des outputs tant que la position fractionnaire est entre
+            // `prev` (frac 0) et la frame courante `input[i]` (frac 1).
+            while self.rs_frac < 1.0 {
+                let f = self.rs_frac as f32;
+                for c in 0..CHANNELS {
+                    let prev = self.rs_prev[c];
+                    let cur = input[base + c];
+                    out.push(prev + (cur - prev) * f);
+                }
+                self.rs_frac += speed;
+            }
+            self.rs_frac -= 1.0;
+            self.rs_prev.copy_from_slice(&input[base..base + CHANNELS]);
+            i += 1;
+        }
     }
 
     /// Pull samples for playback.
@@ -251,6 +358,9 @@ impl JitterBuffer {
             self.underruns += 1;
             self.adapt_up();
             self.primed = false;
+            // Phase C — un trou de playout casse la continuité d'entrée : on
+            // ré-amorce le resampler (sinon interpolation sur une frame périmée).
+            self.rs_has_prev = false;
             available
         };
 
@@ -360,6 +470,12 @@ impl JitterBuffer {
     /// (correction de drift / post-burst).
     pub fn drift_drops(&self) -> u64 {
         self.drift_drops
+    }
+
+    /// Phase C — vitesse de resampling courante (≈ 1,0). L'écart à 1,0 reflète
+    /// la dérive d'horloge compensée en continu. `(speed - 1)·1e6` ≈ ppm corrigés.
+    pub fn resample_speed(&self) -> f64 {
+        self.rs_speed
     }
 
     fn adapt_up(&mut self) {
@@ -625,5 +741,78 @@ mod tests {
             "le filet réactif doit remonter la cible: {} ms",
             jb.target_ms()
         );
+    }
+
+    // ── Phase C — compensation de drift continue (resampler + servo) ───────
+
+    #[test]
+    fn resample_speed_one_is_near_identity() {
+        let mut jb = JitterBuffer::new();
+        let input: Vec<f32> = (0..240).map(|i| i as f32).collect(); // 120 frames.
+        let mut out = Vec::new();
+        jb.resample_into(&input, &mut out); // rs_speed = 1.0 par défaut.
+        let out_frames = out.len() / CHANNELS;
+        assert!((118..=121).contains(&out_frames), "out_frames={out_frames}");
+    }
+
+    #[test]
+    fn servo_speeds_up_when_overfull_and_slows_when_underfull() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        let target = jb.target_samples;
+        // Trop plein (3× la cible) → le servo doit accélérer (drainer).
+        jb.push_to_ring(&vec![0.05_f32; target * 3]);
+        for _ in 0..1000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() > 1.0, "trop plein → speed>1: {}", jb.resample_speed());
+        // Vide bien en dessous de la cible → le servo doit ralentir (remplir).
+        let mut sink = vec![0.0_f32; target * 3];
+        let _ = jb.consumer.pop_slice(&mut sink);
+        for _ in 0..2000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() < 1.0, "sous-rempli → speed<1: {}", jb.resample_speed());
+    }
+
+    #[test]
+    fn servo_speed_is_hard_clamped() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        jb.push_to_ring(&vec![0.05_f32; jb.target_samples * 10]); // excès énorme.
+        for _ in 0..100_000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() <= 1.0 + RESAMPLE_MAX_ADJ + 1e-9);
+        assert!(jb.resample_speed() >= 1.0 - RESAMPLE_MAX_ADJ - 1e-9);
+    }
+
+    #[test]
+    fn resampler_output_count_tracks_speed() {
+        // À speed > 1, on produit MOINS de frames qu'on en reçoit → le buffer
+        // draine en douceur (compensation d'un sender plus rapide).
+        let mut jb = JitterBuffer::new();
+        jb.rs_speed = 1.0 + RESAMPLE_MAX_ADJ; // +0,5 %.
+        let input = vec![0.1_f32; 2000 * CHANNELS];
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            jb.resample_into(&input, &mut out);
+        }
+        let out_frames = out.len() / CHANNELS;
+        let in_frames = 10 * 2000;
+        assert!(out_frames < in_frames, "speed>1 doit réduire: {out_frames}/{in_frames}");
+        let ratio = out_frames as f64 / in_frames as f64;
+        assert!(
+            (ratio - 1.0 / (1.0 + RESAMPLE_MAX_ADJ)).abs() < 0.001,
+            "ratio sortie/entrée = {ratio}"
+        );
+    }
+
+    #[test]
+    fn local_mode_disables_resampling() {
+        let mut jb = JitterBuffer::new();
+        assert!(jb.resample_enabled, "réseau : resampling actif par défaut");
+        jb.set_local_mode(true);
+        assert!(!jb.resample_enabled, "self-monitor : resampling désactivé");
     }
 }

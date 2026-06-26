@@ -6,6 +6,35 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-4] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase C : compensation de drift continue
+> (resampling asservi au remplissage). Complète B : le buffer TIENT son
+> plancher bas malgré le drift d'horloge.**
+
+### Added
+- **Compensation de drift d'horloge en continu** (streams réseau). Un servo
+  proportionnel asservit la vitesse de lecture du flux entrant (`rs_speed ≈ 1,0`)
+  sur le remplissage du buffer : si le buffer se remplit (sender plus rapide),
+  on resample pour produire légèrement moins de samples → drainage doux ; et
+  inversement. Remplace les **drift-drains discrets** (sauts masqués par
+  crossfade, jusqu'à 5,7 s d'audio drainé en Wi-Fi mesuré) par un ajustement
+  **inaudible et permanent**. Ratio borné à **±0,5 %** (~8 cents en transitoire
+  extrême ; le drift réel ~7 ppm ne demande que 0,0007 %) + slew-rate lent
+  (faible bande passante, façon DLL) → zéro wobble de hauteur. Interpolation
+  linéaire (transparente à ratio ≈ 1). Calcul pur → **identique macOS / Windows**.
+
+### Changed
+- En tenant le remplissage sur la cible, la Phase C **empêche le drift de vider
+  le buffer** → plus d'underruns de drift → le filet réactif (Phase B) retombe
+  à 0 → la cible **tient son plancher de ~5 ms** au lieu d'osciller à ~10 ms.
+  C'est la pièce qui transforme le gisement de la Phase B en latence réelle.
+
+### Notes
+- Le resampling est **désactivé pour le self-monitor** (mode local : pas de
+  drift réseau) — comportement Chantier C inchangé. Le drift-drain et le filet
+  réactif restent en **backstop** pour les rafales extrêmes.
+
 ## [0.5.2-3] — 2026-06-26
 
 > **Jitter buffer adaptatif — Phase B : cible pilotée par la gigue mesurée.**
