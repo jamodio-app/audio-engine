@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-au-host"
-version = "0.5.1-3"
+version = "0.5.1-4"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
