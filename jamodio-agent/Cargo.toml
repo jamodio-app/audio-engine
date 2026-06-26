@@ -14,6 +14,10 @@ jamodio-audio-core = { path = "../jamodio-audio-core" }
 cpal = "0.15"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
+# socket2 : bind du serveur WS avec SO_REUSEADDR (tokio ne le pose pas sur
+# Windows) → permet de re-binder le port 9876 immédiatement après un
+# redémarrage de l'agent, malgré la connexion précédente encore en TIME_WAIT.
+socket2 = "0.5"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

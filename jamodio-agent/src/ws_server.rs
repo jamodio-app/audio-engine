@@ -305,19 +305,20 @@ pub async fn start(handle: WsServerHandle) {
         }),
     );
 
-    // Bind avec retry/back-off. Raison (Windows, refresh ASIO 26/06) : sur
-    // `app.restart()` (bouton « Redémarrer l'agent »), le NOUVEAU process démarre
-    // avant que l'ANCIEN ait libéré le port 9876 → le bind échouait, `start`
-    // retournait, et l'agent relancé tournait SANS WS (sourd : le browser ne
-    // pouvait plus se reconnecter, il fallait tuer l'agent à la main). On
-    // retente jusqu'à ce que l'ancien process meure (~1 s en pratique). 10×500ms
-    // = 5 s de marge ; au-delà, c'est probablement une autre instance → on logue
-    // et on abandonne (le single-instance plugin gère le vrai doublon).
+    // Bind du port 9876 avec SO_REUSEADDR. Raison (Windows, redémarrage agent
+    // 26/06, confirmé par logs) : après la mort de l'ancien process, sa
+    // connexion WS avec le browser reste ~30 s en TIME_WAIT → un bind classique
+    // échoue avec WSAEADDRINUSE (os error 10048) tant que ce TIME_WAIT n'est pas
+    // purgé. `tokio::TcpListener::bind` ne pose PAS SO_REUSEADDR sur Windows, on
+    // passe donc par socket2. SO_REUSEADDR autorise le bind malgré le TIME_WAIT
+    // → reconnexion immédiate après « Redémarrer l'agent ». Petit retry en filet
+    // pour une race brève si l'ancien listener n'est pas encore tout à fait
+    // fermé (≠ TIME_WAIT, que SO_REUSEADDR couvre déjà).
     let listener = {
-        const MAX_ATTEMPTS: u32 = 10;
+        const MAX_ATTEMPTS: u32 = 5;
         let mut attempt: u32 = 0;
         loop {
-            match tokio::net::TcpListener::bind("127.0.0.1:9876").await {
+            match bind_ws_listener() {
                 Ok(l) => break l,
                 Err(e) => {
                     attempt += 1;
@@ -326,7 +327,7 @@ pub async fn start(handle: WsServerHandle) {
                             target: "jamodio::ws",
                             error = %e,
                             attempts = attempt,
-                            "port 9876 toujours occupé — abandon (autre instance ?)"
+                            "bind 9876 impossible — abandon (autre instance ?)"
                         );
                         return;
                     }
@@ -334,9 +335,9 @@ pub async fn start(handle: WsServerHandle) {
                         target: "jamodio::ws",
                         error = %e,
                         attempt,
-                        "port 9876 occupé (ancien process en cours de fermeture ?) — retry dans 500ms"
+                        "bind 9876 échoué — retry dans 300ms"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
             }
         }
@@ -346,6 +347,21 @@ pub async fn start(handle: WsServerHandle) {
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!(target: "jamodio::ws", error = %e, "axum serve terminated");
     }
+}
+
+/// Crée le listener TCP du serveur WS (127.0.0.1:9876) avec `SO_REUSEADDR`.
+/// Indispensable pour re-binder immédiatement après un redémarrage de l'agent
+/// malgré la connexion précédente encore en TIME_WAIT (sinon WSAEADDRINUSE sur
+/// Windows). Passe par `socket2` car tokio ne pose pas SO_REUSEADDR sur Windows.
+fn bind_ws_listener() -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr: std::net::SocketAddr = std::net::SocketAddr::from(([127, 0, 0, 1], 9876));
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?; // SO_REUSEADDR
+    socket.set_nonblocking(true)?; // requis par TcpListener::from_std
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
 }
 
 /// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
