@@ -18,6 +18,7 @@ use crate::audio::midi::CapturedMidiEvent;
 use jamodio_audio_core::protocol::AgentState;
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
+use jamodio_audio_core::sync::jitter::JitterEstimator;
 #[cfg(target_os = "macos")]
 use jamodio_au_host::AuHost;
 #[cfg(target_os = "windows")]
@@ -281,9 +282,21 @@ pub struct PipelineState {
     /// (= une mesure capture→send par bloc Opus).
     /// `capture_drops` est incrémenté depuis le callback CPAL (cf. capture.rs)
     /// quand le `sample_tx` est plein — signal direct de saturation encoder.
-    /// `drift_ppm_by_producer` est mis à jour par les recv tasks après chaque
-    /// `DriftEstimator::observe()`. Lecture côté ws_server au flush 1 Hz.
+    /// `net_stats_by_producer` est mis à jour par les recv tasks après chaque
+    /// paquet (drift + gigue réseau). Lecture côté ws_server au flush 1 Hz.
     pub perfstats: PerfHandles,
+}
+
+/// Métriques de timing réseau mesurées par stream entrant, alimentées par les
+/// recv tasks (`recv_decode_task`) et lues à 1 Hz par le perfstats_task.
+/// Struct extensible : le chantier jitter buffer adaptatif y ajoutera la cible
+/// mesurée et le ratio de resampling de drift (Phases B/C).
+#[derive(Clone, Copy, Default)]
+pub struct ProducerNetStats {
+    /// Dérive d'horloge sender↔nous, en ppm. Cf. [`sync::drift::DriftEstimator`].
+    pub drift_ppm: f64,
+    /// Gigue réseau lissée, en ms (RFC 3550). Cf. [`sync::jitter::JitterEstimator`].
+    pub jitter_ms: f64,
 }
 
 /// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
@@ -305,7 +318,7 @@ pub struct PerfHandles {
     /// v0.4.8 — temps de traitement PUR du encode_stage (Opus + RTP build + send).
     pub encode_latency: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
-    pub drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
+    pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
     /// pour `fetch_max`). Lu+reset par perfstats_task 1 Hz. Diagnostic.
@@ -331,7 +344,7 @@ impl PerfHandles {
             process_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            drift_ppm_by_producer: Arc::new(Mutex::new(HashMap::new())),
+            net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1150,9 +1163,9 @@ impl PipelineState {
 
         // Spawn receive + decode task (reçoit aussi sfu_addr pour le punch périodique)
         let mixer = self.mixer.clone();
-        let drift_ppm_handle = self.perfstats.drift_ppm_by_producer.clone();
+        let net_stats_handle = self.perfstats.net_stats_by_producer.clone();
         tokio::spawn(async move {
-            recv_decode_task(receiver, sfu_addr, producer_id, mixer, drift_ppm_handle, stop_rx).await;
+            recv_decode_task(receiver, sfu_addr, producer_id, mixer, net_stats_handle, stop_rx).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
@@ -2274,7 +2287,7 @@ async fn recv_decode_task(
     sfu_addr: SocketAddr,
     producer_id: String,
     mixer: Arc<Mutex<AudioMixer>>,
-    drift_ppm_by_producer: Arc<Mutex<HashMap<String, f64>>>,
+    net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut decoder = match MusicDecoder::new() {
@@ -2285,15 +2298,18 @@ async fn recv_decode_task(
         }
     };
 
-    // T4.2a — DriftEstimator (mesure pure pour l'instant, log toutes les 30s)
+    // Estimateurs de timing réseau (mesure pure — Phase A du chantier jitter
+    // adaptatif). `drift` = dérive d'horloge sender↔nous ; `jitter` = gigue
+    // réseau (RFC 3550). En Phase B la gigue pilotera la cible du buffer.
     let drift_label = producer_id.chars().take(8).collect::<String>();
     let mut drift = DriftEstimator::new(drift_label);
-    // Sprint S1 — pour ne pas écraser le hashmap à chaque paquet RTP (= 50/s
-    // par stream), on snapshot le ppm périodiquement. Le DriftEstimator
-    // recalcule à chaque observe() en interne, donc lire 1×/s côté ws_server
-    // donne déjà une vue actuelle ; ici on push uniquement quand la valeur
-    // a "bougé sensiblement" (> 1 ppm) pour minimiser la contention Mutex.
-    let mut last_pushed_ppm: f64 = 0.0;
+    let mut jitter = JitterEstimator::new();
+    // Pour ne pas écraser le hashmap partagé à chaque paquet RTP (~400/s par
+    // stream), on ne le met à jour que quand une métrique a "bougé sensiblement"
+    // (drift > 1 ppm OU gigue > 0,5 ms) depuis la dernière écriture. Minimise la
+    // contention Mutex ; ws_server lit à 1 Hz. Les deux estimateurs recalculent
+    // en interne à chaque observe(), la map n'est qu'un miroir paresseux.
+    let mut last_pushed = ProducerNetStats::default();
 
     // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -2343,19 +2359,25 @@ async fn recv_decode_task(
                         }
 
                         if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
-                            // T4.2a — alimente l'estimateur de dérive d'horloge
-                            drift.observe(_header.timestamp, std::time::Instant::now());
-                            // Sprint S1 — push le ppm courant dans le hashmap
-                            // partagé si la valeur a bougé de > 1 ppm depuis
-                            // la dernière push. Évite la contention Mutex à
-                            // 50 Hz et garde le hashmap lisible pour ws_server
-                            // (1 Hz). À warmup le ppm reste à 0.0 (cf. drift.rs).
-                            let current_ppm = drift.drift_ppm();
-                            if (current_ppm - last_pushed_ppm).abs() > 1.0 {
-                                drift_ppm_by_producer
+                            // Alimente les estimateurs de timing réseau avec un
+                            // unique instant d'arrivée (cohérent entre les deux).
+                            let recv_instant = std::time::Instant::now();
+                            drift.observe(_header.timestamp, recv_instant);
+                            jitter.observe(_header.timestamp, recv_instant);
+                            // Miroir paresseux dans la map partagée : on n'écrit
+                            // que si drift > 1 ppm OU gigue > 0,5 ms de variation
+                            // depuis la dernière écriture (cf. last_pushed).
+                            let current = ProducerNetStats {
+                                drift_ppm: drift.drift_ppm(),
+                                jitter_ms: jitter.jitter_ms(),
+                            };
+                            if (current.drift_ppm - last_pushed.drift_ppm).abs() > 1.0
+                                || (current.jitter_ms - last_pushed.jitter_ms).abs() > 0.5
+                            {
+                                net_stats_by_producer
                                     .lock()
-                                    .insert(producer_id.clone(), current_ppm);
-                                last_pushed_ppm = current_ppm;
+                                    .insert(producer_id.clone(), current);
+                                last_pushed = current;
                             }
                             // Detect packet loss → PLC
                             if let Some(prev) = last_seq {
@@ -2422,7 +2444,7 @@ async fn recv_decode_task(
     // Sprint S1 — retire l'entrée drift_ppm de ce producer au shutdown du
     // task. Sans ça, un peer disparu laisse un ppm fantôme dans le hashmap
     // → le PerfStats publié continuerait à mentionner ce peer mort.
-    drift_ppm_by_producer.lock().remove(&producer_id);
+    net_stats_by_producer.lock().remove(&producer_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════

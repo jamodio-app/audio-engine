@@ -6,6 +6,29 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2-2] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase A : instrumentation (mesure pure, aucun
+> changement de comportement).**
+
+### Added
+- **Estimateur de gigue réseau (RFC 3550 §A.8)** par stream entrant
+  (`sync::jitter::JitterEstimator`) : mesure la variation du délai de transit
+  inter-paquets, lissée par EWMA (gain 1/16). C'est le *capteur* du chantier
+  jitter buffer adaptatif — en Phase B la gigue pilotera la cible du buffer
+  (`target ≈ k·gigue`) au lieu d'une valeur fixe réactive. Calcul pur,
+  **identique macOS / Windows**.
+- **Télémétrie `jitterMs` par peer** (champ `PeerPerf`) + **log `jamodio::netstats`
+  1 Hz** (gigue mesurée vs cible courante du buffer) pour calibrer les Phases B/C
+  sur réseau réel.
+
+### Changed
+- **Refactor télémétrie réseau par stream** : la map `drift_ppm_by_producer`
+  (`HashMap<String, f64>`) devient `net_stats_by_producer`
+  (`HashMap<String, ProducerNetStats>`) regroupant drift + gigue — structure
+  extensible pour les métriques des Phases B/C (cible mesurée, ratio resampling),
+  au lieu d'empiler des maps parallèles.
+
 ## [0.5.2-1] — 2026-06-26
 
 > **Latence : −4 ms note→oreille sur le flux musique (encodeur Opus).**
