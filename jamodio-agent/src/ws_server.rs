@@ -181,6 +181,74 @@ impl WsServerHandle {
             crate::check_for_update(app, me).await;
         });
     }
+
+    /// Redémarrage IMMÉDIAT de l'agent, SANS flux d'update (message browser
+    /// `RelaunchNow`, bouton « Redémarrer l'agent » du badge WASAPI). Un boot
+    /// frais re-sonde le host CPAL → ASIO détecté si l'interface a été branchée
+    /// après le démarrage. Contrairement à `trigger_restart` (qui passe par
+    /// `check_for_update` et ne relance QUE si une update existe), celui-ci
+    /// relance toujours. Broadcaste `Shutdown` aux browsers AVANT de couper,
+    /// avec un court délai (le temps que la frame WS parte), puis `app.restart()`.
+    pub fn trigger_relaunch(&self) {
+        let Some(app) = self.app.get().cloned() else {
+            tracing::warn!(target: "jamodio::ws", "Relaunch requested but AppHandle not set — ignoring");
+            return;
+        };
+        tracing::info!(target: "jamodio::ws", "browser requested agent relaunch (WASAPI→ASIO refresh)");
+        self.broadcast_shutdown("relaunch");
+        let exe = std::env::current_exe();
+        tauri::async_runtime::spawn(async move {
+            // Laisse partir la frame Shutdown vers les browsers.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            // On N'UTILISE PAS `app.restart()` : il relance le nouveau process
+            // PENDANT que l'ancien tient encore le verrou tauri-plugin-single-
+            // instance → le nouveau est vu comme « 2e instance » et se tue
+            // aussitôt → plus AUCUN agent (symptôme Windows confirmé par logs
+            // 2026-06-26 : pastille en boucle, WS jamais de retour). À la place
+            // on spawne un relanceur DÉTACHÉ marqué `--awaited-relaunch` : il
+            // attend (cf. main.rs) que CE process meure — donc que le verrou
+            // single-instance ET le port 9876 soient libérés — avant de démarrer.
+            match exe {
+                Ok(path) => {
+                    if let Err(e) = spawn_awaited_relaunch(&path) {
+                        tracing::error!(target: "jamodio::ws", error = %e, "spawn du relanceur échoué");
+                    } else {
+                        tracing::info!(target: "jamodio::ws", "relanceur détaché spawné — sortie du process courant");
+                    }
+                }
+                Err(e) => tracing::error!(
+                    target: "jamodio::ws", error = %e,
+                    "current_exe() indisponible — relance impossible"
+                ),
+            }
+            // Laisse le relanceur démarrer (il dort), puis on quitte proprement
+            // pour libérer le verrou + le port.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            app.exit(0);
+        });
+    }
+}
+
+/// Spawne une nouvelle instance de l'agent en mode « relance attendue ». Le
+/// nouveau process est DÉTACHÉ (survit à la mort du parent) et reçoit l'argument
+/// `--awaited-relaunch` : au démarrage il attend ~2 s (cf. `main()`) que le
+/// process courant meure et libère le verrou single-instance + le port WS 9876,
+/// AVANT d'initialiser Tauri — sinon le plugin single-instance le tuerait comme
+/// « 2e instance » (race classique de `app.restart()`).
+fn spawn_awaited_relaunch(exe: &std::path::Path) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--awaited-relaunch");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS : pas de console héritée. CREATE_NEW_PROCESS_GROUP :
+        // le child ne reçoit pas les signaux du parent qui s'éteint.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map(|_child| ())
 }
 
 /// Start the localhost WebSocket server on port 9876.
@@ -237,11 +305,41 @@ pub async fn start(handle: WsServerHandle) {
         }),
     );
 
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:9876").await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(target: "jamodio::ws", error = %e, "port 9876 already in use — another instance running?");
-            return;
+    // Bind du port 9876 avec SO_REUSEADDR. Raison (Windows, redémarrage agent
+    // 26/06, confirmé par logs) : après la mort de l'ancien process, sa
+    // connexion WS avec le browser reste ~30 s en TIME_WAIT → un bind classique
+    // échoue avec WSAEADDRINUSE (os error 10048) tant que ce TIME_WAIT n'est pas
+    // purgé. `tokio::TcpListener::bind` ne pose PAS SO_REUSEADDR sur Windows, on
+    // passe donc par socket2. SO_REUSEADDR autorise le bind malgré le TIME_WAIT
+    // → reconnexion immédiate après « Redémarrer l'agent ». Petit retry en filet
+    // pour une race brève si l'ancien listener n'est pas encore tout à fait
+    // fermé (≠ TIME_WAIT, que SO_REUSEADDR couvre déjà).
+    let listener = {
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            match bind_ws_listener() {
+                Ok(l) => break l,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        tracing::error!(
+                            target: "jamodio::ws",
+                            error = %e,
+                            attempts = attempt,
+                            "bind 9876 impossible — abandon (autre instance ?)"
+                        );
+                        return;
+                    }
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        error = %e,
+                        attempt,
+                        "bind 9876 échoué — retry dans 300ms"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
         }
     };
 
@@ -249,6 +347,21 @@ pub async fn start(handle: WsServerHandle) {
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!(target: "jamodio::ws", error = %e, "axum serve terminated");
     }
+}
+
+/// Crée le listener TCP du serveur WS (127.0.0.1:9876) avec `SO_REUSEADDR`.
+/// Indispensable pour re-binder immédiatement après un redémarrage de l'agent
+/// malgré la connexion précédente encore en TIME_WAIT (sinon WSAEADDRINUSE sur
+/// Windows). Passe par `socket2` car tokio ne pose pas SO_REUSEADDR sur Windows.
+fn bind_ws_listener() -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr: std::net::SocketAddr = std::net::SocketAddr::from(([127, 0, 0, 1], 9876));
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?; // SO_REUSEADDR
+    socket.set_nonblocking(true)?; // requis par TcpListener::from_std
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
 }
 
 /// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
@@ -291,6 +404,14 @@ async fn handle_one_message(
     if matches!(browser_msg, BrowserMessage::Restart) {
         tracing::info!(target: "jamodio::ws", "browser requested agent restart (update banner)");
         handle.trigger_restart();
+        return true;
+    }
+
+    // RelaunchNow : redémarrage immédiat sans flux d'update (badge WASAPI →
+    // bouton « Redémarrer l'agent »). Même raison que Restart : besoin de
+    // l'AppHandle, fire-and-forget.
+    if matches!(browser_msg, BrowserMessage::RelaunchNow) {
+        handle.trigger_relaunch();
         return true;
     }
 
@@ -1332,7 +1453,12 @@ async fn handle_message(
             let output_buf_ms_opt: Option<f32> = pl.output_buffer_samples.map(|n| n as f32 / 48.0);
             let input_buf_ms_est = input_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             let output_buf_ms_est = output_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
-            let opus_ms: f32 = 2.5; // Opus frame 120 samples @ 48kHz
+            // Latence algorithmique Opus = lookahead encodeur. En mode
+            // RESTRICTED_LOWDELAY (cf. MusicEncoder) le lookahead vaut
+            // exactement une frame de 120 samples = 2,5 ms — invariant verrouillé
+            // par le test `lowdelay_lookahead_vs_audio`. (En mode Audio il valait
+            // 6,5 ms : la télémétrie d'avant sous-estimait donc la latence.)
+            let opus_ms: f32 = 2.5;
 
             let mixer = pl.mixer.lock();
             let underruns = mixer.total_underruns();
@@ -1809,9 +1935,10 @@ async fn handle_message(
             }
         }
 
-        // Restart est intercepté en amont dans handle_one_message (il a besoin
-        // du AppHandle, pas seulement du pipeline) et n'atteint jamais ce match.
-        // Bras défensif pour l'exhaustivité — no-op si jamais routé ici.
-        BrowserMessage::Restart => vec![],
+        // Restart et RelaunchNow sont interceptés en amont dans
+        // handle_one_message (ils ont besoin du AppHandle, pas seulement du
+        // pipeline) et n'atteignent jamais ce match. Bras défensifs pour
+        // l'exhaustivité — no-op si jamais routés ici.
+        BrowserMessage::Restart | BrowserMessage::RelaunchNow => vec![],
     }
 }

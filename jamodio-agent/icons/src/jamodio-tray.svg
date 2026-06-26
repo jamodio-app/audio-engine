@@ -1,11 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Jamodio tray icon — 32x32 template-style (monochrome noir, macOS menubar
-     rend en blanc/gris selon thème). Fond transparent. -->
+<!-- Jamodio tray icon — badge COULEUR (variante YC validée 25/06/2026).
+     PLUS un template : disque jaune marque (#e8ff3a) + contour sombre + logo v1
+     (2 ondes + studio anneau) en sombre. Remplit toute la hauteur de la barre
+     → bien plus visible que l'ancien glyphe fin, et lisible sur barre claire ET
+     sombre (badge auto-contrasté).
+
+     IMPORTANT : nécessite `iconAsTemplate: false` côté macOS (tauri.conf.json),
+     sinon macOS ignore les couleurs et recolore en monochrome. Sur Windows,
+     l'icône est de toute façon remplacée au runtime (set_icon, cf. main.rs).
+     On ne peut pas empêcher l'encoche des MacBook Pro de masquer l'icône
+     (limite OS) ; l'entrée fiable reste l'icône Dock (cf. main.rs Reopen). -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="32" height="32">
-  <g fill="none" stroke="#000000" stroke-linecap="round">
-    <path d="M 10 50 Q 30 22 50 50 Q 70 78 90 50" stroke-width="3" opacity="0.55"/>
-    <path d="M 10 50 Q 30 36 50 50 Q 70 64 90 50" stroke-width="6"/>
+  <!-- Disque marque + fin contour sombre (définition sur fond clair) -->
+  <circle cx="50" cy="50" r="47" fill="#e8ff3a" stroke="#141414" stroke-width="3"/>
+
+  <!-- Ondes v1 (2 traits), sombres. La seconde, plus fine et atténuée, donne la
+       profondeur de la marque. Le studio plein (ci-dessous) couvre leur
+       croisement central → pas besoin de masque sur un badge couleur. -->
+  <g fill="none" stroke="#141414" stroke-linecap="round">
+    <path d="M 14 50 Q 32 29 50 50 Q 68 71 86 50" stroke-width="7" opacity="0.38"/>
+    <path d="M 14 50 Q 32 37 50 50 Q 68 63 86 50" stroke-width="11"/>
   </g>
-  <circle cx="50" cy="50" r="15" fill="#ffffff" stroke="#000000" stroke-width="4"/>
-  <circle cx="50" cy="50" r="9" fill="#000000"/>
+
+  <!-- Studio : disque sombre (couvre les ondes) + anneau jaune + point sombre.
+       Couleurs réelles (badge non-template) → pas de masque nécessaire. -->
+  <circle cx="50" cy="50" r="15" fill="#141414"/>
+  <circle cx="50" cy="50" r="9" fill="#e8ff3a"/>
+  <circle cx="50" cy="50" r="4.5" fill="#141414"/>
 </svg>

@@ -156,6 +156,18 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
 }
 
 fn main() {
+    // Relance « attendue » (bouton « Redémarrer l'agent » → ws_server::
+    // spawn_awaited_relaunch). On a été spawné DÉTACHÉ par l'ancien process
+    // pendant qu'il s'éteignait. On attend qu'il soit mort — donc que le verrou
+    // tauri-plugin-single-instance ET le port WS 9876 soient libérés — AVANT
+    // d'initialiser Tauri. Sans ce délai, le plugin single-instance nous
+    // tuerait comme « 2e instance » et il ne resterait AUCUN agent (race
+    // classique de app.restart(), à l'origine du bug Windows du 26/06). Doit
+    // impérativement précéder `tauri::Builder`.
+    if std::env::args().any(|a| a == "--awaited-relaunch") {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+
     // Init tracing AVANT tout le reste : tous les eprintln! ont été migrés
     // vers tracing::{info,warn,error,debug,trace}, et on veut capturer même
     // les events pendant le setup Tauri. Le guard doit rester vivant : on le
@@ -209,16 +221,13 @@ fn main() {
             }
 
             if let Some(tray) = app.tray_by_id("main") {
-                // Windows : tray.png est un glyphe "template" gris foncé —
-                // macOS le recolore selon le thème (iconAsTemplate), Windows
-                // l'affiche tel quel → quasi invisible sur la barre des
-                // tâches sombre par défaut (= "pas d'icône" rapporté en
-                // v0.4.x). On remplace par l'icône couleur de l'app (tuile
-                // noire + glyphe jaune, lisible sur thème sombre ET clair).
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = tray.set_icon(Some(tauri::include_image!("icons/32x32.png")));
-                }
+                // tray.png est désormais un BADGE COULEUR (disque jaune marque +
+                // logo sombre, cf. icons/src/jamodio-tray.svg), visible sur Mac
+                // ET Windows. On NE le remplace plus par 32x32.png au runtime sur
+                // Windows : cet override datait du tray template monochrome
+                // (invisible sur barre sombre) et provoquait désormais un flash
+                // (badge jaune chargé par la config → remplacé par la tuile
+                // noire). Une seule icône de marque partout, pas de flash.
                 let _ = tray.set_menu(Some(menu));
                 tray.on_menu_event(|app, event| match event.id.as_ref() {
                     // Même chemin de sortie que le bouton de la fenêtre :
@@ -318,6 +327,25 @@ fn main() {
                 api.prevent_close();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("Failed to run Jamodio Audio Engine");
+        // `build` + `run` (plutôt que `run(generate_context!())`) pour pouvoir
+        // intercepter les RunEvent — notamment `Reopen` (macOS).
+        .build(tauri::generate_context!())
+        .expect("Failed to run Jamodio Audio Engine")
+        .run(|app_handle, event| {
+            // macOS : clic sur l'icône Dock → `applicationShouldHandleReopen`.
+            // Option B : la fenêtre principale est `visible:false` + masquée à
+            // la fermeture ; sans ce handler, cliquer l'icône Dock ne faisait
+            // RIEN (porte d'entrée morte). On (re)montre + focus la fenêtre
+            // d'infos de l'Agent — entrée fiable, jamais masquée par l'encoche.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = &event {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                }
+            }
+            // Évite les warnings unused sur les autres OS / variantes.
+            let _ = (app_handle, &event);
+        });
 }

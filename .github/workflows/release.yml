@@ -25,6 +25,15 @@ on:
 permissions:
   contents: write
 
+# Sérialise les runs d'une MÊME tag : sans ça, un re-run (ou un double
+# déclenchement) lance 2 jobs `publish` en parallèle qui se battent sur l'upload
+# des assets en nom stable → HTTP 422 "ReleaseAsset.name already exists" (le
+# delete-then-upload de `--clobber` race). `cancel-in-progress: false` = on
+# laisse finir le run en cours plutôt que de couper un build/publish à moitié.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     strategy:
@@ -204,8 +213,16 @@ jobs:
           #   - Windows x64 MSI (NSIS retiré du bundle, plus aucun binaire NSIS produit)
           # macOS Intel + Windows NSIS legacy : abandonnés (cf. mémoires
           # agent_windows_blocker.md + beta_launch_strategy.md).
+          #
+          # Re-run safety : si la release porte déjà des assets en nom stable
+          # (run précédent), `gh release download` les rapatrie aussi → on les
+          # EXCLUT du glob, sinon `cp Jamodio-Audio-Engine-*.msi <même nom>`
+          # copierait un fichier sur lui-même (`cp: same file` → abort set -e).
           for f in *.dmg *.msi; do
             [ -f "$f" ] || continue
+            case "$f" in
+              Jamodio-Audio-Engine-*) continue ;;   # déjà en nom stable → skip
+            esac
             case "$f" in
               *aarch64*.dmg)
                 cp -v "$f" 'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg'
@@ -216,12 +233,17 @@ jobs:
             esac
           done
 
-          echo "▸ Upload des copies stables (clobber → remplace si re-run)"
+          echo "▸ Upload des copies stables (delete-then-upload = idempotent)"
+          # On supprime explicitement l'asset existant AVANT l'upload plutôt que
+          # de compter sur `--clobber` : ce dernier fait delete+upload en un appel
+          # et peut renvoyer 422 "already exists" si un autre run a uploadé entre
+          # les deux. Le delete séparé (|| true) rend l'étape rejouable sans échec.
           for stable in \
             'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg' \
             'Jamodio-Audio-Engine-Windows.msi'; do
             if [ -f "$stable" ]; then
-              gh release upload "$TAG" "$stable" -R "$REPO" --clobber
+              gh release delete-asset "$TAG" "$stable" -R "$REPO" --yes 2>/dev/null || true
+              gh release upload "$TAG" "$stable" -R "$REPO"
               echo "  ✓ $stable"
             else
               echo "  ⚠ $stable introuvable, passé"
