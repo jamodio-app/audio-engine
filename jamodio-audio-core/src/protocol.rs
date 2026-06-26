@@ -216,6 +216,16 @@ pub enum BrowserMessage {
     /// le browser voit la WS tomber (Shutdown puis close) et bascule en
     /// fallback, puis reconnecte sur l'agent relancé/à jour.
     Restart,
+    /// Redémarrage IMMÉDIAT de l'agent, SANS passer par le flux d'update.
+    /// Déclenché par le bouton « Redémarrer l'agent » du badge WASAPI
+    /// (Réglages audio) : un boot frais re-sonde le host CPAL → ASIO est
+    /// détecté si l'interface a été branchée APRÈS le démarrage de l'agent
+    /// (cas fréquent avec l'autostart au login). Contrairement à `Restart` —
+    /// qui passe par `check_for_update` et ne relance QUE si une mise à jour
+    /// existe — celui-ci relance toujours. Broadcaste
+    /// `Shutdown{reason:"relaunch"}` puis `app.restart()`. Pas de réponse
+    /// directe (la WS tombe puis reconnecte sur l'agent relancé).
+    RelaunchNow,
 }
 
 /// Spec d'un stem à enregistrer, transmise par le browser au start.
@@ -726,4 +736,24 @@ pub enum AgentState {
     Idle,
     Capturing,
     Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Contrat wire avec le browser (groupe.js / studio-settings-modal.js) :
+    // `restart` et `relaunch-now` doivent rester stables (kebab-case du tag
+    // `type`). Ne JAMAIS renommer sans migration côté web.
+    #[test]
+    fn restart_and_relaunch_now_parse_from_wire() {
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"restart"}"#).unwrap(),
+            BrowserMessage::Restart
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
+            BrowserMessage::RelaunchNow
+        ));
+    }
 }

@@ -181,6 +181,27 @@ impl WsServerHandle {
             crate::check_for_update(app, me).await;
         });
     }
+
+    /// Redémarrage IMMÉDIAT de l'agent, SANS flux d'update (message browser
+    /// `RelaunchNow`, bouton « Redémarrer l'agent » du badge WASAPI). Un boot
+    /// frais re-sonde le host CPAL → ASIO détecté si l'interface a été branchée
+    /// après le démarrage. Contrairement à `trigger_restart` (qui passe par
+    /// `check_for_update` et ne relance QUE si une update existe), celui-ci
+    /// relance toujours. Broadcaste `Shutdown` aux browsers AVANT de couper,
+    /// avec un court délai (le temps que la frame WS parte), puis `app.restart()`.
+    pub fn trigger_relaunch(&self) {
+        let Some(app) = self.app.get().cloned() else {
+            tracing::warn!(target: "jamodio::ws", "Relaunch requested but AppHandle not set — ignoring");
+            return;
+        };
+        tracing::info!(target: "jamodio::ws", "browser requested agent relaunch (WASAPI→ASIO refresh)");
+        self.broadcast_shutdown("relaunch");
+        tauri::async_runtime::spawn(async move {
+            // Laisse partir le Shutdown vers les browsers avant le restart.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            app.restart();
+        });
+    }
 }
 
 /// Start the localhost WebSocket server on port 9876.
@@ -291,6 +312,14 @@ async fn handle_one_message(
     if matches!(browser_msg, BrowserMessage::Restart) {
         tracing::info!(target: "jamodio::ws", "browser requested agent restart (update banner)");
         handle.trigger_restart();
+        return true;
+    }
+
+    // RelaunchNow : redémarrage immédiat sans flux d'update (badge WASAPI →
+    // bouton « Redémarrer l'agent »). Même raison que Restart : besoin de
+    // l'AppHandle, fire-and-forget.
+    if matches!(browser_msg, BrowserMessage::RelaunchNow) {
+        handle.trigger_relaunch();
         return true;
     }
 
@@ -1809,9 +1838,10 @@ async fn handle_message(
             }
         }
 
-        // Restart est intercepté en amont dans handle_one_message (il a besoin
-        // du AppHandle, pas seulement du pipeline) et n'atteint jamais ce match.
-        // Bras défensif pour l'exhaustivité — no-op si jamais routé ici.
-        BrowserMessage::Restart => vec![],
+        // Restart et RelaunchNow sont interceptés en amont dans
+        // handle_one_message (ils ont besoin du AppHandle, pas seulement du
+        // pipeline) et n'atteignent jamais ce match. Bras défensifs pour
+        // l'exhaustivité — no-op si jamais routés ici.
+        BrowserMessage::Restart | BrowserMessage::RelaunchNow => vec![],
     }
 }
