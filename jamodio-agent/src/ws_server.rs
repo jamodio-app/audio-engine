@@ -196,12 +196,59 @@ impl WsServerHandle {
         };
         tracing::info!(target: "jamodio::ws", "browser requested agent relaunch (WASAPI→ASIO refresh)");
         self.broadcast_shutdown("relaunch");
+        let exe = std::env::current_exe();
         tauri::async_runtime::spawn(async move {
-            // Laisse partir le Shutdown vers les browsers avant le restart.
+            // Laisse partir la frame Shutdown vers les browsers.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            app.restart();
+
+            // On N'UTILISE PAS `app.restart()` : il relance le nouveau process
+            // PENDANT que l'ancien tient encore le verrou tauri-plugin-single-
+            // instance → le nouveau est vu comme « 2e instance » et se tue
+            // aussitôt → plus AUCUN agent (symptôme Windows confirmé par logs
+            // 2026-06-26 : pastille en boucle, WS jamais de retour). À la place
+            // on spawne un relanceur DÉTACHÉ marqué `--awaited-relaunch` : il
+            // attend (cf. main.rs) que CE process meure — donc que le verrou
+            // single-instance ET le port 9876 soient libérés — avant de démarrer.
+            match exe {
+                Ok(path) => {
+                    if let Err(e) = spawn_awaited_relaunch(&path) {
+                        tracing::error!(target: "jamodio::ws", error = %e, "spawn du relanceur échoué");
+                    } else {
+                        tracing::info!(target: "jamodio::ws", "relanceur détaché spawné — sortie du process courant");
+                    }
+                }
+                Err(e) => tracing::error!(
+                    target: "jamodio::ws", error = %e,
+                    "current_exe() indisponible — relance impossible"
+                ),
+            }
+            // Laisse le relanceur démarrer (il dort), puis on quitte proprement
+            // pour libérer le verrou + le port.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            app.exit(0);
         });
     }
+}
+
+/// Spawne une nouvelle instance de l'agent en mode « relance attendue ». Le
+/// nouveau process est DÉTACHÉ (survit à la mort du parent) et reçoit l'argument
+/// `--awaited-relaunch` : au démarrage il attend ~2 s (cf. `main()`) que le
+/// process courant meure et libère le verrou single-instance + le port WS 9876,
+/// AVANT d'initialiser Tauri — sinon le plugin single-instance le tuerait comme
+/// « 2e instance » (race classique de `app.restart()`).
+fn spawn_awaited_relaunch(exe: &std::path::Path) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--awaited-relaunch");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS : pas de console héritée. CREATE_NEW_PROCESS_GROUP :
+        // le child ne reçoit pas les signaux du parent qui s'éteint.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map(|_child| ())
 }
 
 /// Start the localhost WebSocket server on port 9876.

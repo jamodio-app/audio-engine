@@ -156,6 +156,18 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
 }
 
 fn main() {
+    // Relance « attendue » (bouton « Redémarrer l'agent » → ws_server::
+    // spawn_awaited_relaunch). On a été spawné DÉTACHÉ par l'ancien process
+    // pendant qu'il s'éteignait. On attend qu'il soit mort — donc que le verrou
+    // tauri-plugin-single-instance ET le port WS 9876 soient libérés — AVANT
+    // d'initialiser Tauri. Sans ce délai, le plugin single-instance nous
+    // tuerait comme « 2e instance » et il ne resterait AUCUN agent (race
+    // classique de app.restart(), à l'origine du bug Windows du 26/06). Doit
+    // impérativement précéder `tauri::Builder`.
+    if std::env::args().any(|a| a == "--awaited-relaunch") {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+
     // Init tracing AVANT tout le reste : tous les eprintln! ont été migrés
     // vers tracing::{info,warn,error,debug,trace}, et on veut capturer même
     // les events pendant le setup Tauri. Le guard doit rester vivant : on le
