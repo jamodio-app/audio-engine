@@ -4,7 +4,26 @@ use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
 pub struct JitterBuffer {
     producer: ringbuf::HeapProd<f32>,
     consumer: ringbuf::HeapCons<f32>,
+    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Valeur dérivée, recalculée par `recompute_target()` à chaque changement de
+    /// `floor_samples` ou `reactive_extra_samples`. Lue par `pull` (pre-fill +
+    /// seuil de drift-drain).
     target_samples: usize,
+    /// Plancher PRÉDICTIF (samples). En mode auto : piloté par la gigue réseau
+    /// mesurée (`observe_jitter`) ≈ `k·gigue + headroom`. En mode manuel / local :
+    /// valeur figée par `set_target_ms`. Init = `INITIAL_TARGET_MS` (sûr avant la
+    /// 1re mesure de gigue fiable).
+    floor_samples: usize,
+    /// Marge RÉACTIVE temporaire (samples) ajoutée au plancher : +5 ms à chaque
+    /// underrun (`adapt_up`), décroît vers 0 au calme (`adapt_down`). C'est le
+    /// FILET de sécurité — il garantit qu'on n'est jamais durablement moins
+    /// bufferisé que le comportement réactif historique, quelle que soit la
+    /// justesse de l'estimation de gigue.
+    reactive_extra_samples: usize,
+    /// `true` : le plancher suit la gigue mesurée (réseau). `false` : plancher
+    /// figé par l'utilisateur (slider UI) ou le self-monitor — `observe_jitter`
+    /// devient alors un no-op (on respecte l'override).
+    jitter_auto: bool,
     underruns: u64,
     last_adapt: std::time::Instant,
     /// Pre-fill gate : on n'autorise le playout qu'une fois `target_samples`
@@ -41,13 +60,42 @@ pub struct JitterBuffer {
     /// Nombre de samples de fondu d'ENTRÉE restant à appliquer à la reprise
     /// après un trou (concealment). 0 = pas de fondu en cours.
     conceal_fade_in_remaining: usize,
+    /// Phase C — compensation de drift continue (streams RÉSEAU uniquement).
+    /// `false` en mode local (self-monitor : pas de drift réseau).
+    resample_enabled: bool,
+    /// Vitesse de lecture du flux entrant : input frames consommées par output
+    /// frame. ≈ 1,0, piloté par un servo sur le remplissage : > 1 si le buffer
+    /// est trop plein (sender plus rapide) → on produit MOINS de samples → le
+    /// buffer draine en douceur ; < 1 sinon. Borné à ±`RESAMPLE_MAX_ADJ`
+    /// (pitch inaudible). Remplace les drift-drains discrets par un ajustement continu.
+    rs_speed: f64,
+    /// Position fractionnaire de lecture, continuité inter-push. ∈ [0, 1).
+    rs_frac: f64,
+    /// Frame d'entrée précédente, pour l'interpolation linéaire (continuité).
+    rs_prev: [f32; CHANNELS],
+    /// `false` tant que `rs_prev` n'est pas amorcée (1er push, ou reprise après
+    /// un trou de playout → on ré-amorce pour éviter une interpolation sur une
+    /// frame périmée).
+    rs_has_prev: bool,
+    /// Buffer de sortie réutilisé du resampler (zéro-alloc en régime).
+    rs_scratch: Vec<f32>,
 }
 
 const SAMPLE_RATE: usize = 48000;
 const CHANNELS: usize = 2;
 const MIN_TARGET_MS: usize = 5;
 const MAX_TARGET_MS: usize = 40;
+/// Plancher auto avant que la gigue mesurée soit fiable (warmup JitterEstimator).
+/// Valeur sûre et conservatrice ; `observe_jitter` la fait ensuite descendre/monter.
 const INITIAL_TARGET_MS: usize = 10;
+/// Phase B — calibration du plancher prédictif : `floor = k·gigue + headroom`.
+/// `k = 3` sur la gigue EWMA (RFC 3550, ≈ déviation absolue moyenne) couvre
+/// largement la queue de distribution (≈ 3,7σ) ; `headroom` ajoute une marge
+/// fixe pour la granularité de mesure. Calibré sur réseaux réels (gigue ethernet
+/// mesurée ~0,7–1 ms → plancher ~5 ms ; gigue 3 ms → ~11 ms). Le filet réactif
+/// (`reactive_extra`) couvre ce que l'EWMA sous-estime (rafales Wi-Fi).
+const JITTER_TARGET_K: f64 = 3.0;
+const JITTER_HEADROOM_MS: f64 = 2.5;
 /// Capacité du ring buffer, en ms d'audio stéréo. Marge confortable au-dessus
 /// de MAX_TARGET_MS (40) pour absorber les bursts SFU sans truncation
 /// même quand le buffer est proche de sa cible haute. Coût RAM : ~115 KB / stream.
@@ -77,6 +125,22 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 /// ~2 ms = assez pour tuer le clic, assez court pour rester transparent.
 const CONCEAL_FADE_MS: usize = 2;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
+/// Phase C — gain proportionnel du servo de drift (erreur de remplissage relative
+/// → écart de vitesse). Un simple P suffit : la correction stationnaire requise
+/// (~7 ppm de drift) est minuscule, l'erreur résiduelle de remplissage est < 1 frame.
+const RESAMPLE_KP: f64 = 0.01;
+/// Borne dure du ratio : ±0,5 % = ~8 cents en transitoire extrême, inaudible.
+/// Le drift réel (~7 ppm = 0,0007 %) laisse une marge de sécurité énorme ;
+/// le clamp protège contre un emballement du servo sur un burst.
+const RESAMPLE_MAX_ADJ: f64 = 0.005;
+/// Slew-rate du ratio par push (~400/s) : 2e-5/push ⇒ ~0,008/s. Le ratio bouge
+/// lentement (faible bande passante, façon DLL) → aucun wobble de hauteur audible.
+const RESAMPLE_SLEW_PER_PUSH: f64 = 0.00002;
+
+/// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
+fn ms_f64_to_samples(ms: f64) -> usize {
+    (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
+}
 
 impl Default for JitterBuffer {
     fn default() -> Self {
@@ -90,10 +154,14 @@ impl JitterBuffer {
         let rb = HeapRb::<f32>::new(capacity);
         let (producer, consumer) = rb.split();
 
+        let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
         Self {
             producer,
             consumer,
-            target_samples: INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000,
+            target_samples: initial,
+            floor_samples: initial,
+            reactive_extra_samples: 0,
+            jitter_auto: true,
             underruns: 0,
             last_adapt: std::time::Instant::now(),
             primed: false,
@@ -103,6 +171,12 @@ impl JitterBuffer {
             crossfade_pos: 0,
             local_mode: false,
             conceal_fade_in_remaining: 0,
+            resample_enabled: true,
+            rs_speed: 1.0,
+            rs_frac: 0.0,
+            rs_prev: [0.0; CHANNELS],
+            rs_has_prev: false,
+            rs_scratch: Vec::with_capacity(2048),
         }
     }
 
@@ -110,6 +184,8 @@ impl JitterBuffer {
     /// adaptation bornée à `LOCAL_MAX_TARGET_MS`). Appelé par `add_local_stream`.
     pub fn set_local_mode(&mut self, on: bool) {
         self.local_mode = on;
+        // Le self-monitor local n'a pas de drift réseau → pas de resampling Phase C.
+        self.resample_enabled = !on;
     }
 
     /// Push decoded PCM samples (interleaved stereo f32).
@@ -125,14 +201,83 @@ impl JitterBuffer {
     /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
     /// audiblement moins violent qu'une coupure mid-paquet.
     pub fn push(&mut self, samples: &[f32]) {
-        let needed = samples.len();
+        // Phase C — en régime établi (primed) et pour les streams réseau, on
+        // resample le flux entrant en continu pour tenir le remplissage sur la
+        // cible (compensation de drift d'horloge sender↔nous). Hors régime
+        // (pre-fill / reprise) ou self-monitor : push direct, chemin historique.
+        if self.resample_enabled && self.primed {
+            self.update_resample_speed();
+            // `scratch` sorti du `self` (mem::take préserve la capacité) pour
+            // satisfaire l'emprunteur : resample_into emprunte `self` en mut.
+            let mut scratch = std::mem::take(&mut self.rs_scratch);
+            scratch.clear();
+            self.resample_into(samples, &mut scratch);
+            self.push_to_ring(&scratch);
+            self.rs_scratch = scratch; // restitué (capacité conservée → zéro-alloc).
+        } else {
+            self.push_to_ring(samples);
+        }
+    }
+
+    /// Écrit `data` dans le ring avec politique drop-oldest sur overflow.
+    fn push_to_ring(&mut self, data: &[f32]) {
+        let needed = data.len();
         let vacant = self.producer.vacant_len();
         if vacant < needed {
             let to_drop = needed - vacant;
             let dropped = self.consumer.skip(to_drop);
             self.overflow_drops += dropped as u64;
         }
-        self.producer.push_slice(samples);
+        self.producer.push_slice(data);
+    }
+
+    /// Servo de drift (Phase C) : ajuste `rs_speed` pour ramener le remplissage
+    /// vers `target_samples`. Proportionnel + slew-rate limité + clamp dur.
+    fn update_resample_speed(&mut self) {
+        let fill = self.consumer.occupied_len() as f64;
+        let target = self.target_samples.max(1) as f64;
+        let err = (fill - target) / target; // > 0 : trop plein → accélérer (drainer).
+        let speed_target =
+            (1.0 + RESAMPLE_KP * err).clamp(1.0 - RESAMPLE_MAX_ADJ, 1.0 + RESAMPLE_MAX_ADJ);
+        let delta = (speed_target - self.rs_speed).clamp(-RESAMPLE_SLEW_PER_PUSH, RESAMPLE_SLEW_PER_PUSH);
+        self.rs_speed = (self.rs_speed + delta).clamp(1.0 - RESAMPLE_MAX_ADJ, 1.0 + RESAMPLE_MAX_ADJ);
+    }
+
+    /// Resampler linéaire streaming : lit `input` (stéréo interleaved) à la
+    /// vitesse `rs_speed` et écrit ~`in_frames / rs_speed` frames dans `out`.
+    /// État (`rs_prev`, `rs_frac`, `rs_has_prev`) assure la continuité entre
+    /// pushes. Interpolation linéaire = transparente à un ratio ≈ 1 (≤ 0,5 %).
+    fn resample_into(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let in_frames = input.len() / CHANNELS;
+        if in_frames == 0 {
+            return;
+        }
+        let speed = self.rs_speed;
+        let mut i = 0; // prochaine frame d'entrée à charger comme "cur".
+        if !self.rs_has_prev {
+            // Amorçage : la 1re frame devient `prev`, on interpole à partir d'elle.
+            self.rs_prev.copy_from_slice(&input[0..CHANNELS]);
+            self.rs_has_prev = true;
+            self.rs_frac = 0.0;
+            i = 1;
+        }
+        while i < in_frames {
+            let base = i * CHANNELS;
+            // Produit des outputs tant que la position fractionnaire est entre
+            // `prev` (frac 0) et la frame courante `input[i]` (frac 1).
+            while self.rs_frac < 1.0 {
+                let f = self.rs_frac as f32;
+                for c in 0..CHANNELS {
+                    let prev = self.rs_prev[c];
+                    let cur = input[base + c];
+                    out.push(prev + (cur - prev) * f);
+                }
+                self.rs_frac += speed;
+            }
+            self.rs_frac -= 1.0;
+            self.rs_prev.copy_from_slice(&input[base..base + CHANNELS]);
+            i += 1;
+        }
     }
 
     /// Pull samples for playback.
@@ -213,6 +358,9 @@ impl JitterBuffer {
             self.underruns += 1;
             self.adapt_up();
             self.primed = false;
+            // Phase C — un trou de playout casse la continuité d'entrée : on
+            // ré-amorce le resampler (sinon interpolation sur une frame périmée).
+            self.rs_has_prev = false;
             available
         };
 
@@ -274,9 +422,39 @@ impl JitterBuffer {
     /// avant de reprendre le playout.
     pub fn set_target_ms(&mut self, target_ms: usize) {
         let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
-        self.target_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
+        // Override manuel (slider UI) ou pin du self-monitor : on fige le
+        // plancher sur cette valeur et on COUPE le pilotage par la gigue
+        // (`observe_jitter` devient no-op). Le filet réactif reste actif.
+        self.jitter_auto = false;
+        self.floor_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
+        self.reactive_extra_samples = 0;
+        self.recompute_target();
         self.last_adapt = std::time::Instant::now();
         self.primed = false;
+    }
+
+    /// Phase B — alimente le plancher prédictif avec la gigue réseau mesurée
+    /// (RFC 3550, ms). No-op si la cible est en override manuel (`jitter_auto`
+    /// = false) ou si l'estimation n'est pas encore fiable (appelant garde
+    /// `JitterEstimator::is_warm()`). Le plancher = `clamp(MIN, k·gigue +
+    /// headroom, MAX)` ; le filet réactif s'ajoute par-dessus.
+    pub fn observe_jitter(&mut self, jitter_ms: f64) {
+        if !self.jitter_auto {
+            return;
+        }
+        let floor_ms =
+            (JITTER_TARGET_K * jitter_ms + JITTER_HEADROOM_MS).clamp(MIN_TARGET_MS as f64, MAX_TARGET_MS as f64);
+        self.floor_samples = ms_f64_to_samples(floor_ms);
+        self.recompute_target();
+    }
+
+    /// Recalcule la cible effective = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// `cap` = `LOCAL_MAX_TARGET_MS` en mode self-monitor, sinon `MAX_TARGET_MS`.
+    fn recompute_target(&mut self) {
+        let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
+        let min_s = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
+        self.target_samples = (self.floor_samples + self.reactive_extra_samples).clamp(min_s, cap_s);
     }
 
     pub fn underruns(&self) -> u64 {
@@ -294,25 +472,36 @@ impl JitterBuffer {
         self.drift_drops
     }
 
+    /// Phase C — vitesse de resampling courante (≈ 1,0). L'écart à 1,0 reflète
+    /// la dérive d'horloge compensée en continu. `(speed - 1)·1e6` ≈ ppm corrigés.
+    pub fn resample_speed(&self) -> f64 {
+        self.rs_speed
+    }
+
     fn adapt_up(&mut self) {
         let grow = 5 * SAMPLE_RATE * CHANNELS / 1000;
         // Chantier C — en mode local la cible est plafonnée à LOCAL_MAX_TARGET_MS
         // (latence de monitoring bornée, priorité absolue). Les streams réseau
         // gardent MAX_TARGET_MS (40 ms).
-        let max_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
-        let max = max_ms * SAMPLE_RATE * CHANNELS / 1000;
-        self.target_samples = (self.target_samples + grow).min(max);
+        let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
+        let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
+        // Borne le filet pour que `floor + extra` ne dépasse jamais le cap :
+        // sinon une accumulation sans effet rendrait la redescente lente.
+        let max_extra = cap_s.saturating_sub(self.floor_samples);
+        self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
+        self.recompute_target();
         self.last_adapt = std::time::Instant::now();
     }
 
     fn adapt_down(&mut self) {
         // Mode local : hold plus long (évite d'osciller entre deux spikes
-        // plugin) — mais on redescend bien vers 5 ms dès le calme installé.
+        // plugin) — mais on redescend bien vers le plancher dès le calme installé.
         let hold = if self.local_mode { LOCAL_ADAPT_DOWN_SECS } else { 5 };
         if self.last_adapt.elapsed().as_secs() >= hold {
             let shrink = 2 * SAMPLE_RATE * CHANNELS / 1000 + SAMPLE_RATE * CHANNELS / 2000;
-            let min = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
-            self.target_samples = self.target_samples.saturating_sub(shrink).max(min);
+            // Décroît le filet réactif vers 0 (le plancher prédictif fournit la base).
+            self.reactive_extra_samples = self.reactive_extra_samples.saturating_sub(shrink);
+            self.recompute_target();
             self.last_adapt = std::time::Instant::now();
         }
     }
@@ -496,5 +685,134 @@ mod tests {
             "la cible a bien grandi sous underruns répétés: {} ms",
             jb.target_ms()
         );
+    }
+
+    // ── Phase B — cible pilotée par la gigue mesurée ───────────────────────
+
+    #[test]
+    fn observe_jitter_low_gives_low_target() {
+        let mut jb = JitterBuffer::new();
+        // gigue 0,7 ms → floor = 3·0,7 + 2,5 = 4,6 → clamp MIN = 5 ms.
+        jb.observe_jitter(0.7);
+        assert_eq!(jb.target_ms(), 5);
+    }
+
+    #[test]
+    fn observe_jitter_high_gives_proportional_target() {
+        let mut jb = JitterBuffer::new();
+        // gigue 5 ms → floor = 3·5 + 2,5 = 17,5 ms.
+        jb.observe_jitter(5.0);
+        let t = jb.target_ms();
+        assert!((16..=18).contains(&t), "target attendu ~17 ms, obtenu {t}");
+    }
+
+    #[test]
+    fn observe_jitter_clamps_to_max() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(100.0); // énorme → borné à MAX_TARGET_MS.
+        assert_eq!(jb.target_ms(), MAX_TARGET_MS);
+    }
+
+    #[test]
+    fn manual_override_disables_jitter_targeting() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(20); // slider UI : override manuel.
+        jb.observe_jitter(0.5); // doit être ignoré.
+        assert_eq!(jb.target_ms(), 20);
+    }
+
+    #[test]
+    fn underrun_raises_target_above_jitter_floor_then_floor_holds() {
+        // Garantie anti-régression : même avec un plancher gigue bas (5 ms),
+        // le filet réactif remonte la cible à l'underrun (jamais moins sûr que
+        // l'historique).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher → 5 ms.
+        assert_eq!(jb.target_ms(), 5);
+
+        let five_ms = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        // Prime puis vide → un pull à vide déclenche l'underrun + adapt_up.
+        jb.push(&vec![0.1_f32; five_ms]);
+        let mut out = vec![0.0_f32; five_ms];
+        jb.pull(&mut out); // prime + consomme tout.
+        jb.pull(&mut out); // buffer vide → underrun → +5 ms réactif.
+        assert!(
+            jb.target_ms() > 5,
+            "le filet réactif doit remonter la cible: {} ms",
+            jb.target_ms()
+        );
+    }
+
+    // ── Phase C — compensation de drift continue (resampler + servo) ───────
+
+    #[test]
+    fn resample_speed_one_is_near_identity() {
+        let mut jb = JitterBuffer::new();
+        let input: Vec<f32> = (0..240).map(|i| i as f32).collect(); // 120 frames.
+        let mut out = Vec::new();
+        jb.resample_into(&input, &mut out); // rs_speed = 1.0 par défaut.
+        let out_frames = out.len() / CHANNELS;
+        assert!((118..=121).contains(&out_frames), "out_frames={out_frames}");
+    }
+
+    #[test]
+    fn servo_speeds_up_when_overfull_and_slows_when_underfull() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        let target = jb.target_samples;
+        // Trop plein (3× la cible) → le servo doit accélérer (drainer).
+        jb.push_to_ring(&vec![0.05_f32; target * 3]);
+        for _ in 0..1000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() > 1.0, "trop plein → speed>1: {}", jb.resample_speed());
+        // Vide bien en dessous de la cible → le servo doit ralentir (remplir).
+        let mut sink = vec![0.0_f32; target * 3];
+        let _ = jb.consumer.pop_slice(&mut sink);
+        for _ in 0..2000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() < 1.0, "sous-rempli → speed<1: {}", jb.resample_speed());
+    }
+
+    #[test]
+    fn servo_speed_is_hard_clamped() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        jb.push_to_ring(&vec![0.05_f32; jb.target_samples * 10]); // excès énorme.
+        for _ in 0..100_000 {
+            jb.update_resample_speed();
+        }
+        assert!(jb.resample_speed() <= 1.0 + RESAMPLE_MAX_ADJ + 1e-9);
+        assert!(jb.resample_speed() >= 1.0 - RESAMPLE_MAX_ADJ - 1e-9);
+    }
+
+    #[test]
+    fn resampler_output_count_tracks_speed() {
+        // À speed > 1, on produit MOINS de frames qu'on en reçoit → le buffer
+        // draine en douceur (compensation d'un sender plus rapide).
+        let mut jb = JitterBuffer::new();
+        jb.rs_speed = 1.0 + RESAMPLE_MAX_ADJ; // +0,5 %.
+        let input = vec![0.1_f32; 2000 * CHANNELS];
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            jb.resample_into(&input, &mut out);
+        }
+        let out_frames = out.len() / CHANNELS;
+        let in_frames = 10 * 2000;
+        assert!(out_frames < in_frames, "speed>1 doit réduire: {out_frames}/{in_frames}");
+        let ratio = out_frames as f64 / in_frames as f64;
+        assert!(
+            (ratio - 1.0 / (1.0 + RESAMPLE_MAX_ADJ)).abs() < 0.001,
+            "ratio sortie/entrée = {ratio}"
+        );
+    }
+
+    #[test]
+    fn local_mode_disables_resampling() {
+        let mut jb = JitterBuffer::new();
+        assert!(jb.resample_enabled, "réseau : resampling actif par défaut");
+        jb.set_local_mode(true);
+        assert!(!jb.resample_enabled, "self-monitor : resampling désactivé");
     }
 }

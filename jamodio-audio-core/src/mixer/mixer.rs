@@ -227,6 +227,17 @@ impl AudioMixer {
         }
     }
 
+    /// Phase B — transmet la gigue réseau mesurée (RFC 3550, ms) au jitter
+    /// buffer du stream pour piloter sa cible prédictive. No-op si le stream
+    /// n'existe pas (peer parti) ou s'il est en override manuel (cf.
+    /// [`JitterBuffer::observe_jitter`]). Appelé par la recv task à cadence
+    /// réduite (pas à chaque paquet) pour limiter la contention du lock mixer.
+    pub fn observe_jitter(&mut self, producer_id: &str, jitter_ms: f64) {
+        if let Some(stream) = self.streams.get_mut(producer_id) {
+            stream.jitter.observe_jitter(jitter_ms);
+        }
+    }
+
     /// Push decoded samples into a stream's jitter buffer.
     ///
     /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).

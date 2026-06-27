@@ -6,6 +6,194 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-06-27
+
+> **Release latence : Opus low-delay + jitter buffer adaptatif (gigue mesurée +
+> compensation de drift continue). Synthèse des pré-releases 0.5.2-1 → 0.5.2-7.**
+
+### Added
+- **Encodeur Opus en `RESTRICTED_LOWDELAY`** : **−4 ms/sens** de latence
+  algorithmique (lookahead 312→120 samples, mesuré), qualité CELT identique.
+- **Jitter buffer adaptatif piloté par la gigue mesurée** (RFC 3550) : la cible
+  suit `k·gigue + headroom` par peer au lieu d'un ratchet réactif, avec filet
+  réactif conservé (jamais moins sûr que l'historique). Plafonne le pire cas
+  (queue 40→17 ms) et s'adapte à chaque réseau.
+- **Compensation de drift d'horloge en continu** (resampler asservi au
+  remplissage, ratio borné ±0,5 %, inaudible) : remplace les drift-drains
+  discrets, tient le buffer bas malgré la dérive sender↔récepteur.
+- **Instrumentation déterministe** : gigue/drift par peer (`jamodio::netstats`) +
+  latence d'émission (`send_path_latency`) loggées pour piloter l'optimisation
+  sur des chiffres fiables (pas l'acoustique).
+
+### Notes
+- Un **pacing d'émission** (lissage des rafales Windows/ASIO) a été tenté
+  (0.5.2-5/-6) puis **retiré** (0.5.2-7) : l'instrumentation a montré qu'il
+  injectait ~160 ms (sommeil-par-paquet tokio → saturation de file). La rafale
+  d'émission Windows reste à traiter proprement (cf.
+  `internal-docs/plans/PLAN-CHANTIER-LATENCE-2026-06.md`).
+
+## [0.5.2-7] — 2026-06-26
+
+> **REVERT du pacing d'émission (régression grave) — retour au comportement
+> sain. L'instrumentation est conservée.**
+
+### Fixed
+- **Pacing d'émission RETIRÉ.** L'instrumentation `send_path_latency` (0.5.2-6) a
+  révélé que le pacer injectait **~160 ms** de latence d'émission (mesuré p50 sur
+  les deux postes) + instabilité agent (backpressure). **Cause racine** : le pacer
+  dormait ~2,5 ms/paquet via `tokio::sleep_until`, dont la granularité (~1 ms,
+  arrondi au-dessus) faisait drainer **plus lentement** (~3-4 ms/paquet) que la
+  production (2,5 ms/paquet) → la file RTP **saturait à 64 paquets = ~160 ms** et y
+  restait. Le sommeil-par-paquet est fondamentalement incompatible avec la cadence
+  2,5 ms. La tâche UDP **renvoie désormais immédiatement** (comportement validé
+  ≤ 0.5.2-4). Opus LowDelay + jitter buffer adaptatif (A/B/C) **conservés**.
+- **Instrumentation `send_path_latency` CONSERVÉE** (le canal RTP porte l'instant
+  de production) : doit lire ~0 ms en envoi immédiat. Garde la visibilité
+  déterministe sur la latence d'émission pour toute future tentative de lissage.
+
+### Notes
+- La **rafale d'émission Windows/ASIO** (cause des bursts) reste donc à traiter,
+  mais par une approche saine (thread de pacing haute résolution dédié, ou buffer
+  ASIO plus petit côté Windows) — décidée sur la base de `send_path_latency`.
+
+## [0.5.2-6] — 2026-06-26
+
+> **Observabilité latence d'émission + durcissement du pacer (anti-accumulation).**
+
+### Added
+- **Mesure déterministe du délai d'émission** (`send_path_latency`) : temps réel
+  de la production d'un paquet (sortie encodeur) à son envoi socket = attente
+  file RTP + sommeil du pacer. C'était l'**angle mort** de la latence d'émission.
+  Le canal RTP transporte désormais l'instant de production ; la tâche UDP mesure
+  le délai après envoi. Loggué à 1 Hz (`send_path_p50/p99/max_ms` dans le perfstats).
+  → On juge le pacing sur des chiffres **déterministes et répétables**, plus sur
+  l'acoustique (dont le bruit ±15-20 ms — I/O intégré du Mac, setup — masque nos
+  variations de ~5 ms).
+
+### Fixed
+- **Pacer : rétention bornée (anti-accumulation de latence).** L'ancien garde-fou
+  par backlog (`SEND_MAX_BACKLOG=8` ≈ 20 ms) pouvait laisser la file s'accumuler
+  en dents de scie jusqu'à ~20 ms (selon l'horloge de capture) → latence
+  d'émission injectée (régression suspectée du 0.5.2-5). Remplacé par une **borne
+  dure de rétention** : `send_at = deadline.clamp(now, now + SEND_MAX_HOLD_US)`
+  avec `SEND_MAX_HOLD_US = 10 ms`. Un paquet n'est **jamais** retenu plus de 10 ms
+  → le deadline ne peut pas s'envoler devant `now` → **accumulation
+  mathématiquement impossible**. Étale toujours une rafale complète (1 buffer),
+  no-op sur flux régulier (Mac).
+
+## [0.5.2-5] — 2026-06-26
+
+> **Pacing d'émission : lisse les rafales de paquets (Windows/ASIO) pour que le
+> récepteur tienne un buffer bas.**
+
+### Fixed
+- **Émission des paquets RTP réétalée à la cadence temps-réel (2,5 ms).** Sur
+  Windows/ASIO, un callback audio livre plusieurs frames Opus d'un coup que
+  `encode_stage` encode et envoie **en rafale** ; la tâche UDP les forwardait
+  immédiatement → le pair récepteur recevait des grappes → buffer de gigue forcé
+  à monter (20-30 ms mesuré) + drift-drains. La tâche UDP **pace** désormais les
+  envois sur la période d'une frame (fonction pure `paced_send_time_us`), avec
+  garde-fou backlog (drainage immédiat si la file s'accumule → zéro drop, latence
+  bornée). **Flux déjà régulier (Mac) ≈ no-op** ; flux en rafale (Windows) → étalé
+  → le récepteur peut enfin tenir le buffer bas que les Phases B/C visent.
+  C'est le **goulot d'émission Windows** identifié en mesurant une session
+  Mac↔PC réelle. Calcul pur → mac+win.
+
+## [0.5.2-4] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase C : compensation de drift continue
+> (resampling asservi au remplissage). Complète B : le buffer TIENT son
+> plancher bas malgré le drift d'horloge.**
+
+### Added
+- **Compensation de drift d'horloge en continu** (streams réseau). Un servo
+  proportionnel asservit la vitesse de lecture du flux entrant (`rs_speed ≈ 1,0`)
+  sur le remplissage du buffer : si le buffer se remplit (sender plus rapide),
+  on resample pour produire légèrement moins de samples → drainage doux ; et
+  inversement. Remplace les **drift-drains discrets** (sauts masqués par
+  crossfade, jusqu'à 5,7 s d'audio drainé en Wi-Fi mesuré) par un ajustement
+  **inaudible et permanent**. Ratio borné à **±0,5 %** (~8 cents en transitoire
+  extrême ; le drift réel ~7 ppm ne demande que 0,0007 %) + slew-rate lent
+  (faible bande passante, façon DLL) → zéro wobble de hauteur. Interpolation
+  linéaire (transparente à ratio ≈ 1). Calcul pur → **identique macOS / Windows**.
+
+### Changed
+- En tenant le remplissage sur la cible, la Phase C **empêche le drift de vider
+  le buffer** → plus d'underruns de drift → le filet réactif (Phase B) retombe
+  à 0 → la cible **tient son plancher de ~5 ms** au lieu d'osciller à ~10 ms.
+  C'est la pièce qui transforme le gisement de la Phase B en latence réelle.
+
+### Notes
+- Le resampling est **désactivé pour le self-monitor** (mode local : pas de
+  drift réseau) — comportement Chantier C inchangé. Le drift-drain et le filet
+  réactif restent en **backstop** pour les rafales extrêmes.
+
+## [0.5.2-3] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase B : cible pilotée par la gigue mesurée.**
+
+### Changed
+- **La cible du jitter buffer réseau est désormais dérivée de la gigue mesurée**
+  (Phase A) au lieu d'un ratchet purement réactif. Modèle :
+  `target = clamp(MIN, plancher + filet_réactif, MAX)` où
+  `plancher = clamp(MIN, k·gigue + headroom, MAX)` (`k=3`, `headroom=2,5 ms`).
+  Sur réseau propre (gigue ~0,7–1 ms mesurée), la cible tient **~5 ms** au lieu
+  de ~15 ms de médiane observée → **~10 ms de latence de réception en moins**,
+  sans surprovisionner. La cible s'adapte **par peer** à sa propre gigue.
+- **Garantie anti-régression** : le filet réactif (+5 ms à l'underrun, décroît
+  au calme) est **conservé** et s'ajoute au plancher. Le système ne peut jamais
+  être durablement moins bufferisé que le comportement historique — il descend
+  seulement quand la gigue mesurée ET l'absence d'underrun le confirment.
+  L'override manuel (slider UI) et le self-monitor (mode local) sont respectés
+  (pilotage gigue désactivé, comportement inchangé).
+
+### Added
+- `JitterBuffer::observe_jitter()` + warmup `JitterEstimator::is_warm()` (≥100
+  paquets) pour ne jamais abaisser la cible sur une estimation non stabilisée.
+  Câblage `recv_decode_task` → `AudioMixer::observe_jitter` throttlé ~10×/s.
+
+## [0.5.2-2] — 2026-06-26
+
+> **Jitter buffer adaptatif — Phase A : instrumentation (mesure pure, aucun
+> changement de comportement).**
+
+### Added
+- **Estimateur de gigue réseau (RFC 3550 §A.8)** par stream entrant
+  (`sync::jitter::JitterEstimator`) : mesure la variation du délai de transit
+  inter-paquets, lissée par EWMA (gain 1/16). C'est le *capteur* du chantier
+  jitter buffer adaptatif — en Phase B la gigue pilotera la cible du buffer
+  (`target ≈ k·gigue`) au lieu d'une valeur fixe réactive. Calcul pur,
+  **identique macOS / Windows**.
+- **Télémétrie `jitterMs` par peer** (champ `PeerPerf`) + **log `jamodio::netstats`
+  1 Hz** (gigue mesurée vs cible courante du buffer) pour calibrer les Phases B/C
+  sur réseau réel.
+
+### Changed
+- **Refactor télémétrie réseau par stream** : la map `drift_ppm_by_producer`
+  (`HashMap<String, f64>`) devient `net_stats_by_producer`
+  (`HashMap<String, ProducerNetStats>`) regroupant drift + gigue — structure
+  extensible pour les métriques des Phases B/C (cible mesurée, ratio resampling),
+  au lieu d'empiler des maps parallèles.
+
+## [0.5.2-1] — 2026-06-26
+
+> **Latence : −4 ms note→oreille sur le flux musique (encodeur Opus).**
+
+### Changed
+- **Encodeur Opus passé en `RESTRICTED_LOWDELAY`** (était `AUDIO`). À 2,5 ms de
+  frame, Opus opère déjà en CELT-only (SILK exige des frames ≥ 10 ms) : le mode
+  `AUDIO` réservait inutilement le lookahead du resampler SILK — du **délai mort**.
+  Mesuré via `OPUS_GET_LOOKAHEAD` (test de régression `lowdelay_lookahead_vs_audio`) :
+  lookahead **312 → 120 samples**, soit **6,5 → 2,5 ms**. Gain **−4 ms** par sens,
+  **qualité CELT identique** (rien n'est retiré au signal, seulement le délai mort).
+
+### Fixed
+- **Télémétrie de latence Opus corrigée.** Le calcul `totalLatencyMs` modélisait
+  la part Opus à 2,5 ms alors que le lookahead réel en mode `AUDIO` était de
+  6,5 ms — la latence affichée **sous-estimait donc de 4 ms**. Avec
+  `RESTRICTED_LOWDELAY` le lookahead vaut exactement une frame (2,5 ms) :
+  la constante est désormais **exacte** (invariant verrouillé par test).
+
 ## [0.5.1] — 2026-06-26
 
 > **Confort & robustesse : éditeurs de plugins macOS, détection ASIO sans

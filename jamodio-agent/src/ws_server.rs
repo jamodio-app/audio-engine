@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
-use crate::pipeline::PipelineState;
+use crate::pipeline::{PipelineState, ProducerNetStats};
 
 /// Timeout sur les locks `pipeline.lock().await` dans les handlers heartbeat.
 /// Si dépassé, on répond `Error{overloaded}` au browser au lieu de bloquer
@@ -600,6 +600,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let capture_snap = pl.perfstats.capture_latency.lock().flush();
             let process_snap = pl.perfstats.process_latency.lock().flush();
             let encode_snap = pl.perfstats.encode_latency.lock().flush();
+            let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -616,9 +617,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             } else {
                 0.0
             };
-            // Snapshot drift_ppm par peer (clone du hashmap, cheap car ≤4 peers)
-            let drift_map: std::collections::HashMap<String, f64> =
-                pl.perfstats.drift_ppm_by_producer.lock().clone();
+            // Snapshot des stats réseau par peer (drift + gigue) — clone du
+            // hashmap, cheap car ≤4 peers.
+            let net_stats_map: std::collections::HashMap<String, ProducerNetStats> =
+                pl.perfstats.net_stats_by_producer.lock().clone();
             // Snapshot mixer stats (underruns + drift_drops cumul + target_ms)
             // + Chantier C : stats du self-monitor (latence courante + underruns).
             let (mixer_stats, monitor_buffer_ms, monitor_underruns) = {
@@ -790,22 +792,37 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 drops_per_sec: pipeline_snap.drops + capture_drops_window,
             };
 
-            // Construction des peers : on dérive de mixer_stats + drift_map.
-            // Si un producer est dans mixer mais pas dans drift_map (warmup),
-            // ppm = 0.0 (cf. drift.rs).
+            // Construction des peers : on dérive de mixer_stats + net_stats_map.
+            // Si un producer est dans mixer mais pas dans net_stats_map (warmup),
+            // les métriques réseau valent 0.0 (cf. drift.rs / jitter.rs).
             let peers: Vec<PeerPerf> = mixer_stats
                 .into_iter()
                 .map(|(producer_id, underruns, drift_drops, target_ms)| {
-                    let drift_ppm = drift_map.get(&producer_id).copied().unwrap_or(0.0);
+                    let net = net_stats_map.get(&producer_id).copied().unwrap_or_default();
                     PeerPerf {
                         producer_id,
-                        drift_ppm,
+                        drift_ppm: net.drift_ppm,
+                        jitter_ms: net.jitter_ms,
                         buffer_target_ms: target_ms,
                         underruns,
                         drift_drops,
                     }
                 })
                 .collect();
+
+            // Phase A — observabilité : log par peer de la gigue mesurée vs la
+            // cible courante du buffer (calibration des Phases B/C). 1 Hz, debug.
+            for p in &peers {
+                tracing::debug!(
+                    target: "jamodio::netstats",
+                    producer = &p.producer_id[..8.min(p.producer_id.len())],
+                    jitter_ms = p.jitter_ms,
+                    drift_ppm = p.drift_ppm,
+                    buffer_target_ms = p.buffer_target_ms,
+                    underruns = p.underruns,
+                    "peer net stats"
+                );
+            }
 
             // Skip si rien à reporter (encoder idle + pas de peer + pas de plugin)
             if plugin_perf.is_none()
@@ -839,6 +856,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 process_max_ms = process_snap.max_ms,
                 encode_p99_ms = encode_snap.p99_ms,
                 encode_max_ms = encode_snap.max_ms,
+                send_path_p50_ms = send_path_snap.p50_ms,
+                send_path_p99_ms = send_path_snap.p99_ms,
+                send_path_max_ms = send_path_snap.max_ms,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,
@@ -898,7 +918,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 if !should_emit {
                     continue;
                 }
-                let drift_ppm = drift_map.get(&producer_id).copied().unwrap_or(0.0);
+                let drift_ppm = net_stats_map
+                    .get(&producer_id)
+                    .map(|n| n.drift_ppm)
+                    .unwrap_or(0.0);
                 tracing::warn!(
                     target: "jamodio::mixer",
                     producer = &producer_id[..8.min(producer_id.len())],
