@@ -38,7 +38,6 @@ use rubato::Resampler as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Wrapper to make cpal::Stream Send — we only hold it alive (RAII), never use across threads.
 struct SendStream(#[allow(dead_code)] cpal::Stream);
@@ -962,12 +961,12 @@ impl PipelineState {
 
         // 4. Channels
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
-        // Le canal transporte (instant_de_production, paquet) pour mesurer le
-        // délai d'émission (attente file + pacing) côté tâche UDP — observabilité
-        // déterministe de la latence d'émission (cf. send_path_latency).
-        let (rtp_tx, mut rtp_rx) =
-            tokio_mpsc::channel::<(std::time::Instant, Vec<u8>)>(64);
         let input_rms = self.input_rms.clone();
+        // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
+        // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
+        // `encode_stage_loop` → `RtpSender::send_blocking`). Supprime le hop tokio
+        // normal-priorité = supprime la gigue d'égression sous charge Windows.
+        let sender = Arc::new(sender);
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
@@ -1083,7 +1082,7 @@ impl PipelineState {
             .name("encoder".into())
             .spawn(move || {
                 encoder_thread(
-                    sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
+                    sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
@@ -1097,31 +1096,8 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 7. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to).
-        //    Pacing d'émission : on lisse les rafales (Windows/ASIO produit
-        //    plusieurs frames Opus par callback → encode_stage les envoie
-        //    d'affilée) en réétalant les paquets à la cadence temps-réel
-        //    (cf. `paced_send_time_us`). Flux régulier (Mac) ≈ no-op ; flux en
-        //    rafale (Windows) → étalé → le récepteur peut tenir un buffer bas.
-        let sender = Arc::new(sender);
-        let send_path_latency = self.perfstats.send_path_latency.clone();
-        tokio::spawn({
-            let sender = sender.clone();
-            async move {
-                // Envoi IMMÉDIAT (comportement sain validé ≤ 0.5.2-4). Le pacing
-                // par sommeil-par-paquet a été retiré (v0.5.2-7) : la granularité
-                // du timer tokio (~1 ms, arrondi au-dessus) faisait drainer le
-                // pacer plus lentement que la production (2,5 ms/paquet) → la file
-                // RTP saturait à 64 paquets = ~160 ms de latence d'émission +
-                // instabilité (backpressure). L'instrumentation `send_path_latency`
-                // est CONSERVÉE (doit lire ~0 ici) pour garder la visibilité.
-                while let Some((produced_at, packet)) = rtp_rx.recv().await {
-                    let _ = sender.send(packet).await;
-                    let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
-                    send_path_latency.lock().observe(send_delay_ms);
-                }
-            }
-        });
+        // 7. (Émission RT — cf. section 4 : le thread d'encode chiffre + envoie
+        //    directement, il n'y a plus de tâche UDP tokio.)
 
         // 8. Start CPAL output stream (playback) if not already running.
         //    Ouvert sur le thread COM-STA (ASIO) comme l'input.
@@ -1451,7 +1427,7 @@ fn dispatch_subblock_midi(
 /// Architecture (cf. PLAN-EXECUTION-AGENT-STABILITE.md §S3) :
 ///
 /// ```text
-/// CPAL callback ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─►rtp_tx─► UDP task
+/// CPAL callback ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─SRTP+send_to─► SFU
 ///                              (remap+resample)              (plugin+RMS+self-monitor)        (Opus+RTP)
 /// ```
 ///
@@ -1469,7 +1445,7 @@ fn dispatch_subblock_midi(
 #[allow(clippy::too_many_arguments)]
 fn encoder_thread(
     sample_rx: Receiver<Vec<f32>>,
-    rtp_tx: tokio_mpsc::Sender<(std::time::Instant, Vec<u8>)>,
+    sender: Arc<RtpSender>,
     stop_rx: Receiver<()>,
     ssrc: u32,
     payload_type: u8,
@@ -1573,7 +1549,7 @@ fn encoder_thread(
         .spawn(move || {
             encode_stage_loop(
                 proc_to_enc_rx,
-                rtp_tx,
+                sender,
                 stop_enc,
                 ssrc,
                 payload_type,
@@ -2230,7 +2206,7 @@ fn process_stage_loop(
 
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
-    rtp_tx: tokio_mpsc::Sender<(std::time::Instant, Vec<u8>)>,
+    sender: Arc<RtpSender>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     ssrc: u32,
     payload_type: u8,
@@ -2292,39 +2268,37 @@ fn encode_stage_loop(
                             let packet =
                                 rtp::build_packet(&header, &opus_buf[..encoded_len]);
 
-                            // Horodatage de production : permet à la tâche UDP de
-                            // mesurer le délai d'émission (file + pacing).
-                            if let Err(e) = rtp_tx.try_send((std::time::Instant::now(), packet)) {
-                                use tokio::sync::mpsc::error::TrySendError;
-                                match e {
-                                    TrySendError::Full(_) => {
-                                        static FULLS: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let n = FULLS.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
+                            // 0.5.3-3 — ÉMISSION RT : chiffrement SRTP + send_to
+                            // NON-BLOQUANT directement ici (thread d'encode RT),
+                            // plus de hop tokio (supprime la gigue d'égression sous
+                            // charge Windows). `send_path` mesure désormais le coût
+                            // protect+send_to (doit lire ~0). Sur WouldBlock (buffer
+                            // noyau plein, rarissime) on DROP la frame (concealée par
+                            // le PLC récepteur) au lieu de staller le thread RT.
+                            let produced_at = std::time::Instant::now();
+                            match sender.send_blocking(packet) {
+                                Ok(_) => {
+                                    let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
+                                    perfstats.send_path_latency.lock().observe(send_delay_ms);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    static WOULDBLOCK: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = WOULDBLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n == 0 || n.is_power_of_two() {
+                                        tracing::warn!(
+                                            target: "jamodio::encoder",
+                                            drop_count = n + 1,
+                                            "UDP send buffer full (WouldBlock) — frame dropped (réseau/CPU saturé ?)"
                                         );
-                                        if n == 0 || n.is_power_of_two() {
-                                            tracing::warn!(
-                                                target: "jamodio::encoder",
-                                                drop_count = n + 1,
-                                                "RTP channel full — packet dropped (CPU/network overload?)"
-                                            );
-                                        }
                                     }
-                                    TrySendError::Closed(_) => {
-                                        static CLOSED: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let n = CLOSED.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        if n == 0 {
-                                            tracing::debug!(
-                                                target: "jamodio::encoder",
-                                                "RTP channel closed — UDP task gone (post stop_capture)"
-                                            );
-                                        }
+                                }
+                                Err(e) => {
+                                    static SENDERR: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = SENDERR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n == 0 || n.is_power_of_two() {
+                                        tracing::warn!(target: "jamodio::encoder", error = %e, drop_count = n + 1, "UDP send_to error");
                                     }
                                 }
                             }

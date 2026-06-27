@@ -42,15 +42,26 @@ impl RtpSender {
         Ok(Self { socket, target, srtp })
     }
 
-    /// Encrypt with SRTP then send. The `packet` buffer must have enough capacity
-    /// for the auth tag (~16 bytes appended). Returns 0 if SRTP encryption fails.
-    pub async fn send(&self, packet: Vec<u8>) -> std::io::Result<usize> {
+    /// Chiffre SRTP puis envoie en **NON-BLOQUANT** — conçu pour être appelé
+    /// directement depuis le thread d'encode RT (pas de hop tokio → pas de gigue
+    /// d'égression sous charge). Le socket est en non-blocking : `try_send_to`
+    /// rend immédiatement. `Err(WouldBlock)` (buffer noyau d'envoi plein,
+    /// rarissime en UDP) signale au caller de **dropper** la frame (concealée par
+    /// le PLC récepteur) plutôt que de staller le thread RT. Retourne `Ok(0)` si
+    /// le chiffrement échoue. `packet` doit avoir la capacité pour l'auth tag
+    /// SRTP (~16 octets ajoutés).
+    ///
+    /// NB : `try_send_to` ne nécessite PAS d'être appelé dans le runtime tokio
+    /// (c'est un syscall non-bloquant via la registration du socket, créée au
+    /// `new()`) — valide tant que le runtime du process est vivant (toute la vie
+    /// de l'agent côté Tauri).
+    pub fn send_blocking(&self, packet: Vec<u8>) -> std::io::Result<usize> {
         let mut buf = packet;
         if let Err(e) = self.srtp.protect(&mut buf) {
             tracing::error!(target: "jamodio::srtp", role = "sender", error = ?e, "SRTP protect failed");
             return Ok(0);
         }
-        self.socket.send_to(&buf, self.target).await
+        self.socket.try_send_to(&buf, self.target)
     }
 
     /// Local address (for NAT hole-punching info).

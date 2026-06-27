@@ -6,6 +6,29 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3-3] — 2026-06-27
+
+> **Pré-release — émission en temps-réel (symétrie avec le fix réception 0.5.3-2).**
+> La tâche UDP d'émission tournait sur le pool tokio en priorité NORMALE — le
+> dernier maillon audio non-RT. Sous charge Windows elle se faisait préempter →
+> gigue d'égression (le récepteur distant devait l'absorber).
+
+### Changed
+- **Chiffrement SRTP + `send_to` fusionnés dans le thread d'encode (RT/MMCSS)** :
+  `RtpSender::send_blocking` (non-bloquant via `try_send_to`) appelé directement
+  après l'encodage Opus. **Suppression de la tâche UDP tokio + du channel RTP** →
+  émission RT, zéro hop, zéro gigue d'égression. Sur `WouldBlock` (buffer noyau
+  plein, rarissime) la frame est droppée (concealée par le PLC récepteur) plutôt
+  que de staller le thread RT — jamais de pacing (envoi immédiat, `send_path` le
+  prouve).
+- Code allégé : une tâche async + un channel + un hop en moins.
+
+### Notes
+- `send_path_latency` mesure désormais le coût protect+send_to (doit lire ~0).
+  Nouveau compteur de drops `WouldBlock` (doit rester à 0).
+- Émission et réception sont maintenant **toutes deux en temps-réel** (parité
+  avec JackTrip/SonoBus/Jamulus côté threads RT).
+
 ## [0.5.3-2] — 2026-06-27
 
 > **Pré-release — fix « injouable Windows » : décodage de réception en temps-réel.**
