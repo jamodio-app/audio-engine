@@ -6,6 +6,32 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-06-27
+
+> **Release latence : Opus low-delay + jitter buffer adaptatif (gigue mesurée +
+> compensation de drift continue). Synthèse des pré-releases 0.5.2-1 → 0.5.2-7.**
+
+### Added
+- **Encodeur Opus en `RESTRICTED_LOWDELAY`** : **−4 ms/sens** de latence
+  algorithmique (lookahead 312→120 samples, mesuré), qualité CELT identique.
+- **Jitter buffer adaptatif piloté par la gigue mesurée** (RFC 3550) : la cible
+  suit `k·gigue + headroom` par peer au lieu d'un ratchet réactif, avec filet
+  réactif conservé (jamais moins sûr que l'historique). Plafonne le pire cas
+  (queue 40→17 ms) et s'adapte à chaque réseau.
+- **Compensation de drift d'horloge en continu** (resampler asservi au
+  remplissage, ratio borné ±0,5 %, inaudible) : remplace les drift-drains
+  discrets, tient le buffer bas malgré la dérive sender↔récepteur.
+- **Instrumentation déterministe** : gigue/drift par peer (`jamodio::netstats`) +
+  latence d'émission (`send_path_latency`) loggées pour piloter l'optimisation
+  sur des chiffres fiables (pas l'acoustique).
+
+### Notes
+- Un **pacing d'émission** (lissage des rafales Windows/ASIO) a été tenté
+  (0.5.2-5/-6) puis **retiré** (0.5.2-7) : l'instrumentation a montré qu'il
+  injectait ~160 ms (sommeil-par-paquet tokio → saturation de file). La rafale
+  d'émission Windows reste à traiter proprement (cf.
+  `internal-docs/plans/PLAN-CHANTIER-LATENCE-2026-06.md`).
+
 ## [0.5.2-7] — 2026-06-26
 
 > **REVERT du pacing d'émission (régression grave) — retour au comportement
