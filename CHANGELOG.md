@@ -6,6 +6,23 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3-1] — 2026-06-27
+
+> **Pré-release — instrumentation de la rafale d'émission Windows/ASIO (mesure
+> seule, aucun changement de comportement).** Étape préalable au chantier rafale :
+> on mesure AVANT de corriger (cf. leçon 0.5.2-7 sur le pacing reverté).
+
+### Added
+- **Métrique `emit_burst`** (perfstats, log `jamodio::perfstats`) : nombre de
+  frames Opus émises par bloc d'entrée à `encode_stage`. ≈1 = flux régulier ;
+  ≫1 = rafale. À 48 kHz natif (resampler bypassé), `emit_burst_mean` ≈
+  taille_callback / 120 → révèle si le driver ASIO honore `Fixed(128)` (≈1) ou
+  délivre sa taille de control panel (ex. 512 → ≈4). Champs `emit_burst_p50 /
+  _max / _mean` dans la ligne « perfstats snapshot ».
+- **Log one-shot de la taille du 1er callback capture** réellement livrée par le
+  driver (`jamodio::capture`, `frames_per_callback`) — diagnostic direct,
+  sans inférence, de la granularité de la rafale.
+
 ## [0.5.2] — 2026-06-27
 
 > **Release latence : Opus low-delay + jitter buffer adaptatif (gigue mesurée +

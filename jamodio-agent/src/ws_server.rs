@@ -601,6 +601,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let process_snap = pl.perfstats.process_latency.lock().flush();
             let encode_snap = pl.perfstats.encode_latency.lock().flush();
             let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
+            // 0.5.3 — rafale d'émission (frames Opus/bloc à encode_stage).
+            let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -859,6 +861,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 send_path_p50_ms = send_path_snap.p50_ms,
                 send_path_p99_ms = send_path_snap.p99_ms,
                 send_path_max_ms = send_path_snap.max_ms,
+                // 0.5.3 — rafale d'émission : frames Opus émises par bloc d'entrée.
+                // ≈1 = flux régulier (pas de rafale) ; ≫1 = callback gros (ASIO non
+                // honoré). À 48 k natif : emit_burst_mean ≈ taille_callback / 120.
+                emit_burst_p50 = emit_burst_snap.p50_ms,
+                emit_burst_max = emit_burst_snap.max_ms,
+                emit_burst_mean = emit_burst_snap.mean_ms,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,

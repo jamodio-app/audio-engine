@@ -322,6 +322,16 @@ pub struct PerfHandles {
     /// C'était l'angle mort de la latence d'émission ; on le mesure désormais
     /// pour juger le pacing sur des chiffres déterministes (pas l'acoustique).
     pub send_path_latency: Arc<Mutex<Histogram>>,
+    /// 0.5.3 — RAFALE d'émission : nombre de frames Opus émises par bloc d'entrée
+    /// à `encode_stage` (= nombre d'itérations du `while accumulator >= frame_len`).
+    /// C'est LA mesure déterministe de la rafale Windows/ASIO : un callback qui
+    /// livre N×120 samples d'un coup → N frames `try_send` d'affilée → le pair
+    /// récepteur reçoit une grappe (son `buffer_target_ms` monte). À 48 k natif
+    /// (resampler bypassé) ce chiffre ≈ taille_callback / 120 → révèle SANS
+    /// inférence si le driver ASIO a honoré `Fixed(128)` (≈1) ou délivre sa
+    /// taille de control panel (≈4 pour 512). Cible après fix : ≈1.
+    /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
+    pub emit_burst: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
@@ -349,6 +359,7 @@ impl PerfHandles {
             process_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2212,6 +2223,9 @@ fn encode_stage_loop(
                 let t_stage_start = std::time::Instant::now();
                 accumulator.extend_from_slice(&stereo);
 
+                // 0.5.3 — comptage de la RAFALE : combien de frames Opus ce bloc
+                // d'entrée fait-il partir d'affilée ? (cf. PerfHandles::emit_burst)
+                let mut frames_this_block: u32 = 0;
                 while accumulator.len() >= frame_len {
                     // Encode directement depuis le slice de l'accumulateur —
                     // l'ancien `drain(..).collect()` allouait un Vec par frame
@@ -2268,6 +2282,7 @@ fn encode_stage_loop(
 
                             sequence = sequence.wrapping_add(1);
                             timestamp = timestamp.wrapping_add(frame_size as u32);
+                            frames_this_block += 1;
                         }
                         Err(e) => {
                             tracing::error!(
@@ -2282,6 +2297,11 @@ fn encode_stage_loop(
                     // sans collect → pas d'allocation.
                     accumulator.drain(..frame_len);
                 }
+
+                // 0.5.3 — enregistre la rafale de CE bloc. On observe même 0
+                // (bloc plus petit qu'une frame = sous-frame = AUCUNE rafale,
+                // c'est le bon signe) : la moyenne reflète alors frames/bloc réel.
+                perfstats.emit_burst.lock().observe(frames_this_block as f32);
 
                 // Sprint S1/S3 — pipeline_latency end-to-end. Le timestamp
                 // `t_block_start` est apposé par `capture_stage_loop` en

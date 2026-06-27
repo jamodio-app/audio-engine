@@ -108,6 +108,33 @@ fn forward_samples(samples: Vec<f32>, sample_tx: &Sender<Vec<f32>>, capture_drop
     }
 }
 
+/// 0.5.3 — log one-shot de la taille RÉELLE du premier callback livré par le
+/// driver (frames/canal). C'est le diagnostic direct de la rafale d'émission :
+/// révèle si le backend ASIO a honoré notre `Fixed(128)` (≈128 → ~1 frame Opus,
+/// flux régulier) ou s'il délivre la taille de son propre control panel
+/// (ex. 512 → 4 frames émises d'affilée → grappe côté récepteur). Complète la
+/// métrique `emit_burst` (frames/bloc à encode_stage) côté pipeline.
+/// Coût hot-path : un load `Relaxed` par callback (quasi nul), un seul log/stream.
+#[inline]
+fn log_first_callback(
+    logged: &std::sync::atomic::AtomicBool,
+    samples_interleaved: usize,
+    channels: u16,
+) {
+    use std::sync::atomic::Ordering;
+    if logged.load(Ordering::Relaxed) || logged.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let frames = samples_interleaved / (channels.max(1) as usize);
+    tracing::info!(
+        target: "jamodio::capture",
+        frames_per_callback = frames,
+        interleaved_len = samples_interleaved,
+        channels,
+        "taille du 1er callback capture livrée par le driver (granularité de la rafale d'émission)"
+    );
+}
+
 /// Start capturing audio from the given device.
 /// Returns `(stream, channels_captured, native_sample_rate, fixed_buffer)`.
 /// `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`, `None`
@@ -182,11 +209,15 @@ pub fn start_capture(
     // on re-fabrique une closure indépendante. `sample_tx` et `capture_drops`
     // sont des Sender/Arc, clone-safe.
     let attempts = std::cell::Cell::new(0usize);
+    // 0.5.3 — partagé entre toutes les tentatives de build : on logue la taille
+    // du tout premier callback effectif (diagnostic rafale, cf. log_first_callback).
+    let first_block_logged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let build_one = || {
         let attempt = attempts.get() + 1;
         attempts.set(attempt);
         let sample_tx = sample_tx.clone();
         let capture_drops = capture_drops.clone();
+        let first_logged = first_block_logged.clone();
         // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
         // On ouvre le stream au format NATIF du driver puis on convertit chaque
         // bloc en f32 normalisé [-1,1] (ce que la pipeline encoder attend).
@@ -194,6 +225,7 @@ pub fn start_capture(
             SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    log_first_callback(&first_logged, data.len(), channels);
                     forward_samples(data.to_vec(), &sample_tx, &capture_drops);
                 },
                 on_capture_err,
@@ -202,6 +234,7 @@ pub fn start_capture(
             SampleFormat::I32 => device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    log_first_callback(&first_logged, data.len(), channels);
                     const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
                     forward_samples(f, &sample_tx, &capture_drops);
@@ -212,6 +245,7 @@ pub fn start_capture(
             SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    log_first_callback(&first_logged, data.len(), channels);
                     const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
                     forward_samples(f, &sample_tx, &capture_drops);
