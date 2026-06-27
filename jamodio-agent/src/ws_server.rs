@@ -603,6 +603,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
             // 0.5.3 — rafale d'émission (frames Opus/bloc à encode_stage).
             let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
+            // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
+            let recv_path_snap = pl.perfstats.recv_path.lock().flush();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -861,6 +863,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 send_path_p50_ms = send_path_snap.p50_ms,
                 send_path_p99_ms = send_path_snap.p99_ms,
                 send_path_max_ms = send_path_snap.max_ms,
+                // 0.5.3-2 — latence réception (arrivée→push). p99 qui grimpe =
+                // décodage préempté (le bug Windows que le thread RT corrige).
+                recv_path_p50_ms = recv_path_snap.p50_ms,
+                recv_path_p99_ms = recv_path_snap.p99_ms,
+                recv_path_max_ms = recv_path_snap.max_ms,
                 // 0.5.3 — rafale d'émission : frames Opus émises par bloc d'entrée.
                 // ≈1 = flux régulier (pas de rafale) ; ≫1 = callback gros (ASIO non
                 // honoré). À 48 k natif : emit_burst_mean ≈ taille_callback / 120.

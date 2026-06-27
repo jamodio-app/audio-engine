@@ -27,6 +27,10 @@ impl MusicEncoder {
         // Low-latency music settings
         encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(320000))?;
         encoder.set_inband_fec(false)?;
+        // DTX OFF = un paquet par frame en CONTINU, même en silence. INVARIANT
+        // dont dépend l'idle-timeout fantôme de `recv_io_task` (pipeline.rs) :
+        // « 8 s sans paquet = flux mort ». Activer DTX casserait cette hypothèse
+        // (un pair silencieux cesserait d'émettre) → revoir l'idle-timeout avant.
         encoder.set_dtx(false)?;
         encoder.set_vbr(false)?; // CBR for predictable latency
 

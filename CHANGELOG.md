@@ -6,6 +6,46 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3-2] — 2026-06-27
+
+> **Pré-release — fix « injouable Windows » : décodage de réception en temps-réel.**
+> Cause racine (tests réels PC↔Mac + triple revue senior) : `recv_decode_task`
+> décodait sur le pool tokio en priorité NORMALE, alors que l'émission est RT
+> (MMCSS). Sur Windows l'ordonnanceur le préempte ~10-15 ms → le jitter buffer
+> n'est pas réalimenté → underruns → la cible se colle au plafond 40 ms
+> (+25 ms de latence). macOS masquait le trou (scheduler clément).
+
+### Changed
+- **Réception scindée en 2** (symétrie avec l'émission) : une tâche I/O async par
+  pair (`recv_io_task` : recv UDP + horodatage d'arrivée + comedia punch +
+  idle-timeout) qui forwarde les paquets bruts à **UN thread de décodage RT
+  unique partagé** (`decode_rt_loop`) via un MPSC borné + pool de buffers (zéro
+  alloc/dealloc sur le thread RT). Le décodage Opus + PLC + push jitter buffer
+  tournent désormais en temps-réel.
+- **Promotion RT « event-driven »** (`promote_thread_for_audio_recv`) : MMCSS
+  « Pro Audio » sur Windows ; sur macOS **QoS `USER_INTERACTIVE` seul** — PAS le
+  workgroup CoreAudio (un thread piloté par l'arrivée réseau n'a pas la deadline
+  I/O du cycle audio ; le faire rejoindre le workgroup le sur-peuplerait et
+  dégraderait l'émission). Garantie anti-régression macOS.
+- Un seul thread de décodage partagé (pas thread-par-stream) → pas de
+  sur-souscription MMCSS, et **réduit** la contention du mutex mixer vs l'ancien
+  modèle (1 écrivain au lieu de N tâches).
+
+### Added
+- **Métrique `recv_path`** (perfstats : `recv_path_p50/p99/max_ms`) : latence
+  arrivée réseau → juste avant push mixer. Miroir de `send_path`. Doit lire
+  ~0,1-0,5 ms ; un p99 qui grimpe = décodage préempté.
+- **Idle-timeout 8 s** par pair : nettoie les producteurs fantômes (flux non
+  fermés après reconnexion). Sûr car Opus est en CBR + DTX OFF (paquets continus).
+- **Epoch de génération** par io task : un re-add du même `producer_id` ne peut
+  plus voir un vieux `Remove` supprimer le stream re-créé (lifecycle bulletproof).
+
+### Notes
+- Le chemin d'émission reste sain et inchangé (Opus low-delay + jitter A/B/C).
+  Item suivant (hors scope) : la tâche UDP d'émission tourne aussi en tokio
+  normal-priorité (gigue d'égression) → à fusionner dans le thread d'encode RT
+  après mesure.
+
 ## [0.5.3-1] — 2026-06-27
 
 > **Pré-release — instrumentation de la rafale d'émission Windows/ASIO (mesure

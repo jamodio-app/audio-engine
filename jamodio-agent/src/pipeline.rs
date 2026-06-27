@@ -161,8 +161,16 @@ pub struct PipelineState {
     playback_stream: Option<SendStream>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
-    /// Handles to stop per-stream receive tasks.
+    /// Handles to stop per-stream receive I/O tasks (async tokio).
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
+    /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
+    /// `None` = pas de stream reçu en cours.
+    decode_thread: Option<DecodeThread>,
+    /// 0.5.3-2 — compteur de génération des io tasks de réception. Incrémenté à
+    /// chaque `add_stream` ; permet au thread de décodage de distinguer un Remove
+    /// d'une ancienne connexion d'un re-add du même `producer_id` (race évitée).
+    recv_epoch: u64,
     /// Selected devices : ids stricts au format `"{idx}:{name}"` produits par
     /// `device::list_inputs/outputs`. Le browser stocke et renvoie EXACTEMENT
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
@@ -288,7 +296,7 @@ pub struct PipelineState {
 }
 
 /// Métriques de timing réseau mesurées par stream entrant, alimentées par les
-/// recv tasks (`recv_decode_task`) et lues à 1 Hz par le perfstats_task.
+/// le thread de décodage (`decode_rt_loop`) et lues à 1 Hz par le perfstats_task.
 /// Struct extensible : le chantier jitter buffer adaptatif y ajoutera la cible
 /// mesurée et le ratio de resampling de drift (Phases B/C).
 #[derive(Clone, Copy, Default)]
@@ -332,6 +340,12 @@ pub struct PerfHandles {
     /// taille de control panel (≈4 pour 512). Cible après fix : ≈1.
     /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
     pub emit_burst: Arc<Mutex<Histogram>>,
+    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de l'arrivée réseau (horodatée
+    /// dans `recv_io_task`) à juste avant `push_samples` (file MPSC + parse +
+    /// décode Opus). Miroir de `send_path_latency`. Doit lire ~0,1-0,5 ms si le
+    /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
+    /// bug Windows que ce thread RT corrige).
+    pub recv_path: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
@@ -360,6 +374,7 @@ impl PerfHandles {
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -536,6 +551,8 @@ impl PipelineState {
             playback_stream: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
+            decode_thread: None,
+            recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
             state: AgentState::Idle,
@@ -1188,20 +1205,40 @@ impl PipelineState {
         // Note : pas de punch synchrone ici. Le punch SRTP serait rejeté par le SFU
         // tant que celui-ci n'a pas reçu nos clés via connect-plain-transport
         // (qui n'est envoyé par le browser qu'après cette réponse). On punch en boucle
-        // dans recv_decode_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
+        // dans recv_io_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
 
-        // Add stream to mixer
-        self.mixer.lock().add_stream(&producer_id);
+        // 0.5.3-2 — lazy-start du thread de décodage RT partagé (au 1er stream).
+        // Le stream mixer N'EST PLUS créé ici : le thread de décodage le crée au
+        // 1er paquet du pair (il est l'unique écrivain du mixer côté pairs → zéro
+        // race add/remove/push).
+        if self.decode_thread.is_none() {
+            self.decode_thread = Some(
+                spawn_decode_thread(
+                    self.mixer.clone(),
+                    self.perfstats.net_stats_by_producer.clone(),
+                    self.perfstats.recv_path.clone(),
+                )
+                .map_err(|e| format!("spawn decode thread: {}", e))?,
+            );
+        }
+        let decode = self
+            .decode_thread
+            .as_ref()
+            .expect("decode thread démarré juste au-dessus");
 
-        // Stop signal
+        // Stop signal pour la tâche I/O de ce pair.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.recv_stops.insert(producer_id.clone(), stop_tx);
 
-        // Spawn receive + decode task (reçoit aussi sfu_addr pour le punch périodique)
-        let mixer = self.mixer.clone();
-        let net_stats_handle = self.perfstats.net_stats_by_producer.clone();
+        // Spawn la tâche I/O async (recv UDP + horodatage + punch + idle-timeout).
+        // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
+        let tx = decode.tx.clone();
+        let pool_rx = decode.pool_rx.clone();
+        let pid: Arc<str> = Arc::from(producer_id.as_str());
+        self.recv_epoch = self.recv_epoch.wrapping_add(1);
+        let epoch = self.recv_epoch;
         tokio::spawn(async move {
-            recv_decode_task(receiver, sfu_addr, producer_id, mixer, net_stats_handle, stop_rx).await;
+            recv_io_task(receiver, sfu_addr, pid, epoch, tx, pool_rx, stop_rx).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
@@ -1228,10 +1265,12 @@ impl PipelineState {
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
+        // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
+        // thread de décodage qui retire l'état + le stream mixer + net_stats,
+        // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
         if let Some(stop) = self.recv_stops.remove(producer_id) {
             let _ = stop.send(());
         }
-        self.mixer.lock().remove_stream(producer_id);
     }
 
     fn stop_capture(&mut self) {
@@ -1270,6 +1309,16 @@ impl PipelineState {
         let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
         for id in ids {
             self.remove_stream(&id);
+        }
+        // 0.5.3-2 — arrête le thread de décodage RT partagé. Shutdown (il nettoie
+        // les streams mixer + net_stats restants) puis join (sortie immédiate sur
+        // le message). On drop le Sender pour fermer le MPSC côté principal ; les
+        // io tasks restantes (oneshots déjà envoyés ci-dessus) verront Err à leur
+        // prochain send et sortiront.
+        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
+            let _ = tx.send(DecodeMsg::Shutdown);
+            drop(tx);
+            let _ = join.join();
         }
         close_stream_on_com(self.playback_stream.take()); // drop sur le thread COM-STA (ASIO)
         self.output_buffer_samples = None;
@@ -2327,50 +2376,311 @@ fn encode_stage_loop(
     }
 }
 
-// ─── Receive + decode task (tokio, one per remote stream) ──────────
+// ═══════════════════════════════════════════════════════════════════
+// Réception : tâches I/O async (1/pair) + UN thread de décodage RT partagé
+// ═══════════════════════════════════════════════════════════════════
+//
+// Pourquoi ce split (0.5.3-2, fix « injouable Windows ») :
+// Le décodage Opus alimente le jitter buffer (`push_samples`) ; le callback de
+// SORTIE le draine. Si le décodage tourne en priorité NORMALE (ancien
+// `recv_decode_task` sur le pool tokio), Windows le préempte ~10-15 ms → le
+// buffer n'est pas réalimenté → underrun → `adapt_up` colle la cible au plafond
+// 40 ms → +25 ms de latence (injouable). L'émission, elle, est RT (MMCSS) → le
+// self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
+// clément). Tous les concurrents (JackTrip/SonoBus/Jamulus) mettent la réception
+// sur un thread RT — jamais normal.
+//
+// Design (validé en triple revue senior) :
+//   - `recv_io_task` (async tokio, 1/pair) : recv UDP + horodatage d'arrivée +
+//     comedia punch + idle-timeout fantôme. Forwarde le paquet brut via un MPSC.
+//   - `decode_rt_loop` (UN seul std::thread, RT) : décode pour TOUS les pairs
+//     (HashMap d'état). Promotion « event-driven » (MMCSS Windows / QoS macOS
+//     SEUL, PAS le workgroup → pas de sur-population). Seul écrivain du mixer côté
+//     pairs (add/remove/push tous depuis ce thread) → zéro race, zéro contention
+//     mutex ×N (1 thread partagé, pas thread-par-stream).
+// Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
-async fn recv_decode_task(
-    receiver: RtpReceiver,
-    sfu_addr: SocketAddr,
-    producer_id: String,
+/// Message d'une `recv_io_task` vers le thread de décodage RT partagé.
+enum DecodeMsg {
+    /// Paquet RTP déchiffré, horodaté à l'arrivée (avant tout parse/file).
+    /// `epoch` = génération de l'io task émettrice (cf. re-add même producer).
+    Packet {
+        producer_id: Arc<str>,
+        epoch: u64,
+        recv_instant: std::time::Instant,
+        buf: Vec<u8>,
+    },
+    /// Pair terminé (stop ou idle-timeout) : envoyé en DERNIER par l'io task →
+    /// le thread retire l'état + le stream mixer APRÈS le dernier paquet du pair
+    /// (ordre garanti : l'io task est l'unique émetteur de ce producteur).
+    /// `epoch` : on n'honore le Remove que s'il matche la génération courante
+    /// (sinon un Remove d'une ancienne connexion supprimerait un stream re-créé).
+    Remove { producer_id: Arc<str>, epoch: u64 },
+    /// Arrêt complet (stop_all).
+    Shutdown,
+}
+
+/// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
+struct DecodeState {
+    /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
+    epoch: u64,
+    decoder: MusicDecoder,
+    drift: DriftEstimator,
+    jitter: JitterEstimator,
+    last_seq: Option<u16>,
+    last_pushed: ProducerNetStats,
+    pkt_count: u64,
+    logged_large_jump: bool,
+}
+
+impl DecodeState {
+    fn new(producer_id: &str, epoch: u64) -> Option<Self> {
+        let decoder = match MusicDecoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(target: "jamodio::recv", producer = %producer_id, error = %e, "failed to create decoder");
+                return None;
+            }
+        };
+        let drift_label = producer_id.chars().take(8).collect::<String>();
+        Some(Self {
+            epoch,
+            decoder,
+            drift: DriftEstimator::new(drift_label),
+            jitter: JitterEstimator::new(),
+            last_seq: None,
+            last_pushed: ProducerNetStats::default(),
+            pkt_count: 0,
+            logged_large_jump: false,
+        })
+    }
+}
+
+/// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
+struct DecodeThread {
+    /// MPSC vers le thread (paquets + lifecycle). Cloné dans chaque io task.
+    tx: Sender<DecodeMsg>,
+    /// Pool de buffers recyclés. Cloné dans chaque io task (côté réception).
+    pool_rx: Receiver<Vec<u8>>,
+    join: std::thread::JoinHandle<()>,
+}
+
+/// Démarre le thread de décodage RT unique (lazy, au 1er stream). Faillible
+/// (cohérent avec le spawn de l'encoder thread) : une erreur OS de création de
+/// thread est propagée au lieu de paniquer.
+fn spawn_decode_thread(
     mixer: Arc<Mutex<AudioMixer>>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    recv_path: Arc<Mutex<Histogram>>,
+) -> std::io::Result<DecodeThread> {
+    // Data MPSC : N io tasks → 1 thread. 256 = large (décode ≫ arrivée).
+    let (tx, rx) = bounded::<DecodeMsg>(256);
+    // Pool : buffers MTU réutilisés → zéro alloc/dealloc sur le thread RT.
+    let (pool_tx, pool_rx) = bounded::<Vec<u8>>(128);
+    for _ in 0..128 {
+        let _ = pool_tx.try_send(Vec::with_capacity(2048));
+    }
+    let join = std::thread::Builder::new()
+        .name("audio-decode".into())
+        .spawn(move || decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path))?;
+    Ok(DecodeThread { tx, pool_rx, join })
+}
+
+/// Boucle du thread de décodage RT. Promu en tête. Multiplexe tous les pairs.
+fn decode_rt_loop(
+    rx: Receiver<DecodeMsg>,
+    pool_tx: Sender<Vec<u8>>,
+    mixer: Arc<Mutex<AudioMixer>>,
+    net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: Arc<Mutex<Histogram>>,
 ) {
-    let mut decoder = match MusicDecoder::new() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(target: "jamodio::recv", producer = %producer_id, error = %e, "failed to create decoder");
-            return;
+    // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
+    // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
+    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv();
+
+    let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            DecodeMsg::Shutdown => break,
+            DecodeMsg::Remove { producer_id, epoch } => {
+                // N'honore le Remove que pour la génération courante : un Remove
+                // d'une ancienne connexion (re-add même producer) ne doit PAS
+                // supprimer le stream re-créé par la nouvelle génération.
+                if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
+                    states.remove(&producer_id);
+                    mixer.lock().remove_stream(&producer_id);
+                    // Sans ça, un peer disparu laisserait un ppm fantôme dans la
+                    // map → PerfStats continuerait à mentionner ce peer mort.
+                    net_stats_by_producer.lock().remove(&*producer_id);
+                }
+            }
+            DecodeMsg::Packet { producer_id, epoch, recv_instant, buf } => {
+                // (Re)création de l'état + du stream mixer selon la génération.
+                let needs_create = match states.get(&producer_id) {
+                    Some(st) if st.epoch == epoch => false,
+                    // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
+                    // traîne après un re-add) → ignoré.
+                    Some(st) if st.epoch > epoch => {
+                        let _ = pool_tx.try_send(buf);
+                        continue;
+                    }
+                    // Génération plus RÉCENTE que l'état présent → l'ancienne est
+                    // supersédée : on retire son stream avant d'en recréer un.
+                    Some(_) => {
+                        mixer.lock().remove_stream(&producer_id);
+                        true
+                    }
+                    None => true,
+                };
+                if needs_create {
+                    match DecodeState::new(&producer_id, epoch) {
+                        Some(st) => {
+                            mixer.lock().add_stream(&producer_id);
+                            states.insert(producer_id.clone(), st);
+                        }
+                        None => {
+                            let _ = pool_tx.try_send(buf);
+                            continue;
+                        }
+                    }
+                }
+                let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
+                decode_one_packet(st, &producer_id, recv_instant, &buf, &mixer, &net_stats_by_producer, &recv_path);
+                // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
+                let _ = pool_tx.try_send(buf);
+            }
         }
+    }
+
+    // Shutdown : nettoie les streams mixer + net_stats restants (Remove non
+    // encore traités). Sépare les locks (jamais les deux en même temps).
+    {
+        let mut m = mixer.lock();
+        for id in states.keys() {
+            m.remove_stream(id);
+        }
+    }
+    {
+        let mut ns = net_stats_by_producer.lock();
+        for id in states.keys() {
+            ns.remove(&**id);
+        }
+    }
+}
+
+/// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
+/// thread RT. `recv_instant` = arrivée réseau horodatée par `recv_io_task`
+/// (JAMAIS un `Instant::now()` ici, sinon le délai de file polluerait la gigue).
+#[allow(clippy::too_many_arguments)]
+fn decode_one_packet(
+    st: &mut DecodeState,
+    producer_id: &str,
+    recv_instant: std::time::Instant,
+    buf: &[u8],
+    mixer: &Arc<Mutex<AudioMixer>>,
+    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: &Arc<Mutex<Histogram>>,
+) {
+    let short = &producer_id[..8.min(producer_id.len())];
+    st.pkt_count += 1;
+    if st.pkt_count == 1 {
+        tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
+    } else if st.pkt_count.is_multiple_of(5000) {
+        tracing::debug!(target: "jamodio::recv", producer = short, count = st.pkt_count, "RTP packets received");
+    }
+
+    let Some((header, payload)) = rtp::parse_header(buf) else {
+        return;
     };
 
-    // Estimateurs de timing réseau (mesure pure — Phase A du chantier jitter
-    // adaptatif). `drift` = dérive d'horloge sender↔nous ; `jitter` = gigue
-    // réseau (RFC 3550). En Phase B la gigue pilotera la cible du buffer.
-    let drift_label = producer_id.chars().take(8).collect::<String>();
-    let mut drift = DriftEstimator::new(drift_label);
-    let mut jitter = JitterEstimator::new();
-    // Pour ne pas écraser le hashmap partagé à chaque paquet RTP (~400/s par
-    // stream), on ne le met à jour que quand une métrique a "bougé sensiblement"
-    // (drift > 1 ppm OU gigue > 0,5 ms) depuis la dernière écriture. Minimise la
-    // contention Mutex ; ws_server lit à 1 Hz. Les deux estimateurs recalculent
-    // en interne à chaque observe(), la map n'est qu'un miroir paresseux.
-    let mut last_pushed = ProducerNetStats::default();
+    // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
+    // (celui horodaté dans recv_io_task) pour drift ET gigue.
+    st.drift.observe(header.timestamp, recv_instant);
+    st.jitter.observe(header.timestamp, recv_instant);
+    // Miroir paresseux dans la map partagée : on n'écrit que si drift > 1 ppm OU
+    // gigue > 0,5 ms de variation depuis la dernière écriture (limite la
+    // contention ; ws_server lit à 1 Hz).
+    let current = ProducerNetStats {
+        drift_ppm: st.drift.drift_ppm(),
+        jitter_ms: st.jitter.jitter_ms(),
+    };
+    if (current.drift_ppm - st.last_pushed.drift_ppm).abs() > 1.0
+        || (current.jitter_ms - st.last_pushed.jitter_ms).abs() > 0.5
+    {
+        net_stats_by_producer.lock().insert(producer_id.to_string(), current);
+        st.last_pushed = current;
+    }
+    // Phase B — pilote la cible du jitter buffer avec la gigue mesurée, ~10×/s
+    // (1 paquet sur 40) et seulement une fois l'estimateur fiable (warmup).
+    if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
+        let jitter_ms = st.jitter.jitter_ms();
+        mixer.lock().observe_jitter(producer_id, jitter_ms);
+    }
+    // Détection de perte → PLC
+    if let Some(prev) = st.last_seq {
+        let expected = prev.wrapping_add(1);
+        if header.sequence != expected {
+            let gap = header.sequence.wrapping_sub(expected);
+            if gap <= 10 {
+                for _ in 0..gap.min(3) {
+                    // Copie obligatoire avant push : decode_loss() rend une slice
+                    // d'un buffer interne écrasé au decode suivant (Sprint 3 BUG 7).
+                    let plc_owned: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
+                    if let Some(plc) = plc_owned {
+                        mixer.lock().push_samples(producer_id, &plc);
+                    }
+                }
+            } else if !st.logged_large_jump {
+                tracing::warn!(target: "jamodio::recv", producer = short, prev_seq = prev, got_seq = header.sequence, gap, "large seq jump (skipping PLC)");
+                st.logged_large_jump = true;
+            }
+        }
+    }
+    st.last_seq = Some(header.sequence);
 
-    // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut last_seq: Option<u16> = None;
-    let mut pkt_count: u64 = 0;
-    let mut logged_large_jump = false;
+    // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
+    // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.
+    if let Some(pcm) = st.decoder.decode(payload) {
+        let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
+        recv_path.lock().observe(recv_path_ms);
+        mixer.lock().push_samples(producer_id, pcm);
+    }
+}
 
-    // Punch périodique pour comedia : 1er paquet SRTP valide reçu par le SFU
-    // = src_addr enregistrée. On retry jusqu'au 1er paquet entrant côté agent.
-    // 100 ms × 30 = 3 s : marge confortable pour que le browser pousse
-    // connect-plain-transport au SFU avant qu'on stoppe.
+/// Tâche I/O de réception (async tokio, 1 par pair). Recv UDP + horodatage +
+/// comedia punch + idle-timeout. Ne décode RIEN : forwarde le paquet brut au
+/// thread de décodage RT. Envoie un `Remove` terminal sur sortie (stop/idle).
+#[allow(clippy::too_many_arguments)]
+async fn recv_io_task(
+    receiver: RtpReceiver,
+    sfu_addr: SocketAddr,
+    producer_id: Arc<str>,
+    epoch: u64,
+    tx: Sender<DecodeMsg>,
+    pool_rx: Receiver<Vec<u8>>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let short = &producer_id[..8.min(producer_id.len())];
+
+    // Punch périodique pour comedia : on retry jusqu'au 1er paquet entrant.
+    // 100 ms × 30 = 3 s (marge pour le connect-plain-transport du browser).
     let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut punch_remaining: u32 = 30;
+
+    // Idle-timeout : un pair vivant envoie ~400 pkt/s (Opus CBR + DTX OFF →
+    // paquets continus MÊME en silence, cf. encoder.rs). 8 s sans paquet = flux
+    // mort (reconnexion non signalée par le browser) → auto-terminaison pour
+    // nettoyer le producteur fantôme.
+    let idle_timeout = std::time::Duration::from_secs(8);
+    let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(2));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_packet = std::time::Instant::now();
+    let mut got_first = false;
+
+    // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
+    let mut buf: Vec<u8> = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
 
     loop {
         tokio::select! {
@@ -2379,118 +2689,43 @@ async fn recv_decode_task(
                 let _ = receiver.punch(sfu_addr).await;
                 punch_remaining -= 1;
             }
+            _ = idle_check.tick() => {
+                if got_first && last_packet.elapsed() >= idle_timeout {
+                    tracing::warn!(target: "jamodio::recv", producer = short, "no packet for 8s — terminating (ghost/orphan stream)");
+                    break;
+                }
+            }
             result = receiver.recv(&mut buf) => {
                 match result {
-                    Ok((len, _addr)) => {
-                        // len == 0 : RTCP filtré ou échec SRTP unprotect (déjà loggé en amont)
-                        if len == 0 { continue; }
-
-                        // 1er paquet valide reçu : comedia activé, on stoppe les punches
-                        if pkt_count == 0 { punch_remaining = 0; }
-
-                        pkt_count += 1;
-                        if pkt_count == 1 {
-                            tracing::info!(
-                                target: "jamodio::recv",
-                                producer = &producer_id[..8.min(producer_id.len())],
-                                bytes = len,
-                                "first RTP packet received"
-                            );
-                        } else if pkt_count.is_multiple_of(5000) {
-                            tracing::debug!(
-                                target: "jamodio::recv",
-                                producer = &producer_id[..8.min(producer_id.len())],
-                                count = pkt_count,
-                                "RTP packets received"
-                            );
+                    Ok((len, _addr)) if len > 0 => {
+                        // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
+                        let recv_instant = std::time::Instant::now();
+                        last_packet = recv_instant;
+                        // 1er paquet valide : comedia activé → on stoppe les punches.
+                        if !got_first {
+                            got_first = true;
+                            punch_remaining = 0;
                         }
-
-                        if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
-                            // Alimente les estimateurs de timing réseau avec un
-                            // unique instant d'arrivée (cohérent entre les deux).
-                            let recv_instant = std::time::Instant::now();
-                            drift.observe(_header.timestamp, recv_instant);
-                            jitter.observe(_header.timestamp, recv_instant);
-                            // Miroir paresseux dans la map partagée : on n'écrit
-                            // que si drift > 1 ppm OU gigue > 0,5 ms de variation
-                            // depuis la dernière écriture (cf. last_pushed).
-                            let current = ProducerNetStats {
-                                drift_ppm: drift.drift_ppm(),
-                                jitter_ms: jitter.jitter_ms(),
-                            };
-                            if (current.drift_ppm - last_pushed.drift_ppm).abs() > 1.0
-                                || (current.jitter_ms - last_pushed.jitter_ms).abs() > 0.5
-                            {
-                                net_stats_by_producer
-                                    .lock()
-                                    .insert(producer_id.clone(), current);
-                                last_pushed = current;
-                            }
-                            // Phase B — pilote la cible du jitter buffer avec la
-                            // gigue mesurée, ~10×/s (1 paquet sur 40, pas à chaque
-                            // paquet : limite la contention du lock mixer) et
-                            // uniquement une fois l'estimateur fiable (warmup).
-                            if jitter.is_warm() && pkt_count.is_multiple_of(40) {
-                                let jitter_ms = jitter.jitter_ms();
-                                tokio::task::block_in_place(|| {
-                                    mixer.lock().observe_jitter(&producer_id, jitter_ms);
-                                });
-                            }
-                            // Detect packet loss → PLC
-                            if let Some(prev) = last_seq {
-                                let expected = prev.wrapping_add(1);
-                                if _header.sequence != expected {
-                                    let gap = _header.sequence.wrapping_sub(expected);
-                                    if gap <= 10 {
-                                        for _ in 0..gap.min(3) {
-                                            // PLC : copie obligatoire avant le push_samples car
-                                            // decode_loss() rend une slice référencant un buffer
-                                            // interne au decoder qui sera écrasé par le decode
-                                            // suivant (cf. Sprint 3 BUG 7).
-                                            let plc_owned: Option<Vec<f32>> = decoder.decode_loss().map(|s| s.to_vec());
-                                            if let Some(plc) = plc_owned {
-                                                // block_in_place : signale au scheduler tokio
-                                                // qu'on prend un lock parking_lot bloquant
-                                                // (le callback CPAL peut le tenir pendant
-                                                // mix_into). Sans ça, le worker tokio peut
-                                                // être bloqué → backpressure UDP recv.
-                                                tokio::task::block_in_place(|| {
-                                                    mixer.lock().push_samples(&producer_id, &plc);
-                                                });
-                                            }
-                                        }
-                                    } else if !logged_large_jump {
-                                        tracing::warn!(
-                                            target: "jamodio::recv",
-                                            producer = &producer_id[..8.min(producer_id.len())],
-                                            prev_seq = prev,
-                                            got_seq = _header.sequence,
-                                            gap,
-                                            "large seq jump (skipping PLC)"
-                                        );
-                                        logged_large_jump = true;
-                                    }
-                                }
-                            }
-                            last_seq = Some(_header.sequence);
-
-                            // Decode actual packet : on push directement la slice
-                            // pendant qu'elle est valide (pas de re-emprunt de
-                            // decoder avant la fin du push).
-                            if let Some(pcm) = decoder.decode(payload) {
-                                tokio::task::block_in_place(|| {
-                                    mixer.lock().push_samples(&producer_id, pcm);
-                                });
-                            }
+                        // Échange le buffer plein contre un neuf (pool) et envoie
+                        // le plein au thread de décodage.
+                        let fresh = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
+                        let full = std::mem::replace(&mut buf, fresh);
+                        if tx
+                            .send(DecodeMsg::Packet {
+                                producer_id: producer_id.clone(),
+                                epoch,
+                                recv_instant,
+                                buf: full,
+                            })
+                            .is_err()
+                        {
+                            break; // thread de décodage parti (shutdown)
                         }
                     }
+                    // len == 0 : RTCP filtré / échec SRTP (déjà loggé) → on réutilise buf.
+                    Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            target: "jamodio::recv",
-                            producer = %producer_id,
-                            error = %e,
-                            "UDP recv error"
-                        );
+                        tracing::warn!(target: "jamodio::recv", producer = %producer_id, error = %e, "UDP recv error");
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
@@ -2498,10 +2733,10 @@ async fn recv_decode_task(
         }
     }
 
-    // Sprint S1 — retire l'entrée drift_ppm de ce producer au shutdown du
-    // task. Sans ça, un peer disparu laisse un ppm fantôme dans le hashmap
-    // → le PerfStats publié continuerait à mentionner ce peer mort.
-    net_stats_by_producer.lock().remove(&producer_id);
+    // Message terminal : le thread retire l'état + le stream mixer + l'entrée
+    // net_stats de ce pair, APRÈS notre dernier paquet (ordre garanti — émetteur
+    // unique) → zéro 'unknown stream', zéro ppm fantôme.
+    let _ = tx.send(DecodeMsg::Remove { producer_id, epoch });
 }
 
 // ═══════════════════════════════════════════════════════════════════
