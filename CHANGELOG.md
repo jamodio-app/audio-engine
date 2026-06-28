@@ -6,6 +6,34 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-1] — 2026-06-28
+
+> **Pré-release — Chantier #1 : plancher jitter buffer « tail-aware » (Phase 1).**
+> Notre seul vrai retard vs les concurrents était la sophistication du jitter
+> buffer : on dimensionnait le plancher sur la gigue MOYENNE (RFC 3550), trop
+> basse sur réseau bursty → on underrun PUIS on réagit (1 glitch par rafale). Les
+> concurrents pilotent sur le pire-cas réel. **CONSTANTES À CALIBRER sur lien réel.**
+
+### Changed
+- **Le plancher du jitter buffer est désormais piloté par la QUEUE de gigue**
+  (pire-cas récent), pas la moyenne. `JitterEstimator` gagne un estimateur de
+  queue (peak-hold attaque rapide / release lent ~4 s) ; `floor = clamp(MIN,
+  K_TAIL·queue + headroom, MAX)` (K_TAIL=1, headroom=3 ms — calibration). Effet :
+  sur lien bursty le plancher couvre la queue PROACTIVEMENT → moins d'underruns,
+  buffer stable plus bas au lieu d'osciller. Sur lien propre (queue ≈ 0) →
+  plancher ≈ MIN, identique à l'historique (zéro régression).
+- **Garde-fous** : le filet réactif (+5 ms/underrun) reste en backstop (jamais
+  pire qu'avant) ; réseau UNIQUEMENT (le self-monitor local n'est pas touché) ;
+  MIN 5 / MAX 40 conservés.
+
+### Added
+- Télémétrie `jitter_tail_ms` (log `jamodio::netstats` + wire `jitterTailMs`) pour
+  calibrer K_TAIL / headroom / release sur réseau réel.
+
+### Notes
+- Phase 1 du chantier ; Phase 2 (baseline appris par taux de glitch + hystérésis)
+  conditionnelle à la mesure. Cf. `internal-docs/plans/PLAN-CHANTIER-1-JITTER-2026-06.md`.
+
 ## [0.5.3] — 2026-06-28
 
 > **Release temps-réel Windows : réception + émission RT (Windows jouable) +

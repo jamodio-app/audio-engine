@@ -26,6 +26,13 @@ const SAMPLE_RATE_HZ: f64 = 48_000.0;
 /// Gain de l'EWMA RFC 3550. 1/16 = compromis standard réactivité/stabilité.
 const EWMA_GAIN: f64 = 1.0 / 16.0;
 
+/// Chantier #1 — gain de RELEASE de l'estimateur de QUEUE (peak-hold).
+/// Attaque instantanée (`|D|` plus grand → la queue saute dessus), release lent
+/// (la queue redescend doucement vers la gigue courante). À ~400 paquets/s,
+/// 1/1600 ≈ constante de temps ~4 s : la cible reste dimensionnée pour le pire
+/// cas RÉCENT, puis se détend quand le lien se calme. CONSTANTE DE CALIBRATION.
+const TAIL_RELEASE_GAIN: f64 = 1.0 / 1600.0;
+
 /// Nombre de paquets observés avant que l'estimation soit jugée fiable. À ~400
 /// paquets/s (frame 2,5 ms), 100 paquets = ~250 ms — assez pour que l'EWMA
 /// (gain 1/16) ait convergé (~95 % après 48 échantillons). Avant ce seuil,
@@ -40,8 +47,14 @@ pub struct JitterEstimator {
     first_instant: Option<Instant>,
     /// Délai de transit du paquet précédent (en samples). `None` avant le 1er.
     prev_transit: Option<f64>,
-    /// Gigue lissée `J`, en samples.
+    /// Gigue lissée `J`, en samples (MOYENNE — RFC 3550, télémétrie + warmup).
     jitter_samples: f64,
+    /// Chantier #1 — estimateur de QUEUE de `|D|` (peak-hold attaque rapide /
+    /// release lent), en samples. Capte le pire-cas RÉCENT de variation de
+    /// transit (≈ p~max sur ~4 s), pas la moyenne. C'est lui qui doit piloter le
+    /// plancher du jitter buffer : sur réseau bursty la queue est plusieurs × la
+    /// moyenne → dimensionner sur la moyenne fait underrun-puis-réagir.
+    jitter_tail_samples: f64,
     /// Nombre de paquets observés (pour le warmup).
     observations: u64,
 }
@@ -73,14 +86,28 @@ impl JitterEstimator {
 
         if let Some(prev) = self.prev_transit {
             let d = (transit - prev).abs();
+            // Moyenne EWMA (RFC 3550).
             self.jitter_samples += (d - self.jitter_samples) * EWMA_GAIN;
+            // Queue (peak-hold) : attaque instantanée, release lent.
+            if d > self.jitter_tail_samples {
+                self.jitter_tail_samples = d;
+            } else {
+                self.jitter_tail_samples += (d - self.jitter_tail_samples) * TAIL_RELEASE_GAIN;
+            }
         }
         self.prev_transit = Some(transit);
     }
 
-    /// Gigue lissée en millisecondes.
+    /// Gigue MOYENNE lissée en millisecondes (RFC 3550). Télémétrie + warmup.
     pub fn jitter_ms(&self) -> f64 {
         self.jitter_samples / SAMPLE_RATE_HZ * 1000.0
+    }
+
+    /// Chantier #1 — gigue de QUEUE (pire-cas récent de `|D|`) en millisecondes.
+    /// ≥ `jitter_ms()`. C'est CE signal qui dimensionne le plancher du jitter
+    /// buffer (proactif sur la queue, pas réactif sur la moyenne).
+    pub fn jitter_tail_ms(&self) -> f64 {
+        self.jitter_tail_samples / SAMPLE_RATE_HZ * 1000.0
     }
 
     /// `true` une fois l'estimation stabilisée (≥ `WARMUP_PACKETS` paquets).
@@ -126,5 +153,41 @@ mod tests {
         }
         let j = est.jitter_ms();
         assert!((2.0..6.0).contains(&j), "gigue mesurée hors plage = {j}");
+    }
+
+    /// Chantier #1 — flux globalement régulier MAIS avec des rafales rares :
+    /// la QUEUE doit ressortir bien au-dessus de la MOYENNE (c'est tout l'intérêt
+    /// — dimensionner sur la queue plutôt que sur la moyenne sous-estimée).
+    #[test]
+    fn tail_exceeds_mean_on_bursty_stream() {
+        let mut est = JitterEstimator::new();
+        let t0 = Instant::now();
+        // Émission régulière 2,5 ms ; arrivée régulière SAUF 1 paquet sur 50 qui
+        // arrive 15 ms en retard (rafale). La moyenne EWMA reste petite (rare),
+        // la queue (peak-hold) doit capter les ~15 ms.
+        for i in 0..600u32 {
+            let rtp_ts = i * 120;
+            let late_us = if i % 50 == 25 { 15_000 } else { 0 };
+            let arrival = t0 + Duration::from_micros((i as u64) * 2500 + late_us);
+            est.observe(rtp_ts, arrival);
+        }
+        let mean = est.jitter_ms();
+        let tail = est.jitter_tail_ms();
+        assert!(tail > mean, "queue ({tail}) doit dépasser la moyenne ({mean})");
+        assert!(tail > 5.0, "la queue doit capter la rafale ~15 ms, vu = {tail}");
+    }
+
+    /// Flux parfaitement régulier → la queue converge aussi vers ~0 (pas de
+    /// sur-provisionnement sur lien propre = pas de régression latence).
+    #[test]
+    fn tail_stays_low_on_clean_stream() {
+        let mut est = JitterEstimator::new();
+        let t0 = Instant::now();
+        for i in 0..200u32 {
+            let rtp_ts = i * 120;
+            let arrival = t0 + Duration::from_micros((i as u64) * 2500);
+            est.observe(rtp_ts, arrival);
+        }
+        assert!(est.jitter_tail_ms() < 0.05, "queue résiduelle = {}", est.jitter_tail_ms());
     }
 }

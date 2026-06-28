@@ -663,10 +663,13 @@ pub struct PeerPerf {
     pub producer_id: String,
     #[serde(rename = "driftPpm")]
     pub drift_ppm: f64,
-    /// Gigue réseau mesurée (RFC 3550, EWMA), en ms. Capteur du jitter buffer
-    /// adaptatif : sert à dimensionner `bufferTargetMs` (Phase B).
+    /// Gigue réseau MOYENNE mesurée (RFC 3550, EWMA), en ms.
     #[serde(rename = "jitterMs")]
     pub jitter_ms: f64,
+    /// Chantier #1 — gigue de QUEUE (pire-cas récent), en ms. C'est elle qui
+    /// dimensionne désormais `bufferTargetMs` ; exposée pour la calibration.
+    #[serde(rename = "jitterTailMs")]
+    pub jitter_tail_ms: f64,
     #[serde(rename = "bufferTargetMs")]
     pub buffer_target_ms: usize,
     pub underruns: u64,

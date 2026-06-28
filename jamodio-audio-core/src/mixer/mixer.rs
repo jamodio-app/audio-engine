@@ -232,9 +232,9 @@ impl AudioMixer {
     /// n'existe pas (peer parti) ou s'il est en override manuel (cf.
     /// [`JitterBuffer::observe_jitter`]). Appelé par la recv task à cadence
     /// réduite (pas à chaque paquet) pour limiter la contention du lock mixer.
-    pub fn observe_jitter(&mut self, producer_id: &str, jitter_ms: f64) {
+    pub fn observe_jitter(&mut self, producer_id: &str, jitter_tail_ms: f64) {
         if let Some(stream) = self.streams.get_mut(producer_id) {
-            stream.jitter.observe_jitter(jitter_ms);
+            stream.jitter.observe_jitter(jitter_tail_ms);
         }
     }
 

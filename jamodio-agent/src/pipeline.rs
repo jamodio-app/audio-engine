@@ -432,8 +432,11 @@ pub struct PipelineState {
 pub struct ProducerNetStats {
     /// Dérive d'horloge sender↔nous, en ppm. Cf. [`sync::drift::DriftEstimator`].
     pub drift_ppm: f64,
-    /// Gigue réseau lissée, en ms (RFC 3550). Cf. [`sync::jitter::JitterEstimator`].
+    /// Gigue réseau MOYENNE lissée, en ms (RFC 3550). Cf. [`sync::jitter::JitterEstimator`].
     pub jitter_ms: f64,
+    /// Chantier #1 — gigue de QUEUE (pire-cas récent), en ms. C'est elle qui
+    /// pilote le plancher du jitter buffer ; exposée pour la calibration.
+    pub jitter_tail_ms: f64,
 }
 
 /// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
@@ -2803,18 +2806,21 @@ fn decode_one_packet(
     let current = ProducerNetStats {
         drift_ppm: st.drift.drift_ppm(),
         jitter_ms: st.jitter.jitter_ms(),
+        jitter_tail_ms: st.jitter.jitter_tail_ms(),
     };
     if (current.drift_ppm - st.last_pushed.drift_ppm).abs() > 1.0
         || (current.jitter_ms - st.last_pushed.jitter_ms).abs() > 0.5
+        || (current.jitter_tail_ms - st.last_pushed.jitter_tail_ms).abs() > 0.5
     {
         net_stats_by_producer.lock().insert(producer_id.to_string(), current);
         st.last_pushed = current;
     }
-    // Phase B — pilote la cible du jitter buffer avec la gigue mesurée, ~10×/s
-    // (1 paquet sur 40) et seulement une fois l'estimateur fiable (warmup).
+    // Chantier #1 — pilote le plancher du jitter buffer avec la gigue de QUEUE
+    // (pire-cas récent, pas la moyenne), ~10×/s (1 paquet sur 40) et seulement
+    // une fois l'estimateur fiable (warmup).
     if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
-        let jitter_ms = st.jitter.jitter_ms();
-        mixer.lock().observe_jitter(producer_id, jitter_ms);
+        let jitter_tail_ms = st.jitter.jitter_tail_ms();
+        mixer.lock().observe_jitter(producer_id, jitter_tail_ms);
     }
     // Détection de perte → PLC
     if let Some(prev) = st.last_seq {

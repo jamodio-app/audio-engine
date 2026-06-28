@@ -89,13 +89,18 @@ const MAX_TARGET_MS: usize = 40;
 /// Valeur sûre et conservatrice ; `observe_jitter` la fait ensuite descendre/monter.
 const INITIAL_TARGET_MS: usize = 10;
 /// Phase B — calibration du plancher prédictif : `floor = k·gigue + headroom`.
-/// `k = 3` sur la gigue EWMA (RFC 3550, ≈ déviation absolue moyenne) couvre
-/// largement la queue de distribution (≈ 3,7σ) ; `headroom` ajoute une marge
-/// fixe pour la granularité de mesure. Calibré sur réseaux réels (gigue ethernet
-/// mesurée ~0,7–1 ms → plancher ~5 ms ; gigue 3 ms → ~11 ms). Le filet réactif
-/// (`reactive_extra`) couvre ce que l'EWMA sous-estime (rafales Wi-Fi).
-const JITTER_TARGET_K: f64 = 3.0;
-const JITTER_HEADROOM_MS: f64 = 2.5;
+/// Chantier #1 (28/06) — l'ancien plancher `k=3·gigue_MOYENNE + 2,5` (Phase B)
+/// sous-estimait la queue sur réseau bursty (Wi-Fi/internet) → underrun-puis-réagit.
+/// Remplacé par un plancher piloté par la QUEUE de gigue (`jitter_tail_ms`) au lieu
+/// de la MOYENNE. La queue étant déjà le pire-cas récent, le multiplicateur est
+/// proche de 1 (vs k=3 sur la moyenne) + un petit headroom pour les arrivées
+/// tardives consécutives. `floor = clamp(MIN, K_TAIL·queue + TAIL_HEADROOM, MAX)`.
+/// Effet : sur lien bursty le plancher couvre la queue PROACTIVEMENT → moins
+/// d'underruns, buffer stable plus bas que l'oscillation réactive. Sur lien propre
+/// (queue ≈ 0) → plancher ≈ MIN, identique à l'historique (zéro régression).
+/// CONSTANTES DE CALIBRATION (à affiner sur lien réel — cf. PLAN-CHANTIER-1-JITTER).
+const K_TAIL: f64 = 1.0;
+const TAIL_HEADROOM_MS: f64 = 3.0;
 /// Capacité du ring buffer, en ms d'audio stéréo. Marge confortable au-dessus
 /// de MAX_TARGET_MS (40) pour absorber les bursts SFU sans truncation
 /// même quand le buffer est proche de sa cible haute. Coût RAM : ~115 KB / stream.
@@ -433,17 +438,19 @@ impl JitterBuffer {
         self.primed = false;
     }
 
-    /// Phase B — alimente le plancher prédictif avec la gigue réseau mesurée
-    /// (RFC 3550, ms). No-op si la cible est en override manuel (`jitter_auto`
-    /// = false) ou si l'estimation n'est pas encore fiable (appelant garde
-    /// `JitterEstimator::is_warm()`). Le plancher = `clamp(MIN, k·gigue +
-    /// headroom, MAX)` ; le filet réactif s'ajoute par-dessus.
-    pub fn observe_jitter(&mut self, jitter_ms: f64) {
+    /// Chantier #1 (ex-Phase B) — alimente le plancher prédictif avec la **QUEUE**
+    /// de gigue réseau mesurée (`jitter_tail_ms`, pire-cas récent) au lieu de la
+    /// moyenne. No-op si override manuel (`jitter_auto = false`) ou si l'estimation
+    /// n'est pas fiable (appelant garde `JitterEstimator::is_warm()`). Plancher =
+    /// `clamp(MIN, K_TAIL·queue + TAIL_HEADROOM, MAX)` ; le filet réactif s'ajoute
+    /// par-dessus (backstop CONSERVÉ). Réseau uniquement — le self-monitor local
+    /// (`local_mode`) n'appelle pas ce chemin (cible pilotée par `set_target_ms`).
+    pub fn observe_jitter(&mut self, jitter_tail_ms: f64) {
         if !self.jitter_auto {
             return;
         }
-        let floor_ms =
-            (JITTER_TARGET_K * jitter_ms + JITTER_HEADROOM_MS).clamp(MIN_TARGET_MS as f64, MAX_TARGET_MS as f64);
+        let floor_ms = (K_TAIL * jitter_tail_ms + TAIL_HEADROOM_MS)
+            .clamp(MIN_TARGET_MS as f64, MAX_TARGET_MS as f64);
         self.floor_samples = ms_f64_to_samples(floor_ms);
         self.recompute_target();
     }
@@ -687,12 +694,14 @@ mod tests {
         );
     }
 
-    // ── Phase B — cible pilotée par la gigue mesurée ───────────────────────
+    // ── Chantier #1 — cible pilotée par la QUEUE de gigue (tail-aware) ─────
+    // `observe_jitter` reçoit désormais la gigue de QUEUE (jitter_tail_ms).
+    // floor = clamp(MIN, K_TAIL·queue + TAIL_HEADROOM, MAX) = clamp(5, queue+3, 40).
 
     #[test]
     fn observe_jitter_low_gives_low_target() {
         let mut jb = JitterBuffer::new();
-        // gigue 0,7 ms → floor = 3·0,7 + 2,5 = 4,6 → clamp MIN = 5 ms.
+        // queue 0,7 ms → floor = 1·0,7 + 3 = 3,7 → clamp MIN = 5 ms.
         jb.observe_jitter(0.7);
         assert_eq!(jb.target_ms(), 5);
     }
@@ -700,10 +709,10 @@ mod tests {
     #[test]
     fn observe_jitter_high_gives_proportional_target() {
         let mut jb = JitterBuffer::new();
-        // gigue 5 ms → floor = 3·5 + 2,5 = 17,5 ms.
-        jb.observe_jitter(5.0);
+        // queue 12 ms (rafale) → floor = 1·12 + 3 = 15 ms → couvre la queue.
+        jb.observe_jitter(12.0);
         let t = jb.target_ms();
-        assert!((16..=18).contains(&t), "target attendu ~17 ms, obtenu {t}");
+        assert!((14..=16).contains(&t), "target attendu ~15 ms, obtenu {t}");
     }
 
     #[test]
