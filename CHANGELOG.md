@@ -6,6 +6,46 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3-4] — 2026-06-28
+
+> **Pré-release — fiabilité : fix démarrage ASIO « à froid » (PC Windows).**
+> Au 1er `StartCapture` sur certains drivers ASIO full-duplex (Focusrite 48k),
+> les streams se construisaient mais NI le callback d'entrée NI celui de sortie
+> ne s'engageaient : capture muette (l'instrument n'entrait pas) + sortie qui ne
+> pull pas (jitter buffer overflow en cascade → ni peers ni self-monitor). Un
+> reconnect manuel (driver « chaud ») réparait — il fallait toggler MIDI/AUDIO.
+> Cause : `build_output_stream` (ASIOCreateBuffers) appelé APRÈS un `play()`
+> d'entrée recréait les buffers ASIO en cours de route → callbacks muets.
+
+### Added
+- **Watchdog de liveness cold-start ASIO (Volet A — auto-réparation).** Deux
+  compteurs `capture_callbacks`/`output_callbacks` (`AtomicU64`, +1 par callback
+  CPAL d'entrée/sortie). Après un `start_capture`, le handler `StartCapture`
+  observe ~700 ms : si un compteur reste à 0 = cold-start muet → `warn` clair +
+  `stop_all` + relance auto (bornée à 3 essais). L'utilisateur n'a **plus jamais**
+  à toggler MIDI/AUDIO ; il ne voit qu'un court délai au lieu d'un studio muet.
+  Sur macOS/Linux les callbacks démarrent toujours → la 1re fenêtre valide,
+  **no-op, zéro régression, zéro relance**.
+- Si la réparation échoue après les 3 essais → `CaptureError` EXPLICITE au
+  browser (`reason: "asio-coldstart-failed"`) — **jamais de silence ni de
+  fallback**.
+- Débit de callbacks CPAL par seconde dans les perfstats
+  (`capture_cb_per_sec`/`output_cb_per_sec`, ≈370/s sain, 0 = muet).
+
+### Changed
+- **Ordre build/play des streams CPAL (Volet B — fix racine).** On construit
+  désormais l'entrée **et** la sortie (tous les buffers ASIO créés) **avant** de
+  démarrer l'une ou l'autre, dans un seul passage COM-STA, sortie d'abord. Évite
+  le recreate de buffers ASIO en cours de route (cause du cold-start muet). Le
+  watchdog (Volet A) reste le filet pour un driver qui raterait malgré tout.
+  Sur CoreAudio « build des deux puis play » est inoffensif (aucune régression
+  attendue).
+
+### Notes
+- Le throttle de logs « jitter buffer overflow » (power-of-two) borne déjà le
+  flood pendant la fenêtre de réparation (~700 ms) — Volet C couvert par
+  l'existant.
+
 ## [0.5.3-3] — 2026-06-27
 
 > **Pré-release — émission en temps-réel (symétrie avec le fix réception 0.5.3-2).**

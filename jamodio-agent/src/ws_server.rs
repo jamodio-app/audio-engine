@@ -589,6 +589,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         const PEER_UNSTABLE_WINDOW: std::time::Duration =
             std::time::Duration::from_secs(30);
         const PEER_UNSTABLE_THRESHOLD: usize = 16;
+        // 0.5.3-4 — valeurs cumulées au tick précédent pour calculer le DÉBIT de
+        // callbacks CPAL par seconde (liveness ASIO). Avancent ≈370/s en session
+        // saine ; figés à 0 = cold-start muet (le watchdog l'aura déjà réparé).
+        let mut prev_capture_callbacks: u64 = 0;
+        let mut prev_output_callbacks: u64 = 0;
         loop {
             interval.tick().await;
             let pl = perfstats_pipeline.lock().await;
@@ -605,6 +610,15 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
             // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
             let recv_path_snap = pl.perfstats.recv_path.lock().flush();
+            // 0.5.3-4 — débit de callbacks CPAL sur la fenêtre 1 s (liveness ASIO).
+            // Compteurs cumulés → on logue le delta. 0 en session active = sortie
+            // ou entrée muette (cold-start), sinon ≈370/s.
+            let capture_callbacks_total = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+            let output_callbacks_total = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+            let capture_cb_per_sec = capture_callbacks_total.saturating_sub(prev_capture_callbacks);
+            let output_cb_per_sec = output_callbacks_total.saturating_sub(prev_output_callbacks);
+            prev_capture_callbacks = capture_callbacks_total;
+            prev_output_callbacks = output_callbacks_total;
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -874,6 +888,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 emit_burst_p50 = emit_burst_snap.p50_ms,
                 emit_burst_max = emit_burst_snap.max_ms,
                 emit_burst_mean = emit_burst_snap.mean_ms,
+                // 0.5.3-4 — liveness callbacks CPAL (par seconde). 0 en session
+                // active = cold-start muet (watchdog). ≈370/s = sain.
+                capture_cb_per_sec,
+                output_cb_per_sec,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,
@@ -1284,6 +1302,121 @@ async fn try_lock_pipeline(
     }
 }
 
+/// 0.5.3-4 — démarre la capture avec un WATCHDOG de liveness des callbacks ASIO
+/// « à froid ».
+///
+/// # Pourquoi (bug PC 28/06)
+/// Au 1er `StartCapture` sur certains drivers ASIO full-duplex (Focusrite 48k),
+/// les streams se construisent (`build_*_stream` OK) mais NI le callback
+/// d'entrée NI celui de sortie ne s'engagent : capture muette (instrument
+/// n'entre pas) + sortie qui ne pull pas (jitter buffer overflow en cascade).
+/// Un reconnect manuel (stop + nouveau start, driver « chaud ») répare. On
+/// automatise donc cette réparation : on observe les compteurs de callbacks et,
+/// s'ils ne bougent pas, on relance la capture tout seul — l'utilisateur n'a
+/// plus jamais à toggler MIDI/AUDIO.
+///
+/// # Garde-fous (règles Jamodio)
+/// - Relance **bornée** (`MAX_ATTEMPTS`) → pas de boucle de thrash.
+/// - Si la réparation échoue après les essais → `CaptureStartError::ColdStartFailed`
+///   = erreur CLAIRE remontée au browser (JAMAIS un silence/fallback).
+/// - Sur Mac/Linux les callbacks démarrent toujours → la 1re fenêtre valide,
+///   no-op, zéro régression (0 relance).
+///
+/// Le lock `PipelineState` est relâché pendant la fenêtre d'observation pour ne
+/// pas bloquer heartbeat/perfstats ; les compteurs sont des `Arc<AtomicU64>`
+/// lisibles sans lock.
+async fn start_capture_with_watchdog(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+    ssrc: u32,
+    sfu_ip: String,
+    sfu_port: u16,
+    channel_index: Option<u8>,
+    srtp_parameters: jamodio_audio_core::net::srtp::SrtpParameters,
+) -> Result<
+    (u16, jamodio_audio_core::net::srtp::SrtpParameters, crate::pipeline::CaptureStartedInfo),
+    crate::pipeline::CaptureStartError,
+> {
+    use crate::pipeline::CaptureStartError;
+    use std::sync::atomic::Ordering;
+
+    // Fenêtre d'observation : largement > plusieurs périodes de callback (ASIO
+    // 128@48k ≈ 2,7 ms → un démarrage SAIN produit des centaines de callbacks en
+    // 700 ms ; un cold-start muet en produit 0 → faux positif quasi impossible).
+    const WATCHDOG_MS: u64 = 700;
+    // Borne dure du nombre de tentatives `start_capture` (anti-thrash).
+    const MAX_ATTEMPTS: u32 = 3;
+    // Court répit entre `stop_all` et la relance (laisse le driver ASIO relâcher).
+    const RETRY_GAP_MS: u64 = 120;
+
+    // Compteurs de liveness — clonés une fois, lisibles sans le lock pipeline.
+    let (cap_counter, out_counter) = {
+        let Some(pl) = try_lock_pipeline(pipeline).await else {
+            return Err(CaptureStartError::Other("agent overloaded".into()));
+        };
+        (
+            pl.perfstats.capture_callbacks.clone(),
+            pl.perfstats.output_callbacks.clone(),
+        )
+    };
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        // 1) start_capture sous le lock, puis on RELÂCHE pour la fenêtre d'obs.
+        let started = {
+            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                return Err(CaptureStartError::Other("agent overloaded".into()));
+            };
+            pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters.clone())
+                .await
+        };
+        let ok = match started {
+            Ok(ok) => ok,
+            // Échec de build (device introuvable, driver occupé…) = PAS un
+            // cold-start muet : on remonte tel quel, un retry ne changerait rien.
+            Err(e) => return Err(e),
+        };
+
+        // 2) Snapshot APRÈS le start (lock relâché) + fenêtre d'observation.
+        let cap0 = cap_counter.load(Ordering::Relaxed);
+        let out0 = out_counter.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(WATCHDOG_MS)).await;
+        let cap_live = cap_counter.load(Ordering::Relaxed) > cap0;
+        let out_live = out_counter.load(Ordering::Relaxed) > out0;
+
+        if cap_live && out_live {
+            if attempt > 1 {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    attempt,
+                    "cold-start ASIO réparé : callbacks d'entrée+sortie actifs après relance auto"
+                );
+            }
+            return Ok(ok);
+        }
+
+        // 3) Cold-start raté : au moins un callback est resté muet sur 700 ms.
+        tracing::warn!(
+            target: "jamodio::ws",
+            attempt,
+            max_attempts = MAX_ATTEMPTS,
+            capture_live = cap_live,
+            output_live = out_live,
+            window_ms = WATCHDOG_MS,
+            "cold-start ASIO : callback(s) muet(s) — stop_all + relance auto de la capture"
+        );
+
+        // stop_all = exactement ce que fait le reconnect manuel qui débloque
+        // (ferme entrée+sortie+décodage → la relance reconstruit tout à froid).
+        if let Some(mut pl) = try_lock_pipeline(pipeline).await {
+            pl.stop_all();
+        }
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_GAP_MS)).await;
+        }
+    }
+
+    Err(CaptureStartError::ColdStartFailed { attempts: MAX_ATTEMPTS })
+}
+
 async fn handle_message(
     msg: BrowserMessage,
     pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
@@ -1327,18 +1460,29 @@ async fn handle_message(
                 ?channel_index,
                 "StartCapture"
             );
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
-            };
             // Le browser passe l'id du device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
             // L'id est strict ({idx}:{name}) — pas de fuzzy, pas de fallback.
             // ⚠ Bug fix : set_input_device() (pas select_devices) pour ne pas
             // écraser l'output_device_id précédemment configuré.
             if input_device.is_some() {
+                let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                    return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+                };
                 pl.set_input_device(input_device.clone());
             }
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
+            // 0.5.3-4 — WATCHDOG cold-start ASIO : start_capture + vérification de
+            // liveness des callbacks (relance auto si muet). Cf. la fonction.
+            match start_capture_with_watchdog(
+                pipeline,
+                ssrc,
+                sfu_ip.clone(),
+                sfu_port,
+                channel_index,
+                srtp_parameters,
+            )
+            .await
+            {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser
@@ -1379,6 +1523,24 @@ async fn handle_message(
                         reason: "output-device-not-found".into(),
                         requested_device: requested,
                         detail: None,
+                    }]
+                }
+                Err(crate::pipeline::CaptureStartError::ColdStartFailed { attempts }) => {
+                    // 0.5.3-4 — le watchdog a relancé `attempts` fois mais les
+                    // callbacks ASIO sont restés muets. On remonte une erreur
+                    // CLAIRE au browser (jamais de studio muet silencieux).
+                    tracing::error!(
+                        target: "jamodio::ws",
+                        attempts,
+                        "StartCapture: cold-start ASIO non réparé après relances auto — erreur remontée au browser"
+                    );
+                    vec![AgentMessage::CaptureError {
+                        reason: "asio-coldstart-failed".into(),
+                        requested_device: input_device,
+                        detail: Some(format!(
+                            "démarrage audio ASIO muet après {} tentatives — réessayer ou vérifier le pilote/panneau ASIO",
+                            attempts
+                        )),
                     }]
                 }
                 Err(crate::pipeline::CaptureStartError::Other(msg)) => {

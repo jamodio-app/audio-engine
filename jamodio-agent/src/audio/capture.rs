@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use crossbeam_channel::{Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,7 +77,16 @@ fn on_capture_err(err: cpal::StreamError) {
 /// pour être réutilisé par chaque callback typé (f32/i32/i16) — seule la
 /// conversion vers f32 diffère, la comptabilité des drops est commune.
 #[inline]
-fn forward_samples(samples: Vec<f32>, sample_tx: &Sender<Vec<f32>>, capture_drops: &AtomicU64) {
+fn forward_samples(
+    samples: Vec<f32>,
+    sample_tx: &Sender<Vec<f32>>,
+    capture_drops: &AtomicU64,
+    capture_callbacks: &AtomicU64,
+) {
+    // 0.5.3-4 — liveness : +1 par callback CPAL d'entrée effectivement délivré
+    // par le driver. Lu par le watchdog cold-start ASIO (cf. ws_server). Un seul
+    // load+store Relaxed = négligeable sur le hot-path RT.
+    capture_callbacks.fetch_add(1, Ordering::Relaxed);
     let n = samples.len();
     match sample_tx.try_send(samples) {
         Ok(_) => {}
@@ -156,7 +165,18 @@ fn log_first_callback(
 /// pour permettre l'extraction d'un canal mono précis sur les interfaces
 /// multi-canaux (Scarlett, Motu, etc.). Les samples envoyés sont en f32
 /// entrelacés sur `channels_captured` canaux, au sample rate natif.
-pub fn start_capture(
+/// 0.5.3-4 (Volet B) — construit le stream d'entrée SANS le démarrer
+/// (`build_input_stream` mais PAS `play()`). Le `play()` est délégué au caller
+/// pour permettre de construire l'ENTRÉE **et** la SORTIE avant de démarrer
+/// l'une ou l'autre : sur un device ASIO full-duplex, appeler
+/// `build_output_stream` (ASIOCreateBuffers) APRÈS un `play()` d'entrée
+/// (ASIOStart) recrée les buffers en cours de route → les 2 callbacks restent
+/// muets (cold-start raté, bug PC 28/06). En créant tous les buffers d'abord,
+/// puis en démarrant, on évite ce recreate. Cf. `pipeline::start_capture`.
+///
+/// Retourne `(stream NON démarré, channels, native_sr, fixed_buffer)`. Le
+/// stream doit être `play()`-é par le caller (sur le thread COM-STA pour ASIO).
+pub fn build_capture_stream(
     device: &Device,
     sample_tx: Sender<Vec<f32>>,
     // Sprint S1 — incrémenté à chaque drop "sample channel full". Le compteur
@@ -164,6 +184,8 @@ pub fn start_capture(
     // celui-ci est lu+reset par ws_server au flush 1 Hz pour publier le
     // dropsPerSec dans `PerfStats.pipelineLatencyMs.dropsPerSec`.
     capture_drops: Arc<AtomicU64>,
+    // 0.5.3-4 — liveness : +1 par callback effectif (cf. `forward_samples`).
+    capture_callbacks: Arc<AtomicU64>,
 ) -> Result<(cpal::Stream, u16, u32, Option<u32>), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
     // physiques + le sample rate natif (cf. doc fonction).
@@ -217,6 +239,7 @@ pub fn start_capture(
         attempts.set(attempt);
         let sample_tx = sample_tx.clone();
         let capture_drops = capture_drops.clone();
+        let capture_callbacks = capture_callbacks.clone();
         let first_logged = first_block_logged.clone();
         // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
         // On ouvre le stream au format NATIF du driver puis on convertit chaque
@@ -226,7 +249,7 @@ pub fn start_capture(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     log_first_callback(&first_logged, data.len(), channels);
-                    forward_samples(data.to_vec(), &sample_tx, &capture_drops);
+                    forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks);
                 },
                 on_capture_err,
                 None,
@@ -237,7 +260,7 @@ pub fn start_capture(
                     log_first_callback(&first_logged, data.len(), channels);
                     const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
                 },
                 on_capture_err,
                 None,
@@ -248,7 +271,7 @@ pub fn start_capture(
                     log_first_callback(&first_logged, data.len(), channels);
                     const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
                 },
                 on_capture_err,
                 None,
@@ -291,7 +314,9 @@ pub fn start_capture(
         );
     }
 
-    stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
+    // Volet B : on NE démarre PAS ici. Le caller (`pipeline::start_capture`)
+    // construit aussi la sortie avant de `play()` les deux streams, sur le
+    // thread COM-STA (ASIO). Cf. doc de fonction.
     Ok((stream, channels, native_sr, fixed_buffer))
 }
 
