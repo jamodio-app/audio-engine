@@ -48,6 +48,12 @@ pub enum PromotionMethod {
     /// macOS — fallback `pthread_set_qos_class_self_np(USER_INTERACTIVE)`
     /// + `thread_policy_set(THREAD_TIME_CONSTRAINT_POLICY)`.
     MacOsTimeConstraint,
+    /// macOS — QoS `USER_INTERACTIVE` SEUL (ni workgroup, ni time-constraint).
+    /// Pour les threads RT **pilotés par les événements** (arrivée réseau), PAS
+    /// par le cycle I/O audio : on les élève au-dessus du normal sans leur faire
+    /// promettre une deadline I/O (le workgroup/time-constraint = 2,5 ms est
+    /// réservé aux threads en lock-step avec le device). Cf. `promote_thread_for_audio_recv`.
+    MacOsQos,
     /// Windows — `AvSetMmThreadCharacteristicsW("Pro Audio")` (MMCSS).
     WindowsMmcss,
     /// Linux/autres — `thread_priority::Crossplatform` (best-effort,
@@ -67,6 +73,7 @@ impl PromotionMethod {
         match self {
             Self::MacOsWorkgroup => "macos-workgroup",
             Self::MacOsTimeConstraint => "macos-time-constraint",
+            Self::MacOsQos => "macos-qos",
             Self::WindowsMmcss => "windows-mmcss",
             Self::Generic => "generic",
             Self::None => "none",
@@ -252,6 +259,115 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
     }
 }
 
+/// Promeut le thread courant pour le **décodage de réception** (thread unique
+/// partagé, alimenté par l'arrivée réseau). Variante « event-driven » de
+/// [`promote_thread_for_audio`] :
+///
+/// - **macOS** : `QOS_CLASS_USER_INTERACTIVE` **seul** — surtout PAS le workgroup
+///   CoreAudio ni le `THREAD_TIME_CONSTRAINT_POLICY`. Ce thread n'est PAS en
+///   lock-step avec le cycle I/O du device (il décode quand des paquets UDP
+///   arrivent) ; le faire rejoindre le workgroup de sortie le **sur-peuplerait**
+///   et risquerait de dégrader les threads d'émission qui, eux, ont une vraie
+///   deadline I/O. QoS seul = élévation douce au-dessus du normal, sans fausse
+///   promesse de deadline. (Le Mac fonctionne déjà en priorité normale sur ce
+///   chemin → cette promotion ne peut pas régresser, au pire elle aide.)
+/// - **Windows** : MMCSS « Pro Audio » (identique à l'émission). Un seul thread
+///   de décodage → aucun souci de budget MMCSS.
+/// - **Linux/autres** : `thread_priority` best-effort.
+///
+/// Même garde anti-double-promotion par thread, même contrat de Drop (sur le
+/// même thread).
+pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
+    let already = PROMOTION_ACTIVE.with(|c| {
+        let prev = c.get();
+        if !prev {
+            c.set(true);
+        }
+        prev
+    });
+    if already {
+        tracing::warn!(
+            target: "jamodio::rt_priority",
+            "double promotion détectée sur ce thread (recv) — handle no-op."
+        );
+        return make_none_handle();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match macos_qos::apply() {
+            Ok(()) => {
+                tracing::info!(
+                    target: "jamodio::rt_priority",
+                    method = "macos-qos",
+                    "decode thread promoted via QoS USER_INTERACTIVE (event-driven, no workgroup)"
+                );
+                RtPriorityHandle {
+                    method: PromotionMethod::MacOsQos,
+                    workgroup: None,
+                    _not_sync: std::marker::PhantomData,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::rt_priority",
+                    error = %e,
+                    "macos QoS promotion failed — decode thread at normal priority"
+                );
+                make_none_handle()
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match windows_mmcss::apply() {
+            Ok(h) => {
+                tracing::info!(
+                    target: "jamodio::rt_priority",
+                    method = "windows-mmcss",
+                    task = "Pro Audio",
+                    "decode thread promoted via MMCSS Pro Audio"
+                );
+                RtPriorityHandle {
+                    method: PromotionMethod::WindowsMmcss,
+                    mmcss_handle: h,
+                    _not_sync: std::marker::PhantomData,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::rt_priority",
+                    error = %e,
+                    "windows MMCSS failed (recv) — decode thread at normal priority"
+                );
+                make_none_handle()
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let prio = thread_priority::ThreadPriority::Crossplatform(
+            95u8.try_into().expect("0..=100"),
+        );
+        match thread_priority::set_current_thread_priority(prio) {
+            Ok(()) => RtPriorityHandle {
+                method: PromotionMethod::Generic,
+                _not_sync: std::marker::PhantomData,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::rt_priority",
+                    error = ?e,
+                    "thread-priority refused (recv) — decode thread at normal priority"
+                );
+                make_none_handle()
+            }
+        }
+    }
+}
+
 fn make_none_handle() -> RtPriorityHandle {
     RtPriorityHandle {
         method: PromotionMethod::None,
@@ -274,10 +390,10 @@ impl Drop for RtPriorityHandle {
                     self.workgroup.take(); // explicit drop = leave
                 }
             }
-            PromotionMethod::MacOsTimeConstraint => {
-                // Time-constraint sticky au thread — au shutdown du thread,
-                // l'OS nettoie automatiquement. On pourrait re-apply STANDARD
-                // policy mais ce thread va mourir immédiatement après → inutile.
+            PromotionMethod::MacOsTimeConstraint | PromotionMethod::MacOsQos => {
+                // QoS / time-constraint sont sticky au thread — au shutdown du
+                // thread, l'OS nettoie automatiquement. Ce thread meurt juste
+                // après le drop du handle → inutile de re-apply STANDARD policy.
             }
             PromotionMethod::WindowsMmcss => {
                 #[cfg(target_os = "windows")]
@@ -416,6 +532,40 @@ mod macos_fallback {
     }
 }
 
+// ─── macOS : QoS USER_INTERACTIVE seul (threads RT event-driven) ───
+//
+// Pour le thread de décodage de réception : on l'élève au-dessus de SCHED_OTHER
+// (que Darwin ignore de toute façon) via la QoS la plus haute, SANS lui imposer
+// un `THREAD_TIME_CONSTRAINT_POLICY` (réservé aux threads en lock-step avec le
+// device, cf. `macos_fallback`) et SANS le faire rejoindre le workgroup CoreAudio
+// de sortie (qui modèle une deadline I/O qu'un thread piloté par l'arrivée UDP
+// n'a pas — et le sur-peupler nuirait aux threads d'émission). QoS seul = le bon
+// niveau pour ce profil event-driven.
+
+#[cfg(target_os = "macos")]
+mod macos_qos {
+    use std::io;
+
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+
+    /// `qos_class_t` USER_INTERACTIVE (cf. `<sys/qos.h>`).
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+    pub fn apply() -> io::Result<()> {
+        // SAFETY : appel libc sans pointeur.
+        let st = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+        if st != 0 {
+            return Err(io::Error::other(format!(
+                "pthread_set_qos_class_self_np returned {}",
+                st
+            )));
+        }
+        Ok(())
+    }
+}
+
 // ─── Windows : MMCSS Pro Audio ─────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -471,6 +621,26 @@ mod tests {
                 | PromotionMethod::Generic
                 | PromotionMethod::None
         ));
+        drop(h);
+    }
+
+    /// `promote_thread_for_audio_recv` (variante event-driven du thread de
+    /// décodage) ne doit jamais paniquer et drop-safe. Sur macOS elle ne doit
+    /// PAS rejoindre le workgroup (→ `MacOsQos` ou `None`, jamais `MacOsWorkgroup`).
+    #[test]
+    fn promote_recv_then_drop_is_safe() {
+        let h = promote_thread_for_audio_recv();
+        let m = h.method();
+        assert!(matches!(
+            m,
+            PromotionMethod::MacOsQos
+                | PromotionMethod::WindowsMmcss
+                | PromotionMethod::Generic
+                | PromotionMethod::None
+        ));
+        // Garantie anti-régression Mac : la réception ne rejoint JAMAIS le
+        // workgroup de sortie (sur-population → dégraderait l'émission).
+        assert!(!matches!(m, PromotionMethod::MacOsWorkgroup));
         drop(h);
     }
 

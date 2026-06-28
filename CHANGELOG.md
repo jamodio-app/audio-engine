@@ -6,6 +6,38 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-06-28
+
+> **Release temps-réel Windows : réception + émission RT (Windows jouable) +
+> auto-recovery des callbacks ASIO. Synthèse des pré-releases 0.5.3-1 → 0.5.3-5.**
+
+### Added
+- **Décodage de réception en temps-réel** (un thread RT partagé, MMCSS Windows /
+  QoS `USER_INTERACTIVE` macOS) : corrige le « 60 ms injouable » Windows — le
+  décodage ne se faisait plus préempter, le jitter buffer du pair ne se collait
+  plus au plafond 40 ms. Validé PC↔Mac en internet réel.
+- **Émission en temps-réel** : chiffrement SRTP + `send_to` fusionnés dans le
+  thread d'encode RT (suppression de la tâche UDP tokio + du hop) → émission RT,
+  zéro gigue d'égression. `WouldBlock` → drop (PLC) plutôt que staller le RT.
+- **Auto-recovery de la mort des callbacks audio** (`audio_liveness_supervisor`
+  + `restart_audio_streams`) : surveille en continu les callbacks CPAL ; s'ils
+  se figent en cours de session (driver ASIO qui émet un `kAsioResetRequest` non
+  honoré par CPAL → callbacks haltés en silence), recrée UNIQUEMENT les streams
+  CPAL en gardant encodeur/SFU/réseau (pas de re-handshake, ~100-300 ms de trou).
+  Borné, erreur claire au browser si épuisé. Générique (toute interface), no-op
+  macOS. Recovery validée sur PC (1 trou de ~1 s auto-résorbé).
+- **Instrumentation déterministe** : `emit_burst` (frames Opus/bloc), taille du
+  1er callback, latence du chemin de réception `recv_path`, débit de callbacks
+  CPAL/s (`capture_cb_per_sec`/`output_cb_per_sec`).
+
+### Notes
+- Émission ET réception sont désormais **toutes deux en temps-réel** (parité
+  JackTrip/SonoBus/Jamulus côté threads RT).
+- Le watchdog « cold-start » 700 ms (pré-release 0.5.3-4) a été **remplacé** par
+  le superviseur de liveness continu : le diagnostic initial était faux (les
+  callbacks ASIO démarrent bien puis meurent ~21 s plus tard, ce n'est pas un
+  démarrage à froid). Cause racine = `kAsioResetRequest` non géré par CPAL 0.15.
+
 ## [0.5.2] — 2026-06-27
 
 > **Release latence : Opus low-delay + jitter buffer adaptatif (gigue mesurée +

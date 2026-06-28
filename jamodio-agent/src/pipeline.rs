@@ -38,7 +38,6 @@ use rubato::Resampler as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Wrapper to make cpal::Stream Send — we only hold it alive (RAII), never use across threads.
 struct SendStream(#[allow(dead_code)] cpal::Stream);
@@ -67,6 +66,20 @@ enum OutputOpen {
     Opened { stream: SendStream, buffer: Option<u32>, name: String },
     NotFound,
     BuildFailed(String),
+    /// 0.5.3-4 — un stream de playback tournait déjà (re-StartCapture « à chaud »)
+    /// → on ne reconstruit/redémarre PAS la sortie. Pas de cold-start à éviter.
+    Skipped,
+}
+
+/// 0.5.3-4 (Volet B) — résultat du passage COM-STA unique qui construit
+/// l'ENTRÉE et la SORTIE puis les démarre (sortie d'abord). Regrouper build+play
+/// des deux streams dans un seul passage évite de recréer les buffers ASIO de la
+/// sortie APRÈS un `play()` d'entrée (cold-start full-duplex muet, bug PC 28/06).
+struct BuiltDuplex {
+    /// Entrée — déjà démarrée (`play()` appelé dans la closure, après la sortie).
+    input: BuiltInput,
+    /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
+    output: OutputOpen,
 }
 
 /// Résout le device de sortie + ouvre le stream playback **sur le thread
@@ -74,9 +87,13 @@ enum OutputOpen {
 /// ASIO charge le driver via CoCreateInstance, qui exige COM initialisé et
 /// le même apartment pour toute la vie de l'objet. Résolution et build sont
 /// atomiques (le `cpal::Device` !Send ne traverse pas les threads).
-fn open_output_on_com(output_id: Option<String>, mixer: Arc<Mutex<AudioMixer>>) -> OutputOpen {
+fn open_output_on_com(
+    output_id: Option<String>,
+    mixer: Arc<Mutex<AudioMixer>>,
+    output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+) -> OutputOpen {
     crate::audio::com_exec::run(move || {
-        use cpal::traits::DeviceTrait;
+        use cpal::traits::{DeviceTrait, StreamTrait};
         let device_opt = match output_id.as_deref() {
             Some(id) => crate::audio::device::get_output_device(id),
             None => crate::audio::device::default_output_device().map(|(d, _)| d),
@@ -85,10 +102,116 @@ fn open_output_on_com(output_id: Option<String>, mixer: Arc<Mutex<AudioMixer>>) 
             return OutputOpen::NotFound;
         };
         let name = device.name().unwrap_or_default();
-        match crate::audio::playback::start_playback(&device, mixer) {
-            Ok((stream, buffer)) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
+        // Volet B : build (sans play) puis play, sur le thread COM-STA. Sur ce
+        // chemin (add_stream / sortie seule, capture déjà chaude) il n'y a pas
+        // de cold-start full-duplex à éviter, donc build+play immédiat suffit.
+        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks) {
+            Ok((stream, buffer)) => match stream.play() {
+                Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
+                Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
+            },
             Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
         }
+    })
+}
+
+/// 0.5.3-4/-5 — ouvre l'ENTRÉE et (optionnellement) la SORTIE atomiquement sur le
+/// thread COM-STA : on construit les deux streams (tous les buffers ASIO créés)
+/// PUIS on démarre la sortie puis l'entrée. Construire `build_output`
+/// (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers en cours
+/// de route → callbacks muets. Primitif partagé par `start_capture` (1er start)
+/// et `restart_audio_streams` (recréation à chaud après mort des callbacks ASIO).
+///
+/// `build_output=false` ⇒ un playback tourne déjà (re-start à chaud) → on ne
+/// reconstruit que l'entrée, la sortie revient en `OutputOpen::Skipped`.
+///
+/// Tous les drops internes (échec build/play) ont lieu DANS la closure, donc sur
+/// le thread COM-STA (fermeture ASIO sur l'apartment créateur — contrat `SendStream`).
+#[allow(clippy::too_many_arguments)]
+fn open_duplex_on_com(
+    input_id: Option<String>,
+    output_id: Option<String>,
+    build_output: bool,
+    mixer: Arc<Mutex<AudioMixer>>,
+    sample_tx: Sender<Vec<f32>>,
+    capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<BuiltDuplex, CaptureStartError> {
+    crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        // --- ENTRÉE : résolution + build (SANS play) ---
+        let device = match input_id.as_deref() {
+            Some(id) => crate::audio::device::get_input_device(id),
+            None => crate::audio::device::default_input_id()
+                .as_deref()
+                .and_then(crate::audio::device::get_input_device),
+        };
+        let Some(device) = device else {
+            return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
+        };
+        let name = device.name().unwrap_or_default();
+        // Id rapporté : celui demandé, sinon le default résolu ({idx}:{name}).
+        let resolved_id = input_id
+            .unwrap_or_else(|| crate::audio::device::default_input_id().unwrap_or_else(|| name.clone()));
+        let (in_stream, channels, native_sr, input_buf) =
+            crate::audio::capture::build_capture_stream(
+                &device,
+                sample_tx,
+                capture_drops,
+                capture_callbacks,
+            )
+            .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
+
+        // --- SORTIE : résolution + build (SANS play) + play, si nécessaire ---
+        let output = if build_output {
+            let dev = match output_id.as_deref() {
+                Some(id) => crate::audio::device::get_output_device(id),
+                None => crate::audio::device::default_output_device().map(|(d, _)| d),
+            };
+            match dev {
+                None => {
+                    // Sortie introuvable = fatal. `in_stream` (non démarré) est
+                    // droppé ici, sur le thread COM-STA. Erreur claire.
+                    return Err(CaptureStartError::OutputDeviceNotFound { requested: output_id });
+                }
+                Some(d) => {
+                    let out_name = d.name().unwrap_or_default();
+                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks) {
+                        // Démarre la SORTIE d'abord (buffers tous créés).
+                        Ok((out_stream, buffer)) => match out_stream.play() {
+                            Ok(()) => OutputOpen::Opened {
+                                stream: SendStream(out_stream),
+                                buffer,
+                                name: out_name,
+                            },
+                            Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
+                        },
+                        Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
+                    }
+                }
+            }
+        } else {
+            OutputOpen::Skipped
+        };
+
+        // --- Démarre l'ENTRÉE, après la sortie. En cas d'échec, in_stream ET la
+        //     sortie démarrée sont droppés sur ce thread COM-STA. ---
+        in_stream
+            .play()
+            .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
+
+        Ok(BuiltDuplex {
+            input: BuiltInput {
+                stream: SendStream(in_stream),
+                name,
+                resolved_id,
+                channels,
+                native_sr,
+                input_buf,
+            },
+            output,
+        })
     })
 }
 
@@ -159,10 +282,24 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// 0.5.3-5 — clone du `Sender` du canal capture→encoder, conservé pour
+    /// pouvoir RECRÉER le seul stream CPAL d'entrée (sans toucher à l'encodeur,
+    /// au RtpSender, au SRTP ni à la réception) quand le superviseur de liveness
+    /// détecte que les callbacks ASIO se sont arrêtés en cours de session
+    /// (`restart_audio_streams`). `None` hors capture.
+    capture_sample_tx: Option<Sender<Vec<f32>>>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
-    /// Handles to stop per-stream receive tasks.
+    /// Handles to stop per-stream receive I/O tasks (async tokio).
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
+    /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
+    /// `None` = pas de stream reçu en cours.
+    decode_thread: Option<DecodeThread>,
+    /// 0.5.3-2 — compteur de génération des io tasks de réception. Incrémenté à
+    /// chaque `add_stream` ; permet au thread de décodage de distinguer un Remove
+    /// d'une ancienne connexion d'un re-add du même `producer_id` (race évitée).
+    recv_epoch: u64,
     /// Selected devices : ids stricts au format `"{idx}:{name}"` produits par
     /// `device::list_inputs/outputs`. Le browser stocke et renvoie EXACTEMENT
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
@@ -288,7 +425,7 @@ pub struct PipelineState {
 }
 
 /// Métriques de timing réseau mesurées par stream entrant, alimentées par les
-/// recv tasks (`recv_decode_task`) et lues à 1 Hz par le perfstats_task.
+/// le thread de décodage (`decode_rt_loop`) et lues à 1 Hz par le perfstats_task.
 /// Struct extensible : le chantier jitter buffer adaptatif y ajoutera la cible
 /// mesurée et le ratio de resampling de drift (Phases B/C).
 #[derive(Clone, Copy, Default)]
@@ -322,7 +459,36 @@ pub struct PerfHandles {
     /// C'était l'angle mort de la latence d'émission ; on le mesure désormais
     /// pour juger le pacing sur des chiffres déterministes (pas l'acoustique).
     pub send_path_latency: Arc<Mutex<Histogram>>,
+    /// 0.5.3 — RAFALE d'émission : nombre de frames Opus émises par bloc d'entrée
+    /// à `encode_stage` (= nombre d'itérations du `while accumulator >= frame_len`).
+    /// C'est LA mesure déterministe de la rafale Windows/ASIO : un callback qui
+    /// livre N×120 samples d'un coup → N frames `try_send` d'affilée → le pair
+    /// récepteur reçoit une grappe (son `buffer_target_ms` monte). À 48 k natif
+    /// (resampler bypassé) ce chiffre ≈ taille_callback / 120 → révèle SANS
+    /// inférence si le driver ASIO a honoré `Fixed(128)` (≈1) ou délivre sa
+    /// taille de control panel (≈4 pour 512). Cible après fix : ≈1.
+    /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
+    pub emit_burst: Arc<Mutex<Histogram>>,
+    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de l'arrivée réseau (horodatée
+    /// dans `recv_io_task`) à juste avant `push_samples` (file MPSC + parse +
+    /// décode Opus). Miroir de `send_path_latency`. Doit lire ~0,1-0,5 ms si le
+    /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
+    /// bug Windows que ce thread RT corrige).
+    pub recv_path: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// 0.5.3-4 — LIVENESS du callback CPAL d'ENTRÉE : incrémenté d'1 à chaque
+    /// callback de capture (cf. `capture::forward_samples`). Sert au watchdog
+    /// cold-start ASIO (`ws_server` handler `StartCapture`) : si ce compteur ne
+    /// bouge pas ~700 ms après un `start_capture` réussi → le callback ASIO ne
+    /// s'est PAS engagé (démarrage à froid muet, bug PC 28/06) → relance auto.
+    /// Cumulatif (jamais reset) : le watchdog mesure un DELTA. Coût hot-path :
+    /// un `fetch_add(Relaxed)` par callback = négligeable.
+    pub capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    /// 0.5.3-4 — LIVENESS du callback CPAL de SORTIE : incrémenté d'1 à chaque
+    /// callback de playback (cf. `playback`/`mix_into`). Pendant du précédent
+    /// pour la sortie : si la sortie ne pull pas (jitter buffer overflow en
+    /// cascade), ce compteur reste figé → le watchdog le détecte.
+    pub output_callbacks: Arc<std::sync::atomic::AtomicU64>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
@@ -349,7 +515,11 @@ impl PerfHandles {
             process_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -523,8 +693,11 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            capture_sample_tx: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
+            decode_thread: None,
+            recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
             state: AgentState::Idle,
@@ -853,7 +1026,11 @@ impl PipelineState {
         // côté mixer couvre le court gap (changement de sortie = action rare).
         // Résolution + ouverture atomiques sur le thread COM-STA (cf. com_exec).
         close_stream_on_com(self.playback_stream.take());
-        match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
+        match open_output_on_com(
+            self.output_device_id.clone(),
+            self.mixer.clone(),
+            self.perfstats.output_callbacks.clone(),
+        ) {
             OutputOpen::Opened { stream, buffer, name } => {
                 self.playback_stream = Some(stream);
                 self.output_buffer_samples = buffer;
@@ -875,6 +1052,9 @@ impl PipelineState {
                 );
                 self.output_buffer_samples = None;
             }
+            // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
+            // duplex de start_capture).
+            OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
         }
     }
 
@@ -902,8 +1082,6 @@ impl PipelineState {
         channel_index: Option<u8>,
         sfu_srtp: SrtpParameters,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
-        use cpal::traits::DeviceTrait;
-
         // 1. STOP toute capture en cours D'ABORD. ASIO est mono-client :
         // impossible d'ouvrir un second stream tant que l'ancien tient le
         // driver ; et la fermeture doit se faire sur le thread COM-STA (cf.
@@ -934,12 +1112,16 @@ impl PipelineState {
 
         // 4. Channels
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
-        // Le canal transporte (instant_de_production, paquet) pour mesurer le
-        // délai d'émission (attente file + pacing) côté tâche UDP — observabilité
-        // déterministe de la latence d'émission (cf. send_path_latency).
-        let (rtp_tx, mut rtp_rx) =
-            tokio_mpsc::channel::<(std::time::Instant, Vec<u8>)>(64);
+        // 0.5.3-5 — on conserve un clone du Sender pour pouvoir RECRÉER le stream
+        // d'entrée (sans relancer l'encodeur) si les callbacks ASIO meurent en
+        // cours de session (cf. `restart_audio_streams`).
+        self.capture_sample_tx = Some(sample_tx.clone());
         let input_rms = self.input_rms.clone();
+        // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
+        // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
+        // `encode_stage_loop` → `RtpSender::send_blocking`). Supprime le hop tokio
+        // normal-priorité = supprime la gigue d'égression sous charge Windows.
+        let sender = Arc::new(sender);
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
@@ -960,40 +1142,33 @@ impl PipelineState {
         //    Sprint S1 — `capture_drops` partagé avec le callback CPAL :
         //    incrémenté quand `sample_tx` est plein, lu+reset par ws_server au
         //    flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
-        let capture_drops_for_callback = self.perfstats.capture_drops.clone();
-        let built = crate::audio::com_exec::run(move || -> Result<BuiltInput, CaptureStartError> {
-            let device = match input_id.as_deref() {
-                Some(id) => crate::audio::device::get_input_device(id),
-                None => crate::audio::device::default_input_id()
-                    .as_deref()
-                    .and_then(crate::audio::device::get_input_device),
-            };
-            let Some(device) = device else {
-                return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
-            };
-            let name = device.name().unwrap_or_default();
-            // Id rapporté : celui demandé, sinon le default résolu ({idx}:{name}).
-            let resolved_id = input_id
-                .unwrap_or_else(|| crate::audio::device::default_input_id().unwrap_or_else(|| name.clone()));
-            let (stream, channels, native_sr, input_buf) =
-                crate::audio::capture::start_capture(&device, sample_tx, capture_drops_for_callback)
-                    .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
-            Ok(BuiltInput {
-                stream: SendStream(stream),
-                name,
-                resolved_id,
-                channels,
-                native_sr,
-                input_buf,
-            })
-        })?;
-        let in_name = built.name;
-        let resolved_input_id = built.resolved_id;
-        let channels_in = built.channels;
-        let native_sr = built.native_sr;
-        let input_buf = built.input_buf;
+        //
+        //    Volet B (0.5.3-4) — on construit l'ENTRÉE **et** la SORTIE puis on
+        //    les démarre (sortie d'abord, entrée ensuite) dans CE seul passage
+        //    COM-STA. Sur un device ASIO full-duplex, appeler `build_output`
+        //    (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers
+        //    en cours → callbacks muets (cold-start raté). En créant tous les
+        //    buffers avant de démarrer, on évite ce recreate. La sortie n'est
+        //    (re)construite que si aucun playback ne tourne déjà (cold path).
+        let need_output = self.playback_stream.is_none();
+        let built = open_duplex_on_com(
+            input_id,
+            self.output_device_id.clone(),
+            need_output,
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+        )?;
+        let BuiltDuplex { input: built_input, output: built_output } = built;
+        let in_name = built_input.name;
+        let resolved_input_id = built_input.resolved_id;
+        let channels_in = built_input.channels;
+        let native_sr = built_input.native_sr;
+        let input_buf = built_input.input_buf;
         tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        self.capture_stream = Some(built.stream);
+        self.capture_stream = Some(built_input.stream);
         tracing::info!(
             target: "jamodio::pipeline",
             channels_in, native_sr, ?channel_index,
@@ -1055,7 +1230,7 @@ impl PipelineState {
             .name("encoder".into())
             .spawn(move || {
                 encoder_thread(
-                    sample_rx, rtp_tx, stop_rx, ssrc, payload_type, input_rms,
+                    sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
@@ -1069,57 +1244,30 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 7. Spawn tokio task for UDP sending (chiffrement SRTP en place avant send_to).
-        //    Pacing d'émission : on lisse les rafales (Windows/ASIO produit
-        //    plusieurs frames Opus par callback → encode_stage les envoie
-        //    d'affilée) en réétalant les paquets à la cadence temps-réel
-        //    (cf. `paced_send_time_us`). Flux régulier (Mac) ≈ no-op ; flux en
-        //    rafale (Windows) → étalé → le récepteur peut tenir un buffer bas.
-        let sender = Arc::new(sender);
-        let send_path_latency = self.perfstats.send_path_latency.clone();
-        tokio::spawn({
-            let sender = sender.clone();
-            async move {
-                // Envoi IMMÉDIAT (comportement sain validé ≤ 0.5.2-4). Le pacing
-                // par sommeil-par-paquet a été retiré (v0.5.2-7) : la granularité
-                // du timer tokio (~1 ms, arrondi au-dessus) faisait drainer le
-                // pacer plus lentement que la production (2,5 ms/paquet) → la file
-                // RTP saturait à 64 paquets = ~160 ms de latence d'émission +
-                // instabilité (backpressure). L'instrumentation `send_path_latency`
-                // est CONSERVÉE (doit lire ~0 ici) pour garder la visibilité.
-                while let Some((produced_at, packet)) = rtp_rx.recv().await {
-                    let _ = sender.send(packet).await;
-                    let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
-                    send_path_latency.lock().observe(send_delay_ms);
-                }
-            }
-        });
+        // 7. (Émission RT — cf. section 4 : le thread d'encode chiffre + envoie
+        //    directement, il n'y a plus de tâche UDP tokio.)
 
-        // 8. Start CPAL output stream (playback) if not already running.
-        //    Ouvert sur le thread COM-STA (ASIO) comme l'input.
-        //    - device introuvable (sélection sortie disparue) → erreur claire ;
-        //    - échec de BUILD (ex. driver ASIO en duplex, edge non testé) → NON
-        //      FATAL : on ne rend pas l'utilisateur muet pour les autres. La
-        //      capture (entrée) prime ; le playback/self-monitor sera juste
-        //      indisponible jusqu'à une nouvelle sélection. On le voit au log.
-        if self.playback_stream.is_none() {
-            match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
-                OutputOpen::Opened { stream, buffer, name } => {
-                    tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
-                    self.playback_stream = Some(stream);
-                    self.output_buffer_samples = buffer;
-                }
-                OutputOpen::NotFound => {
-                    return Err(CaptureStartError::OutputDeviceNotFound {
-                        requested: self.output_device_id.clone(),
-                    });
-                }
-                OutputOpen::BuildFailed(e) => tracing::warn!(
-                    target: "jamodio::pipeline",
-                    error = %e,
-                    "ouverture du stream de sortie échouée — playback désactivé (capture active)"
-                ),
+        // 8. Stream de sortie (playback) — déjà CONSTRUIT + DÉMARRÉ dans le
+        //    passage COM-STA ci-dessus (Volet B : build entrée+sortie avant de
+        //    démarrer, sortie d'abord). Ici on ne fait que router le résultat :
+        //    - Opened → on conserve le handle (RAII) + le buffer télémétrie ;
+        //    - NotFound → DÉJÀ remonté en erreur depuis la closure (fatal) ;
+        //    - BuildFailed → NON FATAL : la capture (entrée) prime, le playback/
+        //      self-monitor sera indisponible jusqu'à nouvelle sélection ;
+        //    - Skipped → un playback tournait déjà, conservé tel quel.
+        match built_output {
+            OutputOpen::Opened { stream, buffer, name } => {
+                tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
             }
+            OutputOpen::BuildFailed(e) => tracing::warn!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+            ),
+            OutputOpen::Skipped => {}
+            OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
         }
 
         self.state = AgentState::Capturing;
@@ -1144,6 +1292,80 @@ impl PipelineState {
             native_sample_rate: native_sr,
         };
         Ok((local_port, agent_srtp, info))
+    }
+
+    /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
+    /// Lu par le superviseur de liveness (`audio_liveness_supervisor`).
+    pub fn has_active_capture_stream(&self) -> bool {
+        self.capture_stream.is_some()
+    }
+
+    /// 0.5.3-5 — RECRÉE uniquement les streams CPAL (entrée + sortie) sans toucher
+    /// au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception, mixer
+    /// avec ses streams pairs + self-monitor). Appelé par le superviseur de
+    /// liveness quand les callbacks ASIO se sont arrêtés EN COURS de session
+    /// (driver Focusrite qui émet un `kAsioResetRequest` que CPAL n'honore pas →
+    /// le driver halte ses callbacks silencieusement ; recréer les streams = la
+    /// réinitialisation ASIO que la spec impose, et que CPAL omet).
+    ///
+    /// La nouvelle entrée se re-branche sur le MÊME canal `sample_tx` → l'encodeur
+    /// continue sans rien savoir. Aucun re-handshake SFU (le socket/port/SRTP TX
+    /// sont préservés) → pas de coupure réseau, juste un trou audio de ~100-300 ms.
+    ///
+    /// No-op (Ok) hors état `Capturing`. Erreur claire si la recréation échoue
+    /// (le superviseur la borne et remonte au browser — jamais de silence).
+    pub fn restart_audio_streams(&mut self) -> Result<(), String> {
+        if !matches!(self.state, AgentState::Capturing) || self.capture_stream.is_none() {
+            return Ok(());
+        }
+        let Some(sample_tx) = self.capture_sample_tx.clone() else {
+            return Err("restart_audio_streams: pas de canal capture (incohérent)".into());
+        };
+
+        // Ferme les deux streams CPAL sur le thread COM-STA (ASIO stop/dispose sur
+        // l'apartment créateur) AVANT de reconstruire (ASIO mono-client).
+        close_stream_on_com(self.capture_stream.take());
+        close_stream_on_com(self.playback_stream.take());
+        self.output_buffer_samples = None;
+
+        // Reconstruit entrée + sortie (les deux, le playback ayant été fermé) via
+        // le primitif partagé : build des deux puis play sortie→entrée.
+        let built = open_duplex_on_com(
+            self.input_device_id.clone(),
+            self.output_device_id.clone(),
+            true, // playback fermé ci-dessus → on le reconstruit
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+        )
+        .map_err(|e| format!("recréation des streams audio: {}", e))?;
+
+        let BuiltDuplex { input, output } = built;
+        self.input_buffer_samples = input.input_buf;
+        self.capture_stream = Some(input.stream);
+        match output {
+            OutputOpen::Opened { stream, buffer, name } => {
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+                tracing::info!(
+                    target: "jamodio::pipeline",
+                    device = %name,
+                    "streams audio recréés (recovery liveness ASIO)"
+                );
+            }
+            // Sortie non rétablie : l'entrée prime (la capture repart), le
+            // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
+            OutputOpen::BuildFailed(e) => tracing::warn!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "recréation sortie échouée — playback désactivé (capture rétablie)"
+            ),
+            OutputOpen::NotFound => return Err("output device introuvable à la recréation".into()),
+            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+        }
+        Ok(())
     }
 
     /// Add a receive pipeline for one remote stream.
@@ -1177,33 +1399,58 @@ impl PipelineState {
         // Note : pas de punch synchrone ici. Le punch SRTP serait rejeté par le SFU
         // tant que celui-ci n'a pas reçu nos clés via connect-plain-transport
         // (qui n'est envoyé par le browser qu'après cette réponse). On punch en boucle
-        // dans recv_decode_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
+        // dans recv_io_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
 
-        // Add stream to mixer
-        self.mixer.lock().add_stream(&producer_id);
+        // 0.5.3-2 — lazy-start du thread de décodage RT partagé (au 1er stream).
+        // Le stream mixer N'EST PLUS créé ici : le thread de décodage le crée au
+        // 1er paquet du pair (il est l'unique écrivain du mixer côté pairs → zéro
+        // race add/remove/push).
+        if self.decode_thread.is_none() {
+            self.decode_thread = Some(
+                spawn_decode_thread(
+                    self.mixer.clone(),
+                    self.perfstats.net_stats_by_producer.clone(),
+                    self.perfstats.recv_path.clone(),
+                )
+                .map_err(|e| format!("spawn decode thread: {}", e))?,
+            );
+        }
+        let decode = self
+            .decode_thread
+            .as_ref()
+            .expect("decode thread démarré juste au-dessus");
 
-        // Stop signal
+        // Stop signal pour la tâche I/O de ce pair.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.recv_stops.insert(producer_id.clone(), stop_tx);
 
-        // Spawn receive + decode task (reçoit aussi sfu_addr pour le punch périodique)
-        let mixer = self.mixer.clone();
-        let net_stats_handle = self.perfstats.net_stats_by_producer.clone();
+        // Spawn la tâche I/O async (recv UDP + horodatage + punch + idle-timeout).
+        // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
+        let tx = decode.tx.clone();
+        let pool_rx = decode.pool_rx.clone();
+        let pid: Arc<str> = Arc::from(producer_id.as_str());
+        self.recv_epoch = self.recv_epoch.wrapping_add(1);
+        let epoch = self.recv_epoch;
         tokio::spawn(async move {
-            recv_decode_task(receiver, sfu_addr, producer_id, mixer, net_stats_handle, stop_rx).await;
+            recv_io_task(receiver, sfu_addr, pid, epoch, tx, pool_rx, stop_rx).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
         // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
         // un id explicite échoue.
         if self.playback_stream.is_none() {
-            match open_output_on_com(self.output_device_id.clone(), self.mixer.clone()) {
+            match open_output_on_com(
+                self.output_device_id.clone(),
+                self.mixer.clone(),
+                self.perfstats.output_callbacks.clone(),
+            ) {
                 OutputOpen::Opened { stream, buffer, .. } => {
                     self.playback_stream = Some(stream);
                     self.output_buffer_samples = buffer;
                 }
                 OutputOpen::NotFound => return Err("output device introuvable".into()),
                 OutputOpen::BuildFailed(e) => return Err(format!("CPAL output: {}", e)),
+                OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
             }
         }
 
@@ -1217,16 +1464,20 @@ impl PipelineState {
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
+        // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
+        // thread de décodage qui retire l'état + le stream mixer + net_stats,
+        // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
         if let Some(stop) = self.recv_stops.remove(producer_id) {
             let _ = stop.send(());
         }
-        self.mixer.lock().remove_stream(producer_id);
     }
 
     fn stop_capture(&mut self) {
         // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
         // tourner sur l'apartment qui a créé le driver). macOS : inline.
         close_stream_on_com(self.capture_stream.take());
+        // L'encodeur va s'arrêter → le canal capture n'a plus de consommateur.
+        self.capture_sample_tx = None;
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
@@ -1259,6 +1510,16 @@ impl PipelineState {
         let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
         for id in ids {
             self.remove_stream(&id);
+        }
+        // 0.5.3-2 — arrête le thread de décodage RT partagé. Shutdown (il nettoie
+        // les streams mixer + net_stats restants) puis join (sortie immédiate sur
+        // le message). On drop le Sender pour fermer le MPSC côté principal ; les
+        // io tasks restantes (oneshots déjà envoyés ci-dessus) verront Err à leur
+        // prochain send et sortiront.
+        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
+            let _ = tx.send(DecodeMsg::Shutdown);
+            drop(tx);
+            let _ = join.join();
         }
         close_stream_on_com(self.playback_stream.take()); // drop sur le thread COM-STA (ASIO)
         self.output_buffer_samples = None;
@@ -1391,7 +1652,7 @@ fn dispatch_subblock_midi(
 /// Architecture (cf. PLAN-EXECUTION-AGENT-STABILITE.md §S3) :
 ///
 /// ```text
-/// CPAL callback ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─►rtp_tx─► UDP task
+/// CPAL callback ─sample_rx─►  capture_stage  ─►ringbuf 32─►  process_stage  ─►ringbuf 32─►  encode_stage  ─SRTP+send_to─► SFU
 ///                              (remap+resample)              (plugin+RMS+self-monitor)        (Opus+RTP)
 /// ```
 ///
@@ -1409,7 +1670,7 @@ fn dispatch_subblock_midi(
 #[allow(clippy::too_many_arguments)]
 fn encoder_thread(
     sample_rx: Receiver<Vec<f32>>,
-    rtp_tx: tokio_mpsc::Sender<(std::time::Instant, Vec<u8>)>,
+    sender: Arc<RtpSender>,
     stop_rx: Receiver<()>,
     ssrc: u32,
     payload_type: u8,
@@ -1513,7 +1774,7 @@ fn encoder_thread(
         .spawn(move || {
             encode_stage_loop(
                 proc_to_enc_rx,
-                rtp_tx,
+                sender,
                 stop_enc,
                 ssrc,
                 payload_type,
@@ -2170,7 +2431,7 @@ fn process_stage_loop(
 
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
-    rtp_tx: tokio_mpsc::Sender<(std::time::Instant, Vec<u8>)>,
+    sender: Arc<RtpSender>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     ssrc: u32,
     payload_type: u8,
@@ -2212,6 +2473,9 @@ fn encode_stage_loop(
                 let t_stage_start = std::time::Instant::now();
                 accumulator.extend_from_slice(&stereo);
 
+                // 0.5.3 — comptage de la RAFALE : combien de frames Opus ce bloc
+                // d'entrée fait-il partir d'affilée ? (cf. PerfHandles::emit_burst)
+                let mut frames_this_block: u32 = 0;
                 while accumulator.len() >= frame_len {
                     // Encode directement depuis le slice de l'accumulateur —
                     // l'ancien `drain(..).collect()` allouait un Vec par frame
@@ -2229,45 +2493,44 @@ fn encode_stage_loop(
                             let packet =
                                 rtp::build_packet(&header, &opus_buf[..encoded_len]);
 
-                            // Horodatage de production : permet à la tâche UDP de
-                            // mesurer le délai d'émission (file + pacing).
-                            if let Err(e) = rtp_tx.try_send((std::time::Instant::now(), packet)) {
-                                use tokio::sync::mpsc::error::TrySendError;
-                                match e {
-                                    TrySendError::Full(_) => {
-                                        static FULLS: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let n = FULLS.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
+                            // 0.5.3-3 — ÉMISSION RT : chiffrement SRTP + send_to
+                            // NON-BLOQUANT directement ici (thread d'encode RT),
+                            // plus de hop tokio (supprime la gigue d'égression sous
+                            // charge Windows). `send_path` mesure désormais le coût
+                            // protect+send_to (doit lire ~0). Sur WouldBlock (buffer
+                            // noyau plein, rarissime) on DROP la frame (concealée par
+                            // le PLC récepteur) au lieu de staller le thread RT.
+                            let produced_at = std::time::Instant::now();
+                            match sender.send_blocking(packet) {
+                                Ok(_) => {
+                                    let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
+                                    perfstats.send_path_latency.lock().observe(send_delay_ms);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    static WOULDBLOCK: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = WOULDBLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n == 0 || n.is_power_of_two() {
+                                        tracing::warn!(
+                                            target: "jamodio::encoder",
+                                            drop_count = n + 1,
+                                            "UDP send buffer full (WouldBlock) — frame dropped (réseau/CPU saturé ?)"
                                         );
-                                        if n == 0 || n.is_power_of_two() {
-                                            tracing::warn!(
-                                                target: "jamodio::encoder",
-                                                drop_count = n + 1,
-                                                "RTP channel full — packet dropped (CPU/network overload?)"
-                                            );
-                                        }
                                     }
-                                    TrySendError::Closed(_) => {
-                                        static CLOSED: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let n = CLOSED.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        if n == 0 {
-                                            tracing::debug!(
-                                                target: "jamodio::encoder",
-                                                "RTP channel closed — UDP task gone (post stop_capture)"
-                                            );
-                                        }
+                                }
+                                Err(e) => {
+                                    static SENDERR: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = SENDERR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n == 0 || n.is_power_of_two() {
+                                        tracing::warn!(target: "jamodio::encoder", error = %e, drop_count = n + 1, "UDP send_to error");
                                     }
                                 }
                             }
 
                             sequence = sequence.wrapping_add(1);
                             timestamp = timestamp.wrapping_add(frame_size as u32);
+                            frames_this_block += 1;
                         }
                         Err(e) => {
                             tracing::error!(
@@ -2282,6 +2545,11 @@ fn encode_stage_loop(
                     // sans collect → pas d'allocation.
                     accumulator.drain(..frame_len);
                 }
+
+                // 0.5.3 — enregistre la rafale de CE bloc. On observe même 0
+                // (bloc plus petit qu'une frame = sous-frame = AUCUNE rafale,
+                // c'est le bon signe) : la moyenne reflète alors frames/bloc réel.
+                perfstats.emit_burst.lock().observe(frames_this_block as f32);
 
                 // Sprint S1/S3 — pipeline_latency end-to-end. Le timestamp
                 // `t_block_start` est apposé par `capture_stage_loop` en
@@ -2307,50 +2575,311 @@ fn encode_stage_loop(
     }
 }
 
-// ─── Receive + decode task (tokio, one per remote stream) ──────────
+// ═══════════════════════════════════════════════════════════════════
+// Réception : tâches I/O async (1/pair) + UN thread de décodage RT partagé
+// ═══════════════════════════════════════════════════════════════════
+//
+// Pourquoi ce split (0.5.3-2, fix « injouable Windows ») :
+// Le décodage Opus alimente le jitter buffer (`push_samples`) ; le callback de
+// SORTIE le draine. Si le décodage tourne en priorité NORMALE (ancien
+// `recv_decode_task` sur le pool tokio), Windows le préempte ~10-15 ms → le
+// buffer n'est pas réalimenté → underrun → `adapt_up` colle la cible au plafond
+// 40 ms → +25 ms de latence (injouable). L'émission, elle, est RT (MMCSS) → le
+// self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
+// clément). Tous les concurrents (JackTrip/SonoBus/Jamulus) mettent la réception
+// sur un thread RT — jamais normal.
+//
+// Design (validé en triple revue senior) :
+//   - `recv_io_task` (async tokio, 1/pair) : recv UDP + horodatage d'arrivée +
+//     comedia punch + idle-timeout fantôme. Forwarde le paquet brut via un MPSC.
+//   - `decode_rt_loop` (UN seul std::thread, RT) : décode pour TOUS les pairs
+//     (HashMap d'état). Promotion « event-driven » (MMCSS Windows / QoS macOS
+//     SEUL, PAS le workgroup → pas de sur-population). Seul écrivain du mixer côté
+//     pairs (add/remove/push tous depuis ce thread) → zéro race, zéro contention
+//     mutex ×N (1 thread partagé, pas thread-par-stream).
+// Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
-async fn recv_decode_task(
-    receiver: RtpReceiver,
-    sfu_addr: SocketAddr,
-    producer_id: String,
+/// Message d'une `recv_io_task` vers le thread de décodage RT partagé.
+enum DecodeMsg {
+    /// Paquet RTP déchiffré, horodaté à l'arrivée (avant tout parse/file).
+    /// `epoch` = génération de l'io task émettrice (cf. re-add même producer).
+    Packet {
+        producer_id: Arc<str>,
+        epoch: u64,
+        recv_instant: std::time::Instant,
+        buf: Vec<u8>,
+    },
+    /// Pair terminé (stop ou idle-timeout) : envoyé en DERNIER par l'io task →
+    /// le thread retire l'état + le stream mixer APRÈS le dernier paquet du pair
+    /// (ordre garanti : l'io task est l'unique émetteur de ce producteur).
+    /// `epoch` : on n'honore le Remove que s'il matche la génération courante
+    /// (sinon un Remove d'une ancienne connexion supprimerait un stream re-créé).
+    Remove { producer_id: Arc<str>, epoch: u64 },
+    /// Arrêt complet (stop_all).
+    Shutdown,
+}
+
+/// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
+struct DecodeState {
+    /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
+    epoch: u64,
+    decoder: MusicDecoder,
+    drift: DriftEstimator,
+    jitter: JitterEstimator,
+    last_seq: Option<u16>,
+    last_pushed: ProducerNetStats,
+    pkt_count: u64,
+    logged_large_jump: bool,
+}
+
+impl DecodeState {
+    fn new(producer_id: &str, epoch: u64) -> Option<Self> {
+        let decoder = match MusicDecoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(target: "jamodio::recv", producer = %producer_id, error = %e, "failed to create decoder");
+                return None;
+            }
+        };
+        let drift_label = producer_id.chars().take(8).collect::<String>();
+        Some(Self {
+            epoch,
+            decoder,
+            drift: DriftEstimator::new(drift_label),
+            jitter: JitterEstimator::new(),
+            last_seq: None,
+            last_pushed: ProducerNetStats::default(),
+            pkt_count: 0,
+            logged_large_jump: false,
+        })
+    }
+}
+
+/// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
+struct DecodeThread {
+    /// MPSC vers le thread (paquets + lifecycle). Cloné dans chaque io task.
+    tx: Sender<DecodeMsg>,
+    /// Pool de buffers recyclés. Cloné dans chaque io task (côté réception).
+    pool_rx: Receiver<Vec<u8>>,
+    join: std::thread::JoinHandle<()>,
+}
+
+/// Démarre le thread de décodage RT unique (lazy, au 1er stream). Faillible
+/// (cohérent avec le spawn de l'encoder thread) : une erreur OS de création de
+/// thread est propagée au lieu de paniquer.
+fn spawn_decode_thread(
     mixer: Arc<Mutex<AudioMixer>>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    recv_path: Arc<Mutex<Histogram>>,
+) -> std::io::Result<DecodeThread> {
+    // Data MPSC : N io tasks → 1 thread. 256 = large (décode ≫ arrivée).
+    let (tx, rx) = bounded::<DecodeMsg>(256);
+    // Pool : buffers MTU réutilisés → zéro alloc/dealloc sur le thread RT.
+    let (pool_tx, pool_rx) = bounded::<Vec<u8>>(128);
+    for _ in 0..128 {
+        let _ = pool_tx.try_send(Vec::with_capacity(2048));
+    }
+    let join = std::thread::Builder::new()
+        .name("audio-decode".into())
+        .spawn(move || decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path))?;
+    Ok(DecodeThread { tx, pool_rx, join })
+}
+
+/// Boucle du thread de décodage RT. Promu en tête. Multiplexe tous les pairs.
+fn decode_rt_loop(
+    rx: Receiver<DecodeMsg>,
+    pool_tx: Sender<Vec<u8>>,
+    mixer: Arc<Mutex<AudioMixer>>,
+    net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: Arc<Mutex<Histogram>>,
 ) {
-    let mut decoder = match MusicDecoder::new() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(target: "jamodio::recv", producer = %producer_id, error = %e, "failed to create decoder");
-            return;
+    // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
+    // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
+    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv();
+
+    let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            DecodeMsg::Shutdown => break,
+            DecodeMsg::Remove { producer_id, epoch } => {
+                // N'honore le Remove que pour la génération courante : un Remove
+                // d'une ancienne connexion (re-add même producer) ne doit PAS
+                // supprimer le stream re-créé par la nouvelle génération.
+                if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
+                    states.remove(&producer_id);
+                    mixer.lock().remove_stream(&producer_id);
+                    // Sans ça, un peer disparu laisserait un ppm fantôme dans la
+                    // map → PerfStats continuerait à mentionner ce peer mort.
+                    net_stats_by_producer.lock().remove(&*producer_id);
+                }
+            }
+            DecodeMsg::Packet { producer_id, epoch, recv_instant, buf } => {
+                // (Re)création de l'état + du stream mixer selon la génération.
+                let needs_create = match states.get(&producer_id) {
+                    Some(st) if st.epoch == epoch => false,
+                    // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
+                    // traîne après un re-add) → ignoré.
+                    Some(st) if st.epoch > epoch => {
+                        let _ = pool_tx.try_send(buf);
+                        continue;
+                    }
+                    // Génération plus RÉCENTE que l'état présent → l'ancienne est
+                    // supersédée : on retire son stream avant d'en recréer un.
+                    Some(_) => {
+                        mixer.lock().remove_stream(&producer_id);
+                        true
+                    }
+                    None => true,
+                };
+                if needs_create {
+                    match DecodeState::new(&producer_id, epoch) {
+                        Some(st) => {
+                            mixer.lock().add_stream(&producer_id);
+                            states.insert(producer_id.clone(), st);
+                        }
+                        None => {
+                            let _ = pool_tx.try_send(buf);
+                            continue;
+                        }
+                    }
+                }
+                let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
+                decode_one_packet(st, &producer_id, recv_instant, &buf, &mixer, &net_stats_by_producer, &recv_path);
+                // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
+                let _ = pool_tx.try_send(buf);
+            }
         }
+    }
+
+    // Shutdown : nettoie les streams mixer + net_stats restants (Remove non
+    // encore traités). Sépare les locks (jamais les deux en même temps).
+    {
+        let mut m = mixer.lock();
+        for id in states.keys() {
+            m.remove_stream(id);
+        }
+    }
+    {
+        let mut ns = net_stats_by_producer.lock();
+        for id in states.keys() {
+            ns.remove(&**id);
+        }
+    }
+}
+
+/// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
+/// thread RT. `recv_instant` = arrivée réseau horodatée par `recv_io_task`
+/// (JAMAIS un `Instant::now()` ici, sinon le délai de file polluerait la gigue).
+#[allow(clippy::too_many_arguments)]
+fn decode_one_packet(
+    st: &mut DecodeState,
+    producer_id: &str,
+    recv_instant: std::time::Instant,
+    buf: &[u8],
+    mixer: &Arc<Mutex<AudioMixer>>,
+    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: &Arc<Mutex<Histogram>>,
+) {
+    let short = &producer_id[..8.min(producer_id.len())];
+    st.pkt_count += 1;
+    if st.pkt_count == 1 {
+        tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
+    } else if st.pkt_count.is_multiple_of(5000) {
+        tracing::debug!(target: "jamodio::recv", producer = short, count = st.pkt_count, "RTP packets received");
+    }
+
+    let Some((header, payload)) = rtp::parse_header(buf) else {
+        return;
     };
 
-    // Estimateurs de timing réseau (mesure pure — Phase A du chantier jitter
-    // adaptatif). `drift` = dérive d'horloge sender↔nous ; `jitter` = gigue
-    // réseau (RFC 3550). En Phase B la gigue pilotera la cible du buffer.
-    let drift_label = producer_id.chars().take(8).collect::<String>();
-    let mut drift = DriftEstimator::new(drift_label);
-    let mut jitter = JitterEstimator::new();
-    // Pour ne pas écraser le hashmap partagé à chaque paquet RTP (~400/s par
-    // stream), on ne le met à jour que quand une métrique a "bougé sensiblement"
-    // (drift > 1 ppm OU gigue > 0,5 ms) depuis la dernière écriture. Minimise la
-    // contention Mutex ; ws_server lit à 1 Hz. Les deux estimateurs recalculent
-    // en interne à chaque observe(), la map n'est qu'un miroir paresseux.
-    let mut last_pushed = ProducerNetStats::default();
+    // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
+    // (celui horodaté dans recv_io_task) pour drift ET gigue.
+    st.drift.observe(header.timestamp, recv_instant);
+    st.jitter.observe(header.timestamp, recv_instant);
+    // Miroir paresseux dans la map partagée : on n'écrit que si drift > 1 ppm OU
+    // gigue > 0,5 ms de variation depuis la dernière écriture (limite la
+    // contention ; ws_server lit à 1 Hz).
+    let current = ProducerNetStats {
+        drift_ppm: st.drift.drift_ppm(),
+        jitter_ms: st.jitter.jitter_ms(),
+    };
+    if (current.drift_ppm - st.last_pushed.drift_ppm).abs() > 1.0
+        || (current.jitter_ms - st.last_pushed.jitter_ms).abs() > 0.5
+    {
+        net_stats_by_producer.lock().insert(producer_id.to_string(), current);
+        st.last_pushed = current;
+    }
+    // Phase B — pilote la cible du jitter buffer avec la gigue mesurée, ~10×/s
+    // (1 paquet sur 40) et seulement une fois l'estimateur fiable (warmup).
+    if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
+        let jitter_ms = st.jitter.jitter_ms();
+        mixer.lock().observe_jitter(producer_id, jitter_ms);
+    }
+    // Détection de perte → PLC
+    if let Some(prev) = st.last_seq {
+        let expected = prev.wrapping_add(1);
+        if header.sequence != expected {
+            let gap = header.sequence.wrapping_sub(expected);
+            if gap <= 10 {
+                for _ in 0..gap.min(3) {
+                    // Copie obligatoire avant push : decode_loss() rend une slice
+                    // d'un buffer interne écrasé au decode suivant (Sprint 3 BUG 7).
+                    let plc_owned: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
+                    if let Some(plc) = plc_owned {
+                        mixer.lock().push_samples(producer_id, &plc);
+                    }
+                }
+            } else if !st.logged_large_jump {
+                tracing::warn!(target: "jamodio::recv", producer = short, prev_seq = prev, got_seq = header.sequence, gap, "large seq jump (skipping PLC)");
+                st.logged_large_jump = true;
+            }
+        }
+    }
+    st.last_seq = Some(header.sequence);
 
-    // 4096 = MTU + marge auth tag SRTP (~16 octets) + en-tête RTP (12+).
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut last_seq: Option<u16> = None;
-    let mut pkt_count: u64 = 0;
-    let mut logged_large_jump = false;
+    // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
+    // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.
+    if let Some(pcm) = st.decoder.decode(payload) {
+        let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
+        recv_path.lock().observe(recv_path_ms);
+        mixer.lock().push_samples(producer_id, pcm);
+    }
+}
 
-    // Punch périodique pour comedia : 1er paquet SRTP valide reçu par le SFU
-    // = src_addr enregistrée. On retry jusqu'au 1er paquet entrant côté agent.
-    // 100 ms × 30 = 3 s : marge confortable pour que le browser pousse
-    // connect-plain-transport au SFU avant qu'on stoppe.
+/// Tâche I/O de réception (async tokio, 1 par pair). Recv UDP + horodatage +
+/// comedia punch + idle-timeout. Ne décode RIEN : forwarde le paquet brut au
+/// thread de décodage RT. Envoie un `Remove` terminal sur sortie (stop/idle).
+#[allow(clippy::too_many_arguments)]
+async fn recv_io_task(
+    receiver: RtpReceiver,
+    sfu_addr: SocketAddr,
+    producer_id: Arc<str>,
+    epoch: u64,
+    tx: Sender<DecodeMsg>,
+    pool_rx: Receiver<Vec<u8>>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let short = &producer_id[..8.min(producer_id.len())];
+
+    // Punch périodique pour comedia : on retry jusqu'au 1er paquet entrant.
+    // 100 ms × 30 = 3 s (marge pour le connect-plain-transport du browser).
     let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut punch_remaining: u32 = 30;
+
+    // Idle-timeout : un pair vivant envoie ~400 pkt/s (Opus CBR + DTX OFF →
+    // paquets continus MÊME en silence, cf. encoder.rs). 8 s sans paquet = flux
+    // mort (reconnexion non signalée par le browser) → auto-terminaison pour
+    // nettoyer le producteur fantôme.
+    let idle_timeout = std::time::Duration::from_secs(8);
+    let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(2));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_packet = std::time::Instant::now();
+    let mut got_first = false;
+
+    // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
+    let mut buf: Vec<u8> = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
 
     loop {
         tokio::select! {
@@ -2359,118 +2888,43 @@ async fn recv_decode_task(
                 let _ = receiver.punch(sfu_addr).await;
                 punch_remaining -= 1;
             }
+            _ = idle_check.tick() => {
+                if got_first && last_packet.elapsed() >= idle_timeout {
+                    tracing::warn!(target: "jamodio::recv", producer = short, "no packet for 8s — terminating (ghost/orphan stream)");
+                    break;
+                }
+            }
             result = receiver.recv(&mut buf) => {
                 match result {
-                    Ok((len, _addr)) => {
-                        // len == 0 : RTCP filtré ou échec SRTP unprotect (déjà loggé en amont)
-                        if len == 0 { continue; }
-
-                        // 1er paquet valide reçu : comedia activé, on stoppe les punches
-                        if pkt_count == 0 { punch_remaining = 0; }
-
-                        pkt_count += 1;
-                        if pkt_count == 1 {
-                            tracing::info!(
-                                target: "jamodio::recv",
-                                producer = &producer_id[..8.min(producer_id.len())],
-                                bytes = len,
-                                "first RTP packet received"
-                            );
-                        } else if pkt_count.is_multiple_of(5000) {
-                            tracing::debug!(
-                                target: "jamodio::recv",
-                                producer = &producer_id[..8.min(producer_id.len())],
-                                count = pkt_count,
-                                "RTP packets received"
-                            );
+                    Ok((len, _addr)) if len > 0 => {
+                        // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
+                        let recv_instant = std::time::Instant::now();
+                        last_packet = recv_instant;
+                        // 1er paquet valide : comedia activé → on stoppe les punches.
+                        if !got_first {
+                            got_first = true;
+                            punch_remaining = 0;
                         }
-
-                        if let Some((_header, payload)) = rtp::parse_header(&buf[..len]) {
-                            // Alimente les estimateurs de timing réseau avec un
-                            // unique instant d'arrivée (cohérent entre les deux).
-                            let recv_instant = std::time::Instant::now();
-                            drift.observe(_header.timestamp, recv_instant);
-                            jitter.observe(_header.timestamp, recv_instant);
-                            // Miroir paresseux dans la map partagée : on n'écrit
-                            // que si drift > 1 ppm OU gigue > 0,5 ms de variation
-                            // depuis la dernière écriture (cf. last_pushed).
-                            let current = ProducerNetStats {
-                                drift_ppm: drift.drift_ppm(),
-                                jitter_ms: jitter.jitter_ms(),
-                            };
-                            if (current.drift_ppm - last_pushed.drift_ppm).abs() > 1.0
-                                || (current.jitter_ms - last_pushed.jitter_ms).abs() > 0.5
-                            {
-                                net_stats_by_producer
-                                    .lock()
-                                    .insert(producer_id.clone(), current);
-                                last_pushed = current;
-                            }
-                            // Phase B — pilote la cible du jitter buffer avec la
-                            // gigue mesurée, ~10×/s (1 paquet sur 40, pas à chaque
-                            // paquet : limite la contention du lock mixer) et
-                            // uniquement une fois l'estimateur fiable (warmup).
-                            if jitter.is_warm() && pkt_count.is_multiple_of(40) {
-                                let jitter_ms = jitter.jitter_ms();
-                                tokio::task::block_in_place(|| {
-                                    mixer.lock().observe_jitter(&producer_id, jitter_ms);
-                                });
-                            }
-                            // Detect packet loss → PLC
-                            if let Some(prev) = last_seq {
-                                let expected = prev.wrapping_add(1);
-                                if _header.sequence != expected {
-                                    let gap = _header.sequence.wrapping_sub(expected);
-                                    if gap <= 10 {
-                                        for _ in 0..gap.min(3) {
-                                            // PLC : copie obligatoire avant le push_samples car
-                                            // decode_loss() rend une slice référencant un buffer
-                                            // interne au decoder qui sera écrasé par le decode
-                                            // suivant (cf. Sprint 3 BUG 7).
-                                            let plc_owned: Option<Vec<f32>> = decoder.decode_loss().map(|s| s.to_vec());
-                                            if let Some(plc) = plc_owned {
-                                                // block_in_place : signale au scheduler tokio
-                                                // qu'on prend un lock parking_lot bloquant
-                                                // (le callback CPAL peut le tenir pendant
-                                                // mix_into). Sans ça, le worker tokio peut
-                                                // être bloqué → backpressure UDP recv.
-                                                tokio::task::block_in_place(|| {
-                                                    mixer.lock().push_samples(&producer_id, &plc);
-                                                });
-                                            }
-                                        }
-                                    } else if !logged_large_jump {
-                                        tracing::warn!(
-                                            target: "jamodio::recv",
-                                            producer = &producer_id[..8.min(producer_id.len())],
-                                            prev_seq = prev,
-                                            got_seq = _header.sequence,
-                                            gap,
-                                            "large seq jump (skipping PLC)"
-                                        );
-                                        logged_large_jump = true;
-                                    }
-                                }
-                            }
-                            last_seq = Some(_header.sequence);
-
-                            // Decode actual packet : on push directement la slice
-                            // pendant qu'elle est valide (pas de re-emprunt de
-                            // decoder avant la fin du push).
-                            if let Some(pcm) = decoder.decode(payload) {
-                                tokio::task::block_in_place(|| {
-                                    mixer.lock().push_samples(&producer_id, pcm);
-                                });
-                            }
+                        // Échange le buffer plein contre un neuf (pool) et envoie
+                        // le plein au thread de décodage.
+                        let fresh = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
+                        let full = std::mem::replace(&mut buf, fresh);
+                        if tx
+                            .send(DecodeMsg::Packet {
+                                producer_id: producer_id.clone(),
+                                epoch,
+                                recv_instant,
+                                buf: full,
+                            })
+                            .is_err()
+                        {
+                            break; // thread de décodage parti (shutdown)
                         }
                     }
+                    // len == 0 : RTCP filtré / échec SRTP (déjà loggé) → on réutilise buf.
+                    Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            target: "jamodio::recv",
-                            producer = %producer_id,
-                            error = %e,
-                            "UDP recv error"
-                        );
+                        tracing::warn!(target: "jamodio::recv", producer = %producer_id, error = %e, "UDP recv error");
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
@@ -2478,10 +2932,10 @@ async fn recv_decode_task(
         }
     }
 
-    // Sprint S1 — retire l'entrée drift_ppm de ce producer au shutdown du
-    // task. Sans ça, un peer disparu laisse un ppm fantôme dans le hashmap
-    // → le PerfStats publié continuerait à mentionner ce peer mort.
-    net_stats_by_producer.lock().remove(&producer_id);
+    // Message terminal : le thread retire l'état + le stream mixer + l'entrée
+    // net_stats de ce pair, APRÈS notre dernier paquet (ordre garanti — émetteur
+    // unique) → zéro 'unknown stream', zéro ppm fantôme.
+    let _ = tx.send(DecodeMsg::Remove { producer_id, epoch });
 }
 
 // ═══════════════════════════════════════════════════════════════════

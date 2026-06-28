@@ -1,4 +1,4 @@
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use parking_lot::Mutex;
@@ -28,15 +28,22 @@ fn on_playback_err(err: cpal::StreamError) {
     tracing::error!(target: "jamodio::playback", error = %err, "CPAL playback error");
 }
 
-/// Start audio playback on the given device.
-/// Pulls mixed audio from the shared AudioMixer.
-/// Returns `(stream, fixed_buffer)` — le stream doit rester vivant (RAII)
-/// et `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`,
-/// `None` si fallback `BufferSize::Default` (driver auto). Sert à la
-/// télémétrie `outputBufferMs` côté wire (cf. `protocol::Stats`).
-pub fn start_playback(
+/// Construit le stream de playback SANS le démarrer (`build_output_stream` mais
+/// PAS `play()`). Pulls mixed audio from the shared AudioMixer.
+/// Returns `(stream NON démarré, fixed_buffer)` — le stream doit rester vivant
+/// (RAII) et être `play()`-é par le caller (sur le thread COM-STA pour ASIO).
+/// `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`, `None`
+/// si fallback `BufferSize::Default` (driver auto). Sert à la télémétrie
+/// `outputBufferMs` côté wire (cf. `protocol::Stats`).
+///
+/// 0.5.3-4 (Volet B) — `play()` délégué au caller pour construire entrée+sortie
+/// AVANT de démarrer l'une ou l'autre (évite le recreate de buffers ASIO en
+/// cours de route = cold-start muet). Cf. `capture::build_capture_stream`.
+pub fn build_playback_stream(
     device: &Device,
     mixer: Arc<Mutex<AudioMixer>>,
+    // 0.5.3-4 — liveness : +1 par callback de sortie (cf. watchdog cold-start).
+    output_callbacks: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(cpal::Stream, Option<u32>), cpal::BuildStreamError> {
     // Diagnostic SR : on force CPAL en 48 kHz mais si le device préfère un
     // autre rate (Mac casque jack 44.1, BlackHole 2ch, etc.), CoreAudio fait
@@ -94,20 +101,31 @@ pub fn start_playback(
     // Le mixer produit du f32 ; pour les formats entiers (ASIO Int32/Int16) on
     // mixe dans un scratch f32 puis on convertit. Le scratch est capturé par le
     // callback (pas d'alloc par bloc après warmup).
+    // 0.5.3-4 — liveness : +1 par callback de sortie effectivement appelé par le
+    // driver. Si la sortie ne pull pas (cold-start ASIO muet), ce compteur reste
+    // figé → le watchdog (ws_server) le détecte et relance. Un `fetch_add(Relaxed)`
+    // par callback = négligeable sur le hot-path RT.
+    use std::sync::atomic::Ordering;
     let stream = match sample_format {
-        SampleFormat::F32 => device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                mixer.lock().mix_into(data);
-            },
-            on_playback_err,
-            None,
-        )?,
+        SampleFormat::F32 => {
+            let output_callbacks = output_callbacks.clone();
+            device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    mixer.lock().mix_into(data);
+                },
+                on_playback_err,
+                None,
+            )?
+        }
         SampleFormat::I32 => {
+            let output_callbacks = output_callbacks.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                    output_callbacks.fetch_add(1, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);
@@ -120,10 +138,12 @@ pub fn start_playback(
             )?
         }
         SampleFormat::I16 => {
+            let output_callbacks = output_callbacks.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    output_callbacks.fetch_add(1, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);
@@ -145,6 +165,7 @@ pub fn start_playback(
         }
     };
 
-    stream.play().map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)?;
+    // Volet B : on NE démarre PAS ici (cf. doc de fonction). Le caller `play()`
+    // la sortie puis l'entrée, sur le thread COM-STA.
     Ok((stream, fixed_buffer))
 }
