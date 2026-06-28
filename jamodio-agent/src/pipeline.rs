@@ -115,6 +115,106 @@ fn open_output_on_com(
     })
 }
 
+/// 0.5.3-4/-5 — ouvre l'ENTRÉE et (optionnellement) la SORTIE atomiquement sur le
+/// thread COM-STA : on construit les deux streams (tous les buffers ASIO créés)
+/// PUIS on démarre la sortie puis l'entrée. Construire `build_output`
+/// (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers en cours
+/// de route → callbacks muets. Primitif partagé par `start_capture` (1er start)
+/// et `restart_audio_streams` (recréation à chaud après mort des callbacks ASIO).
+///
+/// `build_output=false` ⇒ un playback tourne déjà (re-start à chaud) → on ne
+/// reconstruit que l'entrée, la sortie revient en `OutputOpen::Skipped`.
+///
+/// Tous les drops internes (échec build/play) ont lieu DANS la closure, donc sur
+/// le thread COM-STA (fermeture ASIO sur l'apartment créateur — contrat `SendStream`).
+#[allow(clippy::too_many_arguments)]
+fn open_duplex_on_com(
+    input_id: Option<String>,
+    output_id: Option<String>,
+    build_output: bool,
+    mixer: Arc<Mutex<AudioMixer>>,
+    sample_tx: Sender<Vec<f32>>,
+    capture_drops: Arc<std::sync::atomic::AtomicU64>,
+    capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<BuiltDuplex, CaptureStartError> {
+    crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        // --- ENTRÉE : résolution + build (SANS play) ---
+        let device = match input_id.as_deref() {
+            Some(id) => crate::audio::device::get_input_device(id),
+            None => crate::audio::device::default_input_id()
+                .as_deref()
+                .and_then(crate::audio::device::get_input_device),
+        };
+        let Some(device) = device else {
+            return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
+        };
+        let name = device.name().unwrap_or_default();
+        // Id rapporté : celui demandé, sinon le default résolu ({idx}:{name}).
+        let resolved_id = input_id
+            .unwrap_or_else(|| crate::audio::device::default_input_id().unwrap_or_else(|| name.clone()));
+        let (in_stream, channels, native_sr, input_buf) =
+            crate::audio::capture::build_capture_stream(
+                &device,
+                sample_tx,
+                capture_drops,
+                capture_callbacks,
+            )
+            .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
+
+        // --- SORTIE : résolution + build (SANS play) + play, si nécessaire ---
+        let output = if build_output {
+            let dev = match output_id.as_deref() {
+                Some(id) => crate::audio::device::get_output_device(id),
+                None => crate::audio::device::default_output_device().map(|(d, _)| d),
+            };
+            match dev {
+                None => {
+                    // Sortie introuvable = fatal. `in_stream` (non démarré) est
+                    // droppé ici, sur le thread COM-STA. Erreur claire.
+                    return Err(CaptureStartError::OutputDeviceNotFound { requested: output_id });
+                }
+                Some(d) => {
+                    let out_name = d.name().unwrap_or_default();
+                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks) {
+                        // Démarre la SORTIE d'abord (buffers tous créés).
+                        Ok((out_stream, buffer)) => match out_stream.play() {
+                            Ok(()) => OutputOpen::Opened {
+                                stream: SendStream(out_stream),
+                                buffer,
+                                name: out_name,
+                            },
+                            Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
+                        },
+                        Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
+                    }
+                }
+            }
+        } else {
+            OutputOpen::Skipped
+        };
+
+        // --- Démarre l'ENTRÉE, après la sortie. En cas d'échec, in_stream ET la
+        //     sortie démarrée sont droppés sur ce thread COM-STA. ---
+        in_stream
+            .play()
+            .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
+
+        Ok(BuiltDuplex {
+            input: BuiltInput {
+                stream: SendStream(in_stream),
+                name,
+                resolved_id,
+                channels,
+                native_sr,
+                input_buf,
+            },
+            output,
+        })
+    })
+}
+
 /// Ferme (drop) un `cpal::Stream` **sur le thread COM-STA** (Windows) / inline
 /// (macOS). Indispensable pour ASIO : `IASIO::stop`/`Release` doivent tourner
 /// sur l'apartment qui a créé le driver, sinon corruption COM.
@@ -133,13 +233,6 @@ pub enum CaptureStartError {
     /// Le `requested` est l'id transmis par le browser (None si aucun).
     InputDeviceNotFound { requested: Option<String> },
     OutputDeviceNotFound { requested: Option<String> },
-    /// 0.5.3-4 — démarrage ASIO « à froid » raté de façon répétée : les streams
-    /// se construisent (`build_*_stream` OK) mais leurs callbacks ne s'engagent
-    /// pas (capture/sortie muettes), et le watchdog n'a pas réussi à réparer
-    /// après `attempts` relances auto. On remonte une erreur CLAIRE au browser
-    /// plutôt qu'un studio muet (jamais de fallback silencieux). `attempts` =
-    /// nombre de tentatives `start_capture` effectuées.
-    ColdStartFailed { attempts: u32 },
     /// Erreur technique : SFU, UDP, encoder, etc.
     Other(String),
 }
@@ -152,9 +245,6 @@ impl std::fmt::Display for CaptureStartError {
             }
             Self::OutputDeviceNotFound { requested } => {
                 write!(f, "output device introuvable : {:?}", requested)
-            }
-            Self::ColdStartFailed { attempts } => {
-                write!(f, "démarrage audio ASIO muet après {} tentatives (cold-start)", attempts)
             }
             Self::Other(s) => write!(f, "{}", s),
         }
@@ -192,6 +282,12 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// 0.5.3-5 — clone du `Sender` du canal capture→encoder, conservé pour
+    /// pouvoir RECRÉER le seul stream CPAL d'entrée (sans toucher à l'encodeur,
+    /// au RtpSender, au SRTP ni à la réception) quand le superviseur de liveness
+    /// détecte que les callbacks ASIO se sont arrêtés en cours de session
+    /// (`restart_audio_streams`). `None` hors capture.
+    capture_sample_tx: Option<Sender<Vec<f32>>>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
@@ -597,6 +693,7 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            capture_sample_tx: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
             decode_thread: None,
@@ -1015,6 +1112,10 @@ impl PipelineState {
 
         // 4. Channels
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
+        // 0.5.3-5 — on conserve un clone du Sender pour pouvoir RECRÉER le stream
+        // d'entrée (sans relancer l'encodeur) si les callbacks ASIO meurent en
+        // cours de session (cf. `restart_audio_streams`).
+        self.capture_sample_tx = Some(sample_tx.clone());
         let input_rms = self.input_rms.clone();
         // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
         // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
@@ -1049,95 +1150,17 @@ impl PipelineState {
         //    en cours → callbacks muets (cold-start raté). En créant tous les
         //    buffers avant de démarrer, on évite ce recreate. La sortie n'est
         //    (re)construite que si aucun playback ne tourne déjà (cold path).
-        let capture_drops_for_callback = self.perfstats.capture_drops.clone();
-        let capture_callbacks_for_callback = self.perfstats.capture_callbacks.clone();
-        let output_callbacks_for_callback = self.perfstats.output_callbacks.clone();
         let need_output = self.playback_stream.is_none();
-        let output_id = self.output_device_id.clone();
-        let mixer_for_output = self.mixer.clone();
-        let built = crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
-            use cpal::traits::{DeviceTrait, StreamTrait};
-            // --- ENTRÉE : résolution + build (SANS play) ---
-            let device = match input_id.as_deref() {
-                Some(id) => crate::audio::device::get_input_device(id),
-                None => crate::audio::device::default_input_id()
-                    .as_deref()
-                    .and_then(crate::audio::device::get_input_device),
-            };
-            let Some(device) = device else {
-                return Err(CaptureStartError::InputDeviceNotFound { requested: input_id });
-            };
-            let name = device.name().unwrap_or_default();
-            // Id rapporté : celui demandé, sinon le default résolu ({idx}:{name}).
-            let resolved_id = input_id
-                .unwrap_or_else(|| crate::audio::device::default_input_id().unwrap_or_else(|| name.clone()));
-            let (in_stream, channels, native_sr, input_buf) =
-                crate::audio::capture::build_capture_stream(
-                    &device,
-                    sample_tx,
-                    capture_drops_for_callback,
-                    capture_callbacks_for_callback,
-                )
-                .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
-
-            // --- SORTIE : résolution + build (SANS play) + play, si nécessaire ---
-            // Tous les drops ci-dessous (in_stream, out_stream) se font SUR le
-            // thread COM-STA car ils ont lieu DANS cette closure → fermeture ASIO
-            // sur l'apartment qui a créé le driver (contrat `SendStream`).
-            let output = if need_output {
-                let dev = match output_id.as_deref() {
-                    Some(id) => crate::audio::device::get_output_device(id),
-                    None => crate::audio::device::default_output_device().map(|(d, _)| d),
-                };
-                match dev {
-                    None => {
-                        // Sortie introuvable = fatal. `in_stream` (non démarré)
-                        // est droppé ici, sur le thread COM-STA. Erreur claire.
-                        return Err(CaptureStartError::OutputDeviceNotFound { requested: output_id });
-                    }
-                    Some(d) => {
-                        let out_name = d.name().unwrap_or_default();
-                        match crate::audio::playback::build_playback_stream(
-                            &d,
-                            mixer_for_output,
-                            output_callbacks_for_callback,
-                        ) {
-                            // Démarre la SORTIE d'abord (buffers tous créés).
-                            Ok((out_stream, buffer)) => match out_stream.play() {
-                                Ok(()) => OutputOpen::Opened {
-                                    stream: SendStream(out_stream),
-                                    buffer,
-                                    name: out_name,
-                                },
-                                Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
-                            },
-                            Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
-                        }
-                    }
-                }
-            } else {
-                OutputOpen::Skipped
-            };
-
-            // --- Démarre l'ENTRÉE, après la sortie ---
-            // En cas d'échec ici, in_stream ET la sortie démarrée (`output`)
-            // sont droppés sur ce thread COM-STA (fermeture ASIO correcte).
-            in_stream
-                .play()
-                .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
-
-            Ok(BuiltDuplex {
-                input: BuiltInput {
-                    stream: SendStream(in_stream),
-                    name,
-                    resolved_id,
-                    channels,
-                    native_sr,
-                    input_buf,
-                },
-                output,
-            })
-        })?;
+        let built = open_duplex_on_com(
+            input_id,
+            self.output_device_id.clone(),
+            need_output,
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+        )?;
         let BuiltDuplex { input: built_input, output: built_output } = built;
         let in_name = built_input.name;
         let resolved_input_id = built_input.resolved_id;
@@ -1271,6 +1294,80 @@ impl PipelineState {
         Ok((local_port, agent_srtp, info))
     }
 
+    /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
+    /// Lu par le superviseur de liveness (`audio_liveness_supervisor`).
+    pub fn has_active_capture_stream(&self) -> bool {
+        self.capture_stream.is_some()
+    }
+
+    /// 0.5.3-5 — RECRÉE uniquement les streams CPAL (entrée + sortie) sans toucher
+    /// au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception, mixer
+    /// avec ses streams pairs + self-monitor). Appelé par le superviseur de
+    /// liveness quand les callbacks ASIO se sont arrêtés EN COURS de session
+    /// (driver Focusrite qui émet un `kAsioResetRequest` que CPAL n'honore pas →
+    /// le driver halte ses callbacks silencieusement ; recréer les streams = la
+    /// réinitialisation ASIO que la spec impose, et que CPAL omet).
+    ///
+    /// La nouvelle entrée se re-branche sur le MÊME canal `sample_tx` → l'encodeur
+    /// continue sans rien savoir. Aucun re-handshake SFU (le socket/port/SRTP TX
+    /// sont préservés) → pas de coupure réseau, juste un trou audio de ~100-300 ms.
+    ///
+    /// No-op (Ok) hors état `Capturing`. Erreur claire si la recréation échoue
+    /// (le superviseur la borne et remonte au browser — jamais de silence).
+    pub fn restart_audio_streams(&mut self) -> Result<(), String> {
+        if !matches!(self.state, AgentState::Capturing) || self.capture_stream.is_none() {
+            return Ok(());
+        }
+        let Some(sample_tx) = self.capture_sample_tx.clone() else {
+            return Err("restart_audio_streams: pas de canal capture (incohérent)".into());
+        };
+
+        // Ferme les deux streams CPAL sur le thread COM-STA (ASIO stop/dispose sur
+        // l'apartment créateur) AVANT de reconstruire (ASIO mono-client).
+        close_stream_on_com(self.capture_stream.take());
+        close_stream_on_com(self.playback_stream.take());
+        self.output_buffer_samples = None;
+
+        // Reconstruit entrée + sortie (les deux, le playback ayant été fermé) via
+        // le primitif partagé : build des deux puis play sortie→entrée.
+        let built = open_duplex_on_com(
+            self.input_device_id.clone(),
+            self.output_device_id.clone(),
+            true, // playback fermé ci-dessus → on le reconstruit
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+        )
+        .map_err(|e| format!("recréation des streams audio: {}", e))?;
+
+        let BuiltDuplex { input, output } = built;
+        self.input_buffer_samples = input.input_buf;
+        self.capture_stream = Some(input.stream);
+        match output {
+            OutputOpen::Opened { stream, buffer, name } => {
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+                tracing::info!(
+                    target: "jamodio::pipeline",
+                    device = %name,
+                    "streams audio recréés (recovery liveness ASIO)"
+                );
+            }
+            // Sortie non rétablie : l'entrée prime (la capture repart), le
+            // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
+            OutputOpen::BuildFailed(e) => tracing::warn!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "recréation sortie échouée — playback désactivé (capture rétablie)"
+            ),
+            OutputOpen::NotFound => return Err("output device introuvable à la recréation".into()),
+            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+        }
+        Ok(())
+    }
+
     /// Add a receive pipeline for one remote stream.
     /// `sfu_srtp` : clés du SFU pour ce flux (déchiffrement SFU → agent).
     /// Returns `(local_port, agent_srtp)` — clés agent pour ce transport,
@@ -1379,6 +1476,8 @@ impl PipelineState {
         // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
         // tourner sur l'apartment qui a créé le driver). macOS : inline.
         close_stream_on_com(self.capture_stream.take());
+        // L'encodeur va s'arrêter → le canal capture n'a plus de consommateur.
+        self.capture_sample_tx = None;
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }

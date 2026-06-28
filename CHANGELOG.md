@@ -6,6 +6,45 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.3-5] — 2026-06-28
+
+> **Pré-release — vraie cause du « son qui coupe » Windows trouvée + auto-recovery.**
+> Les logs PC de la 0.5.3-4 ont infirmé le diagnostic « cold-start » : la capture
+> démarre PARFAITEMENT, puis **~21 s plus tard les deux callbacks ASIO meurent
+> d'un coup** (`capture_cb`/`output_cb` → 0, `pipeline_count` → 0) alors que
+> tokio/réseau/décodage continuent. **Cause racine prouvée par le code :** le
+> driver Focusrite émet un `kAsioResetRequest` (resync horloge/buffer USB) que
+> **CPAL 0.15 n'honore pas** (aucun callback de message ASIO enregistré) → la
+> spec impose `ASIOStop→dispose→réinit`, CPAL l'omet → le driver halte ses
+> callbacks en silence. Un restart (ou un rebranchement) recrée les streams = la
+> réinit manquante. macOS/CoreAudio n'a pas ce protocole → immunisé.
+
+### Added
+- **Superviseur de liveness continu (`audio_liveness_supervisor`).** Observe
+  `capture_callbacks`/`output_callbacks` toutes les 500 ms ; si un compteur se
+  fige > 1,5 s en capture active → callbacks ASIO morts → **recréation auto**.
+  Couvre la mort à ~21 s, un cold-start qui ne démarrerait jamais, et toute
+  autre mort silencieuse. Borné (`MAX_RECOVERIES`), compteur remis à zéro dès
+  que les callbacks repartent ; au-delà → `stop_all` + `CaptureError` claire au
+  browser. **No-op sur macOS** (les callbacks ne s'arrêtent pas).
+- **`PipelineState::restart_audio_streams()`** : recrée UNIQUEMENT les streams
+  CPAL (entrée+sortie) sur le thread COM-STA en **gardant l'encodeur, le
+  RtpSender, le SRTP, le SFU et la réception** (la nouvelle entrée se re-branche
+  sur le même canal capture→encoder). → **pas de re-handshake SFU**, juste un
+  trou audio de ~100-300 ms au lieu d'un studio muet définitif.
+
+### Changed
+- Le watchdog cold-start 700 ms de la 0.5.3-4 (qui ciblait le mauvais mode
+  d'échec) est **remplacé** par le superviseur continu — mêmes compteurs, zéro
+  double machinerie. Le primitif d'ouverture des streams est factorisé
+  (`open_duplex_on_com`) et réutilisé par le start ET la recréation.
+
+### Notes
+- Fix racine amont (brancher le vrai `kAsioResetRequest` pour une recovery
+  *proactive*, sans le trou de ~1 s) noté pour plus tard : impose un patch de
+  cpal/asio-sys (cpal n'expose pas son `Driver`). Le superviseur continu rend ce
+  patch optionnel.
+
 ## [0.5.3-4] — 2026-06-28
 
 > **Pré-release — fiabilité : fix démarrage ASIO « à froid » (PC Windows).**

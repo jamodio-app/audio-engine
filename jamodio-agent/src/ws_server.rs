@@ -557,6 +557,18 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // stats mixer (underruns, drift_drops, target_ms). Construit
     // `AgentMessage::PerfStats` et l'envoie. Skip l'émission si encoder
     // idle ET aucun peer actif (= rien d'intéressant à reporter).
+    // 0.5.3-5 — superviseur de liveness des callbacks audio (recovery ASIO).
+    // Gaté sur le client externe (comme perfstats) → une seule instance par
+    // agent ; la webview interne ne pilote pas de capture.
+    let liveness_pipeline = handle.pipeline.clone();
+    let liveness_tx = out_tx.clone();
+    let liveness_task = tokio::spawn(async move {
+        if is_internal {
+            return;
+        }
+        audio_liveness_supervisor(liveness_pipeline, liveness_tx).await;
+    });
+
     let perfstats_pipeline = handle.pipeline.clone();
     let perfstats_tx = out_tx.clone();
     let perfstats_start = Instant::now();
@@ -1148,6 +1160,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
     levels_task.abort();
     perfstats_task.abort();
+    liveness_task.abort();
     send_task.abort();
     shutdown_task.abort();
 
@@ -1302,119 +1315,146 @@ async fn try_lock_pipeline(
     }
 }
 
-/// 0.5.3-4 — démarre la capture avec un WATCHDOG de liveness des callbacks ASIO
-/// « à froid ».
+/// 0.5.3-5 — SUPERVISEUR de liveness des callbacks audio (ASIO/CoreAudio).
 ///
-/// # Pourquoi (bug PC 28/06)
-/// Au 1er `StartCapture` sur certains drivers ASIO full-duplex (Focusrite 48k),
-/// les streams se construisent (`build_*_stream` OK) mais NI le callback
-/// d'entrée NI celui de sortie ne s'engagent : capture muette (instrument
-/// n'entre pas) + sortie qui ne pull pas (jitter buffer overflow en cascade).
-/// Un reconnect manuel (stop + nouveau start, driver « chaud ») répare. On
-/// automatise donc cette réparation : on observe les compteurs de callbacks et,
-/// s'ils ne bougent pas, on relance la capture tout seul — l'utilisateur n'a
-/// plus jamais à toggler MIDI/AUDIO.
+/// # Pourquoi (bug PC 28/06, cause racine prouvée)
+/// Sur certains drivers ASIO full-duplex (Focusrite), ~21 s après un 1er start
+/// « à froid », le driver émet un `kAsioResetRequest` (resync horloge/buffer USB)
+/// que **CPAL 0.15 n'honore pas** (il n'enregistre aucun callback de message
+/// ASIO). La spec impose alors `ASIOStop→dispose→réinit` ; CPAL ne le fait pas →
+/// le driver **arrête silencieusement ses deux callbacks** (entrée+sortie). La
+/// pipeline réseau/tokio survit (recv OK), mais la capture ne produit plus rien
+/// et la sortie ne pull plus le mixer (overflow peer en cascade). Un restart
+/// manuel (ou un rebranchement) recrée les streams = la réinit que CPAL a omise.
+///
+/// Ce superviseur AUTOMATISE cette réinit : il observe les compteurs de callbacks
+/// (`capture_callbacks`/`output_callbacks`) en continu ; si l'un se fige > ~1,5 s
+/// en état `Capturing`, il appelle `restart_audio_streams()` (recrée UNIQUEMENT
+/// les streams CPAL, garde encodeur/SFU/réseau → pas de re-handshake, ~100-300 ms
+/// de trou). Couvre la cause ASIO-reset ET toute autre mort silencieuse, et un
+/// cold-start qui ne démarrerait jamais.
 ///
 /// # Garde-fous (règles Jamodio)
-/// - Relance **bornée** (`MAX_ATTEMPTS`) → pas de boucle de thrash.
-/// - Si la réparation échoue après les essais → `CaptureStartError::ColdStartFailed`
-///   = erreur CLAIRE remontée au browser (JAMAIS un silence/fallback).
-/// - Sur Mac/Linux les callbacks démarrent toujours → la 1re fenêtre valide,
-///   no-op, zéro régression (0 relance).
-///
-/// Le lock `PipelineState` est relâché pendant la fenêtre d'observation pour ne
-/// pas bloquer heartbeat/perfstats ; les compteurs sont des `Arc<AtomicU64>`
-/// lisibles sans lock.
-async fn start_capture_with_watchdog(
-    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
-    ssrc: u32,
-    sfu_ip: String,
-    sfu_port: u16,
-    channel_index: Option<u8>,
-    srtp_parameters: jamodio_audio_core::net::srtp::SrtpParameters,
-) -> Result<
-    (u16, jamodio_audio_core::net::srtp::SrtpParameters, crate::pipeline::CaptureStartedInfo),
-    crate::pipeline::CaptureStartError,
-> {
-    use crate::pipeline::CaptureStartError;
+/// - Recréation **bornée** (`MAX_RECOVERIES` consécutives) → pas de thrash. Le
+///   compteur se remet à zéro dès que les callbacks repartent.
+/// - Au-delà → `stop_all` + `CaptureError` CLAIRE au browser (JAMAIS un silence).
+/// - macOS/Linux : les callbacks ne s'arrêtent pas → jamais de recovery, no-op.
+async fn audio_liveness_supervisor(
+    pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
+) {
     use std::sync::atomic::Ordering;
+    // Cadence d'échantillonnage des compteurs.
+    const TICK_MS: u64 = 500;
+    // Flatline confirmé si aucun callback pendant ce délai en capture active.
+    // ≫ période ASIO (2,7 ms) et > le démarrage d'un stream sain → faux positif
+    // quasi impossible (un stream vivant produit ~185 callbacks en 500 ms).
+    const FLATLINE_MS: u128 = 1500;
+    // Recréations consécutives tolérées avant d'abandonner (erreur au browser).
+    const MAX_RECOVERIES: u32 = 4;
 
-    // Fenêtre d'observation : largement > plusieurs périodes de callback (ASIO
-    // 128@48k ≈ 2,7 ms → un démarrage SAIN produit des centaines de callbacks en
-    // 700 ms ; un cold-start muet en produit 0 → faux positif quasi impossible).
-    const WATCHDOG_MS: u64 = 700;
-    // Borne dure du nombre de tentatives `start_capture` (anti-thrash).
-    const MAX_ATTEMPTS: u32 = 3;
-    // Court répit entre `stop_all` et la relance (laisse le driver ASIO relâcher).
-    const RETRY_GAP_MS: u64 = 120;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Compteurs de liveness — clonés une fois, lisibles sans le lock pipeline.
-    let (cap_counter, out_counter) = {
-        let Some(pl) = try_lock_pipeline(pipeline).await else {
-            return Err(CaptureStartError::Other("agent overloaded".into()));
-        };
-        (
-            pl.perfstats.capture_callbacks.clone(),
-            pl.perfstats.output_callbacks.clone(),
-        )
-    };
+    // État inter-ticks.
+    let mut was_capturing = false;
+    let mut prev_cap = 0u64;
+    let mut prev_out = 0u64;
+    let mut last_progress = Instant::now();
+    let mut recoveries = 0u32;
 
-    for attempt in 1..=MAX_ATTEMPTS {
-        // 1) start_capture sous le lock, puis on RELÂCHE pour la fenêtre d'obs.
-        let started = {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return Err(CaptureStartError::Other("agent overloaded".into()));
-            };
-            pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters.clone())
-                .await
-        };
-        let ok = match started {
-            Ok(ok) => ok,
-            // Échec de build (device introuvable, driver occupé…) = PAS un
-            // cold-start muet : on remonte tel quel, un retry ne changerait rien.
-            Err(e) => return Err(e),
-        };
+    loop {
+        interval.tick().await;
+        let mut pl = pipeline.lock().await;
 
-        // 2) Snapshot APRÈS le start (lock relâché) + fenêtre d'observation.
-        let cap0 = cap_counter.load(Ordering::Relaxed);
-        let out0 = out_counter.load(Ordering::Relaxed);
-        tokio::time::sleep(std::time::Duration::from_millis(WATCHDOG_MS)).await;
-        let cap_live = cap_counter.load(Ordering::Relaxed) > cap0;
-        let out_live = out_counter.load(Ordering::Relaxed) > out0;
+        let capturing =
+            matches!(pl.state, AgentState::Capturing) && pl.has_active_capture_stream();
+        let cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+        let out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
 
-        if cap_live && out_live {
-            if attempt > 1 {
+        // Hors capture (ou transition) : on (ré)initialise la base et on attend.
+        if !capturing || !was_capturing {
+            was_capturing = capturing;
+            recoveries = 0;
+            prev_cap = cap;
+            prev_out = out;
+            last_progress = Instant::now();
+            continue;
+        }
+
+        // Les DEUX compteurs avancent ⇒ session saine.
+        if cap > prev_cap && out > prev_out {
+            prev_cap = cap;
+            prev_out = out;
+            last_progress = Instant::now();
+            if recoveries > 0 {
                 tracing::info!(
                     target: "jamodio::ws",
-                    attempt,
-                    "cold-start ASIO réparé : callbacks d'entrée+sortie actifs après relance auto"
+                    after_recoveries = recoveries,
+                    "callbacks audio rétablis — recovery liveness réussie"
                 );
+                recoveries = 0;
             }
-            return Ok(ok);
+            continue;
         }
 
-        // 3) Cold-start raté : au moins un callback est resté muet sur 700 ms.
+        // Au moins un compteur est figé. On mémorise les valeurs et on attend que
+        // le flatline dépasse le seuil avant d'agir (anti faux-positif).
+        prev_cap = cap;
+        prev_out = out;
+        if last_progress.elapsed().as_millis() < FLATLINE_MS {
+            continue;
+        }
+
+        // Flatline confirmé : les callbacks ASIO sont morts en cours de session.
+        if recoveries >= MAX_RECOVERIES {
+            tracing::error!(
+                target: "jamodio::ws",
+                recoveries,
+                "callbacks audio toujours morts après recovery — arrêt + erreur au browser"
+            );
+            pl.stop_all();
+            drop(pl);
+            let _ = out_tx
+                .send(AgentMessage::CaptureError {
+                    reason: "asio-callbacks-stalled".into(),
+                    requested_device: None,
+                    detail: Some(
+                        "le moteur audio ASIO a cessé de répondre — reconnectez la session ou rebranchez l'interface".into(),
+                    ),
+                })
+                .await;
+            // On cesse de superviser jusqu'à une nouvelle capture.
+            was_capturing = false;
+            recoveries = 0;
+            continue;
+        }
+
+        recoveries += 1;
         tracing::warn!(
             target: "jamodio::ws",
-            attempt,
-            max_attempts = MAX_ATTEMPTS,
-            capture_live = cap_live,
-            output_live = out_live,
-            window_ms = WATCHDOG_MS,
-            "cold-start ASIO : callback(s) muet(s) — stop_all + relance auto de la capture"
+            recovery = recoveries,
+            max = MAX_RECOVERIES,
+            flatline_ms = last_progress.elapsed().as_millis() as u64,
+            "callbacks audio figés (driver ASIO arrêté ?) — recréation des streams"
         );
-
-        // stop_all = exactement ce que fait le reconnect manuel qui débloque
-        // (ferme entrée+sortie+décodage → la relance reconstruit tout à froid).
-        if let Some(mut pl) = try_lock_pipeline(pipeline).await {
-            pl.stop_all();
-        }
-        if attempt < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(RETRY_GAP_MS)).await;
+        match pl.restart_audio_streams() {
+            Ok(()) => {
+                // Repart sur une base propre + fenêtre de grâce (les callbacks
+                // recréés mettent quelques ms à démarrer).
+                prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+                prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+                last_progress = Instant::now();
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "jamodio::ws",
+                    error = %e,
+                    "recréation des streams audio échouée"
+                );
+            }
         }
     }
-
-    Err(CaptureStartError::ColdStartFailed { attempts: MAX_ATTEMPTS })
 }
 
 async fn handle_message(
@@ -1460,29 +1500,21 @@ async fn handle_message(
                 ?channel_index,
                 "StartCapture"
             );
+            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            };
             // Le browser passe l'id du device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
             // L'id est strict ({idx}:{name}) — pas de fuzzy, pas de fallback.
             // ⚠ Bug fix : set_input_device() (pas select_devices) pour ne pas
             // écraser l'output_device_id précédemment configuré.
             if input_device.is_some() {
-                let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                    return vec![AgentMessage::Error { message: "agent overloaded".into() }];
-                };
                 pl.set_input_device(input_device.clone());
             }
-            // 0.5.3-4 — WATCHDOG cold-start ASIO : start_capture + vérification de
-            // liveness des callbacks (relance auto si muet). Cf. la fonction.
-            match start_capture_with_watchdog(
-                pipeline,
-                ssrc,
-                sfu_ip.clone(),
-                sfu_port,
-                channel_index,
-                srtp_parameters,
-            )
-            .await
-            {
+            // La liveness des callbacks ASIO (cold-start ET mort en cours de
+            // session) est surveillée en continu par `audio_liveness_supervisor`,
+            // qui recrée les streams au besoin (cf. la fonction).
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser
@@ -1523,24 +1555,6 @@ async fn handle_message(
                         reason: "output-device-not-found".into(),
                         requested_device: requested,
                         detail: None,
-                    }]
-                }
-                Err(crate::pipeline::CaptureStartError::ColdStartFailed { attempts }) => {
-                    // 0.5.3-4 — le watchdog a relancé `attempts` fois mais les
-                    // callbacks ASIO sont restés muets. On remonte une erreur
-                    // CLAIRE au browser (jamais de studio muet silencieux).
-                    tracing::error!(
-                        target: "jamodio::ws",
-                        attempts,
-                        "StartCapture: cold-start ASIO non réparé après relances auto — erreur remontée au browser"
-                    );
-                    vec![AgentMessage::CaptureError {
-                        reason: "asio-coldstart-failed".into(),
-                        requested_device: input_device,
-                        detail: Some(format!(
-                            "démarrage audio ASIO muet après {} tentatives — réessayer ou vérifier le pilote/panneau ASIO",
-                            attempts
-                        )),
                     }]
                 }
                 Err(crate::pipeline::CaptureStartError::Other(msg)) => {
