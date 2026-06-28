@@ -31,8 +31,8 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   CPAL/s (`capture_cb_per_sec`/`output_cb_per_sec`).
 
 ### Notes
-- Émission ET réception sont désormais **toutes deux en temps-réel** (parité
-  JackTrip/SonoBus/Jamulus côté threads RT).
+- Émission ET réception sont désormais **toutes deux en temps-réel** (tous les
+  étages audio — capture, traitement, encodage, décodage, envoi — sur threads RT).
 - Le watchdog « cold-start » 700 ms (pré-release 0.5.3-4) a été **remplacé** par
   le superviseur de liveness continu : le diagnostic initial était faux (les
   callbacks ASIO démarrent bien puis meurent ~21 s plus tard, ce n'est pas un
@@ -743,7 +743,7 @@ Refactor en vraie source de vérité :
   callback CPAL).
 - `ws_server.rs` : recalcule séparément `input_buf_ms_est` et
   `output_buf_ms_est`, avec fallback estimé 10 ms (= 480 samples / 48,
-  valeur conservatrice WASAPI shared, alignée FarPlay / Jamulus) si
+  valeur conservatrice typique du mode WASAPI shared) si
   `Option` est `None`. `totalLatencyMs` utilise désormais
   `input + opus_enc + opus_dec + jitter + output` au lieu du double-input
   hérité — corrige le calcul faux sur Windows shared.
