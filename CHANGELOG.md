@@ -6,164 +6,37 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
-## [0.5.3-5] — 2026-06-28
+## [0.5.3] — 2026-06-28
 
-> **Pré-release — vraie cause du « son qui coupe » Windows trouvée + auto-recovery.**
-> Les logs PC de la 0.5.3-4 ont infirmé le diagnostic « cold-start » : la capture
-> démarre PARFAITEMENT, puis **~21 s plus tard les deux callbacks ASIO meurent
-> d'un coup** (`capture_cb`/`output_cb` → 0, `pipeline_count` → 0) alors que
-> tokio/réseau/décodage continuent. **Cause racine prouvée par le code :** le
-> driver Focusrite émet un `kAsioResetRequest` (resync horloge/buffer USB) que
-> **CPAL 0.15 n'honore pas** (aucun callback de message ASIO enregistré) → la
-> spec impose `ASIOStop→dispose→réinit`, CPAL l'omet → le driver halte ses
-> callbacks en silence. Un restart (ou un rebranchement) recrée les streams = la
-> réinit manquante. macOS/CoreAudio n'a pas ce protocole → immunisé.
+> **Release temps-réel Windows : réception + émission RT (Windows jouable) +
+> auto-recovery des callbacks ASIO. Synthèse des pré-releases 0.5.3-1 → 0.5.3-5.**
 
 ### Added
-- **Superviseur de liveness continu (`audio_liveness_supervisor`).** Observe
-  `capture_callbacks`/`output_callbacks` toutes les 500 ms ; si un compteur se
-  fige > 1,5 s en capture active → callbacks ASIO morts → **recréation auto**.
-  Couvre la mort à ~21 s, un cold-start qui ne démarrerait jamais, et toute
-  autre mort silencieuse. Borné (`MAX_RECOVERIES`), compteur remis à zéro dès
-  que les callbacks repartent ; au-delà → `stop_all` + `CaptureError` claire au
-  browser. **No-op sur macOS** (les callbacks ne s'arrêtent pas).
-- **`PipelineState::restart_audio_streams()`** : recrée UNIQUEMENT les streams
-  CPAL (entrée+sortie) sur le thread COM-STA en **gardant l'encodeur, le
-  RtpSender, le SRTP, le SFU et la réception** (la nouvelle entrée se re-branche
-  sur le même canal capture→encoder). → **pas de re-handshake SFU**, juste un
-  trou audio de ~100-300 ms au lieu d'un studio muet définitif.
-
-### Changed
-- Le watchdog cold-start 700 ms de la 0.5.3-4 (qui ciblait le mauvais mode
-  d'échec) est **remplacé** par le superviseur continu — mêmes compteurs, zéro
-  double machinerie. Le primitif d'ouverture des streams est factorisé
-  (`open_duplex_on_com`) et réutilisé par le start ET la recréation.
-
-### Notes
-- Fix racine amont (brancher le vrai `kAsioResetRequest` pour une recovery
-  *proactive*, sans le trou de ~1 s) noté pour plus tard : impose un patch de
-  cpal/asio-sys (cpal n'expose pas son `Driver`). Le superviseur continu rend ce
-  patch optionnel.
-
-## [0.5.3-4] — 2026-06-28
-
-> **Pré-release — fiabilité : fix démarrage ASIO « à froid » (PC Windows).**
-> Au 1er `StartCapture` sur certains drivers ASIO full-duplex (Focusrite 48k),
-> les streams se construisaient mais NI le callback d'entrée NI celui de sortie
-> ne s'engageaient : capture muette (l'instrument n'entrait pas) + sortie qui ne
-> pull pas (jitter buffer overflow en cascade → ni peers ni self-monitor). Un
-> reconnect manuel (driver « chaud ») réparait — il fallait toggler MIDI/AUDIO.
-> Cause : `build_output_stream` (ASIOCreateBuffers) appelé APRÈS un `play()`
-> d'entrée recréait les buffers ASIO en cours de route → callbacks muets.
-
-### Added
-- **Watchdog de liveness cold-start ASIO (Volet A — auto-réparation).** Deux
-  compteurs `capture_callbacks`/`output_callbacks` (`AtomicU64`, +1 par callback
-  CPAL d'entrée/sortie). Après un `start_capture`, le handler `StartCapture`
-  observe ~700 ms : si un compteur reste à 0 = cold-start muet → `warn` clair +
-  `stop_all` + relance auto (bornée à 3 essais). L'utilisateur n'a **plus jamais**
-  à toggler MIDI/AUDIO ; il ne voit qu'un court délai au lieu d'un studio muet.
-  Sur macOS/Linux les callbacks démarrent toujours → la 1re fenêtre valide,
-  **no-op, zéro régression, zéro relance**.
-- Si la réparation échoue après les 3 essais → `CaptureError` EXPLICITE au
-  browser (`reason: "asio-coldstart-failed"`) — **jamais de silence ni de
-  fallback**.
-- Débit de callbacks CPAL par seconde dans les perfstats
-  (`capture_cb_per_sec`/`output_cb_per_sec`, ≈370/s sain, 0 = muet).
-
-### Changed
-- **Ordre build/play des streams CPAL (Volet B — fix racine).** On construit
-  désormais l'entrée **et** la sortie (tous les buffers ASIO créés) **avant** de
-  démarrer l'une ou l'autre, dans un seul passage COM-STA, sortie d'abord. Évite
-  le recreate de buffers ASIO en cours de route (cause du cold-start muet). Le
-  watchdog (Volet A) reste le filet pour un driver qui raterait malgré tout.
-  Sur CoreAudio « build des deux puis play » est inoffensif (aucune régression
-  attendue).
+- **Décodage de réception en temps-réel** (un thread RT partagé, MMCSS Windows /
+  QoS `USER_INTERACTIVE` macOS) : corrige le « 60 ms injouable » Windows — le
+  décodage ne se faisait plus préempter, le jitter buffer du pair ne se collait
+  plus au plafond 40 ms. Validé PC↔Mac en internet réel.
+- **Émission en temps-réel** : chiffrement SRTP + `send_to` fusionnés dans le
+  thread d'encode RT (suppression de la tâche UDP tokio + du hop) → émission RT,
+  zéro gigue d'égression. `WouldBlock` → drop (PLC) plutôt que staller le RT.
+- **Auto-recovery de la mort des callbacks audio** (`audio_liveness_supervisor`
+  + `restart_audio_streams`) : surveille en continu les callbacks CPAL ; s'ils
+  se figent en cours de session (driver ASIO qui émet un `kAsioResetRequest` non
+  honoré par CPAL → callbacks haltés en silence), recrée UNIQUEMENT les streams
+  CPAL en gardant encodeur/SFU/réseau (pas de re-handshake, ~100-300 ms de trou).
+  Borné, erreur claire au browser si épuisé. Générique (toute interface), no-op
+  macOS. Recovery validée sur PC (1 trou de ~1 s auto-résorbé).
+- **Instrumentation déterministe** : `emit_burst` (frames Opus/bloc), taille du
+  1er callback, latence du chemin de réception `recv_path`, débit de callbacks
+  CPAL/s (`capture_cb_per_sec`/`output_cb_per_sec`).
 
 ### Notes
-- Le throttle de logs « jitter buffer overflow » (power-of-two) borne déjà le
-  flood pendant la fenêtre de réparation (~700 ms) — Volet C couvert par
-  l'existant.
-
-## [0.5.3-3] — 2026-06-27
-
-> **Pré-release — émission en temps-réel (symétrie avec le fix réception 0.5.3-2).**
-> La tâche UDP d'émission tournait sur le pool tokio en priorité NORMALE — le
-> dernier maillon audio non-RT. Sous charge Windows elle se faisait préempter →
-> gigue d'égression (le récepteur distant devait l'absorber).
-
-### Changed
-- **Chiffrement SRTP + `send_to` fusionnés dans le thread d'encode (RT/MMCSS)** :
-  `RtpSender::send_blocking` (non-bloquant via `try_send_to`) appelé directement
-  après l'encodage Opus. **Suppression de la tâche UDP tokio + du channel RTP** →
-  émission RT, zéro hop, zéro gigue d'égression. Sur `WouldBlock` (buffer noyau
-  plein, rarissime) la frame est droppée (concealée par le PLC récepteur) plutôt
-  que de staller le thread RT — jamais de pacing (envoi immédiat, `send_path` le
-  prouve).
-- Code allégé : une tâche async + un channel + un hop en moins.
-
-### Notes
-- `send_path_latency` mesure désormais le coût protect+send_to (doit lire ~0).
-  Nouveau compteur de drops `WouldBlock` (doit rester à 0).
-- Émission et réception sont maintenant **toutes deux en temps-réel** (parité
-  avec JackTrip/SonoBus/Jamulus côté threads RT).
-
-## [0.5.3-2] — 2026-06-27
-
-> **Pré-release — fix « injouable Windows » : décodage de réception en temps-réel.**
-> Cause racine (tests réels PC↔Mac + triple revue senior) : `recv_decode_task`
-> décodait sur le pool tokio en priorité NORMALE, alors que l'émission est RT
-> (MMCSS). Sur Windows l'ordonnanceur le préempte ~10-15 ms → le jitter buffer
-> n'est pas réalimenté → underruns → la cible se colle au plafond 40 ms
-> (+25 ms de latence). macOS masquait le trou (scheduler clément).
-
-### Changed
-- **Réception scindée en 2** (symétrie avec l'émission) : une tâche I/O async par
-  pair (`recv_io_task` : recv UDP + horodatage d'arrivée + comedia punch +
-  idle-timeout) qui forwarde les paquets bruts à **UN thread de décodage RT
-  unique partagé** (`decode_rt_loop`) via un MPSC borné + pool de buffers (zéro
-  alloc/dealloc sur le thread RT). Le décodage Opus + PLC + push jitter buffer
-  tournent désormais en temps-réel.
-- **Promotion RT « event-driven »** (`promote_thread_for_audio_recv`) : MMCSS
-  « Pro Audio » sur Windows ; sur macOS **QoS `USER_INTERACTIVE` seul** — PAS le
-  workgroup CoreAudio (un thread piloté par l'arrivée réseau n'a pas la deadline
-  I/O du cycle audio ; le faire rejoindre le workgroup le sur-peuplerait et
-  dégraderait l'émission). Garantie anti-régression macOS.
-- Un seul thread de décodage partagé (pas thread-par-stream) → pas de
-  sur-souscription MMCSS, et **réduit** la contention du mutex mixer vs l'ancien
-  modèle (1 écrivain au lieu de N tâches).
-
-### Added
-- **Métrique `recv_path`** (perfstats : `recv_path_p50/p99/max_ms`) : latence
-  arrivée réseau → juste avant push mixer. Miroir de `send_path`. Doit lire
-  ~0,1-0,5 ms ; un p99 qui grimpe = décodage préempté.
-- **Idle-timeout 8 s** par pair : nettoie les producteurs fantômes (flux non
-  fermés après reconnexion). Sûr car Opus est en CBR + DTX OFF (paquets continus).
-- **Epoch de génération** par io task : un re-add du même `producer_id` ne peut
-  plus voir un vieux `Remove` supprimer le stream re-créé (lifecycle bulletproof).
-
-### Notes
-- Le chemin d'émission reste sain et inchangé (Opus low-delay + jitter A/B/C).
-  Item suivant (hors scope) : la tâche UDP d'émission tourne aussi en tokio
-  normal-priorité (gigue d'égression) → à fusionner dans le thread d'encode RT
-  après mesure.
-
-## [0.5.3-1] — 2026-06-27
-
-> **Pré-release — instrumentation de la rafale d'émission Windows/ASIO (mesure
-> seule, aucun changement de comportement).** Étape préalable au chantier rafale :
-> on mesure AVANT de corriger (cf. leçon 0.5.2-7 sur le pacing reverté).
-
-### Added
-- **Métrique `emit_burst`** (perfstats, log `jamodio::perfstats`) : nombre de
-  frames Opus émises par bloc d'entrée à `encode_stage`. ≈1 = flux régulier ;
-  ≫1 = rafale. À 48 kHz natif (resampler bypassé), `emit_burst_mean` ≈
-  taille_callback / 120 → révèle si le driver ASIO honore `Fixed(128)` (≈1) ou
-  délivre sa taille de control panel (ex. 512 → ≈4). Champs `emit_burst_p50 /
-  _max / _mean` dans la ligne « perfstats snapshot ».
-- **Log one-shot de la taille du 1er callback capture** réellement livrée par le
-  driver (`jamodio::capture`, `frames_per_callback`) — diagnostic direct,
-  sans inférence, de la granularité de la rafale.
+- Émission ET réception sont désormais **toutes deux en temps-réel** (parité
+  JackTrip/SonoBus/Jamulus côté threads RT).
+- Le watchdog « cold-start » 700 ms (pré-release 0.5.3-4) a été **remplacé** par
+  le superviseur de liveness continu : le diagnostic initial était faux (les
+  callbacks ASIO démarrent bien puis meurent ~21 s plus tard, ce n'est pas un
+  démarrage à froid). Cause racine = `kAsioResetRequest` non géré par CPAL 0.15.
 
 ## [0.5.2] — 2026-06-27
 
