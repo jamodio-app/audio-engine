@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
@@ -1317,146 +1317,252 @@ async fn try_lock_pipeline(
     }
 }
 
-/// 0.5.3-5 — SUPERVISEUR de liveness des callbacks audio (ASIO/CoreAudio).
+/// 0.5.4-2 — SUPERVISEUR de liveness + RESET COOPÉRATIF des callbacks audio ASIO.
 ///
-/// # Pourquoi (bug PC 28/06, cause racine prouvée)
-/// Sur certains drivers ASIO full-duplex (Focusrite), ~21 s après un 1er start
-/// « à froid », le driver émet un `kAsioResetRequest` (resync horloge/buffer USB)
-/// que **CPAL 0.15 n'honore pas** (il n'enregistre aucun callback de message
-/// ASIO). La spec impose alors `ASIOStop→dispose→réinit` ; CPAL ne le fait pas →
-/// le driver **arrête silencieusement ses deux callbacks** (entrée+sortie). La
-/// pipeline réseau/tokio survit (recv OK), mais la capture ne produit plus rien
-/// et la sortie ne pull plus le mixer (overflow peer en cascade). Un restart
-/// manuel (ou un rebranchement) recrée les streams = la réinit que CPAL a omise.
+/// # Cause racine (bug PC 28/06)
+/// Sur certains drivers ASIO full-duplex (Focusrite), le driver émet un
+/// `kAsioResetRequest` (resync horloge/buffer USB). Le protocole ASIO impose à
+/// l'hôte d'honorer ce message : répondre « 1 » PUIS exécuter lui-même
+/// `ASIOExit→ASIOInit→CreateBuffers→Start`. Or **cpal 0.15 n'enregistre aucun
+/// callback de message ASIO** → asio-sys répond « 1 » au driver mais n'exécute
+/// rien → le driver halte ses callbacks et attend un reset qui ne vient jamais
+/// (wedge ; jusqu'ici seul un replug USB le débloquait).
 ///
-/// Ce superviseur AUTOMATISE cette réinit : il observe les compteurs de callbacks
-/// (`capture_callbacks`/`output_callbacks`) en continu ; si l'un se fige > ~1,5 s
-/// en état `Capturing`, il appelle `restart_audio_streams()` (recrée UNIQUEMENT
-/// les streams CPAL, garde encodeur/SFU/réseau → pas de re-handshake, ~100-300 ms
-/// de trou). Couvre la cause ASIO-reset ET toute autre mort silencieuse, et un
-/// cold-start qui ne démarrerait jamais.
+/// # Deux niveaux de défense
+/// 1. **Reset coopératif (cause racine)** : `audio::asio_reset` enregistre le
+///    callback que cpal omet (via le `Driver` que cpal possède déjà). À chaque
+///    `kAsioResetRequest`, le driver nous réveille IMMÉDIATEMENT (`Notify`) et on
+///    exécute le reset propre — au moment où le driver le demande.
+/// 2. **Filet de liveness (morts silencieuses)** : on observe les compteurs de
+///    callbacks ; un flatline > ~1,5 s en capture active déclenche le même reset.
+///    Couvre les drivers qui halteraient sans émettre de reset request.
 ///
-/// # Garde-fous (règles Jamodio)
-/// - Recréation **bornée** (`MAX_RECOVERIES` consécutives) → pas de thrash. Le
-///   compteur se remet à zéro dès que les callbacks repartent.
-/// - Au-delà → `stop_all` + `CaptureError` CLAIRE au browser (JAMAIS un silence).
-/// - macOS/Linux : les callbacks ne s'arrêtent pas → jamais de recovery, no-op.
+/// # Robustesse du reset (cas dur)
+/// Le reset est BORNÉ avec settle + backoff (`repair_audio_streams`) : le 1er
+/// essai attend que le driver USB relâche après l'`ASIOExit` (cause des échecs
+/// immédiats observés). Si tous les essais échouent (driver bloqué au niveau
+/// matériel USB), on **n'arrête PAS la session** (pas de `stop_all` → pas de
+/// cascade Shutdown/relaunch) : on passe en mode DÉGRADÉ et on relance lentement
+/// en arrière-plan. Le rebranchement de l'interface relance alors l'audio SANS
+/// re-handshake réseau ni redémarrage de l'agent.
+///
+/// macOS/Linux : pas d'ASIO, les callbacks ne meurent pas et le canal de reset
+/// n'est jamais signalé → ce superviseur reste inerte (no-op).
 async fn audio_liveness_supervisor(
     pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
-    out_tx: tokio_mpsc::Sender<AgentMessage>,
+    // Conservé pour un éventuel feedback browser ; aucun message envoyé pour
+    // l'instant (décision produit : on analyse via les logs avant toute UI).
+    _out_tx: tokio_mpsc::Sender<AgentMessage>,
 ) {
     use std::sync::atomic::Ordering;
-    // Cadence d'échantillonnage des compteurs.
+    // Cadence du filet de liveness (le reset coopératif, lui, réagit via Notify).
     const TICK_MS: u64 = 500;
     // Flatline confirmé si aucun callback pendant ce délai en capture active.
-    // ≫ période ASIO (2,7 ms) et > le démarrage d'un stream sain → faux positif
-    // quasi impossible (un stream vivant produit ~185 callbacks en 500 ms).
+    // ≫ période ASIO (2,7 ms) → un stream vivant produit ~185 callbacks/500 ms,
+    // faux positif quasi impossible.
     const FLATLINE_MS: u128 = 1500;
-    // Recréations consécutives tolérées avant d'abandonner (erreur au browser).
-    const MAX_RECOVERIES: u32 = 4;
+    // Intervalle minimal entre deux séquences de réparation (anti-thrash). En
+    // régime nominal le reset s'exécute une fois et réussit ; ce garde borne le
+    // rythme si le driver re-demande des resets en rafale.
+    const MIN_REPAIR_INTERVAL: Duration = Duration::from_secs(2);
+    // En mode dégradé (driver dur-bloqué), on relance LENTEMENT en arrière-plan
+    // jusqu'au replug — heartbeat de récupération, jamais une boucle serrée.
+    const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(8);
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
+    // Canal de signalisation kAsioResetRequest (stable pour la vie du pipeline).
+    let reset_signal = { pipeline.lock().await.reset_signal() };
+    let reset_notify = reset_signal.notify_handle();
+
+    let mut interval = tokio::time::interval(Duration::from_millis(TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // État inter-ticks.
-    let mut was_capturing = false;
+    // État inter-réveils.
+    let mut session_active = false;
     let mut prev_cap = 0u64;
     let mut prev_out = 0u64;
     let mut last_progress = Instant::now();
-    let mut recoveries = 0u32;
+    let mut last_reset_seen = reset_signal.request_count();
+    let mut degraded = false;
+    let mut last_repair: Option<Instant> = None;
 
     loop {
-        interval.tick().await;
-        let mut pl = pipeline.lock().await;
+        // Réveil : tick périodique (filet de liveness) OU demande de reset
+        // immédiate émise par le driver (chemin cause-racine). Les deux futures
+        // sont cancel-safe ; la source de vérité reste `request_count()` + les
+        // compteurs, donc une notification « manquée » est rattrapée au tick.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = reset_notify.notified() => {}
+        }
 
-        let capturing =
-            matches!(pl.state, AgentState::Capturing) && pl.has_active_capture_stream();
-        let cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
-        let out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+        // Observation atomique (lock bref).
+        let (state_capturing, has_stream, cap, out) = {
+            let pl = pipeline.lock().await;
+            (
+                matches!(pl.state, AgentState::Capturing),
+                pl.has_active_capture_stream(),
+                pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
+                pl.perfstats.output_callbacks.load(Ordering::Relaxed),
+            )
+        };
 
-        // Hors capture (ou transition) : on (ré)initialise la base et on attend.
-        if !capturing || !was_capturing {
-            was_capturing = capturing;
-            recoveries = 0;
+        // Hors session, ou transition Idle→Capturing : base propre, on oublie
+        // tout état dégradé, on attend.
+        if !state_capturing || !session_active {
+            session_active = state_capturing;
+            degraded = false;
             prev_cap = cap;
             prev_out = out;
             last_progress = Instant::now();
+            last_reset_seen = reset_signal.request_count();
             continue;
         }
 
-        // Les DEUX compteurs avancent ⇒ session saine.
-        if cap > prev_cap && out > prev_out {
-            prev_cap = cap;
-            prev_out = out;
-            last_progress = Instant::now();
-            if recoveries > 0 {
-                tracing::info!(
-                    target: "jamodio::ws",
-                    after_recoveries = recoveries,
-                    "callbacks audio rétablis — recovery liveness réussie"
-                );
-                recoveries = 0;
-            }
-            continue;
-        }
+        // Un kAsioResetRequest est-il arrivé depuis la dernière observation ?
+        let reqs = reset_signal.request_count();
+        let reset_requested = reqs != last_reset_seen;
 
-        // Au moins un compteur est figé. On mémorise les valeurs et on attend que
-        // le flatline dépasse le seuil avant d'agir (anti faux-positif).
+        // Les DEUX compteurs avancent ET aucun reset en attente ⇒ session saine.
+        let advancing = cap > prev_cap && out > prev_out;
         prev_cap = cap;
         prev_out = out;
-        if last_progress.elapsed().as_millis() < FLATLINE_MS {
+        if advancing && !reset_requested {
+            last_progress = Instant::now();
+            if degraded {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    "callbacks audio rétablis — moteur ASIO récupéré"
+                );
+                degraded = false;
+            }
             continue;
         }
 
-        // Flatline confirmé : les callbacks ASIO sont morts en cours de session.
-        if recoveries >= MAX_RECOVERIES {
-            tracing::error!(
+        // Réparation requise si : le driver l'a demandé, OU les streams sont
+        // tombés (rebuild précédent échoué), OU flatline confirmé.
+        let flatline = !advancing && last_progress.elapsed().as_millis() >= FLATLINE_MS;
+        if !(reset_requested || !has_stream || flatline) {
+            continue;
+        }
+
+        // Throttle : burst initial, puis relance lente en dégradé. Jamais de
+        // boucle serrée.
+        let min_gap = if degraded { DEGRADED_RETRY_INTERVAL } else { MIN_REPAIR_INTERVAL };
+        if let Some(t) = last_repair {
+            if t.elapsed() < min_gap {
+                continue;
+            }
+        }
+        last_repair = Some(Instant::now());
+
+        if reset_requested {
+            tracing::warn!(
                 target: "jamodio::ws",
-                recoveries,
-                "callbacks audio toujours morts après recovery — arrêt + erreur au browser"
+                "kAsioResetRequest reçu — reset coopératif du driver ASIO"
             );
-            pl.stop_all();
-            drop(pl);
-            let _ = out_tx
-                .send(AgentMessage::CaptureError {
-                    reason: "asio-callbacks-stalled".into(),
-                    requested_device: None,
-                    detail: Some(
-                        "le moteur audio ASIO a cessé de répondre — reconnectez la session ou rebranchez l'interface".into(),
-                    ),
-                })
-                .await;
-            // On cesse de superviser jusqu'à une nouvelle capture.
-            was_capturing = false;
-            recoveries = 0;
-            continue;
+        } else {
+            tracing::warn!(
+                target: "jamodio::ws",
+                flatline_ms = last_progress.elapsed().as_millis() as u64,
+                has_stream,
+                "callbacks audio figés — reset du driver ASIO"
+            );
         }
 
-        recoveries += 1;
-        tracing::warn!(
-            target: "jamodio::ws",
-            recovery = recoveries,
-            max = MAX_RECOVERIES,
-            flatline_ms = last_progress.elapsed().as_millis() as u64,
-            "callbacks audio figés (driver ASIO arrêté ?) — recréation des streams"
-        );
-        match pl.restart_audio_streams() {
+        // Reset borné avec settle + backoff (verrou pipeline relâché pendant les
+        // attentes → les heartbeats browser restent servis).
+        let repaired = repair_audio_streams(&pipeline).await;
+
+        // Consomme la demande de reset traitée + fenêtre de grâce (les callbacks
+        // recréés mettent quelques ms à démarrer) + re-baseline des compteurs.
+        last_reset_seen = reset_signal.request_count();
+        last_progress = Instant::now();
+        {
+            let pl = pipeline.lock().await;
+            prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+            prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+        }
+
+        match repaired {
             Ok(()) => {
-                // Repart sur une base propre + fenêtre de grâce (les callbacks
-                // recréés mettent quelques ms à démarrer).
-                prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
-                prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
-                last_progress = Instant::now();
+                if degraded {
+                    tracing::info!(
+                        target: "jamodio::ws",
+                        "moteur ASIO reconstruit après période dégradée"
+                    );
+                    degraded = false;
+                }
+            }
+            Err(last_err) => {
+                if !degraded {
+                    // Transition → dégradé : un seul ERROR, actionnable (analyse).
+                    tracing::error!(
+                        target: "jamodio::ws",
+                        asio_error = %last_err,
+                        "reset ASIO en échec — driver probablement bloqué au niveau USB. \
+                         Session maintenue, relance auto en arrière-plan (rebrancher \
+                         l'interface relancera l'audio sans coupure réseau)."
+                    );
+                    degraded = true;
+                } else {
+                    tracing::debug!(
+                        target: "jamodio::ws",
+                        asio_error = %last_err,
+                        "reset ASIO toujours en échec (dégradé)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 0.5.4-2 — exécute un reset ASIO à chaud, BORNÉ. Ferme les streams (→ `ASIOExit`
+/// au dernier drop = dé-init complète exigée par la spec) puis tente la
+/// reconstruction avec un délai de settle initial + backoff. Relâche le verrou
+/// pipeline pendant les attentes. Renvoie l'erreur ASIO du dernier essai si tous
+/// échouent (le superviseur passe alors en mode dégradé sans couper la session).
+async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>) -> Result<(), String> {
+    // Délais AVANT chaque tentative de reconstruction. Le 1er (~350 ms) laisse le
+    // driver USB relâcher après l'`ASIOExit` — c'est la cause des échecs immédiats
+    // de reconstruction sur wedge dur (recréer sur un driver pas encore relâché
+    // échoue). Les suivants montent pour absorber un blocage transitoire plus long.
+    const BACKOFF_MS: [u64; 4] = [350, 600, 1200, 2500];
+
+    // Phase 1 : fermeture (ASIOExit au dernier drop) — lock bref.
+    {
+        let mut pl = pipeline.lock().await;
+        pl.close_audio_streams_for_reset();
+    }
+
+    let mut last_err = String::from("inconnu");
+    for (i, delay) in BACKOFF_MS.iter().enumerate() {
+        tokio::time::sleep(Duration::from_millis(*delay)).await;
+        let res = {
+            let mut pl = pipeline.lock().await;
+            pl.rebuild_audio_streams()
+        };
+        match res {
+            Ok(()) => {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    attempt = i + 1,
+                    "reset ASIO : streams reconstruits"
+                );
+                return Ok(());
             }
             Err(e) => {
-                tracing::error!(
+                last_err = e.to_string();
+                tracing::warn!(
                     target: "jamodio::ws",
-                    error = %e,
-                    "recréation des streams audio échouée"
+                    attempt = i + 1,
+                    max = BACKOFF_MS.len(),
+                    asio_error = %last_err,
+                    "reset ASIO : reconstruction échouée, nouvel essai"
                 );
             }
         }
     }
+    Err(last_err)
 }
 
 async fn handle_message(

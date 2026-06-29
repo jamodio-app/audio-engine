@@ -6,6 +6,43 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-2] — 2026-06-29
+
+> **Pré-release — Recovery ASIO Windows : cause racine du wedge dur traitée.**
+> Le watchdog de 0.5.3-5 détectait la mort des callbacks ASIO et recréait les
+> streams (OK sur cold-start « soft »), mais sur un **wedge dur** (driver
+> Focusrite USB complètement bloqué) la recréation échouait et l'utilisateur
+> devait DÉBRANCHER/REBRANCHER physiquement son interface. Cause racine prouvée :
+> **cpal 0.15 n'enregistre aucun callback de message ASIO** → quand le driver
+> émet `kAsioResetRequest`, asio-sys lui répond « 1 » (« host gère le reset »)
+> mais n'exécute rien → le driver halte ses callbacks et attend un reset qui ne
+> vient jamais. Le replug USB n'était qu'une rustine matérielle pour un reset
+> logiciel jamais effectué.
+
+### Added
+- **Callback de message ASIO** (`audio/asio_reset.rs`) : on enregistre, via le
+  `Driver` que cpal possède déjà (`Device::as_inner()` → `DeviceInner::Asio` →
+  champ `pub driver`), le callback que cpal omet — **sans forker cpal**. À chaque
+  `kAsioResetRequest`, le driver nous réveille IMMÉDIATEMENT (`Notify`) et on
+  exécute le reset propre, au moment où il le demande (et non 1,5 s plus tard via
+  le sondage de liveness). Garde RAII (`Weak<Driver>`) pour retirer le callback
+  sans empêcher l'`ASIOExit`. No-op hors Windows/ASIO.
+
+### Changed
+- **Reset ASIO robuste, borné, avec settle + backoff** (`repair_audio_streams`) :
+  fermeture des streams (→ `ASIOExit` = dé-init complète) puis reconstruction
+  avec un délai initial (~350 ms, laisse le driver USB relâcher — cause des échecs
+  immédiats sur wedge dur) puis backoff [600/1200/2500 ms]. `restart_audio_streams`
+  est scindé en `close_audio_streams_for_reset` + `rebuild_audio_streams` (erreur
+  TYPÉE portant le code/texte ASIO exact pour le diagnostic).
+- **Plus de cascade Shutdown/relaunch** : en cas d'échec après les essais, on
+  **n'appelle plus `stop_all`** (qui démontait la session → « pipeline stopped »
+  → relaunch). On passe en mode DÉGRADÉ, session réseau/SFU maintenue, avec une
+  relance lente en arrière-plan (~8 s) jusqu'au retour du driver. Le rebranchement
+  de l'interface relance alors l'audio SANS re-handshake réseau ni redémarrage de
+  l'agent. Le filet de liveness (flatline > 1,5 s) reste en secours des morts
+  silencieuses qui n'émettraient pas de reset request.
+
 ## [0.5.4-1] — 2026-06-28
 
 > **Pré-release — Chantier #1 : plancher jitter buffer « tail-aware » (Phase 1).**

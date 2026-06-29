@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.4-1"
+version = "0.5.4-2"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -54,6 +54,15 @@ tauri-plugin-updater = "2"
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.15", features = ["asio"] }
+# Accès DIRECT à l'API ASIO bas-niveau que cpal n'expose pas : enregistrement
+# du callback de message ASIO (`Driver::add_message_callback`) pour honorer
+# `kAsioResetRequest`. cpal 0.15 ne pose AUCUN message callback → quand le
+# driver demande un reset, asio-sys lui répond « 1 » (host gère) mais n'exécute
+# rien → le driver halte ses callbacks silencieusement (wedge). On rétablit le
+# handshake en se branchant sur le même registre global via le `Driver` que cpal
+# possède déjà (cf. audio/asio_reset.rs). Version PINNÉE sur celle de cpal 0.15.3
+# (= asio-sys 0.2.x) pour partager exactement le même crate (registre/types).
+asio-sys = "0.2"
 # Hôte VST3 plugins — Windows uniquement (parité fonctionnelle avec AU sur macOS).
 jamodio-vst3-host = { path = "../jamodio-vst3-host" }
 # Sprint S2 — MMCSS "Pro Audio" pour la priorité RT du thread encoder

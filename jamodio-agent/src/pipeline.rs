@@ -80,6 +80,9 @@ struct BuiltDuplex {
     input: BuiltInput,
     /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
     output: OutputOpen,
+    /// 0.5.4-2 — garde du callback `kAsioResetRequest` enregistré sur le driver
+    /// d'entrée (cf. `audio::asio_reset`). Garde vide hors ASIO/Windows.
+    reset_guard: crate::audio::asio_reset::ResetCallbackGuard,
 }
 
 /// Résout le device de sortie + ouvre le stream playback **sur le thread
@@ -120,7 +123,7 @@ fn open_output_on_com(
 /// PUIS on démarre la sortie puis l'entrée. Construire `build_output`
 /// (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers en cours
 /// de route → callbacks muets. Primitif partagé par `start_capture` (1er start)
-/// et `restart_audio_streams` (recréation à chaud après mort des callbacks ASIO).
+/// et `rebuild_audio_streams` (recréation à chaud après mort des callbacks ASIO).
 ///
 /// `build_output=false` ⇒ un playback tourne déjà (re-start à chaud) → on ne
 /// reconstruit que l'entrée, la sortie revient en `OutputOpen::Skipped`.
@@ -137,6 +140,7 @@ fn open_duplex_on_com(
     capture_drops: Arc<std::sync::atomic::AtomicU64>,
     capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
@@ -201,6 +205,12 @@ fn open_duplex_on_com(
             .play()
             .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
 
+        // 0.5.4-2 — enregistre le callback `kAsioResetRequest` sur le driver
+        // d'entrée (no-op hors ASIO). Sur ce thread COM-STA, `device` tient
+        // encore le driver vivant. Le garde rendu est conservé tant que le
+        // stream vit (cf. `reset_guard` côté PipelineState).
+        let reset_guard = crate::audio::asio_reset::register(&device, &reset_signal);
+
         Ok(BuiltDuplex {
             input: BuiltInput {
                 stream: SendStream(in_stream),
@@ -211,6 +221,7 @@ fn open_duplex_on_com(
                 input_buf,
             },
             output,
+            reset_guard,
         })
     })
 }
@@ -286,8 +297,17 @@ pub struct PipelineState {
     /// pouvoir RECRÉER le seul stream CPAL d'entrée (sans toucher à l'encodeur,
     /// au RtpSender, au SRTP ni à la réception) quand le superviseur de liveness
     /// détecte que les callbacks ASIO se sont arrêtés en cours de session
-    /// (`restart_audio_streams`). `None` hors capture.
+    /// (`rebuild_audio_streams`). `None` hors capture.
     capture_sample_tx: Option<Sender<Vec<f32>>>,
+    /// 0.5.4-2 — canal de signalisation `kAsioResetRequest` (cf.
+    /// `audio::asio_reset`). Partagé avec le superviseur de liveness, qui exécute
+    /// le reset différé dès qu'un driver ASIO le demande. No-op hors Windows.
+    reset_signal: crate::audio::asio_reset::ResetSignal,
+    /// 0.5.4-2 — garde RAII de l'enregistrement du callback de reset ASIO sur le
+    /// driver courant. `Some` pendant la capture (entrée ouverte). Droppé AVANT
+    /// les streams à la fermeture/recréation pour retirer proprement le callback
+    /// sans empêcher l'`ASIOExit`.
+    reset_guard: Option<crate::audio::asio_reset::ResetCallbackGuard>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
@@ -697,6 +717,8 @@ impl PipelineState {
             capture_stream: None,
             playback_stream: None,
             capture_sample_tx: None,
+            reset_signal: crate::audio::asio_reset::ResetSignal::new(),
+            reset_guard: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
             decode_thread: None,
@@ -1117,7 +1139,7 @@ impl PipelineState {
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
         // 0.5.3-5 — on conserve un clone du Sender pour pouvoir RECRÉER le stream
         // d'entrée (sans relancer l'encodeur) si les callbacks ASIO meurent en
-        // cours de session (cf. `restart_audio_streams`).
+        // cours de session (cf. `rebuild_audio_streams`).
         self.capture_sample_tx = Some(sample_tx.clone());
         let input_rms = self.input_rms.clone();
         // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
@@ -1163,8 +1185,12 @@ impl PipelineState {
             self.perfstats.capture_drops.clone(),
             self.perfstats.capture_callbacks.clone(),
             self.perfstats.output_callbacks.clone(),
+            self.reset_signal.clone(),
         )?;
-        let BuiltDuplex { input: built_input, output: built_output } = built;
+        let BuiltDuplex { input: built_input, output: built_output, reset_guard } = built;
+        // Conserve le garde du callback de reset ASIO (no-op hors ASIO) tant que
+        // la capture vit ; remplacé/droppé à la fermeture et à la recréation.
+        self.reset_guard = Some(reset_guard);
         let in_name = built_input.name;
         let resolved_input_id = built_input.resolved_id;
         let channels_in = built_input.channels;
@@ -1303,49 +1329,78 @@ impl PipelineState {
         self.capture_stream.is_some()
     }
 
-    /// 0.5.3-5 — RECRÉE uniquement les streams CPAL (entrée + sortie) sans toucher
-    /// au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception, mixer
-    /// avec ses streams pairs + self-monitor). Appelé par le superviseur de
-    /// liveness quand les callbacks ASIO se sont arrêtés EN COURS de session
-    /// (driver Focusrite qui émet un `kAsioResetRequest` que CPAL n'honore pas →
-    /// le driver halte ses callbacks silencieusement ; recréer les streams = la
-    /// réinitialisation ASIO que la spec impose, et que CPAL omet).
-    ///
-    /// La nouvelle entrée se re-branche sur le MÊME canal `sample_tx` → l'encodeur
-    /// continue sans rien savoir. Aucun re-handshake SFU (le socket/port/SRTP TX
-    /// sont préservés) → pas de coupure réseau, juste un trou audio de ~100-300 ms.
-    ///
-    /// No-op (Ok) hors état `Capturing`. Erreur claire si la recréation échoue
-    /// (le superviseur la borne et remonte au browser — jamais de silence).
-    pub fn restart_audio_streams(&mut self) -> Result<(), String> {
-        if !matches!(self.state, AgentState::Capturing) || self.capture_stream.is_none() {
-            return Ok(());
-        }
-        let Some(sample_tx) = self.capture_sample_tx.clone() else {
-            return Err("restart_audio_streams: pas de canal capture (incohérent)".into());
-        };
+    /// 0.5.4-2 — clone du canal de signalisation `kAsioResetRequest`, pour que le
+    /// superviseur de liveness sache (immédiatement) quand un driver ASIO demande
+    /// un reset. No-op sémantique hors Windows (jamais signalé).
+    pub fn reset_signal(&self) -> crate::audio::asio_reset::ResetSignal {
+        self.reset_signal.clone()
+    }
 
-        // Ferme les deux streams CPAL sur le thread COM-STA (ASIO stop/dispose sur
-        // l'apartment créateur) AVANT de reconstruire (ASIO mono-client).
+    /// 0.5.4-2 — PHASE 1 du reset ASIO à chaud : ferme les deux streams CPAL sur
+    /// le thread COM-STA. Le drop du dernier `Arc<Driver>` déclenche `ASIOExit` +
+    /// `removeCurrentDriver` — la dé-initialisation COMPLÈTE que la spec ASIO
+    /// impose sur `kAsioResetRequest`, et que `restart` blind ne garantissait que
+    /// par effet de bord. Séparée de la reconstruction pour permettre au
+    /// superviseur de LIBÉRER le verrou pipeline pendant le délai de settle (le
+    /// driver USB a besoin de quelques centaines de ms pour relâcher après
+    /// `ASIOExit`) et entre deux essais.
+    ///
+    /// Le garde du callback de reset est retiré AVANT la fermeture des streams :
+    /// le driver est alors encore vivant (`Weak::upgrade` réussit) → retrait
+    /// propre du callback du registre global, sans tenir de référence forte qui
+    /// bloquerait l'`ASIOExit`.
+    pub fn close_audio_streams_for_reset(&mut self) {
+        // Retire le callback de reset pendant que le driver est encore tenu par
+        // les streams (upgrade Weak OK).
+        self.reset_guard = None;
+        // Ferme les streams CPAL sur l'apartment créateur (ASIO stop/dispose/exit
+        // sur le thread COM-STA). ASIO étant mono-client, on ferme TOUT avant de
+        // reconstruire.
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
         self.output_buffer_samples = None;
+        self.input_buffer_samples = None;
+    }
 
-        // Reconstruit entrée + sortie (les deux, le playback ayant été fermé) via
-        // le primitif partagé : build des deux puis play sortie→entrée.
+    /// 0.5.4-2 — PHASE 2 du reset ASIO à chaud : reconstruit entrée + sortie sans
+    /// toucher au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception,
+    /// mixer avec ses streams pairs + self-monitor). La nouvelle entrée se
+    /// re-branche sur le MÊME canal `sample_tx` → l'encodeur continue sans rien
+    /// savoir ; aucun re-handshake SFU → pas de coupure réseau, juste un trou
+    /// audio le temps du reset.
+    ///
+    /// Renvoie l'erreur TYPÉE (`CaptureStartError`, qui porte le texte/code ASIO
+    /// exact remonté par CPAL) afin que le superviseur puisse logger précisément
+    /// et décider d'un nouvel essai. No-op (`Ok`) hors état `Capturing`.
+    ///
+    /// PRÉ-REQUIS : `close_audio_streams_for_reset()` a été appelé (streams
+    /// fermés, `ASIOExit` effectué) — sinon ASIO mono-client refuserait l'ouverture.
+    pub fn rebuild_audio_streams(&mut self) -> Result<(), CaptureStartError> {
+        if !matches!(self.state, AgentState::Capturing) {
+            return Ok(());
+        }
+        let Some(sample_tx) = self.capture_sample_tx.clone() else {
+            return Err(CaptureStartError::Other(
+                "rebuild_audio_streams: pas de canal capture (incohérent)".into(),
+            ));
+        };
+
         let built = open_duplex_on_com(
             self.input_device_id.clone(),
             self.output_device_id.clone(),
-            true, // playback fermé ci-dessus → on le reconstruit
+            true, // playback fermé en phase 1 → on le reconstruit
             self.mixer.clone(),
             sample_tx,
             self.perfstats.capture_drops.clone(),
             self.perfstats.capture_callbacks.clone(),
             self.perfstats.output_callbacks.clone(),
-        )
-        .map_err(|e| format!("recréation des streams audio: {}", e))?;
+            self.reset_signal.clone(),
+        )?;
 
-        let BuiltDuplex { input, output } = built;
+        let BuiltDuplex { input, output, reset_guard } = built;
+        // Le nouveau driver a son propre callback de reset enregistré : on
+        // remplace le garde (l'ancien a déjà été droppé en phase 1).
+        self.reset_guard = Some(reset_guard);
         self.input_buffer_samples = input.input_buf;
         self.capture_stream = Some(input.stream);
         match output {
@@ -1355,7 +1410,7 @@ impl PipelineState {
                 tracing::info!(
                     target: "jamodio::pipeline",
                     device = %name,
-                    "streams audio recréés (recovery liveness ASIO)"
+                    "streams audio recréés (reset ASIO)"
                 );
             }
             // Sortie non rétablie : l'entrée prime (la capture repart), le
@@ -1365,7 +1420,11 @@ impl PipelineState {
                 error = %e,
                 "recréation sortie échouée — playback désactivé (capture rétablie)"
             ),
-            OutputOpen::NotFound => return Err("output device introuvable à la recréation".into()),
+            OutputOpen::NotFound => {
+                return Err(CaptureStartError::OutputDeviceNotFound {
+                    requested: self.output_device_id.clone(),
+                })
+            }
             OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
         }
         Ok(())
@@ -1476,6 +1535,10 @@ impl PipelineState {
     }
 
     fn stop_capture(&mut self) {
+        // 0.5.4-2 — retire le callback de reset ASIO TANT QUE le driver est encore
+        // tenu par `capture_stream` (Weak::upgrade OK → retrait propre du registre
+        // global). Doit précéder la fermeture du stream.
+        self.reset_guard = None;
         // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
         // tourner sur l'apartment qui a créé le driver). macOS : inline.
         close_stream_on_com(self.capture_stream.take());

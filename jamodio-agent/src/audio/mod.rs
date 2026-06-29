@@ -1,3 +1,4 @@
+pub mod asio_reset;
 pub mod buffer_size;
 pub mod com_exec;
 pub mod device;
