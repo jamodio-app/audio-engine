@@ -73,6 +73,38 @@ fn on_capture_err(err: cpal::StreamError) {
     tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
 }
 
+/// 0.5.4-3 — logue la plage de buffer ASIO exposée par le driver (min/max) pour
+/// le couple `(channels, sr)`. Diagnostic du gel Focusrite : permet de comparer
+/// notre ancien `Fixed(128)` à la grille native du driver, et de connaître la
+/// taille préférée effectivement retenue (croisé avec `log_first_callback`).
+/// Appelé uniquement sur le chemin ASIO. No-op si le device ne renseigne pas de
+/// `Range`.
+fn log_asio_buffer_range(device: &Device, channels: u16, sr: u32) {
+    use cpal::SupportedBufferSize;
+    let Ok(configs) = device.supported_input_configs() else {
+        return;
+    };
+    let target_sr = SampleRate(sr);
+    for cfg in configs {
+        if cfg.channels() == channels
+            && cfg.min_sample_rate() <= target_sr
+            && cfg.max_sample_rate() >= target_sr
+        {
+            if let SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
+                tracing::info!(
+                    target: "jamodio::capture",
+                    asio_buffer_min = *min,
+                    asio_buffer_max = *max,
+                    channels,
+                    sr,
+                    "plage de buffer ASIO du driver — on défère à sa taille préférée (plus de Fixed(128) forcé)"
+                );
+            }
+            return;
+        }
+    }
+}
+
 /// Pousse un bloc de samples f32 entrelacés vers le thread encoder. Factorisé
 /// pour être réutilisé par chaque callback typé (f32/i32/i16) — seule la
 /// conversion vers f32 diffère, la comptabilité des drops est commune.
@@ -204,12 +236,28 @@ pub fn build_capture_stream(
     // (CoreAudio/WASAPI : f32 natif → la branche F32 est prise, inchangé.)
     let sample_format = default_cfg.sample_format();
 
-    // Buffer size : on essaye Fixed(128) (= ~2.7ms low-latency, accepté par
-    // CoreAudio mac + ASIO Windows + parfois WASAPI exclusive Win 11) et on
-    // fallback sur Default si le device n'expose pas ce range (= WASAPI
-    // shared sur mic onboard typique, qui impose ~10ms min). Le fallback
-    // évite l'erreur `StreamConfigNotSupported` qui bloquait v0.3.0 sur PC.
-    let (buffer_size, fixed_buffer) = if device_supports_fixed_buffer(device, channels, native_sr, 128) {
+    // Buffer size — stratégie PAR HOST (cause racine du gel ASIO Focusrite,
+    // sessions du 29/06) :
+    //
+    // - **ASIO (Windows)** : on DÉFÈRE à la taille PRÉFÉRÉE du driver
+    //   (`BufferSize::Default` → asio-sys utilise `ASIOGetBufferSize().pref`),
+    //   exactement comme un DAW et comme JUCE/RtAudio/Jamulus. Forcer `Fixed(128)`
+    //   était fautif : asio-sys ne valide QUE `demandé ≤ max` (il IGNORE le min,
+    //   la taille préférée ET la granularité du driver). Sur le Focusrite USB,
+    //   128 hors-grille était accepté par `ASIOCreateBuffers` mais faisait HALTER
+    //   les callbacks après ~75 s de streaming → studio injouable. La taille
+    //   réellement retenue par le driver est révélée par `log_first_callback`.
+    //   La basse latence (128 = 2,7 ms) n'était qu'un choix : ni Opus (encodeur à
+    //   accumulateur → frames 120) ni les plugins (process_stage re-bloque en
+    //   sous-blocs) ne dépendent de la taille de capture.
+    // - **CoreAudio / WASAPI** : INCHANGÉ — Fixed(128) low-latency si exposé,
+    //   sinon Default. (CoreAudio ignore de toute façon la valeur et prend la
+    //   taille native du device ; WASAPI shared impose la sienne.)
+    let on_asio = crate::audio::host::kind() == crate::audio::host::HostKind::Asio;
+    let (buffer_size, fixed_buffer) = if on_asio {
+        log_asio_buffer_range(device, channels, native_sr);
+        (BufferSize::Default, None)
+    } else if device_supports_fixed_buffer(device, channels, native_sr, 128) {
         (BufferSize::Fixed(128), Some(128u32))
     } else {
         tracing::info!(

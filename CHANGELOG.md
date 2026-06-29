@@ -6,6 +6,36 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-3] — 2026-06-29
+
+> **Pré-release — Gel ASIO Focusrite Windows : on ne force plus la taille de
+> buffer.** Analyse des sessions du 29/06 (Ben PC Focusrite injouable vs Ben Mac
+> Scarlett parfait) : sur Windows ASIO, les callbacks du driver **haltaient après
+> ~75-85 s** de streaming continu (pas de surcharge CPU, pipeline saine, RTT
+> stable, et même en SOLO sans pair). Cause racine : on demandait
+> `BufferSize::Fixed(128)`, mais `asio-sys` ne valide QUE `demandé ≤ max` — il
+> **ignore le min, la taille préférée ET la granularité** du driver. 128
+> hors-grille était accepté par le Focusrite puis le déstabilisait. Le Mac ne
+> gelait pas car **CoreAudio ignore la valeur** et prend la taille native du
+> device (64). Confirmé par JUCE/SonoBus, RtAudio/JackTrip et Jamulus : tous
+> snappent sur la grille du driver / utilisent sa taille préférée, aucun ne force
+> une taille arbitraire.
+
+### Changed
+- **ASIO (Windows) : on défère à la taille de buffer PRÉFÉRÉE du driver**
+  (`BufferSize::Default` → `asio-sys` utilise `ASIOGetBufferSize().pref`), au lieu
+  de forcer `Fixed(128)`. En duplex ASIO, entrée et sortie partagent le même
+  `ASIOCreateBuffers` → les deux passent par `Default` pour rester cohérents.
+  CoreAudio / WASAPI **inchangés** (Fixed(128) low-latency si exposé, sinon
+  Default). 128 n'était qu'un choix de latence : ni Opus (encodeur à accumulateur
+  → frames 120) ni les plugins (process_stage re-bloque) ne dépendent de la taille
+  de capture.
+
+### Added
+- Log `plage de buffer ASIO du driver` (min/max) au démarrage capture +
+  `frames_per_callback` réel → révèle la taille préférée effective du Focusrite et
+  confirme si l'ancien 128 était hors-grille. Diagnostic de la prochaine session.
+
 ## [0.5.4-2] — 2026-06-29
 
 > **Pré-release — Recovery ASIO Windows : cause racine du wedge dur traitée.**
