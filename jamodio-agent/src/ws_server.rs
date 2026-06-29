@@ -1181,10 +1181,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         )
         .await
         {
-            Ok(mut pl) => pl.stop_all(),
+            // 0.5.4-5 — déconnexion WS = sortie de studio : on PARK (driver ASIO
+            // gardé chaud pour un rejoin rapide, relâché après grâce) au lieu de
+            // tout fermer. Sur macOS/WASAPI, `leave_session` retombe sur stop_all.
+            Ok(mut pl) => pl.leave_session(),
             Err(_) => tracing::warn!(
                 target: "jamodio::ws",
-                "pipeline lock timeout during cleanup — stop_all skipped (next client will see stale state)"
+                "pipeline lock timeout during cleanup — leave_session skipped (next client will see stale state)"
             ),
         }
         // Libère le slot. Note : on ne `take()` PAS notre Sender dans
@@ -1368,6 +1371,10 @@ async fn audio_liveness_supervisor(
     // En mode dégradé (driver dur-bloqué), on relance LENTEMENT en arrière-plan
     // jusqu'au replug — heartbeat de récupération, jamais une boucle serrée.
     const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(8);
+    // 0.5.4-5 — délai de grâce avant de relâcher le driver ASIO gardé chaud
+    // (parké, hors studio). Couvre les leave/rejoin rapides (anti-churn Focusrite)
+    // puis libère l'interface pour un autre logiciel (DAW). Cf. `park`.
+    const PARK_GRACE: Duration = Duration::from_secs(30);
 
     // Canal de signalisation kAsioResetRequest (stable pour la vie du pipeline).
     let reset_signal = { pipeline.lock().await.reset_signal() };
@@ -1393,6 +1400,14 @@ async fn audio_liveness_supervisor(
         tokio::select! {
             _ = interval.tick() => {}
             _ = reset_notify.notified() => {}
+        }
+
+        // 0.5.4-5 — relâche le driver ASIO gardé chaud si la grâce de park est
+        // expirée (≥ 30 s hors studio sans rejoin) → libère l'interface. No-op si
+        // pas parké / hors ASIO.
+        {
+            let mut pl = pipeline.lock().await;
+            pl.close_warm_if_grace_expired(PARK_GRACE);
         }
 
         // Observation atomique (lock bref).
@@ -1836,7 +1851,9 @@ async fn handle_message(
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];
             };
-            pl.stop_all();
+            // 0.5.4-5 — sortie de studio : PARK sur ASIO (driver gardé chaud →
+            // rejoin instantané, anti-churn Focusrite), stop_all complet ailleurs.
+            pl.leave_session();
             vec![make_status(AgentState::Idle)]
         }
 

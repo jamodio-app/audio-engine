@@ -85,6 +85,60 @@ struct BuiltDuplex {
     reset_guard: crate::audio::asio_reset::ResetCallbackGuard,
 }
 
+/// 0.5.4-5 — état du driver ASIO gardé « CHAUD » à travers les leave/rejoin.
+///
+/// # Pourquoi (bug PC 29/06)
+/// Le driver Focusrite USB ASIO se dégrade sous des cycles `ASIOExit/ASIOInit`
+/// RAPIDES — soit il gèle ses callbacks, soit il les garde vivants mais ne livre
+/// que du SILENCE (« ni son ni vumètre » au rejoin). C'est exactement ce que
+/// provoquait notre teardown COMPLET à chaque sortie de studio. Un DAW, lui,
+/// ouvre l'interface une fois et la garde. On fait pareil : on garde les streams
+/// capture+sortie ouverts et on ne reconstruit que la couche SESSION (encodeur,
+/// SFU, réception) au rejoin.
+///
+/// # Cycle de vie
+/// Présent UNIQUEMENT sur ASIO/Windows quand les streams sont ouverts (session
+/// active OU parkée). Sur macOS/CoreAudio + WASAPI il reste `None` → fermeture à
+/// chaque stop, comportement strictement inchangé. Relâché (ASIOExit propre)
+/// quand : grâce expirée (~30 s hors studio), device changé, ou arrêt agent.
+struct WarmAudio {
+    /// Devices pour lesquels les streams chauds sont ouverts. Un rejoin sur un
+    /// device DIFFÉRENT force fermeture+réouverture (une seule ré-init, pas du
+    /// churn).
+    input_id: Option<String>,
+    output_id: Option<String>,
+    /// Caractéristiques mémorisées à l'ouverture, pour reconstruire l'encodeur +
+    /// renvoyer `CaptureStartedInfo` au rejoin SANS rouvrir le driver.
+    channels_in: u16,
+    native_sr: u32,
+    resolved_input_id: String,
+    in_name: String,
+    input_buf: Option<u32>,
+    /// Receiver STABLE du canal capture→encodeur. Le stream d'entrée (toujours
+    /// ouvert) pousse sur le `Sender` correspondant (conservé dans
+    /// `capture_sample_tx`). Au rejoin : on draine le périmé puis on clone ce
+    /// Receiver pour le nouvel encodeur. Le callback RT de capture est INCHANGÉ.
+    sample_rx: Receiver<Vec<f32>>,
+    /// `Some(t)` = PARKÉ (hors studio, en attente d'un rejoin ou de la fermeture
+    /// de grâce à `t + GRACE`). `None` = session active utilisant ces streams.
+    parked_since: Option<std::time::Instant>,
+}
+
+/// 0.5.4-5 — caractéristiques audio renvoyées par `prepare_audio_for_session`,
+/// que la capture soit ouverte à froid ou réutilisée à chaud. Permet à
+/// `start_capture` de construire l'encodeur + `CaptureStartedInfo` de façon
+/// uniforme, sans savoir si le driver a été (ré)ouvert ou réutilisé.
+struct AcquiredAudio {
+    /// `Receiver` du canal capture→encodeur (clone du canal stable côté chaud,
+    /// ou frais côté froid). Déplacé dans le thread encodeur.
+    sample_rx: Receiver<Vec<f32>>,
+    channels_in: u16,
+    native_sr: u32,
+    input_buf: Option<u32>,
+    in_name: String,
+    resolved_input_id: String,
+}
+
 /// Résout le device de sortie + ouvre le stream playback **sur le thread
 /// COM-STA** (Windows) / inline (macOS). Voir `com_exec` pour le pourquoi :
 /// ASIO charge le driver via CoCreateInstance, qui exige COM initialisé et
@@ -312,6 +366,10 @@ pub struct PipelineState {
     /// les streams à la fermeture/recréation pour retirer proprement le callback
     /// sans empêcher l'`ASIOExit`.
     reset_guard: Option<crate::audio::asio_reset::ResetCallbackGuard>,
+    /// 0.5.4-5 — driver ASIO gardé chaud à travers les leave/rejoin (cf.
+    /// `WarmAudio`). `Some` ⇔ streams ASIO ouverts (session active ou parkée).
+    /// `None` hors ASIO/Windows et hors capture → comportement historique.
+    warm: Option<WarmAudio>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
@@ -735,6 +793,7 @@ impl PipelineState {
             capture_sample_tx: None,
             reset_signal: crate::audio::asio_reset::ResetSignal::new(),
             reset_guard: None,
+            warm: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
             decode_thread: None,
@@ -1108,6 +1167,223 @@ impl PipelineState {
         self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
     }
 
+    /// 0.5.4-5 — host audio actif = ASIO (Windows) ? Gouverne le keep-warm.
+    /// Faux sur macOS/CoreAudio + WASAPI → fermeture à chaque stop (historique).
+    fn host_is_asio() -> bool {
+        crate::audio::host::kind() == crate::audio::host::HostKind::Asio
+    }
+
+    /// 0.5.4-5 — démonte la couche SESSION (encodeur, self-monitor, réception,
+    /// décodage) en GARDANT les streams audio + le canal capture. Utilisé au park
+    /// (sortie de studio sur ASIO) et avant un rejoin qui réutilise le driver
+    /// chaud. NE touche NI au driver (`capture_stream`/`playback_stream`), NI au
+    /// `reset_guard`, NI à `warm`, NI à `capture_sample_tx`.
+    fn teardown_session(&mut self) {
+        if let Some(stop) = self.encoder_stop.take() {
+            let _ = stop.send(());
+        }
+        // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
+        self.mixer.lock().remove_local_stream();
+        // Coupe les réceptions pair + le thread de décodage RT partagé.
+        let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
+        for id in ids {
+            self.remove_stream(&id);
+        }
+        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
+            let _ = tx.send(DecodeMsg::Shutdown);
+            drop(tx);
+            let _ = join.join();
+        }
+    }
+
+    /// 0.5.4-5 — ferme COMPLÈTEMENT le driver audio : streams capture+sortie (sur
+    /// le thread COM-STA → ASIOExit propre), garde de reset, canal capture, état
+    /// `warm`, buffers et tailles mesurées. Relâche l'interface (dispo pour un
+    /// DAW). NE touche PAS à la session (à appeler après `teardown_session`).
+    fn close_audio_driver(&mut self) {
+        // Retire le callback de reset TANT QUE le driver est encore tenu par les
+        // streams (Weak::upgrade OK → retrait propre du registre global).
+        self.reset_guard = None;
+        self.perfstats.input_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        close_stream_on_com(self.capture_stream.take());
+        close_stream_on_com(self.playback_stream.take());
+        self.capture_sample_tx = None;
+        self.warm = None;
+        self.output_buffer_samples = None;
+        self.input_buffer_samples = None;
+    }
+
+    /// 0.5.4-5 — PARK : sortie de studio sur ASIO en gardant le driver CHAUD.
+    /// Démonte la session mais garde les streams ouverts + marque l'instant de
+    /// park (fermeture de grâce ~30 s plus tard si pas de rejoin). Élimine le
+    /// churn ASIOExit/ASIOInit qui dégradait le Focusrite (gel / silence).
+    fn park(&mut self) {
+        if self.recorder.is_some() {
+            tracing::warn!(target: "jamodio::pipeline", "park during recording — files discarded");
+            let _ = self.stop_recording();
+        }
+        self.teardown_session();
+        if let Some(w) = self.warm.as_mut() {
+            w.parked_since = Some(std::time::Instant::now());
+        }
+        self.input_buffer_samples = None;
+        self.state = AgentState::Idle;
+        tracing::info!(
+            target: "jamodio::pipeline",
+            "studio quitté — driver ASIO gardé chaud (rejoin instantané, relâche dans ~30 s)"
+        );
+    }
+
+    /// 0.5.4-5 — sortie de studio : PARK si éligible (ASIO + capture active +
+    /// driver chaud présent), sinon `stop_all` complet (macOS/WASAPI, ou pas de
+    /// capture). Point d'entrée unique appelé par ws_server (Stop + WS disconnect).
+    pub fn leave_session(&mut self) {
+        if Self::host_is_asio()
+            && matches!(self.state, AgentState::Capturing)
+            && self.warm.is_some()
+        {
+            self.park();
+        } else {
+            self.stop_all();
+        }
+    }
+
+    /// 0.5.4-5 — relâche le driver chaud si la grâce est expirée (parké depuis ≥
+    /// `grace`). Appelé périodiquement par le superviseur de liveness. Renvoie
+    /// `true` si une fermeture a eu lieu.
+    pub fn close_warm_if_grace_expired(&mut self, grace: std::time::Duration) -> bool {
+        let expired = self
+            .warm
+            .as_ref()
+            .and_then(|w| w.parked_since)
+            .is_some_and(|t| t.elapsed() >= grace);
+        if expired {
+            tracing::info!(
+                target: "jamodio::pipeline",
+                grace_s = grace.as_secs(),
+                "grâce expirée — driver ASIO relâché (interface libérée pour un autre logiciel)"
+            );
+            self.close_audio_driver();
+        }
+        expired
+    }
+
+    /// 0.5.4-5 — acquiert les streams audio pour une (nouvelle) session :
+    /// RÉUTILISE le driver ASIO chaud (rejoin sans ré-init = anti-churn) si host
+    /// ASIO + streams ouverts + MÊMES devices ; sinon ferme tout et ouvre à froid
+    /// (un device changé = une seule ré-init propre). Encapsule tout le teardown
+    /// de la session/driver précédent·e. Renvoie les caractéristiques du device
+    /// (pour l'encodeur + `CaptureStartedInfo`) et le `Receiver` capture.
+    fn prepare_audio_for_session(&mut self) -> Result<AcquiredAudio, CaptureStartError> {
+        let input_id = self.input_device_id.clone();
+        let output_id = self.output_device_id.clone();
+
+        let reuse = Self::host_is_asio()
+            && self.capture_stream.is_some()
+            && self
+                .warm
+                .as_ref()
+                .is_some_and(|w| w.input_id == input_id && w.output_id == output_id);
+
+        if reuse {
+            // Rejoin sur driver chaud : on démonte SEULEMENT la session, on GARDE
+            // les streams + le canal. Zéro ASIOExit/ASIOInit = zéro churn.
+            self.teardown_session();
+            let w = self.warm.as_mut().expect("reuse ⇒ warm présent");
+            w.parked_since = None; // session active → annule la fermeture de grâce
+            // Draine les buffers périmés accumulés pendant le park (le stream a
+            // continué à pousser sans consommateur → vieux audio dans le canal).
+            while w.sample_rx.try_recv().is_ok() {}
+            self.input_buffer_samples = w.input_buf;
+            tracing::info!(
+                target: "jamodio::pipeline",
+                device = %w.in_name,
+                "driver ASIO réutilisé à chaud (rejoin sans ré-init)"
+            );
+            return Ok(AcquiredAudio {
+                sample_rx: w.sample_rx.clone(),
+                channels_in: w.channels_in,
+                native_sr: w.native_sr,
+                input_buf: w.input_buf,
+                in_name: w.in_name.clone(),
+                resolved_input_id: w.resolved_input_id.clone(),
+            });
+        }
+
+        // Pas de réutilisation (à froid, device changé, ou hors ASIO) :
+        // fermeture COMPLÈTE de la session + du driver, puis ouverture.
+        self.teardown_session();
+        self.close_audio_driver();
+
+        let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
+        self.capture_sample_tx = Some(sample_tx.clone());
+
+        // playback_stream vient d'être fermé → on (re)construit la sortie aussi.
+        let built = open_duplex_on_com(
+            input_id.clone(),
+            output_id.clone(),
+            true,
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+            self.perfstats.input_frames.clone(),
+            self.perfstats.output_frames.clone(),
+            self.reset_signal.clone(),
+        )?;
+        let BuiltDuplex { input, output, reset_guard } = built;
+        self.reset_guard = Some(reset_guard);
+        let channels_in = input.channels;
+        let native_sr = input.native_sr;
+        let input_buf = input.input_buf;
+        let in_name = input.name;
+        let resolved_input_id = input.resolved_id;
+        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
+        self.capture_stream = Some(input.stream);
+        self.input_buffer_samples = input_buf;
+        match output {
+            OutputOpen::Opened { stream, buffer, name } => {
+                tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+            }
+            OutputOpen::BuildFailed(e) => tracing::warn!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+            ),
+            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+            OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
+        }
+
+        // Sur ASIO : mémorise l'état chaud pour réutiliser le driver aux rejoin.
+        // Hors ASIO : `warm` reste `None` → fermeture à chaque stop (historique).
+        if Self::host_is_asio() {
+            self.warm = Some(WarmAudio {
+                input_id,
+                output_id,
+                channels_in,
+                native_sr,
+                resolved_input_id: resolved_input_id.clone(),
+                in_name: in_name.clone(),
+                input_buf,
+                sample_rx: sample_rx.clone(),
+                parked_since: None,
+            });
+        }
+
+        Ok(AcquiredAudio {
+            sample_rx,
+            channels_in,
+            native_sr,
+            input_buf,
+            in_name,
+            resolved_input_id,
+        })
+    }
+
     /// Start the capture pipeline: CPAL → accumulator → Opus → RTP → UDP.
     /// `channel_index` : si `Some(i)`, extrait le canal physique i et duplique
     /// L=R=canal[i] avant encodage Opus (mode mono propre, centré à la lecture).
@@ -1124,16 +1400,21 @@ impl PipelineState {
         channel_index: Option<u8>,
         sfu_srtp: SrtpParameters,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
-        // 1. STOP toute capture en cours D'ABORD. ASIO est mono-client :
-        // impossible d'ouvrir un second stream tant que l'ancien tient le
-        // driver ; et la fermeture doit se faire sur le thread COM-STA (cf.
-        // stop_capture → close_stream_on_com). Sur macOS, sans effet de bord.
-        // (Le build du nouveau stream, plus bas, EST la validation du device :
-        // on n'alloue le socket UDP qu'ensuite mais un échec retombe proprement
-        // via `?`, RAII relâche tout.)
-        self.stop_capture();
-
-        let input_id = self.input_device_id.clone();
+        // 1. ACQUISITION AUDIO — réutilise le driver ASIO gardé CHAUD (rejoin sans
+        //    ré-init = anti-churn Focusrite), ou ouvre à froid. Encapsule TOUT le
+        //    teardown de la session/driver précédent·e + ouvre/réutilise les
+        //    streams (validation du device incluse : `?` ⇒ échec propre, RAII
+        //    relâche tout ; le socket UDP n'est alloué qu'après). ASIO mono-client
+        //    respecté (le chaud N'EST réutilisé que pour le MÊME device, sinon
+        //    fermé d'abord). Cf. `prepare_audio_for_session`.
+        let AcquiredAudio {
+            sample_rx,
+            channels_in,
+            native_sr,
+            input_buf,
+            in_name,
+            resolved_input_id,
+        } = self.prepare_audio_for_session()?;
 
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -1152,12 +1433,9 @@ impl PipelineState {
         // Pas de punch ici : le 1er paquet audio chiffré (sous 10 ms) sert de punch
         // pour comedia. Un punch en clair serait rejeté par le SFU (enableSrtp:true).
 
-        // 4. Channels
-        let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
-        // 0.5.3-5 — on conserve un clone du Sender pour pouvoir RECRÉER le stream
-        // d'entrée (sans relancer l'encodeur) si les callbacks ASIO meurent en
-        // cours de session (cf. `rebuild_audio_streams`).
-        self.capture_sample_tx = Some(sample_tx.clone());
+        // 4. Couche session : encodeur RT. Le canal capture (`sample_rx`) et le
+        //    `capture_sample_tx` sont gérés par `prepare_audio_for_session`
+        //    (stables tant que le driver chaud vit ; frais à froid).
         let input_rms = self.input_rms.clone();
         // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
         // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
@@ -1167,56 +1445,9 @@ impl PipelineState {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
-        // 5. RÉSOLUTION + OUVERTURE DU STREAM CPAL, atomiquement sur le thread
-        //    COM-STA (cf. `com_exec`). Le `cpal::Device` est !Send et ne doit
-        //    pas quitter ce thread : on résout l'id, on ouvre le stream, et on
-        //    ne renvoie que des données `Send` (+ le handle `SendStream`).
-        //    Résolution STRICTE : l'id du browser DOIT pointer sur un device
-        //    courant (pas de fallback default, sauf AUCUN id sélectionné =
-        //    premier lancement). Une erreur de build (driver, sample-rate) est
-        //    technique pure, pas une erreur de sélection user.
-        //
-        //    CPAL est ouvert dans TOUS les modes (AUDIO et MIDI) : en MIDI ses
-        //    samples sont écrasés par 0 côté `process_stage` (le plugin
-        //    instrument génère l'audio depuis les events MIDI) → aucun swap de
-        //    source pendant les bascules MIDI↔AUDIO, donc aucun craquement.
-        //
-        //    Sprint S1 — `capture_drops` partagé avec le callback CPAL :
-        //    incrémenté quand `sample_tx` est plein, lu+reset par ws_server au
-        //    flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
-        //
-        //    Volet B (0.5.3-4) — on construit l'ENTRÉE **et** la SORTIE puis on
-        //    les démarre (sortie d'abord, entrée ensuite) dans CE seul passage
-        //    COM-STA. Sur un device ASIO full-duplex, appeler `build_output`
-        //    (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers
-        //    en cours → callbacks muets (cold-start raté). En créant tous les
-        //    buffers avant de démarrer, on évite ce recreate. La sortie n'est
-        //    (re)construite que si aucun playback ne tourne déjà (cold path).
-        let need_output = self.playback_stream.is_none();
-        let built = open_duplex_on_com(
-            input_id,
-            self.output_device_id.clone(),
-            need_output,
-            self.mixer.clone(),
-            sample_tx,
-            self.perfstats.capture_drops.clone(),
-            self.perfstats.capture_callbacks.clone(),
-            self.perfstats.output_callbacks.clone(),
-            self.perfstats.input_frames.clone(),
-            self.perfstats.output_frames.clone(),
-            self.reset_signal.clone(),
-        )?;
-        let BuiltDuplex { input: built_input, output: built_output, reset_guard } = built;
-        // Conserve le garde du callback de reset ASIO (no-op hors ASIO) tant que
-        // la capture vit ; remplacé/droppé à la fermeture et à la recréation.
-        self.reset_guard = Some(reset_guard);
-        let in_name = built_input.name;
-        let resolved_input_id = built_input.resolved_id;
-        let channels_in = built_input.channels;
-        let native_sr = built_input.native_sr;
-        let input_buf = built_input.input_buf;
-        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        self.capture_stream = Some(built_input.stream);
+        // 5. (Streams CPAL ouverts/réutilisés en 1. via prepare_audio_for_session,
+        //    sur le thread COM-STA. Volet B cold-start, garde de reset ASIO et
+        //    mémorisation du chaud y sont gérés.)
         tracing::info!(
             target: "jamodio::pipeline",
             channels_in, native_sr, ?channel_index,
@@ -1292,31 +1523,8 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 7. (Émission RT — cf. section 4 : le thread d'encode chiffre + envoie
-        //    directement, il n'y a plus de tâche UDP tokio.)
-
-        // 8. Stream de sortie (playback) — déjà CONSTRUIT + DÉMARRÉ dans le
-        //    passage COM-STA ci-dessus (Volet B : build entrée+sortie avant de
-        //    démarrer, sortie d'abord). Ici on ne fait que router le résultat :
-        //    - Opened → on conserve le handle (RAII) + le buffer télémétrie ;
-        //    - NotFound → DÉJÀ remonté en erreur depuis la closure (fatal) ;
-        //    - BuildFailed → NON FATAL : la capture (entrée) prime, le playback/
-        //      self-monitor sera indisponible jusqu'à nouvelle sélection ;
-        //    - Skipped → un playback tournait déjà, conservé tel quel.
-        match built_output {
-            OutputOpen::Opened { stream, buffer, name } => {
-                tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
-                self.playback_stream = Some(stream);
-                self.output_buffer_samples = buffer;
-            }
-            OutputOpen::BuildFailed(e) => tracing::warn!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "ouverture du stream de sortie échouée — playback désactivé (capture active)"
-            ),
-            OutputOpen::Skipped => {}
-            OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
-        }
+        // 7. (Émission RT — le thread d'encode chiffre + envoie directement.
+        //    Stream de sortie ouvert/réutilisé en 1. via prepare_audio_for_session.)
 
         self.state = AgentState::Capturing;
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
@@ -1556,66 +1764,33 @@ impl PipelineState {
         }
     }
 
-    fn stop_capture(&mut self) {
-        // 0.5.4-2 — retire le callback de reset ASIO TANT QUE le driver est encore
-        // tenu par `capture_stream` (Weak::upgrade OK → retrait propre du registre
-        // global). Doit précéder la fermeture du stream.
-        self.reset_guard = None;
-        // 0.5.4-4 — invalide les tailles de buffer mesurées (re-mesurées au 1er
-        // callback de la prochaine capture) pour ne pas rapporter une latence
-        // périmée si le device change au re-join.
-        self.perfstats.input_frames.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
-        // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
-        // tourner sur l'apartment qui a créé le driver). macOS : inline.
-        close_stream_on_com(self.capture_stream.take());
-        // L'encodeur va s'arrêter → le canal capture n'a plus de consommateur.
-        self.capture_sample_tx = None;
-        if let Some(stop) = self.encoder_stop.take() {
-            let _ = stop.send(());
-        }
-        // Retire le stream self-monitor (créé dans start_capture).
-        // Sans ça, le stream subsisterait dans le mixer avec son volume courant
-        // et continuerait à mixer son ring buffer résiduel jusqu'à underrun.
-        self.mixer.lock().remove_local_stream();
-        // Le buffer input n'a plus de sens hors capture (capture_stream droppé).
-        // L'output reste actif (peut continuer à jouer les peers reçus), on
-        // garde donc `output_buffer_samples` tel quel jusqu'au `stop_all`.
-        self.input_buffer_samples = None;
-    }
-
+    /// Arrêt COMPLET : démonte la session ET ferme le driver audio (ASIOExit,
+    /// relâche l'interface). Utilisé pour un vrai arrêt — macOS/WASAPI à chaque
+    /// sortie de studio (comportement historique), device introuvable, ou
+    /// fermeture forcée. Sur ASIO, la sortie de studio passe plutôt par
+    /// `leave_session` → `park` (driver gardé chaud) ; `stop_all` n'y intervient
+    /// que pour la fermeture définitive.
+    ///
+    /// = `teardown_session` (encodeur, self-monitor, réception, décodage) +
+    /// `close_audio_driver` (streams + reset + canal + `warm` + buffers). L'ordre
+    /// (session AVANT driver) garantit que le retrait du callback de reset se fait
+    /// pendant que le driver est encore tenu par les streams.
     pub fn stop_all(&mut self) {
-        // Évite le bruit en idle : si rien ne tourne, on log en debug pour
-        // pas spammer info à chaque WS disconnect du browser (le probe agent
-        // ouvre/ferme une WS toutes les 30 s, ce qui appelait stop_all).
+        // Évite le bruit en idle : si rien ne tourne, on log en debug pour ne pas
+        // spammer info à chaque WS disconnect du browser (le probe agent ouvre/
+        // ferme une WS toutes les 30 s).
         let was_active = self.capture_stream.is_some()
             || self.playback_stream.is_some()
             || !self.recv_stops.is_empty()
             || self.recorder.is_some();
-        // REC-3 : si un recording était en cours, on l'arrête proprement
-        // (les fichiers sont produits mais perdus — l'utilisateur a quitté).
-        // Évite de laisser un thread record orphelin tenir des ressources.
+        // REC-3 : si un recording était en cours, on l'arrête proprement (fichiers
+        // produits mais perdus — l'utilisateur a quitté). Pas de thread orphelin.
         if self.recorder.is_some() {
             tracing::warn!(target: "jamodio::pipeline", "stop_all during recording — files discarded");
             let _ = self.stop_recording();
         }
-        self.stop_capture();
-        let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
-        for id in ids {
-            self.remove_stream(&id);
-        }
-        // 0.5.3-2 — arrête le thread de décodage RT partagé. Shutdown (il nettoie
-        // les streams mixer + net_stats restants) puis join (sortie immédiate sur
-        // le message). On drop le Sender pour fermer le MPSC côté principal ; les
-        // io tasks restantes (oneshots déjà envoyés ci-dessus) verront Err à leur
-        // prochain send et sortiront.
-        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
-            let _ = tx.send(DecodeMsg::Shutdown);
-            drop(tx);
-            let _ = join.join();
-        }
-        close_stream_on_com(self.playback_stream.take()); // drop sur le thread COM-STA (ASIO)
-        self.output_buffer_samples = None;
+        self.teardown_session();
+        self.close_audio_driver();
         self.state = AgentState::Idle;
         if was_active {
             tracing::info!(target: "jamodio::pipeline", "pipeline stopped");

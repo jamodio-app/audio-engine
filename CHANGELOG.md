@@ -6,6 +6,40 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-5] — 2026-06-30
+
+> **Pré-release — Driver ASIO gardé « CHAUD » à travers les leave/rejoin (cause
+> racine du PC injouable).** Analyse des sessions du 29/06 : le buffer n'était PAS
+> le problème (le Focusrite préfère 128 = ce qu'on lui donnait). La vraie cause :
+> notre code **fermait/rouvrait le driver (ASIOExit/ASIOInit) à CHAQUE sortie/
+> entrée de studio**. Le Focusrite USB ASIO se dégrade sous ces cycles rapides —
+> il gèle ses callbacks OU les garde vivants mais ne livre que du SILENCE (« ni
+> son ni vumètre » au rejoin, prouvé par `output_peak≈0` alors que `cap_cb=374`).
+> Décisif : l'état corrompu **survit à un relaunch de l'agent** → c'est le driver,
+> pas notre code. Un DAW ouvre l'interface une fois et la garde ; on fait pareil.
+
+### Changed
+- **Sur ASIO/Windows, le driver reste OUVERT à travers les leave/rejoin.** À la
+  sortie de studio on ne démonte que la couche SESSION (encodeur, SFU, réception,
+  décodage) via un nouveau `park` ; les streams capture+sortie restent chauds. Au
+  rejoin sur le MÊME device → réutilisation **instantanée** (zéro ASIOExit/ASIOInit
+  = zéro churn). Le canal capture→encodeur devient stable (Receiver cloné par
+  session, drainé du périmé au rejoin) ; le callback RT de capture est **inchangé**.
+- **Relâche du driver** (ASIOExit propre, libère l'interface pour un DAW) : après
+  une **grâce de 30 s** hors studio sans rejoin (minuteur dans le superviseur de
+  liveness), ou si le device d'entrée/sortie **change** (une seule ré-init propre),
+  ou à l'arrêt. Un rejoin dans les 30 s annule la grâce et réutilise le chaud.
+- **macOS/CoreAudio + WASAPI : strictement INCHANGÉS** — le keep-warm est gaté à
+  l'exécution sur le host ASIO (`warm = None` ailleurs → fermeture à chaque stop,
+  comportement historique). Refactor purement additif : `stop_all` factorisé en
+  `teardown_session` + `close_audio_driver`, chemin à froid identique.
+- Filets conservés : watchdog flatline (gel) + reset coopératif `kAsioResetRequest`
+  restent en secours — mais ne doivent quasi plus servir, le churn étant supprimé.
+
+> **Note** : le buffer préféré du driver (0.5.4-3) et la latence honnête (0.5.4-4)
+> restent — corrects et robustes pour tout l'écosystème ASIO, même si pour ce
+> Focusrite la préférée valait déjà 128.
+
 ## [0.5.4-4] — 2026-06-29
 
 > **Pré-release — Télémétrie de latence HONNÊTE : on mesure la taille de buffer
