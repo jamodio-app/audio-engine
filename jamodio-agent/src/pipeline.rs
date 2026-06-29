@@ -94,6 +94,7 @@ fn open_output_on_com(
     output_id: Option<String>,
     mixer: Arc<Mutex<AudioMixer>>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> OutputOpen {
     crate::audio::com_exec::run(move || {
         use cpal::traits::{DeviceTrait, StreamTrait};
@@ -108,7 +109,7 @@ fn open_output_on_com(
         // Volet B : build (sans play) puis play, sur le thread COM-STA. Sur ce
         // chemin (add_stream / sortie seule, capture déjà chaude) il n'y a pas
         // de cold-start full-duplex à éviter, donc build+play immédiat suffit.
-        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks) {
+        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks, output_frames) {
             Ok((stream, buffer)) => match stream.play() {
                 Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
                 Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
@@ -140,6 +141,8 @@ fn open_duplex_on_com(
     capture_drops: Arc<std::sync::atomic::AtomicU64>,
     capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    input_frames: Arc<std::sync::atomic::AtomicU32>,
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
@@ -164,6 +167,7 @@ fn open_duplex_on_com(
                 sample_tx,
                 capture_drops,
                 capture_callbacks,
+                input_frames,
             )
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
 
@@ -181,7 +185,7 @@ fn open_duplex_on_com(
                 }
                 Some(d) => {
                     let out_name = d.name().unwrap_or_default();
-                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks) {
+                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames) {
                         // Démarre la SORTIE d'abord (buffers tous créés).
                         Ok((out_stream, buffer)) => match out_stream.play() {
                             Ok(()) => OutputOpen::Opened {
@@ -512,6 +516,16 @@ pub struct PerfHandles {
     /// pour la sortie : si la sortie ne pull pas (jitter buffer overflow en
     /// cascade), ce compteur reste figé → le watchdog le détecte.
     pub output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    /// 0.5.4-4 — taille RÉELLE du callback CPAL d'ENTRÉE en frames/canal, mesurée
+    /// au 1er callback effectivement livré par le driver. `0` = pas encore mesuré.
+    /// Sert à la télémétrie de latence HONNÊTE : depuis qu'on défère à la taille
+    /// préférée du driver sur ASIO (`BufferSize::Default`), la valeur DEMANDÉE est
+    /// inconnue (`None`) — seule la mesure réelle dit la latence vraie. Corrige
+    /// aussi la sur-estimation Mac historique (on demandait 128, CoreAudio servait
+    /// 64). Re-mesuré à chaque (re)construction de stream.
+    pub input_frames: Arc<std::sync::atomic::AtomicU32>,
+    /// 0.5.4-4 — taille RÉELLE du callback CPAL de SORTIE en frames/canal. Idem.
+    pub output_frames: Arc<std::sync::atomic::AtomicU32>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
@@ -543,6 +557,8 @@ impl PerfHandles {
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            output_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1055,6 +1071,7 @@ impl PipelineState {
             self.output_device_id.clone(),
             self.mixer.clone(),
             self.perfstats.output_callbacks.clone(),
+            self.perfstats.output_frames.clone(),
         ) {
             OutputOpen::Opened { stream, buffer, name } => {
                 self.playback_stream = Some(stream);
@@ -1185,6 +1202,8 @@ impl PipelineState {
             self.perfstats.capture_drops.clone(),
             self.perfstats.capture_callbacks.clone(),
             self.perfstats.output_callbacks.clone(),
+            self.perfstats.input_frames.clone(),
+            self.perfstats.output_frames.clone(),
             self.reset_signal.clone(),
         )?;
         let BuiltDuplex { input: built_input, output: built_output, reset_guard } = built;
@@ -1394,6 +1413,8 @@ impl PipelineState {
             self.perfstats.capture_drops.clone(),
             self.perfstats.capture_callbacks.clone(),
             self.perfstats.output_callbacks.clone(),
+            self.perfstats.input_frames.clone(),
+            self.perfstats.output_frames.clone(),
             self.reset_signal.clone(),
         )?;
 
@@ -1505,6 +1526,7 @@ impl PipelineState {
                 self.output_device_id.clone(),
                 self.mixer.clone(),
                 self.perfstats.output_callbacks.clone(),
+                self.perfstats.output_frames.clone(),
             ) {
                 OutputOpen::Opened { stream, buffer, .. } => {
                     self.playback_stream = Some(stream);
@@ -1539,6 +1561,11 @@ impl PipelineState {
         // tenu par `capture_stream` (Weak::upgrade OK → retrait propre du registre
         // global). Doit précéder la fermeture du stream.
         self.reset_guard = None;
+        // 0.5.4-4 — invalide les tailles de buffer mesurées (re-mesurées au 1er
+        // callback de la prochaine capture) pour ne pas rapporter une latence
+        // périmée si le device change au re-join.
+        self.perfstats.input_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
         // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
         // tourner sur l'apartment qui a créé le driver). macOS : inline.
         close_stream_on_com(self.capture_stream.take());

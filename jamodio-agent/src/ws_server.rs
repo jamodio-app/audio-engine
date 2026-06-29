@@ -1762,17 +1762,32 @@ async fn handle_message(
             });
 
             // Real latency from CPAL buffer: samples / 48000 * 1000.
-            // input/output sont des Option<u32> côté pipeline (Some si
-            // BufferSize::Fixed appliqué, None si fallback Default — taille
-            // réelle inconnue côté agent). Pour les composants de la latence
-            // totale on est obligés d'estimer le None — on prend 10 ms
-            // (= 480 samples / 48), la valeur conservatrice WASAPI shared
-            // standard, alignée sur les recommandations FarPlay/Jamulus pour
-            // ce mode. Les champs wire `inputBufferMs` / `outputBufferMs`
-            // restent absents (= None) pour ne pas mentir.
+            //
+            // 0.5.4-4 — on privilégie la taille RÉELLE mesurée au 1er callback
+            // (`perfstats.input_frames`/`output_frames`, frames/canal ; 0 = pas
+            // encore mesuré). C'est la latence HONNÊTE : depuis qu'on défère à la
+            // taille préférée du driver sur ASIO (`BufferSize::Default`), la valeur
+            // DEMANDÉE est inconnue (`input_buffer_samples = None`) → seule la
+            // mesure dit la vérité. Corrige aussi la sur-estimation Mac historique
+            // (on demandait 128, CoreAudio servait 64). Ordre de priorité :
+            //   1) taille mesurée au callback, 2) taille demandée (Fixed),
+            //   3) fallback conservateur 10 ms (= 480/48, valeur WASAPI shared).
+            // Les champs wire `inputBufferMs`/`outputBufferMs` reflètent désormais
+            // la mesure dès qu'elle est dispo (présents même sur ASIO).
             const DEFAULT_BUF_MS_FALLBACK: f32 = 10.0;
-            let input_buf_ms_opt: Option<f32> = pl.input_buffer_samples.map(|n| n as f32 / 48.0);
-            let output_buf_ms_opt: Option<f32> = pl.output_buffer_samples.map(|n| n as f32 / 48.0);
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let measured_in = pl.perfstats.input_frames.load(AtomicOrdering::Relaxed);
+            let measured_out = pl.perfstats.output_frames.load(AtomicOrdering::Relaxed);
+            let input_buf_ms_opt: Option<f32> = if measured_in > 0 {
+                Some(measured_in as f32 / 48.0)
+            } else {
+                pl.input_buffer_samples.map(|n| n as f32 / 48.0)
+            };
+            let output_buf_ms_opt: Option<f32> = if measured_out > 0 {
+                Some(measured_out as f32 / 48.0)
+            } else {
+                pl.output_buffer_samples.map(|n| n as f32 / 48.0)
+            };
             let input_buf_ms_est = input_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             let output_buf_ms_est = output_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             // Latence algorithmique Opus = lookahead encodeur. En mode

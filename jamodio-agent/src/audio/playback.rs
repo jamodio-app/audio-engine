@@ -44,6 +44,9 @@ pub fn build_playback_stream(
     mixer: Arc<Mutex<AudioMixer>>,
     // 0.5.3-4 — liveness : +1 par callback de sortie (cf. watchdog cold-start).
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    // 0.5.4-4 — taille réelle du callback de sortie (frames/canal), publiée à
+    // chaque callback pour la télémétrie de latence honnête.
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<(cpal::Stream, Option<u32>), cpal::BuildStreamError> {
     // Diagnostic SR : on force CPAL en 48 kHz mais si le device préfère un
     // autre rate (Mac casque jack 44.1, BlackHole 2ch, etc.), CoreAudio fait
@@ -113,10 +116,12 @@ pub fn build_playback_stream(
     let stream = match sample_format {
         SampleFormat::F32 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             device.build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     mixer.lock().mix_into(data);
                 },
                 on_playback_err,
@@ -125,11 +130,13 @@ pub fn build_playback_stream(
         }
         SampleFormat::I32 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);
@@ -143,11 +150,13 @@ pub fn build_playback_stream(
         }
         SampleFormat::I16 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);

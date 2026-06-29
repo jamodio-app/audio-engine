@@ -6,6 +6,25 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-4] — 2026-06-29
+
+> **Pré-release — Télémétrie de latence HONNÊTE : on mesure la taille de buffer
+> réelle.** Le calcul de latence utilisait la taille DEMANDÉE (`Fixed(128)`), pas
+> celle réellement servie par le driver. Conséquences : (1) sur Mac on
+> sur-estimait l'entrée (~+1,3 ms — on demandait 128, CoreAudio servait 64) ;
+> (2) depuis 0.5.4-3 (ASIO → taille préférée du driver, valeur a priori inconnue),
+> le calcul retombait sur le fallback conservateur de 10 ms/côté → latence ASIO
+> gonflée à tort.
+
+### Changed
+- **La latence est calculée sur la taille de buffer RÉELLE**, mesurée au 1er
+  callback CPAL (entrée ET sortie, `perfstats.input_frames`/`output_frames`).
+  Ordre de priorité : taille mesurée → taille demandée (Fixed) → fallback 10 ms.
+  Les champs wire `inputBufferMs`/`outputBufferMs` reflètent désormais la mesure
+  (présents même sur ASIO en `Default`). Re-mesuré à chaque (re)construction de
+  stream ; remis à zéro à l'arrêt capture (pas de valeur périmée au re-join).
+  Coût hot-path : un `store(Relaxed)` u32 par callback (négligeable).
+
 ## [0.5.4-3] — 2026-06-29
 
 > **Pré-release — Gel ASIO Focusrite Windows : on ne force plus la taille de
