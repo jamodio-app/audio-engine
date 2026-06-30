@@ -536,7 +536,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             if !rms_data.is_empty() || has_self_signal {
                 let levels: Vec<StreamLevel> = rms_data
                     .into_iter()
-                    .map(|(producer_id, rms)| StreamLevel { producer_id, rms })
+                    .map(|(producer_id, rms, rms_l, rms_r)| StreamLevel {
+                        producer_id,
+                        rms,
+                        rms_l: Some(rms_l),
+                        rms_r: Some(rms_r),
+                    })
                     .collect();
                 let msg = AgentMessage::StreamLevels {
                     levels,

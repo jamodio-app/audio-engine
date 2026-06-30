@@ -54,6 +54,11 @@ struct StreamState {
     /// DAW pour un signal stéréo entrant. Default 0.0 (centré).
     pan: f32,
     rms: f32,
+    /// RMS par canal (L = samples pairs, R = samples impairs de l'entrelacé
+    /// stéréo). Utilisé pour le VU self stéréo côté browser (2 barres L/R
+    /// indépendantes). `rms` reste le niveau global (back-compat peers).
+    rms_l: f32,
+    rms_r: f32,
     /// Snapshot du `overflow_drops` du jitter au précédent push, pour ne
     /// loguer que sur événement (rate-limited via puissance de 2).
     last_overflow_drops: u64,
@@ -132,6 +137,8 @@ impl AudioMixer {
             volume: 1.0,
             pan: 0.0,
             rms: 0.0,
+            rms_l: 0.0,
+            rms_r: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
             last_drift_drops: 0,
@@ -165,6 +172,8 @@ impl AudioMixer {
             volume: 0.0,
             pan: 0.0,
             rms: 0.0,
+            rms_l: 0.0,
+            rms_r: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
             last_drift_drops: 0,
@@ -253,10 +262,27 @@ impl AudioMixer {
         }
 
         if let Some(stream) = self.streams.get_mut(producer_id) {
-            // Compute RMS of pushed samples
+            // Compute RMS of pushed samples (global + par canal L/R).
             if !samples.is_empty() {
+                let n = samples.len();
                 let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-                stream.rms = (sum_sq / samples.len() as f32).sqrt();
+                stream.rms = (sum_sq / n as f32).sqrt();
+                // L = samples pairs, R = samples impairs (entrelacé stéréo). Si
+                // longueur impaire (cas dégénéré), on retombe sur le global.
+                if n >= 2 && n.is_multiple_of(2) {
+                    let half = (n / 2) as f32;
+                    let mut sq_l = 0.0f32;
+                    let mut sq_r = 0.0f32;
+                    for pair in samples.chunks_exact(2) {
+                        sq_l += pair[0] * pair[0];
+                        sq_r += pair[1] * pair[1];
+                    }
+                    stream.rms_l = (sq_l / half).sqrt();
+                    stream.rms_r = (sq_r / half).sqrt();
+                } else {
+                    stream.rms_l = stream.rms;
+                    stream.rms_r = stream.rms;
+                }
             }
 
             stream.jitter.push(samples);
@@ -414,9 +440,12 @@ impl AudioMixer {
     }
 
     /// RMS level per stream (for VU meters sent to browser).
-    pub fn stream_rms(&self) -> Vec<(String, f32)> {
+    /// Retourne `(producer_id, rms_global, rms_l, rms_r)` par stream. Le global
+    /// reste utilisé pour les VU peers (1 valeur) ; L/R alimentent le VU self
+    /// stéréo (2 barres indépendantes) côté browser.
+    pub fn stream_rms(&self) -> Vec<(String, f32, f32, f32)> {
         self.streams.iter().map(|(id, stream)| {
-            (id.clone(), stream.rms)
+            (id.clone(), stream.rms, stream.rms_l, stream.rms_r)
         }).collect()
     }
 
@@ -542,6 +571,21 @@ impl AudioMixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rms_par_canal_l_r_independants() {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1");
+        // Entrelacé stéréo : L = 1.0 partout, R = 0.0 partout.
+        let mut s = Vec::new();
+        for _ in 0..100 { s.push(1.0); s.push(0.0); }
+        m.push_samples("p1", &s);
+        let (_, rms, rms_l, rms_r) = m.stream_rms().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        assert!((rms_l - 1.0).abs() < 1e-4, "rms_l ≈ 1 (canal gauche plein)");
+        assert!(rms_r.abs() < 1e-4, "rms_r ≈ 0 (canal droit silencieux)");
+        // rms global = sqrt(moyenne sur tous) = sqrt(0.5) ≈ 0.707.
+        assert!((rms - 0.5f32.sqrt()).abs() < 1e-3, "rms global = sqrt(0.5)");
+    }
 
     /// Helper : pousse un signal constant 1.0 dans un stream et mixe un bloc,
     /// retourne (gain_L_effectif, gain_R_effectif) mesurés sur la sortie.

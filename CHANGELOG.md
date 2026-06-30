@@ -6,6 +6,20 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-9] — 2026-06-30
+
+> **Pré-release — VU self stéréo (niveaux L/R indépendants).** Le VU « moi »
+> affichait le même niveau sur les 2 barres (un seul RMS global) même quand le
+> signal n'était que d'un côté. L'agent pousse désormais un RMS gauche ET droite
+> séparés. Aucun impact sur le flux audio ni la latence (calcul sur le plan de
+> contrôle StreamLevels 10 Hz).
+
+### Added
+- `StreamLevel.rmsL` / `rmsL` (wire, optionnels, `skip_serializing_if` → back-compat
+  browser ancien) : RMS par canal (L = samples pairs, R = impairs de l'entrelacé).
+  Mixer : `StreamState.rms_l/rms_r` calculés dans `push_samples`, `stream_rms()`
+  retourne `(id, rms, rms_l, rms_r)`. Test `rms_par_canal_l_r_independants`.
+
 ## [0.5.4-8] — 2026-06-30
 
 > **Pré-release — Capture d'une PAIRE stéréo arbitraire.** L'agent peut désormais

@@ -712,7 +712,14 @@ pub struct RecordedFileWire {
 pub struct StreamLevel {
     #[serde(rename = "producerId")]
     pub producer_id: String,
+    /// Niveau global (mono) — VU peers (1 valeur sur 2 barres).
     pub rms: f32,
+    /// Niveaux par canal L/R — VU self stéréo (2 barres indépendantes).
+    /// Omis du JSON si absent (back-compat browser ancien : ignore ces champs).
+    #[serde(rename = "rmsL", skip_serializing_if = "Option::is_none")]
+    pub rms_l: Option<f32>,
+    #[serde(rename = "rmsR", skip_serializing_if = "Option::is_none")]
+    pub rms_r: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
