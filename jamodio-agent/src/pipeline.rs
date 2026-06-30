@@ -1412,10 +1412,13 @@ impl PipelineState {
     /// Start the capture pipeline: CPAL → accumulator → Opus → RTP → UDP.
     /// `channel_index` : si `Some(i)`, extrait le canal physique i et duplique
     /// L=R=canal[i] avant encodage Opus (mode mono propre, centré à la lecture).
-    /// Si `None`, capture stéréo standard (canaux 1+2 du device).
+    /// `stereo_start` : si `Some(N)` (et channel_index None), capture la PAIRE
+    /// stéréo L=ch[N], R=ch[N+1] (synthé/clavier stéréo sur 3+4, 5+6, …).
+    /// Si les deux sont `None`, capture stéréo standard (canaux 1+2 du device).
     /// `sfu_srtp` : clés SRTP du SFU (chiffrement RTP entrant côté agent).
     /// Returns `(local_port, agent_srtp)` — le browser relaie `agent_srtp`
     /// au SFU via `connect-plain-transport`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_capture(
         &mut self,
         ssrc: u32,
@@ -1423,6 +1426,7 @@ impl PipelineState {
         sfu_port: u16,
         payload_type: u8,
         channel_index: Option<u8>,
+        stereo_start: Option<u8>,
         sfu_srtp: SrtpParameters,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
         // 1. ACQUISITION AUDIO — réutilise le driver ASIO gardé CHAUD (rejoin sans
@@ -1475,23 +1479,38 @@ impl PipelineState {
         //    mémorisation du chaud y sont gérés.)
         tracing::info!(
             target: "jamodio::pipeline",
-            channels_in, native_sr, ?channel_index,
+            channels_in, native_sr, ?channel_index, ?stereo_start,
             needs_resample = native_sr != 48000,
             "input config"
         );
 
-        // Valider que le canal mono demandé existe bien sur le device
-        let effective_channel = channel_index.and_then(|idx| {
-            if (idx as u16) < channels_in { Some(idx) } else {
+        // Sélection effective, validée contre channels_in. Mono prioritaire
+        // (mutuellement exclusif côté browser), puis paire stéréo, sinon défaut.
+        let effective_sel = if let Some(idx) = channel_index {
+            if (idx as u16) < channels_in {
+                ChannelSel::Mono(idx)
+            } else {
                 tracing::warn!(
                     target: "jamodio::pipeline",
-                    requested_channel = idx,
-                    available_channels = channels_in,
+                    requested_channel = idx, available_channels = channels_in,
                     "channel_index hors plage — fallback stéréo"
                 );
-                None
+                ChannelSel::Default
             }
-        });
+        } else if let Some(start) = stereo_start {
+            if (start as u16 + 1) < channels_in {
+                ChannelSel::StereoPair(start)
+            } else {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested_pair_start = start, available_channels = channels_in,
+                    "stereo_start hors plage (besoin de N et N+1) — fallback stéréo"
+                );
+                ChannelSel::Default
+            }
+        } else {
+            ChannelSel::Default
+        };
 
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         //
@@ -1535,7 +1554,7 @@ impl PipelineState {
             .spawn(move || {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
-                    channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
+                    channels_in, native_sr, effective_sel, mixer_for_encoder, input_cut_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
@@ -1835,23 +1854,48 @@ impl PipelineState {
 
 // ─── Encoder thread (std::thread, real-time priority) ──────────────
 
+/// Sélection de canal d'entrée appliquée au remap stéréo. Calculée (et validée
+/// contre `channels_in`) dans `start_capture`, puis threadée jusqu'au remap.
+#[derive(Clone, Copy, Debug)]
+pub enum ChannelSel {
+    /// Stéréo par défaut : ch0 = L, ch1 = R (ou mono centré si channels_in = 1).
+    Default,
+    /// Mono : canal `i` dupliqué L = R = ch[i].
+    Mono(u8),
+    /// Paire stéréo : L = ch[start], R = ch[start + 1].
+    StereoPair(u8),
+}
+
 /// Convertit un bloc PCM entrelacé N canaux vers stéréo entrelacé (L, R, L, R, …).
-/// - `channel_index = Some(i)` : extraction pure du canal i, dupliqué L=R=ch[i]
+/// - `ChannelSel::Mono(i)` : extraction pure du canal i, dupliqué L=R=ch[i]
 ///   (signal mono centré, parfait pour un instrument mono branché sur un seul
 ///   canal d'une interface multi-canaux).
-/// - `channel_index = None` :
+/// - `ChannelSel::StereoPair(start)` : L=ch[start], R=ch[start+1] (paire stéréo
+///   arbitraire — clavier/synthé stéréo branché sur 3+4, 5+6, …).
+/// - `ChannelSel::Default` :
 ///     - si source mono (channels_in = 1) → L=R=sample (centrage)
 ///     - sinon → prend les 2 premiers canaux (ch0 = L, ch1 = R)
 ///
+/// Les indices sont supposés déjà validés contre `channels_in` (cf.
+/// `start_capture`) ; un index hors plage retomberait sur Default par sécurité.
+///
 /// Sortie : un `Vec<f32>` de longueur `frames × 2` (interleaved stéréo).
-fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -> Vec<f32> {
+fn remap_to_stereo(src: &[f32], channels_in: usize, sel: ChannelSel) -> Vec<f32> {
     if channels_in == 0 {
         return Vec::new();
     }
     let frames = src.len() / channels_in;
     let mut out = Vec::with_capacity(frames * 2);
-    match channel_index {
-        Some(idx) => {
+    // Garde-fou ultime : indices hors plage → Default (ne devrait pas arriver,
+    // validé en amont, mais évite tout panic d'indexation dans le thread RT).
+    let sel = match sel {
+        ChannelSel::Mono(i) if (i as usize) < channels_in => ChannelSel::Mono(i),
+        ChannelSel::StereoPair(s) if (s as usize + 1) < channels_in => ChannelSel::StereoPair(s),
+        ChannelSel::Default => ChannelSel::Default,
+        _ => ChannelSel::Default,
+    };
+    match sel {
+        ChannelSel::Mono(idx) => {
             let i = idx as usize;
             for f in 0..frames {
                 let s = src[f * channels_in + i];
@@ -1859,7 +1903,15 @@ fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -
                 out.push(s);
             }
         }
-        None => {
+        ChannelSel::StereoPair(start) => {
+            let l = start as usize;
+            let r = l + 1;
+            for f in 0..frames {
+                out.push(src[f * channels_in + l]);
+                out.push(src[f * channels_in + r]);
+            }
+        }
+        ChannelSel::Default => {
             if channels_in == 1 {
                 for &s in src.iter().take(frames) {
                     out.push(s);
@@ -1978,7 +2030,7 @@ fn encoder_thread(
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
     native_sr: u32,
-    channel_index: Option<u8>,
+    channel_sel: ChannelSel,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
@@ -2013,7 +2065,7 @@ fn encoder_thread(
                 stop_cap,
                 channels_in,
                 native_sr,
-                channel_index,
+                channel_sel,
                 perfstats_cap,
                 out_name_cap,
             );
@@ -2131,7 +2183,7 @@ fn capture_stage_loop(
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     channels_in: u16,
     native_sr: u32,
-    channel_index: Option<u8>,
+    channel_sel: ChannelSel,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
 ) {
@@ -2203,7 +2255,7 @@ fn capture_stage_loop(
                 // s'arrête juste avant out_tx.send (= AVANT l'entrée en file
                 // dans le ringbuf du process_stage).
                 let t_stage_start = t_block_start;
-                let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
+                let mut stereo = remap_to_stereo(&samples, channels_in, channel_sel);
 
                 // RESAMPLE (Windows 44.1 → 48k). Bypass total si natif = 48k.
                 if let Some(rs) = resampler.as_mut() {
@@ -3405,6 +3457,56 @@ mod plugin_control_tests {
             ctrl.instrument_plugin_info.lock().is_none(),
             "info reste None après échec de load"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// remap_to_stereo — mono / paire stéréo / défaut (cross-platform)
+// ═══════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod remap_tests {
+    use super::{remap_to_stereo, ChannelSel};
+
+    // Bloc 3 canaux × 2 frames : frame0 = [10,20,30], frame1 = [11,21,31].
+    fn block_3ch() -> Vec<f32> {
+        vec![10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
+    }
+
+    #[test]
+    fn mono_duplique_le_canal_sur_l_et_r() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::Mono(1)); // canal 2
+        // L=R=ch1 pour chaque frame
+        assert_eq!(out, vec![20.0, 20.0, 21.0, 21.0]);
+    }
+
+    #[test]
+    fn stereo_pair_mappe_n_et_n_plus_1() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::StereoPair(1)); // 2+3
+        // L=ch1, R=ch2
+        assert_eq!(out, vec![20.0, 30.0, 21.0, 31.0]);
+    }
+
+    #[test]
+    fn default_prend_les_deux_premiers() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::Default);
+        assert_eq!(out, vec![10.0, 20.0, 11.0, 21.0]);
+    }
+
+    #[test]
+    fn default_mono_source_centre() {
+        // channels_in=1 : L=R=sample.
+        let out = remap_to_stereo(&[5.0, 6.0], 1, ChannelSel::Default);
+        assert_eq!(out, vec![5.0, 5.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn indices_hors_plage_retombent_sur_default() {
+        // StereoPair(2) sur 3 canaux : besoin de ch2 ET ch3 → ch3 absent → Default.
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::StereoPair(2));
+        assert_eq!(out, vec![10.0, 20.0, 11.0, 21.0]);
+        // Mono(5) hors plage → Default.
+        let out2 = remap_to_stereo(&block_3ch(), 3, ChannelSel::Mono(5));
+        assert_eq!(out2, vec![10.0, 20.0, 11.0, 21.0]);
     }
 }
 

@@ -1614,13 +1614,14 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, srtp_parameters } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc,
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 ?input_device,
                 ?channel_index,
+                ?stereo_start,
                 "StartCapture"
             );
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
@@ -1637,7 +1638,7 @@ async fn handle_message(
             // La liveness des callbacks ASIO (cold-start ET mort en cours de
             // session) est surveillée en continu par `audio_liveness_supervisor`,
             // qui recrée les streams au besoin (cf. la fonction).
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters).await {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser

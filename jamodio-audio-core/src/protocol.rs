@@ -58,6 +58,12 @@ pub enum BrowserMessage {
         /// Canal mono à extraire (0..N-1). Si `None`, capture stéréo standard.
         #[serde(rename = "channelIndex", default)]
         channel_index: Option<u8>,
+        /// Canal de départ d'une PAIRE stéréo (L = ch[N], R = ch[N+1]). Si
+        /// `None`, paire 1+2 par défaut (comportement historique). Mutuellement
+        /// exclusif avec `channel_index` (mono). `default` = rétro-compatible
+        /// avec les browsers qui n'envoient pas encore ce champ.
+        #[serde(rename = "stereoStart", default)]
+        stereo_start: Option<u8>,
         /// Clés SRTP du SFU (chiffrement des paquets SFU → agent).
         /// Le browser les a reçues dans `plain-transport-created`.
         #[serde(rename = "srtpParameters")]

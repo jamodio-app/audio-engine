@@ -6,6 +6,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-8] — 2026-06-30
+
+> **Pré-release — Capture d'une PAIRE stéréo arbitraire.** L'agent peut désormais
+> capturer n'importe quelle paire stéréo (3+4, 5+6 …) d'une interface multi-canaux,
+> et plus seulement 1+2. Pour un synthé/clavier stéréo branché ailleurs que sur les
+> deux premiers canaux. (Côté browser : sélecteur paires/mono + libellés, et fix
+> attack/release du talkback + bannière « N interfaces · M entrées » — monorepo.)
+
+### Added
+- `StartCapture.stereoStart` (wire, `default` serde → rétro-compatible) : capture
+  la paire stéréo `L=ch[N]`, `R=ch[N+1]`. Enum interne `ChannelSel`
+  (`Default`/`Mono`/`StereoPair`) threadé jusqu'à `remap_to_stereo`, indices
+  validés contre `channels_in` (repli stéréo défaut si hors plage). Tests
+  `remap_tests` (mono / paire / défaut / mono-source / hors-plage).
+
 ## [0.5.4-7] — 2026-06-30
 
 > **Pré-release — Faux « agent saturé / drops/s » pendant le park supprimé.**
