@@ -114,11 +114,19 @@ fn forward_samples(
     sample_tx: &Sender<Vec<f32>>,
     capture_drops: &AtomicU64,
     capture_callbacks: &AtomicU64,
+    capture_feeding: &std::sync::atomic::AtomicBool,
 ) {
     // 0.5.3-4 — liveness : +1 par callback CPAL d'entrée effectivement délivré
     // par le driver. Lu par le watchdog cold-start ASIO (cf. ws_server). Un seul
-    // load+store Relaxed = négligeable sur le hot-path RT.
+    // load+store Relaxed = négligeable sur le hot-path RT. TOUJOURS incrémenté,
+    // même parké (le driver chaud est bien vivant).
     capture_callbacks.fetch_add(1, Ordering::Relaxed);
+    // 0.5.4-7 — driver PARKÉ (gardé chaud, pas d'encodeur consommateur) : on JETTE
+    // sans pousser ni compter de drop. Sinon le canal sans consommateur se remplit
+    // → faux « agent saturé / drops/s » à chaque commutation rapide de studio.
+    if !capture_feeding.load(Ordering::Relaxed) {
+        return;
+    }
     let n = samples.len();
     match sample_tx.try_send(samples) {
         Ok(_) => {}
@@ -226,6 +234,9 @@ pub fn build_capture_stream(
     capture_callbacks: Arc<AtomicU64>,
     // 0.5.4-4 — taille réelle du callback (frames/canal), publiée au 1er callback.
     input_frames: Arc<AtomicU32>,
+    // 0.5.4-7 — `false` = driver parké (gardé chaud) → le callback jette ses
+    // samples sans compter de drop (anti faux « agent saturé »).
+    capture_feeding: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(cpal::Stream, u16, u32, Option<u32>), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
     // physiques + le sample rate natif (cf. doc fonction).
@@ -297,6 +308,7 @@ pub fn build_capture_stream(
         let capture_drops = capture_drops.clone();
         let capture_callbacks = capture_callbacks.clone();
         let input_frames = input_frames.clone();
+        let capture_feeding = capture_feeding.clone();
         let first_logged = first_block_logged.clone();
         // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
         // On ouvre le stream au format NATIF du driver puis on convertit chaque
@@ -306,7 +318,7 @@ pub fn build_capture_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
-                    forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks);
+                    forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,
@@ -317,7 +329,7 @@ pub fn build_capture_stream(
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,
@@ -328,7 +340,7 @@ pub fn build_capture_stream(
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,

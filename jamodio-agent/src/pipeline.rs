@@ -197,6 +197,7 @@ fn open_duplex_on_com(
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
     input_frames: Arc<std::sync::atomic::AtomicU32>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
+    capture_feeding: Arc<std::sync::atomic::AtomicBool>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
@@ -222,6 +223,7 @@ fn open_duplex_on_com(
                 capture_drops,
                 capture_callbacks,
                 input_frames,
+                capture_feeding,
             )
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
 
@@ -584,6 +586,12 @@ pub struct PerfHandles {
     pub input_frames: Arc<std::sync::atomic::AtomicU32>,
     /// 0.5.4-4 — taille RÉELLE du callback CPAL de SORTIE en frames/canal. Idem.
     pub output_frames: Arc<std::sync::atomic::AtomicU32>,
+    /// 0.5.4-7 — `true` quand un encodeur consomme le canal capture (session
+    /// active). `false` quand le driver est PARKÉ (gardé chaud, mais pas de
+    /// session) : le callback de capture continue de tourner (liveness) mais
+    /// JETTE ses samples sans compter de drop — sinon le canal sans consommateur
+    /// se remplit et déclenche un faux « agent saturé / drops/s » (cf. forward_samples).
+    pub capture_feeding: Arc<std::sync::atomic::AtomicBool>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
@@ -617,6 +625,7 @@ impl PerfHandles {
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             input_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            capture_feeding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1179,6 +1188,12 @@ impl PipelineState {
     /// chaud. NE touche NI au driver (`capture_stream`/`playback_stream`), NI au
     /// `reset_guard`, NI à `warm`, NI à `capture_sample_tx`.
     fn teardown_session(&mut self) {
+        // 0.5.4-7 — plus d'encodeur consommateur : le callback du driver chaud
+        // doit JETER ses samples (anti faux « agent saturé / drops/s » pendant le
+        // park). Doit précéder l'arrêt de l'encodeur.
+        self.perfstats
+            .capture_feeding
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
@@ -1340,6 +1355,7 @@ impl PipelineState {
             self.perfstats.output_callbacks.clone(),
             self.perfstats.input_frames.clone(),
             self.perfstats.output_frames.clone(),
+            self.perfstats.capture_feeding.clone(),
             self.reset_signal.clone(),
         )?;
         let BuiltDuplex { input, output, reset_guard } = built;
@@ -1532,6 +1548,13 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
+        // 0.5.4-7 — l'encodeur consomme désormais le canal capture : le callback
+        // peut pousser (et compter de vrais drops). Mis APRÈS le spawn pour que le
+        // park (qui repasse à false) et ce point encadrent exactement la session.
+        self.perfstats
+            .capture_feeding
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         // 7. (Émission RT — le thread d'encode chiffre + envoie directement.
         //    Stream de sortie ouvert/réutilisé en 1. via prepare_audio_for_session.)
 
@@ -1632,6 +1655,7 @@ impl PipelineState {
             self.perfstats.output_callbacks.clone(),
             self.perfstats.input_frames.clone(),
             self.perfstats.output_frames.clone(),
+            self.perfstats.capture_feeding.clone(),
             self.reset_signal.clone(),
         )?;
 

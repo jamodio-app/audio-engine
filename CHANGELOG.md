@@ -6,6 +6,24 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-7] — 2026-06-30
+
+> **Pré-release — Faux « agent saturé / drops/s » pendant le park supprimé.**
+> Test PC 0.5.4-6 : keep-warm **validé** (logs `réutilisé à chaud` à chaque
+> rejoin, 0 `pipeline stopped`, churn éliminé). Mais un effet de bord : pendant le
+> PARK (driver gardé chaud), le callback de capture continuait de pousser des
+> samples alors que l'encodeur était démonté → canal sans consommateur plein →
+> ~250 « drops/s » comptés comme « encoder saturé (CPU?) » → **toast trompeur**
+> « agent saturé, ferme des apps ou choisis un plugin moins lourd » à chaque
+> commutation rapide de studio (alors qu'aucune surcharge, aucun plugin).
+
+### Fixed
+- Flag `capture_feeding` : pendant le park (pas d'encodeur consommateur), le
+  callback du driver chaud **jette ses samples sans compter de drop** (la liveness
+  `capture_callbacks` continue, elle, d'incrémenter — le driver EST vivant). Plus
+  de faux drops, plus de toast « saturé » lors des leave/rejoin. Aucun impact sur
+  la détection des VRAIS drops en session active.
+
 ## [0.5.4-6] — 2026-06-30
 
 > **Pré-release — Fix « double-leave » qui annulait le keep-warm.** Test PC du
