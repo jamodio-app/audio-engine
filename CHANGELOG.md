@@ -6,6 +6,23 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-6] — 2026-06-30
+
+> **Pré-release — Fix « double-leave » qui annulait le keep-warm.** Test PC du
+> 30/06 (autre Focusrite, 20 canaux) : le keep-warm fonctionnait (logs `réutilisé
+> à chaud`) mais la plupart des rejoins repassaient en cold (`input device
+> opened`). Cause : une sortie de studio déclenche DEUX appels (`Stop` du browser
+> PUIS fermeture de sa WebSocket) ; le 1er parkait (driver gardé chaud), mais le
+> 2e — état déjà `Idle` — tombait dans `stop_all` et **refermait le driver**.
+> Résultat : le churn ASIOExit/ASIOInit n'était supprimé qu'une fois sur deux.
+
+### Fixed
+- `leave_session` : tant qu'un driver ASIO **chaud** existe, un 2e leave redondant
+  est désormais **inerte** (park seulement si une capture tourne ; no-op si déjà
+  parké). La fermeture du driver est laissée à la **grâce** (~30 s) — plus aucun
+  leave ne referme le chaud. Les rejoins rapides réutilisent donc TOUJOURS le
+  driver (zéro ré-init). macOS/WASAPI inchangés (`stop_all` comme avant).
+
 ## [0.5.4-5] — 2026-06-30
 
 > **Pré-release — Driver ASIO gardé « CHAUD » à travers les leave/rejoin (cause

@@ -1235,15 +1235,24 @@ impl PipelineState {
         );
     }
 
-    /// 0.5.4-5 — sortie de studio : PARK si éligible (ASIO + capture active +
-    /// driver chaud présent), sinon `stop_all` complet (macOS/WASAPI, ou pas de
-    /// capture). Point d'entrée unique appelé par ws_server (Stop + WS disconnect).
+    /// 0.5.4-5 — sortie de studio. Point d'entrée unique appelé par ws_server
+    /// (Stop + WS disconnect). Sur ASIO avec un driver CHAUD présent : on le
+    /// GARDE (park si on capture ; **no-op si déjà parké**). Sinon `stop_all`
+    /// complet (macOS/WASAPI, ou rien à préserver).
+    ///
+    /// 0.5.4-6 — fix double-leave : une sortie de studio déclenche souvent DEUX
+    /// appels (le `Stop` du browser PUIS la fermeture de sa WS). Avant, le 2e
+    /// (état déjà Idle après park) tombait dans `stop_all` et **refermait le
+    /// driver chaud** → la plupart des rejoins repassaient en cold (churn non
+    /// supprimé). Désormais, tant qu'un driver chaud existe, un 2e leave est
+    /// inerte : c'est la **grâce** (~30 s) qui relâche, pas un leave redondant.
     pub fn leave_session(&mut self) {
-        if Self::host_is_asio()
-            && matches!(self.state, AgentState::Capturing)
-            && self.warm.is_some()
-        {
-            self.park();
+        if Self::host_is_asio() && self.warm.is_some() {
+            // Driver chaud présent : on le préserve. Park seulement si une
+            // capture tourne encore ; sinon (déjà parké) on ne fait RIEN.
+            if matches!(self.state, AgentState::Capturing) {
+                self.park();
+            }
         } else {
             self.stop_all();
         }
