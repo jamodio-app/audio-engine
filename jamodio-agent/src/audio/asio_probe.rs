@@ -32,12 +32,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Lance le spike sur un thread dédié si `JAMODIO_ASIO_PROBE` est défini.
-/// No-op sinon. Non bloquant pour le démarrage de l'agent.
-pub fn spawn_if_requested() {
-    if std::env::var_os("JAMODIO_ASIO_PROBE").is_none() {
-        return;
-    }
+/// Lance le spike sur un thread dédié.
+///
+/// 0.5.4-12 — **build-probe** : lancement AUTOMATIQUE au démarrage (plus besoin de
+/// la var d'env `JAMODIO_ASIO_PROBE`, qui reste honorée pour compat). Cette build
+/// est dédiée au test : au lancement l'agent exécute le probe (~60 s, l'ASIO est
+/// monopolisé le temps du test), logge son verdict, puis relâche l'interface —
+/// l'usage normal redevient possible ensuite. Non bloquant pour le reste du
+/// démarrage (WS, tray). Isolé : jamais câblé au pipeline, aucun impact Mac.
+pub fn spawn_probe_at_startup() {
     let _ = std::thread::Builder::new()
         .name("asio-probe".into())
         // Le spike lui-même s'exécute sur le thread COM-STA (contrat ASIO/COM,
@@ -46,6 +49,10 @@ pub fn spawn_if_requested() {
 }
 
 fn probe() {
+    // Laisse l'énumération CPAL du boot (host::probe) relâcher le driver ASIO
+    // avant qu'on le charge nous-mêmes (mono-client) — évite un conflit d'accès.
+    std::thread::sleep(Duration::from_secs(3));
+    tracing::info!(target: "jamodio::asioprobe", "=== BUILD-PROBE : lancement automatique du test ASIO duplex (~60 s) ===");
     let asio = asio_sys::Asio::new();
     let names = asio.driver_names();
     tracing::info!(target: "jamodio::asioprobe", ?names, "P2.0 spike — drivers ASIO présents");

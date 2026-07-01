@@ -6,6 +6,22 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-12] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE : le spike ASIO duplex se lance AUTOMATIQUEMENT au
+> démarrage** (plus besoin de la variable d'environnement). Build dédiée au test :
+> à l'ouverture, l'agent ouvre le Focusrite en duplex direct (asio-sys) et logge la
+> survie des callbacks sur ~60 s (l'ASIO est monopolisé le temps du test puis
+> relâché — usage normal possible ensuite). But : savoir si le moteur duplex TIENT
+> là où cpal wedge (~20 s). Aucun impact Mac (`#[cfg(windows)]`), jamais câblé au
+> pipeline. À désinstaller après le test.
+
+### Changed
+- `audio::asio_probe` — `spawn_if_requested` → `spawn_probe_at_startup` : lancement
+  automatique au démarrage (la var `JAMODIO_ASIO_PROBE` n'est plus requise). Délai de
+  settle 3 s avant d'ouvrir le driver (évite la contention avec l'énumération CPAL du
+  boot, ASIO mono-client). Log d'en-tête explicite `BUILD-PROBE`. Jetable (supprimé en P2.1).
+
 ## [0.5.4-11] — 2026-07-01
 
 > **Pré-release — P2.0 : spike de faisabilité du host ASIO duplex maison

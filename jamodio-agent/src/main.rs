@@ -202,11 +202,12 @@ fn main() {
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             audio::device::log_devices();
 
-            // ─── P2.0 — spike host ASIO duplex (Windows, opt-in JAMODIO_ASIO_PROBE) ───
-            // No-op si la var d'env est absente. Diagnostic isolé, jamais câblé
-            // au pipeline. Cf. audio/asio_probe.rs + PLAN-ASIO-HOST-DUPLEX-2026-07.
+            // ─── P2.0 — spike host ASIO duplex (build-probe, Windows) ───
+            // 0.5.4-12 : lancement AUTOMATIQUE du test au démarrage (~60 s, ASIO
+            // monopolisé le temps du test puis relâché). Diagnostic isolé, jamais
+            // câblé au pipeline. Cf. audio/asio_probe.rs + PLAN-ASIO-HOST-DUPLEX-2026-07.
             #[cfg(target_os = "windows")]
-            audio::asio_probe::spawn_if_requested();
+            audio::asio_probe::spawn_probe_at_startup();
 
             // ─── Attach menu to config-based tray icon ──────
             // i18n minimal : libellés FR si la locale OS est FR, EN sinon
