@@ -6,6 +6,28 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-11] — 2026-07-01
+
+> **Pré-release — P2.0 : spike de faisabilité du host ASIO duplex maison
+> (diagnostic, Windows only).** Première marche du socle ASIO robuste
+> (cf. `internal-docs/plans/PLAN-ASIO-HOST-DUPLEX-2026-07.md`). Vérifie que le
+> moteur duplex (1 `ASIOCreateBuffers` in+out, 1 `bufferSwitch`, comme
+> Jamulus/JUCE/RtAudio) SURVIT là où le chemin cpal à 2 flux séparés meurt (~20 s,
+> wedge Focusrite). **N'est pas câblé au pipeline, ne s'active que via la variable
+> d'environnement `JAMODIO_ASIO_PROBE`.** Aucun impact Mac (module `#[cfg(windows)]`).
+
+### Added
+- `audio::asio_probe` (Windows only, opt-in `JAMODIO_ASIO_PROBE`) — ouvre le driver
+  ASIO en **duplex direct via `asio-sys`** (chaînage `prepare_input_stream` →
+  `prepare_output_stream` = un seul `ASIOCreateBuffers` couvrant entrée+sortie),
+  enregistre UN callback `bufferSwitch` qui compte les tics + le callback de message
+  (`kAsioResetRequest`), démarre, et logge la survie des callbacks sur 60 s
+  (`target: jamodio::asioprobe`). Zéro accès buffer brut, zéro `unsafe` : le but est
+  de prouver la survie du moteur duplex, pas encore de router l'audio. **Jetable** —
+  remplacé par le vrai `AsioDuplexHost` (câblé `sample_tx`/`mixer`) en P2.1. Pendant
+  les 60 s le spike monopolise l'interface ASIO (mono-client) : ne pas rejoindre un
+  studio en même temps, juste lire les logs.
+
 ## [0.5.4-10] — 2026-07-01
 
 > **Pré-release — Robustesse Windows P0 + P1** (analyse de 3 sessions réelles

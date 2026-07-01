@@ -202,6 +202,12 @@ fn main() {
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             audio::device::log_devices();
 
+            // ─── P2.0 — spike host ASIO duplex (Windows, opt-in JAMODIO_ASIO_PROBE) ───
+            // No-op si la var d'env est absente. Diagnostic isolé, jamais câblé
+            // au pipeline. Cf. audio/asio_probe.rs + PLAN-ASIO-HOST-DUPLEX-2026-07.
+            #[cfg(target_os = "windows")]
+            audio::asio_probe::spawn_if_requested();
+
             // ─── Attach menu to config-based tray icon ──────
             // i18n minimal : libellés FR si la locale OS est FR, EN sinon
             // (couvre la première impression utilisateur EN — cf. ToDo audit 17/05).
