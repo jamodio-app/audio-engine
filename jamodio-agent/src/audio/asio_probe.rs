@@ -56,17 +56,31 @@ fn probe() {
     let asio = asio_sys::Asio::new();
     let names = asio.driver_names();
     tracing::info!(target: "jamodio::asioprobe", ?names, "P2.0 spike — drivers ASIO présents");
-    let Some(name) = names.into_iter().next() else {
-        tracing::warn!(target: "jamodio::asioprobe", "aucun driver ASIO — spike interrompu");
-        return;
-    };
 
-    let driver = match asio.load_driver(&name) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(target: "jamodio::asioprobe", error = ?e, driver = %name, "load_driver a échoué");
-            return;
+    // Sélectionne le 1er driver qui SE CHARGE **et** expose ≥ 1 entrée = l'interface
+    // réellement branchée. Ignore les drivers fantômes (Blackmagic / Focusrite
+    // Thunderbolt sans matériel) qui échouent au load ou n'ont aucune entrée.
+    let mut chosen: Option<(asio_sys::Driver, String)> = None;
+    for name in names {
+        match asio.load_driver(&name) {
+            Ok(d) => {
+                let ins = d.channels().map(|c| c.ins).unwrap_or(0);
+                if ins > 0 {
+                    tracing::info!(target: "jamodio::asioprobe", driver = %name, ins, "driver retenu (a une entrée)");
+                    chosen = Some((d, name));
+                    break;
+                }
+                tracing::info!(target: "jamodio::asioprobe", driver = %name, "chargé mais 0 entrée — ignoré");
+                let _ = d.destroy();
+            }
+            Err(e) => {
+                tracing::info!(target: "jamodio::asioprobe", driver = %name, error = ?e, "non chargeable (pas de matériel ?) — ignoré");
+            }
         }
+    }
+    let Some((driver, name)) = chosen else {
+        tracing::error!(target: "jamodio::asioprobe", "aucun driver ASIO chargeable avec entrée — spike interrompu");
+        return;
     };
 
     // Caractéristiques du driver (log de diagnostic).

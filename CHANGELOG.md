@@ -6,6 +6,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-13] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE (fix sélection driver).** Le probe 0.5.4-12 prenait
+> le PREMIER driver ASIO de la liste (`Blackmagic Audio`, sans matériel → échec
+> immédiat) au lieu du Focusrite. Corrigé : on itère et on retient le 1er driver
+> qui se charge ET expose une entrée. Reste une build-probe jetable (auto au
+> démarrage), aucun impact Mac.
+
+### Fixed
+- `audio::asio_probe` — sélection du driver : itère sur `driver_names()` et retient
+  le premier qui `load_driver` OK **et** `channels().ins > 0` (ignore les drivers
+  fantômes : Blackmagic / Focusrite Thunderbolt sans matériel). Le 0.5.4-12 échouait
+  sur le 1er nom de la liste. (NB : le probe a bien COMPILÉ et TOURNÉ sur Windows en
+  0.5.4-12 — l'API asio-sys directe fonctionne, seule la sélection était naïve.)
+
 ## [0.5.4-12] — 2026-07-01
 
 > **Pré-release — BUILD-PROBE : le spike ASIO duplex se lance AUTOMATIQUEMENT au
