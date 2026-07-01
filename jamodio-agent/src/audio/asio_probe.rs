@@ -32,22 +32,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Enveloppe `Send` pour un pointeur brut de buffer ASIO. Les buffers sont
-/// fournis et possédés par le driver (valides entre `ASIOCreateBuffers` et
-/// `dispose_buffers`) ; on ne les touche QUE dans le `bufferSwitch` (thread du
-/// driver). Le wrapper permet de capturer le pointeur dans la closure `Send`.
-struct SendPtr(*mut std::ffi::c_void);
-unsafe impl Send for SendPtr {}
-
-/// Lance le spike sur un thread dédié.
+/// Lance le spike sur un thread dédié — UNIQUEMENT si `JAMODIO_ASIO_PROBE` est
+/// défini. No-op sinon (démarrage normal = SÛR, aucun accès ASIO du probe).
 ///
-/// 0.5.4-12 — **build-probe** : lancement AUTOMATIQUE au démarrage (plus besoin de
-/// la var d'env `JAMODIO_ASIO_PROBE`, qui reste honorée pour compat). Cette build
-/// est dédiée au test : au lancement l'agent exécute le probe (~60 s, l'ASIO est
-/// monopolisé le temps du test), logge son verdict, puis relâche l'interface —
-/// l'usage normal redevient possible ensuite. Non bloquant pour le reste du
-/// démarrage (WS, tray). Isolé : jamais câblé au pipeline, aucun impact Mac.
+/// 0.5.4-15 — retour à l'opt-in par var d'env après le BSOD de la 0.5.4-12/-14
+/// (lancement auto). Le probe ne fait plus que COMPTER les callbacks (aucune
+/// écriture buffer). Isolé : jamais câblé au pipeline, aucun impact Mac.
 pub fn spawn_probe_at_startup() {
+    if std::env::var_os("JAMODIO_ASIO_PROBE").is_none() {
+        return;
+    }
     let _ = std::thread::Builder::new()
         .name("asio-probe".into())
         // Le spike lui-même s'exécute sur le thread COM-STA (contrat ASIO/COM,
@@ -144,43 +138,16 @@ fn probe() {
         "ASIOCreateBuffers duplex OK — un seul appel couvre entrée + sortie"
     );
 
-    // Octets/échantillon de sortie. On ne remplit la sortie que pour un type
-    // CONNU (le Focusrite est `ASIOSTInt32LSB`, confirmé au chargement) → jamais
-    // d'écriture hors-borne sur un type inattendu.
-    let out_sample_bytes: usize =
-        if matches!(out_ty, Some(asio_sys::AsioSampleType::ASIOSTInt32LSB)) { 4 } else { 0 };
-    let fill_bytes = (buffer_size.max(0) as usize) * out_sample_bytes;
-
-    // Pointeurs des buffers de SORTIE (double-tampon [0]/[1]) par canal.
-    let out_ptrs: Vec<[SendPtr; 2]> = streams
-        .output
-        .as_ref()
-        .map(|s| {
-            s.buffer_infos
-                .iter()
-                .map(|bi| [SendPtr(bi.buffers[0]), SendPtr(bi.buffers[1])])
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Callback `bufferSwitch` : compte les tics ET **remplit la sortie de silence**.
-    // C'est LA différence avec le probe précédent : celui-ci ne servait pas la
-    // sortie et mourait en ~1 s, alors que cpal (qui remplit la sortie via
-    // `mix_into`) tenait ~20 s. Un hôte ASIO DOIT servir la sortie à chaque tick.
-    // (Pas encore de routage audio réel — viendra dans `AsioDuplexHost`.)
+    // ⚠️ Callback `bufferSwitch` : COMPTE SEULEMENT. NE TOUCHE PLUS aux buffers.
+    // La version 0.5.4-14 écrivait du silence dans les buffers de sortie (accès
+    // pointeur brut) → elle a provoqué un BSOD (crash kernel du driver Focusrite).
+    // On n'écrit plus JAMAIS dans les buffers ASIO à l'aveugle depuis ce probe :
+    // le marshalling des buffers se fera dans un environnement où un crash est
+    // contenu (VM / debugger), pas sur la machine de prod. Cf. décision post-BSOD.
     let ticks = Arc::new(AtomicU64::new(0));
     let cb_ticks = ticks.clone();
-    let cb = driver.add_callback(move |info| {
+    let cb = driver.add_callback(move |_info| {
         cb_ticks.fetch_add(1, Ordering::Relaxed);
-        if fill_bytes > 0 {
-            let idx = (info.buffer_index as usize) & 1;
-            for ch in &out_ptrs {
-                // SAFETY : `ch[idx]` pointe sur `buffer_size` échantillons Int32
-                // du buffer de sortie courant (double-tampon fourni par le driver).
-                // On écrit exactement `buffer_size * 4` octets de zéro (silence).
-                unsafe { std::ptr::write_bytes(ch[idx].0 as *mut u8, 0, fill_bytes) };
-            }
-        }
     });
 
     // Callback de message : compte + logge les `kAsioResetRequest` (le protocole
@@ -206,8 +173,7 @@ fn probe() {
     }
     tracing::info!(
         target: "jamodio::asioprobe",
-        fill_bytes,
-        "ASIOStart OK — surveillance 60 s (sortie SERVIE de silence ce coup-ci ; cpal 2-flux tenait ~20 s)"
+        "ASIOStart OK — surveillance 60 s (comptage seul, aucune écriture buffer)"
     );
 
     // Surveillance 60 s : on note la DERNIÈRE tranche de 5 s où les tics ont
@@ -225,7 +191,7 @@ fn probe() {
             target: "jamodio::asioprobe",
             t_s = i * 5, ticks_5s = delta, ticks_total = now,
             resets = resets.load(Ordering::Relaxed),
-            "survie duplex (sortie servie)"
+            "survie duplex (comptage seul)"
         );
         prev = now;
     }

@@ -202,10 +202,10 @@ fn main() {
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             audio::device::log_devices();
 
-            // ─── P2.0 — spike host ASIO duplex (build-probe, Windows) ───
-            // 0.5.4-12 : lancement AUTOMATIQUE du test au démarrage (~60 s, ASIO
-            // monopolisé le temps du test puis relâché). Diagnostic isolé, jamais
-            // câblé au pipeline. Cf. audio/asio_probe.rs + PLAN-ASIO-HOST-DUPLEX-2026-07.
+            // ─── P2.0 — spike host ASIO duplex (Windows, opt-in JAMODIO_ASIO_PROBE) ───
+            // 0.5.4-15 : retour à l'opt-in par var d'env après le BSOD (la 0.5.4-14
+            // écrivait dans les buffers ASIO → crash kernel). No-op sans la var.
+            // Diagnostic isolé (comptage seul), jamais câblé au pipeline.
             #[cfg(target_os = "windows")]
             audio::asio_probe::spawn_probe_at_startup();
 

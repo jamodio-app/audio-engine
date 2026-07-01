@@ -6,6 +6,23 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-15] — 2026-07-01
+
+> **Pré-release — SÉCURITÉ : probe rendu inerte après un BSOD.** La 0.5.4-14
+> écrivait du silence dans les buffers de sortie ASIO (accès pointeur brut) et a
+> provoqué un **BSOD** (crash kernel du driver Focusrite) sur la machine de Ben.
+> On revient à un probe SÛR : plus aucune écriture buffer, et lancement de nouveau
+> opt-in par variable d'environnement (démarrage normal = sûr, le probe ne tourne
+> pas). Leçon : le marshalling des buffers ASIO ne se développera plus à l'aveugle
+> sur une machine de prod — il faut un environnement où un crash est contenu.
+
+### Fixed / Changed
+- `audio::asio_probe` — le `bufferSwitch` **ne touche plus aux buffers** (suppression
+  de l'écriture de sortie `write_bytes` et du wrapper `SendPtr` responsables du BSOD) ;
+  il ne fait que compter les callbacks. `spawn_probe_at_startup` **re-gaté sur la var
+  d'env `JAMODIO_ASIO_PROBE`** (plus de lancement automatique) → un démarrage normal
+  n'exécute AUCUN accès ASIO du probe. cfg(windows), aucun impact Mac.
+
 ## [0.5.4-14] — 2026-07-01
 
 > **Pré-release — BUILD-PROBE (v3) : le callback SERT la sortie.** Résultat du
