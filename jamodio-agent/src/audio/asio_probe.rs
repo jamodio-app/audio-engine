@@ -32,6 +32,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Enveloppe `Send` pour un pointeur brut de buffer ASIO. Les buffers sont
+/// fournis et possédés par le driver (valides entre `ASIOCreateBuffers` et
+/// `dispose_buffers`) ; on ne les touche QUE dans le `bufferSwitch` (thread du
+/// driver). Le wrapper permet de capturer le pointeur dans la closure `Send`.
+struct SendPtr(*mut std::ffi::c_void);
+unsafe impl Send for SendPtr {}
+
 /// Lance le spike sur un thread dédié.
 ///
 /// 0.5.4-12 — **build-probe** : lancement AUTOMATIQUE au démarrage (plus besoin de
@@ -137,12 +144,43 @@ fn probe() {
         "ASIOCreateBuffers duplex OK — un seul appel couvre entrée + sortie"
     );
 
-    // Callback `bufferSwitch` : COMPTE seulement (survie). Le routage réel
-    // (sample_tx / mixer) viendra dans `AsioDuplexHost`.
+    // Octets/échantillon de sortie. On ne remplit la sortie que pour un type
+    // CONNU (le Focusrite est `ASIOSTInt32LSB`, confirmé au chargement) → jamais
+    // d'écriture hors-borne sur un type inattendu.
+    let out_sample_bytes: usize =
+        if matches!(out_ty, Some(asio_sys::AsioSampleType::ASIOSTInt32LSB)) { 4 } else { 0 };
+    let fill_bytes = (buffer_size.max(0) as usize) * out_sample_bytes;
+
+    // Pointeurs des buffers de SORTIE (double-tampon [0]/[1]) par canal.
+    let out_ptrs: Vec<[SendPtr; 2]> = streams
+        .output
+        .as_ref()
+        .map(|s| {
+            s.buffer_infos
+                .iter()
+                .map(|bi| [SendPtr(bi.buffers[0]), SendPtr(bi.buffers[1])])
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Callback `bufferSwitch` : compte les tics ET **remplit la sortie de silence**.
+    // C'est LA différence avec le probe précédent : celui-ci ne servait pas la
+    // sortie et mourait en ~1 s, alors que cpal (qui remplit la sortie via
+    // `mix_into`) tenait ~20 s. Un hôte ASIO DOIT servir la sortie à chaque tick.
+    // (Pas encore de routage audio réel — viendra dans `AsioDuplexHost`.)
     let ticks = Arc::new(AtomicU64::new(0));
     let cb_ticks = ticks.clone();
-    let cb = driver.add_callback(move |_info| {
+    let cb = driver.add_callback(move |info| {
         cb_ticks.fetch_add(1, Ordering::Relaxed);
+        if fill_bytes > 0 {
+            let idx = (info.buffer_index as usize) & 1;
+            for ch in &out_ptrs {
+                // SAFETY : `ch[idx]` pointe sur `buffer_size` échantillons Int32
+                // du buffer de sortie courant (double-tampon fourni par le driver).
+                // On écrit exactement `buffer_size * 4` octets de zéro (silence).
+                unsafe { std::ptr::write_bytes(ch[idx].0 as *mut u8, 0, fill_bytes) };
+            }
+        }
     });
 
     // Callback de message : compte + logge les `kAsioResetRequest` (le protocole
@@ -168,20 +206,26 @@ fn probe() {
     }
     tracing::info!(
         target: "jamodio::asioprobe",
-        "ASIOStart OK — surveillance de la survie des callbacks sur 60 s (le chemin cpal 2-flux mourait vers ~20 s)"
+        fill_bytes,
+        "ASIOStart OK — surveillance 60 s (sortie SERVIE de silence ce coup-ci ; cpal 2-flux tenait ~20 s)"
     );
 
-    // Surveillance 60 s : tics par tranche de 5 s. Des tics réguliers au-delà de
-    // ~20 s = le moteur duplex TIENT = approche validée.
+    // Surveillance 60 s : on note la DERNIÈRE tranche de 5 s où les tics ont
+    // progressé = la durée de SURVIE réelle du moteur (verdict honnête).
     let mut prev = 0u64;
+    let mut last_growth_s = 0u64;
     for i in 1..=12u64 {
         std::thread::sleep(Duration::from_secs(5));
         let now = ticks.load(Ordering::Relaxed);
+        let delta = now - prev;
+        if delta > 0 {
+            last_growth_s = i * 5;
+        }
         tracing::info!(
             target: "jamodio::asioprobe",
-            t_s = i * 5, ticks_5s = now - prev, ticks_total = now,
+            t_s = i * 5, ticks_5s = delta, ticks_total = now,
             resets = resets.load(Ordering::Relaxed),
-            "survie duplex"
+            "survie duplex (sortie servie)"
         );
         prev = now;
     }
@@ -191,10 +235,12 @@ fn probe() {
     driver.remove_message_callback(msg);
     let _ = driver.dispose_buffers();
     let total = ticks.load(Ordering::Relaxed);
+    let survived = last_growth_s >= 55;
     tracing::info!(
         target: "jamodio::asioprobe",
-        ticks_total = total, resets = resets.load(Ordering::Relaxed),
-        "P2.0 spike terminé — VERDICT : tics réguliers sur toute la fenêtre ⇒ le duplex tient (≠ cpal)"
+        ticks_total = total, last_growth_s, survived,
+        resets = resets.load(Ordering::Relaxed),
+        "P2.0 spike terminé — survived=true ⇒ le duplex SERVI tient 60 s ; sinon mort vers last_growth_s"
     );
     let _ = driver.destroy();
 }

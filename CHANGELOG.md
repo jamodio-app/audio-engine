@@ -6,6 +6,23 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-14] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE (v3) : le callback SERT la sortie.** Résultat du
+> probe 0.5.4-13 sur le Focusrite : `ASIOCreateBuffers` duplex OK (buffer 128,
+> Int32LSB) mais les callbacks **gelaient à ~1 s** (373 tics puis plus rien).
+> Différence avec cpal (qui tient ~20 s) : le probe ne remplissait PAS la sortie.
+> Un hôte ASIO doit servir la sortie à chaque tick. Le probe remplit désormais la
+> sortie de silence → test de la vraie question : un duplex CORRECTEMENT SERVI
+> tient-il ? Verdict honnête (`survived`/`last_growth_s`) au lieu du message fixe.
+
+### Changed
+- `audio::asio_probe` — le `bufferSwitch` écrit du silence dans les buffers de
+  sortie (`write_bytes` 0, Int32LSB, `buffer_size` échantillons/canal) à chaque
+  tick, en plus de compter. Verdict basé sur la dernière tranche où les tics ont
+  progressé (`last_growth_s`, `survived = last_growth_s >= 55`). Toujours cfg(windows),
+  jetable, aucun impact Mac.
+
 ## [0.5.4-13] — 2026-07-01
 
 > **Pré-release — BUILD-PROBE (fix sélection driver).** Le probe 0.5.4-12 prenait
