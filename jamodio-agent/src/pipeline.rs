@@ -1708,6 +1708,10 @@ impl PipelineState {
             }
             OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
         }
+        // P1 — repart propre : vide les jitter buffers du périmé accumulé pendant
+        // le gel de sortie (le décodage a continué de pousser jusqu'à 300 ms) et
+        // re-prime à la cible de démarrage. Évite de rejouer le retard accumulé.
+        self.mixer.lock().reset_streams_for_recovery();
         Ok(())
     }
 

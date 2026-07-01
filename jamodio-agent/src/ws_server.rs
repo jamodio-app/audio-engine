@@ -1364,11 +1364,15 @@ async fn audio_liveness_supervisor(
 ) {
     use std::sync::atomic::Ordering;
     // Cadence du filet de liveness (le reset coopératif, lui, réagit via Notify).
-    const TICK_MS: u64 = 500;
+    // P1 (01/07) — 250 ms (vs 500) : réaction plus fine au gel de callbacks ASIO
+    // (mort silencieuse du driver Focusrite), coût négligeable (4 locks brefs/s).
+    const TICK_MS: u64 = 250;
     // Flatline confirmé si aucun callback pendant ce délai en capture active.
-    // ≫ période ASIO (2,7 ms) → un stream vivant produit ~185 callbacks/500 ms,
-    // faux positif quasi impossible.
-    const FLATLINE_MS: u128 = 1500;
+    // P1 (01/07) — 800 ms (vs 1500) : sur la mort silencieuse ASIO le gel dure ~2 s
+    // avant détection à l'ancien seuil → ~1 s de trou audio en trop. 800 ms reste
+    // ≫ période ASIO (2,7 ms) → un stream vivant produit ~290 callbacks/800 ms,
+    // faux positif quasi impossible (aucun gap légitime de cet ordre observé).
+    const FLATLINE_MS: u128 = 800;
     // Intervalle minimal entre deux séquences de réparation (anti-thrash). En
     // régime nominal le reset s'exécute une fois et réussit ; ce garde borne le
     // rythme si le driver re-demande des resets en rafale.

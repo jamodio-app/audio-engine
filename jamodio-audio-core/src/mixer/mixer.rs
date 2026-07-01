@@ -247,6 +247,18 @@ impl AudioMixer {
         }
     }
 
+    /// P1 (01/07) — repart propre après un rétablissement audio (reset ASIO).
+    /// Vide les jitter buffers du périmé accumulé pendant le gel de sortie et les
+    /// re-prime à la cible de démarrage (cf. [`JitterBuffer::reset_for_recovery`]).
+    /// Appelé par la pipeline juste après une reconstruction réussie des streams.
+    /// Tous les streams (pairs + self-monitor) : le trou du reset rompt déjà la
+    /// continuité → aucun artefact ajouté.
+    pub fn reset_streams_for_recovery(&mut self) {
+        for stream in self.streams.values_mut() {
+            stream.jitter.reset_for_recovery();
+        }
+    }
+
     /// Push decoded samples into a stream's jitter buffer.
     ///
     /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).

@@ -6,6 +6,46 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-10] — 2026-07-01
+
+> **Pré-release — Robustesse Windows P0 + P1** (analyse de 3 sessions réelles
+> PC↔Mac). Le réseau était hors de cause (gigue réseau réelle ~0,6 ms, 0 perte) ;
+> deux défauts côté PC dégradaient l'expérience. **P0** : sous charge (éditeur de
+> plugin, batterie), le worker tokio qui horodate les paquets entrants est préempté
+> → un horodatage tardif faisait bondir la queue de gigue à 15-100 ms alors que le
+> réseau était bon, et l'ancien peak-hold épinglait le buffer à 40 ms **sans jamais
+> redescendre** (« le lien se dégrade, on ne se suit plus »). **P1** : sur mort
+> silencieuse du driver Focusrite, la détection du gel prenait ~2 s et le décodage
+> remplissait le buffer de périmé (jusqu'à 300 ms). Aucune régression Mac.
+
+### Changed
+- **(P0)** `sync::jitter` — l'estimateur de queue passe d'un **peak-hold** à un **écart
+  inter-percentile `p95 − p10` du transit sur une fenêtre glissante de 512 paquets
+  (~1,3 s)**. Trois propriétés : (1) **récupération naturelle** (une valeur sort de
+  la fenêtre après ~1,3 s, fini le release lent + ratchet) ; (2) **robuste aux
+  outliers isolés** (un stall touchant < 5 % des paquets n'bouge pas le p95 → le
+  plancher ne gonfle pas ; le trou audio réel reste couvert par le filet réactif) ;
+  (3) **répond au vrai besoin** (une lateness fréquente/soutenue monte le p95 → le
+  buffer grandit). Dimensionné sur le transit (pas `|D|`, aveugle à la durée d'une
+  rafale) ; l'offset d'horloge + le drift lent se simplifient dans `p95 − p10`.
+  Recalcul trié amorti ~12×/s (cache), `jitter_tail_ms()` reste O(1) par-paquet,
+  zéro alloc en régime. API publique inchangée (consommateurs `ring_buffer`/wire
+  intacts). 4 tests ajoutés/refondus (spike isolé ignoré, récupération après
+  perturbation, lateness récurrente captée, burst local bref absorbé).
+  Constantes (fenêtre 512, p95/p10) = premier jet, à calibrer sur lien bursty réel.
+- **(P1)** `ws_server::audio_liveness_supervisor` — détection du gel de callbacks
+  ASIO accélérée : `FLATLINE_MS` 1500 → **800** (≫ période ASIO 2,7 ms → ~290
+  callbacks/800 ms, faux positif quasi impossible), `TICK_MS` 500 → **250**.
+  Économise ~1 s de trou audio par mort ASIO silencieuse.
+
+### Added
+- **(P1)** `JitterBuffer::reset_for_recovery` + `Mixer::reset_streams_for_recovery`
+  — appelés après une reconstruction réussie des streams (`rebuild_audio_streams`) :
+  vident le périmé accumulé pendant le gel de sortie (jusqu'à 300 ms) et re-priment
+  à la cible de démarrage, filet réactif purgé. Repart propre et déterministe au
+  rétablissement (le drift-drain de `pull` le faisait déjà tôt ou tard). Ne touche
+  ni aux modes ni aux compteurs cumulés. Test `reset_for_recovery_flushes_and_reprimes`.
+
 ## [0.5.4-9] — 2026-06-30
 
 > **Pré-release — VU self stéréo (niveaux L/R indépendants).** Le VU « moi »

@@ -185,6 +185,38 @@ impl JitterBuffer {
         }
     }
 
+    /// P1 (01/07) — repart PROPRE après un rétablissement audio (reset ASIO).
+    /// Pendant le gel de sortie, le décodage continue de pousser → le ring se
+    /// remplit jusqu'à `CAPACITY_MS` (300 ms) de samples PÉRIMÉS. À la reprise, le
+    /// drift-drain finit par les évacuer, mais on force ici un départ net et
+    /// déterministe : on VIDE le périmé et on re-prime à la cible de démarrage. La
+    /// continuité audio est de toute façon rompue par le trou du reset → aucun
+    /// artefact ajouté, et on évite de rejouer jusqu'à 300 ms de retard.
+    ///
+    /// Ne touche NI au mode (`local_mode`/`jitter_auto`) NI aux compteurs cumulés
+    /// (`underruns`/`overflow_drops`/`drift_drops` = télémétrie de session). Réseau
+    /// ET self-monitor : sûr pour les deux (le self-monitor re-prime sur la capture
+    /// qui vient de repartir).
+    pub fn reset_for_recovery(&mut self) {
+        // Vide les samples périmés accumulés pendant le gel de sortie.
+        let occupied = self.consumer.occupied_len();
+        self.consumer.skip(occupied);
+        // Re-prime propre + cible de démarrage (le filet réactif repart de 0).
+        let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        self.primed = false;
+        self.reactive_extra_samples = 0;
+        self.floor_samples = initial;
+        self.target_samples = initial;
+        self.last_adapt = std::time::Instant::now();
+        // Continuité du resampler (Phase C) et du crossfade : repart à neuf.
+        self.rs_speed = 1.0;
+        self.rs_frac = 0.0;
+        self.rs_has_prev = false;
+        self.crossfade_tail.clear();
+        self.crossfade_pos = 0;
+        self.conceal_fade_in_remaining = 0;
+    }
+
     /// Chantier C — active le mode self-monitor local (concealment des trous +
     /// adaptation bornée à `LOCAL_MAX_TARGET_MS`). Appelé par `add_local_stream`.
     pub fn set_local_mode(&mut self, on: bool) {
@@ -692,6 +724,25 @@ mod tests {
             "la cible a bien grandi sous underruns répétés: {} ms",
             jb.target_ms()
         );
+    }
+
+    #[test]
+    fn reset_for_recovery_flushes_and_reprimes() {
+        let mut jb = JitterBuffer::new();
+        // Simule le gel de sortie : cible gonflée + ring rempli de périmé.
+        jb.observe_jitter(30.0); // floor ~33 ms
+        let big = vec![0.2_f32; 40 * SAMPLE_RATE * CHANNELS / 1000]; // ~40 ms
+        jb.push(&big);
+        // Rétablissement.
+        jb.reset_for_recovery();
+        // Cible revenue au démarrage (filet réactif purgé).
+        assert_eq!(jb.target_ms(), INITIAL_TARGET_MS, "cible ré-initialisée");
+        // Ring vidé + non primé : un pull rend du silence tant que la cible n'est
+        // pas ré-accumulée (pas de rejeu du retard périmé).
+        let mut out = vec![1.0_f32; 256];
+        let n = jb.pull(&mut out);
+        assert_eq!(n, 0, "non primé après reset → silence");
+        assert!(out.iter().all(|&s| s == 0.0), "sortie silence après reset");
     }
 
     // ── Chantier #1 — cible pilotée par la QUEUE de gigue (tail-aware) ─────
