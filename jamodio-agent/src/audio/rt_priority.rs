@@ -211,11 +211,11 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
                     task = "Pro Audio",
                     "thread promoted via MMCSS Pro Audio"
                 );
-                return RtPriorityHandle {
+                RtPriorityHandle {
                     method: PromotionMethod::WindowsMmcss,
                     mmcss_handle: h,
                     _not_sync: std::marker::PhantomData,
-                };
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -223,7 +223,7 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
                     error = %e,
                     "windows MMCSS failed — running at normal priority"
                 );
-                return make_none_handle();
+                make_none_handle()
             }
         }
     }
