@@ -46,6 +46,20 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   `CPAL_ASIO_DIR`/`LIBCLANG_PATH` requis par asio-sys/bindgen, puis lance cargo).
 
 ### Changed
+- **Buffer audio unifié bas-latence, automatique (`audio::buffer_policy`).** La
+  cible passe de 128 (préféré ASIO / demandé CoreAudio) à **64 samples** (1,33 ms
+  vs 2,67 ms/direction), demandée en `BufferSize::Fixed(64)` sur les chemins pro
+  (CoreAudio ET ASIO) quand le device l'expose, sinon repli `Default`. WASAPI
+  shared inchangé (~10 ms, imposé par Windows). Le gain vient d'un fait mesuré :
+  le Focusrite est stable de 16 à 1024 samples ; la latence se pilote par le
+  buffer, pas par une réécriture du host. **−2,67 ms de RTT, cohérence Mac ↔ PC.**
+- **Backoff automatique 64 → 128 sous charge (pas de slider utilisateur).** Si
+  des drops/underruns PERSISTENT à 64 (détecteur leaky-bucket dans le flush
+  `perfstats`, insensible aux pics isolés), l'agent remonte **une seule fois** à
+  128 via une reconstruction **seamless** des streams (même chemin éprouvé que la
+  recovery de liveness : pas de redémarrage, session réseau maintenue). One-way
+  (anti-oscillation / anti-glitch répété) ; un 64 frais est re-tenté au prochain
+  démarrage. Remplace le « slider buffer » des concurrents par de l'auto-tuning.
 - `AudioDevice` dérive désormais `Clone` (nécessaire au cache d'énumération).
 
 ## [0.5.4-16] — 2026-07-01
