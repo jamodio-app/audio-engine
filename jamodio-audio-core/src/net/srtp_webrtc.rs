@@ -25,6 +25,10 @@ const MASTER_KEY_LEN: usize = 32;
 const MASTER_SALT_LEN: usize = 12;
 const COMBINED_LEN: usize = MASTER_KEY_LEN + MASTER_SALT_LEN; // 44
 
+/// Matériel de clé SRTP décodé : `(master_key 32, master_salt 12)`, chacun dans
+/// un `Zeroizing` → effacé de la mémoire au drop.
+type DecodedSrtpKey = (zeroize::Zeroizing<Vec<u8>>, zeroize::Zeroizing<Vec<u8>>);
+
 /// Clés SRTP au format wire mediasoup (identique à libsrtp wrapper).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SrtpParameters {
@@ -48,9 +52,7 @@ impl SrtpParameters {
     /// veut les deux séparés (libsrtp les concatène en interne).
     /// Clé + salt décodés dans des `Zeroizing` → effacés de la mémoire au drop
     /// (le `Context` a copié/dérivé le matériel en interne).
-    fn decode(
-        &self,
-    ) -> Result<(zeroize::Zeroizing<Vec<u8>>, zeroize::Zeroizing<Vec<u8>>), String> {
+    fn decode(&self) -> Result<DecodedSrtpKey, String> {
         if self.crypto_suite != AEAD_AES_256_GCM {
             return Err(format!("unsupported SRTP suite: {}", self.crypto_suite));
         }
