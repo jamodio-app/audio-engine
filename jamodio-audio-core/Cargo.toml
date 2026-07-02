@@ -1,42 +1,42 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.5.4-16"
+version = "0.5.4-17"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
-description = "Jamodio audio engine core — Opus codec, RTP, UDP, mixer, jitter buffer"
+description = "Jamodio audio engine core â€” Opus codec, RTP, UDP, mixer, jitter buffer"
 
 [dependencies]
 audiopus = "0.3.0-rc.0"    # Opus encode/decode (safe wrapper around libopus)
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync"] }
-crossbeam-channel = "0.5"  # Lock-free channels (audio thread ↔ network thread)
+crossbeam-channel = "0.5"  # Lock-free channels (audio thread â†” network thread)
 ringbuf = "0.4"            # SPSC lock-free ring buffer (jitter management)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
-base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
-getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres
-zeroize = "1"              # Efface les clés SRTP décodées de la mémoire au drop
-tracing = "0.1"            # Logging structuré (façade) — init côté binaire jamodio-agent
-thiserror = "1"            # Dérive Error proprement (utilisé par plugin_host)
+base64 = "0.22"            # Encode/decode des clÃ©s SRTP (mediasoup wire format)
+getrandom = "0.2"          # GÃ©nÃ©ration de clÃ©s SRTP cryptographiquement sÃ»res
+zeroize = "1"              # Efface les clÃ©s SRTP dÃ©codÃ©es de la mÃ©moire au drop
+tracing = "0.1"            # Logging structurÃ© (faÃ§ade) â€” init cÃ´tÃ© binaire jamodio-agent
+thiserror = "1"            # DÃ©rive Error proprement (utilisÃ© par plugin_host)
 
-# SRTP — chiffrement+auth du flux RTP agent ↔ SFU (AEAD AES-256-GCM).
-# Stratégie par plateforme :
+# SRTP â€” chiffrement+auth du flux RTP agent â†” SFU (AEAD AES-256-GCM).
+# StratÃ©gie par plateforme :
 #
-#   macOS / Linux : libsrtp2 + OpenSSL VENDORÉS (compilés depuis sources).
-#                   → binaire 100 % autonome, aucune dep système chez l'utilisateur.
-#                   Coût : 1er build long (~5 min pour OpenSSL), ensuite caché.
+#   macOS / Linux : libsrtp2 + OpenSSL VENDORÃ‰S (compilÃ©s depuis sources).
+#                   â†’ binaire 100 % autonome, aucune dep systÃ¨me chez l'utilisateur.
+#                   CoÃ»t : 1er build long (~5 min pour OpenSSL), ensuite cachÃ©.
 #                   Wrapper : net/srtp_libsrtp.rs (cfg(not(windows))).
 #
-#   Windows       : webrtc-srtp (pure Rust, écosystème pion/webrtc-rs).
-#                   → 0 dep système (vire vcpkg+OpenSSL+libsrtp du CI).
+#   Windows       : webrtc-srtp (pure Rust, Ã©cosystÃ¨me pion/webrtc-rs).
+#                   â†’ 0 dep systÃ¨me (vire vcpkg+OpenSSL+libsrtp du CI).
 #                   Le crate `srtp 0.7` (libsrtp2 wrapper) a un bug ABI
-#                   irréparable en amont sur MSVC (LLP64 vs LP64), repo
+#                   irrÃ©parable en amont sur MSVC (LLP64 vs LP64), repo
 #                   upstream HyeonuPark/srtp mort depuis 2020-12.
 #                   Wrapper : net/srtp_webrtc.rs (cfg(windows)).
 #
-# Les deux wrappers exposent EXACTEMENT la même API publique (SrtpParameters,
-# SrtpContext::new/protect/unprotect) → udp.rs ne voit aucune différence.
+# Les deux wrappers exposent EXACTEMENT la mÃªme API publique (SrtpParameters,
+# SrtpContext::new/protect/unprotect) â†’ udp.rs ne voit aucune diffÃ©rence.
 [target.'cfg(not(windows))'.dependencies]
 srtp = { version = "0.7", default-features = false, features = ["bytes", "log", "build-libsrtp", "build-openssl"] }
 

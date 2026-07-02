@@ -1,0 +1,24 @@
+[package]
+name = "jamodio-asio-lab"
+version = "0.5.4-17"
+edition = "2021"
+license = "LicenseRef-Jamodio-Proprietary"
+publish = false
+description = "Banc de diagnostic ASIO full-duplex (Windows only) — reproduit et instrumente le gel Focusrite hors de l'agent Tauri. Jetable."
+
+# Contenu Windows-only : sur macOS ce crate compile en no-op (main affiche un
+# message), et n'entraîne AUCUNE dépendance ASIO → le workspace reste buildable
+# sur Mac sans toucher au pipeline CoreAudio.
+[target.'cfg(windows)'.dependencies]
+asio-sys = "0.2"
+# cpal (feature asio) UNIQUEMENT pour le mode diagnostic `coexist` : reproduire
+# la coexistence cpal↔asio-sys sur l'état ASIO global du process (cause présumée
+# du gel ~1 s dans l'agent). Mêmes versions que l'agent → même crate asio-sys
+# partagé (mêmes statics globaux BUFFER_CALLBACK / current driver C).
+cpal = { version = "0.15", features = ["asio"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
