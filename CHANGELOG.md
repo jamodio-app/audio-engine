@@ -6,6 +6,24 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-16] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE v4 : sortie servie via le pattern ÉPROUVÉ de cpal.**
+> Le probe sert de nouveau la sortie (le test pertinent : un duplex correctement
+> servi tient-il ?) mais cette fois en RÉUTILISANT le pattern de marshalling de
+> cpal (MIT) — accès buffer FRAIS dans le callback via `Arc<Mutex<AsioStreams>>`
+> (jamais de pointeur pré-extrait, la faute probable du BSOD 0.5.4-14), slice
+> `from_raw_parts_mut`, bornes strictes (Int32LSB, index 0/1, non-null). **OPT-IN**
+> (var d'env `JAMODIO_ASIO_PROBE` OU fichier `%APPDATA%\Jamodio\asio_probe.on`) →
+> un démarrage normal ne touche JAMAIS à l'ASIO. cfg(windows), aucun impact Mac.
+
+### Changed
+- `audio::asio_probe` — le `bufferSwitch` remplit la sortie de silence via le
+  pattern cpal (`Arc<Mutex<AsioStreams>>` + `from_raw_parts_mut(buffers[idx],
+  buffer_size)`), au lieu du `write_bytes` sur pointeur pré-extrait qui a BSOD.
+- Déclenchement du probe aussi par **fichier marqueur** `%APPDATA%\Jamodio\asio_probe.on`
+  (plus simple que la var d'env), en plus de `JAMODIO_ASIO_PROBE`. Sans marqueur : no-op.
+
 ## [0.5.4-15] — 2026-07-01
 
 > **Pré-release — SÉCURITÉ : probe rendu inerte après un BSOD.** La 0.5.4-14

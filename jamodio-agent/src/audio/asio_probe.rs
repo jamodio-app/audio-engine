@@ -39,7 +39,19 @@ use std::time::Duration;
 /// (lancement auto). Le probe ne fait plus que COMPTER les callbacks (aucune
 /// écriture buffer). Isolé : jamais câblé au pipeline, aucun impact Mac.
 pub fn spawn_probe_at_startup() {
-    if std::env::var_os("JAMODIO_ASIO_PROBE").is_none() {
+    // Armé par la var d'env `JAMODIO_ASIO_PROBE` OU (plus simple) par la présence
+    // du fichier marqueur `%APPDATA%\Jamodio\asio_probe.on`. Sans l'un ou l'autre,
+    // NO-OP → un démarrage normal ne touche jamais à l'ASIO via le probe.
+    let env_on = std::env::var_os("JAMODIO_ASIO_PROBE").is_some();
+    let file_on = std::env::var_os("APPDATA")
+        .map(|p| {
+            std::path::Path::new(&p)
+                .join("Jamodio")
+                .join("asio_probe.on")
+                .exists()
+        })
+        .unwrap_or(false);
+    if !env_on && !file_on {
         return;
     }
     let _ = std::thread::Builder::new()
@@ -138,16 +150,44 @@ fn probe() {
         "ASIOCreateBuffers duplex OK — un seul appel couvre entrée + sortie"
     );
 
-    // ⚠️ Callback `bufferSwitch` : COMPTE SEULEMENT. NE TOUCHE PLUS aux buffers.
-    // La version 0.5.4-14 écrivait du silence dans les buffers de sortie (accès
-    // pointeur brut) → elle a provoqué un BSOD (crash kernel du driver Focusrite).
-    // On n'écrit plus JAMAIS dans les buffers ASIO à l'aveugle depuis ce probe :
-    // le marshalling des buffers se fera dans un environnement où un crash est
-    // contenu (VM / debugger), pas sur la machine de prod. Cf. décision post-BSOD.
+    // Callback `bufferSwitch` : compte les tics ET remplit la sortie de silence,
+    // en RÉUTILISANT LE PATTERN ÉPROUVÉ DE CPAL (MIT) — la leçon du BSOD 0.5.4-14 :
+    //   * accès buffer FRAIS DANS le callback via `Arc<Mutex<AsioStreams>>`
+    //     (JAMAIS de pointeur pré-extrait — c'était la faute probable du BSOD) ;
+    //   * `from_raw_parts_mut(buffers[idx], buffer_size)` = exactement l'helper
+    //     `asio_channel_slice_mut` de cpal ;
+    //   * bornes : sample type connu (Int32LSB), index double-tampon ∈ {0,1},
+    //     pointeur non-null.
+    // ⚠️ Écrit dans les buffers → risque résiduel, mais opt-in (var d'env) : ne
+    // touche JAMAIS l'usage normal.
+    let out_is_int32 = matches!(out_ty, Some(asio_sys::AsioSampleType::ASIOSTInt32LSB));
+    let streams = std::sync::Arc::new(std::sync::Mutex::new(streams));
+    let streams_cb = streams.clone();
     let ticks = Arc::new(AtomicU64::new(0));
     let cb_ticks = ticks.clone();
-    let cb = driver.add_callback(move |_info| {
+    let cb = driver.add_callback(move |info| {
         cb_ticks.fetch_add(1, Ordering::Relaxed);
+        if !out_is_int32 {
+            return;
+        }
+        let idx = info.buffer_index as usize;
+        if idx > 1 {
+            return; // double-tampon ASIO : index attendu 0 ou 1
+        }
+        let Ok(mut guard) = streams_cb.lock() else { return };
+        let Some(out) = guard.output.as_mut() else { return };
+        let bufsz = out.buffer_size as usize;
+        for ch in 0..out.buffer_infos.len() {
+            let ptr = out.buffer_infos[ch].buffers[idx] as *mut i32;
+            if ptr.is_null() {
+                continue;
+            }
+            // SAFETY : mirror exact de `asio_channel_slice_mut` (cpal) — `buffers[idx]`
+            // pointe sur `buffer_size` échantillons Int32 du buffer À REMPLIR (le
+            // driver joue l'autre tampon). On écrit exactement ce buffer, silence.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, bufsz) };
+            slice.fill(0);
+        }
     });
 
     // Callback de message : compte + logge les `kAsioResetRequest` (le protocole
@@ -173,7 +213,8 @@ fn probe() {
     }
     tracing::info!(
         target: "jamodio::asioprobe",
-        "ASIOStart OK — surveillance 60 s (comptage seul, aucune écriture buffer)"
+        out_is_int32,
+        "ASIOStart OK — surveillance 60 s (sortie SERVIE de silence, pattern cpal ; cpal 2-flux tenait ~20 s)"
     );
 
     // Surveillance 60 s : on note la DERNIÈRE tranche de 5 s où les tics ont
@@ -191,7 +232,7 @@ fn probe() {
             target: "jamodio::asioprobe",
             t_s = i * 5, ticks_5s = delta, ticks_total = now,
             resets = resets.load(Ordering::Relaxed),
-            "survie duplex (comptage seul)"
+            "survie duplex (sortie servie, pattern cpal)"
         );
         prev = now;
     }
