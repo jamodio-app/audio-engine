@@ -722,7 +722,7 @@ pub struct StreamLevel {
     pub rms_r: Option<f32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AudioDevice {
     /// Identifiant stable au sein d'une enumeration : `"{index}:{name}"`.
     /// L'index disambigue les devices à nom identique (deux cartes USB

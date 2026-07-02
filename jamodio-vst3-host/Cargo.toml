@@ -1,12 +1,12 @@
 [package]
 name = "jamodio-vst3-host"
-version = "0.5.4-16"
+version = "0.5.4-17"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
-description = "Jamodio VST3 plugin host — Windows uniquement, impl du trait PluginHost de jamodio-audio-core"
+description = "Jamodio VST3 plugin host â€” Windows uniquement, impl du trait PluginHost de jamodio-audio-core"
 
-# Crate frère de `jamodio-au-host` (macOS). Compile à vide sur les autres OS.
+# Crate frÃ¨re de `jamodio-au-host` (macOS). Compile Ã  vide sur les autres OS.
 # Bindings raw VST 3 SDK Steinberg via la crate `vst3` (coupler-rs).
 # Chargement dynamique des .vst3 (DLL Windows ou bundle Mac legacy) via `libloading`.
 

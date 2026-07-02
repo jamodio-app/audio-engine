@@ -6,6 +6,48 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-17] — 2026-07-02
+
+> **Pré-release — CAUSE RACINE DU GEL ASIO TROUVÉE + correctif chirurgical.**
+> Premier débogage sur un vrai PC Windows + Focusrite (avant : dev sur Mac À
+> L'AVEUGLE). Un banc de diagnostic isolé (`jamodio-asio-lab`) prouve que le
+> moteur duplex maison est **fondamentalement sain** (90 s de callbacks réguliers
+> sur le vrai Scarlett, 1 `ASIOCreateBuffers`, sortie servie) — et que le chemin
+> cpal à 2 flux tient AUSSI 90 s en isolation. **La structure des streams n'était
+> donc PAS la cause.** La vraie cause, reproduite à l'identique (mode `enum-during`
+> : gel à t=1 s, ~375 tics puis plat, `resets=0` — exactement les logs de l'agent) :
+> **une ré-énumération ASIO concurrente**. `cpal input_devices()` appelle asio-sys
+> `load_driver`→`ASIOInit` sur le driver **mono-client global au process** ALORS
+> qu'un stream tourne dessus → ré-init sous les pieds du stream → callbacks gelés
+> en silence. Déclencheur dans l'agent : le `GetDevices` du browser pendant une
+> session. (Explique aussi pourquoi le keep-warm 0.5.4-5 aidait sans corriger : il
+> tuait le churn leave/rejoin, pas le rechargement par énumération.)
+
+### Fixed
+- **`audio::device` — cache d'énumération ASIO : plus aucun rechargement du driver
+  mono-client pendant qu'un stream est actif.** Tant qu'un stream ASIO est ouvert
+  (`ASIO_STREAM_ACTIVE`, posé/levé par le pipeline SUR le thread `com_exec` →
+  sérialisé avec l'énumération, pas de course), `list_inputs`/`list_outputs`
+  servent le **dernier cache connu** au lieu de rappeler `input_devices()` (qui
+  rechargerait le driver → gel). Le flag est posé dans la closure com_exec de
+  `open_duplex_on_com` (après ouverture réussie) et levé dans `close_audio_driver`
+  (après ASIOExit). **macOS/CoreAudio + WASAPI strictement inchangés** : le flag
+  n'y est jamais posé → énumération fraîche à chaque appel, comportement historique.
+  Test unitaire `asio_active_serves_cache_and_never_reloads` (headless, sans matériel).
+
+### Added
+- **`jamodio-asio-lab` (crate, Windows only, JETABLE)** — banc de diagnostic ASIO
+  full-duplex minimal (asio-sys direct, marshalling de buffer réutilisé de cpal
+  MIT). Modes : `baseline`, `cpal2` (2 flux cpal = chemin de prod), `coexist[-live]`,
+  `stall`, `churn`, `enum-during`. A permis de trancher empiriquement (au lieu de
+  raisonner à l'aveugle) : le duplex isolé est robuste, seul l'`enum-during`
+  reproduit le gel. Contenu no-op hors Windows → workspace buildable sur Mac.
+- **`scripts/win-cargo.ps1`** — enveloppe de build Windows (charge vcvars64 +
+  `CPAL_ASIO_DIR`/`LIBCLANG_PATH` requis par asio-sys/bindgen, puis lance cargo).
+
+### Changed
+- `AudioDevice` dérive désormais `Clone` (nécessaire au cache d'énumération).
+
 ## [0.5.4-16] — 2026-07-01
 
 > **Pré-release — BUILD-PROBE v4 : sortie servie via le pattern ÉPROUVÉ de cpal.**

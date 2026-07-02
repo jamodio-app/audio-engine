@@ -1,10 +1,10 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.4-16"
+version = "0.5.4-17"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
-description = "Jamodio Desktop Audio Agent — low-latency ASIO/CoreAudio bridge"
+description = "Jamodio Desktop Audio Agent â€” low-latency ASIO/CoreAudio bridge"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -15,8 +15,8 @@ cpal = "0.15"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 # socket2 : bind du serveur WS avec SO_REUSEADDR (tokio ne le pose pas sur
-# Windows) → permet de re-binder le port 9876 immédiatement après un
-# redémarrage de l'agent, malgré la connexion précédente encore en TIME_WAIT.
+# Windows) â†’ permet de re-binder le port 9876 immÃ©diatement aprÃ¨s un
+# redÃ©marrage de l'agent, malgrÃ© la connexion prÃ©cÃ©dente encore en TIME_WAIT.
 socket2 = "0.5"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -26,12 +26,12 @@ parking_lot = "0.12"
 thread-priority = "0.10"
 base64 = "0.22"            # Encode des fichiers Ogg/Opus du record pour le wire WS (REC-3)
 midir = "0.10"             # Discovery + ouverture des MIDI devices (S2 INSERT plugins instruments)
-rubato = "0.16"            # Resampler haute qualité (mic onboard Windows 44.1 → 48 kHz Opus)
+rubato = "0.16"            # Resampler haute qualitÃ© (mic onboard Windows 44.1 â†’ 48 kHz Opus)
 
-# Logging structuré (PROD-grade) — voir convention dans CLAUDE.md.
-# tracing : façade compatible avec spans + structured fields.
+# Logging structurÃ© (PROD-grade) â€” voir convention dans CLAUDE.md.
+# tracing : faÃ§ade compatible avec spans + structured fields.
 # tracing-subscriber : formatters (compact stderr + JSON file).
-# tracing-appender : rotation journalière de fichier non-bloquante.
+# tracing-appender : rotation journaliÃ¨re de fichier non-bloquante.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
 tracing-appender = "0.2"
@@ -43,46 +43,46 @@ opener = "0.7"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-deep-link = "2"
-# Empêche un 2e process agent de démarrer (fix double-launch macOS/Windows).
-# Doit être enregistré AVANT deep-link cf. doc Tauri.
+# EmpÃªche un 2e process agent de dÃ©marrer (fix double-launch macOS/Windows).
+# Doit Ãªtre enregistrÃ© AVANT deep-link cf. doc Tauri.
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 # Auto-update via GitHub releases (config endpoint dans tauri.conf.json).
-# Sans ce plugin, le bloc `updater` de tauri.conf.json est inerte → les
-# users ne sont jamais notifiés (cf. mémoire agent_release_checklist).
+# Sans ce plugin, le bloc `updater` de tauri.conf.json est inerte â†’ les
+# users ne sont jamais notifiÃ©s (cf. mÃ©moire agent_release_checklist).
 tauri-plugin-updater = "2"
 
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.15", features = ["asio"] }
-# Accès DIRECT à l'API ASIO bas-niveau que cpal n'expose pas : enregistrement
+# AccÃ¨s DIRECT Ã  l'API ASIO bas-niveau que cpal n'expose pas : enregistrement
 # du callback de message ASIO (`Driver::add_message_callback`) pour honorer
-# `kAsioResetRequest`. cpal 0.15 ne pose AUCUN message callback → quand le
-# driver demande un reset, asio-sys lui répond « 1 » (host gère) mais n'exécute
-# rien → le driver halte ses callbacks silencieusement (wedge). On rétablit le
-# handshake en se branchant sur le même registre global via le `Driver` que cpal
-# possède déjà (cf. audio/asio_reset.rs). Version PINNÉE sur celle de cpal 0.15.3
-# (= asio-sys 0.2.x) pour partager exactement le même crate (registre/types).
+# `kAsioResetRequest`. cpal 0.15 ne pose AUCUN message callback â†’ quand le
+# driver demande un reset, asio-sys lui rÃ©pond Â« 1 Â» (host gÃ¨re) mais n'exÃ©cute
+# rien â†’ le driver halte ses callbacks silencieusement (wedge). On rÃ©tablit le
+# handshake en se branchant sur le mÃªme registre global via le `Driver` que cpal
+# possÃ¨de dÃ©jÃ  (cf. audio/asio_reset.rs). Version PINNÃ‰E sur celle de cpal 0.15.3
+# (= asio-sys 0.2.x) pour partager exactement le mÃªme crate (registre/types).
 asio-sys = "0.2"
-# Hôte VST3 plugins — Windows uniquement (parité fonctionnelle avec AU sur macOS).
+# HÃ´te VST3 plugins â€” Windows uniquement (paritÃ© fonctionnelle avec AU sur macOS).
 jamodio-vst3-host = { path = "../jamodio-vst3-host" }
-# Sprint S2 — MMCSS "Pro Audio" pour la priorité RT du thread encoder
+# Sprint S2 â€” MMCSS "Pro Audio" pour la prioritÃ© RT du thread encoder
 # (AvSetMmThreadCharacteristicsW dans avrt.dll). Cf. rt_priority.rs.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
-    # Énumération ASIO : `asio-sys` charge les drivers via CoCreateInstance sans
-    # initialiser COM lui-même → l'énumération doit tourner sur un thread STA.
+    # Ã‰numÃ©ration ASIO : `asio-sys` charge les drivers via CoCreateInstance sans
+    # initialiser COM lui-mÃªme â†’ l'Ã©numÃ©ration doit tourner sur un thread STA.
     # Cf. device.rs::enumerate_with_com.
     "Win32_System_Com",
 ] }
-# Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
+# Chantier quit UX â€” promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
 winreg = "0.52"
 
-# Hôte AU plugins — macOS uniquement.
+# HÃ´te AU plugins â€” macOS uniquement.
 [target.'cfg(target_os = "macos")'.dependencies]
 jamodio-au-host = { path = "../jamodio-au-host" }
-# Sprint S2 — bindings Mach (thread_policy_set, mach_timebase_info) pour le
-# fallback QoS+time-constraint quand os_workgroup_join échoue. Cf. rt_priority.rs.
+# Sprint S2 â€” bindings Mach (thread_policy_set, mach_timebase_info) pour le
+# fallback QoS+time-constraint quand os_workgroup_join Ã©choue. Cf. rt_priority.rs.
 mach2 = "0.4"
 libc = "0.2"

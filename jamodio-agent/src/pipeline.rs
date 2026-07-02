@@ -271,6 +271,15 @@ fn open_duplex_on_com(
         // stream vit (cf. `reset_guard` côté PipelineState).
         let reset_guard = crate::audio::asio_reset::register(&device, &reset_signal);
 
+        // 0.5.4-17 — driver ASIO désormais TENU par ce stream : interdit toute
+        // ré-énumération (rechargement du driver mono-client = gel des callbacks,
+        // cause racine prouvée). Posé ICI, sur le thread com_exec, donc sérialisé
+        // avant tout `list_inputs`/`list_outputs` ultérieur (pas de course). No-op
+        // sémantique hors ASIO (le flag n'est jamais lu ailleurs que sur ASIO).
+        if crate::audio::host::kind() == crate::audio::host::HostKind::Asio {
+            crate::audio::device::set_asio_stream_active(true);
+        }
+
         Ok(BuiltDuplex {
             input: BuiltInput {
                 stream: SendStream(in_stream),
@@ -1223,6 +1232,11 @@ impl PipelineState {
         self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
+        // 0.5.4-17 — driver relâché (ASIOExit fait par le drop ci-dessus, sur
+        // com_exec) : la ré-énumération redevient sûre. Posé APRÈS la fermeture
+        // effective (une énumération sérialisée d'ici là aurait servi le cache,
+        // ce qui reste sûr). No-op hors ASIO (le flag était déjà false).
+        crate::audio::device::set_asio_stream_active(false);
         self.capture_sample_tx = None;
         self.warm = None;
         self.output_buffer_samples = None;
