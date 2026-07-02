@@ -1,0 +1,102 @@
+name: Lint
+
+# Clippy sur les DEUX cibles réellement shippées (macOS Apple Silicon +
+# Windows x64), warnings traités comme des erreurs (`-D warnings`).
+#
+# RAISON D'ÊTRE : clippy sur un hôte macOS applique le cfg-stripping AVANT de
+# linter → tout bloc `#[cfg(windows)]` (MMCSS de `rt_priority.rs`, backend
+# `srtp_webrtc.rs`, …) est retiré et jamais analysé. Les warnings du chemin
+# Windows passent donc totalement invisibles en local. Ce job les attrape sur
+# un runner Windows natif — c'est le trou qui avait laissé passer les 3
+# warnings pré-existants nettoyés dans `chore/clippy-clean`.
+#
+# La matrice reflète volontairement `release.yml` : on lint EXACTEMENT ce qu'on
+# distribue. Linux n'est pas une cible (`jamodio-au-host` lie CoreAudio →
+# macOS-only ; macOS Intel abandonné le 2026-05-15). Les étapes d'installation
+# (libopus, ASIO SDK + LLVM, retrait du `.cargo/config.toml` de dev,
+# `CMAKE_POLICY_VERSION_MINIMUM`) sont identiques à `release.yml` pour que
+# clippy voie exactement l'environnement du build de release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Un run par ref : un nouveau push sur une PR annule le run précédent.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (+ clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './ -> target'
+          key: lint-${{ matrix.target }}
+
+      # ── Environnement de build (identique à release.yml) ──────────────────
+      # audiopus (jamodio-audio-core) lie libopus via pkg-config : chaque
+      # runner doit fournir libopus + pkg-config pour l'archi ciblée.
+      - name: Install libopus (macOS native)
+        if: runner.os == 'macOS'
+        run: brew install opus pkg-config
+
+      - name: Install libopus (Windows via vcpkg)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static-md
+          "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ASIO SDK + LLVM : la feature `asio` de cpal (Windows) utilise bindgen
+      # (→ LLVM/clang). Sans ça, le code ASIO Windows ne compile pas et n'est
+      # donc pas linté. SHA256 pinné (supply-chain) — cf. release.yml.
+      - name: Install ASIO SDK + LLVM (Windows, cpal asio feature)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          Invoke-WebRequest -Uri "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip" -OutFile asiosdk.zip
+          $expected = "bc425d9b98701af74b43639798566c48bc005af7328a2251cff722c1885076b2"
+          $actual = (Get-FileHash asiosdk.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Error "ASIO SDK checksum mismatch: $actual (attendu $expected)"; exit 1 }
+          Expand-Archive asiosdk.zip -DestinationPath C:\
+          "CPAL_ASIO_DIR=C:\asiosdk_2.3.3_2019-06-14" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Le .cargo/config.toml du repo est un override PKG_CONFIG_PATH local (dev
+      # Mac M* sous Rosetta) ; il casse pkg-config en CI → on le retire.
+      - name: Remove local dev .cargo/config.toml override
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - name: Clippy (--all-targets, warnings = erreurs)
+        shell: bash
+        env:
+          # opus vendored (audiopus_sys 0.2.2) utilise une syntaxe CMake < 3.5
+          # que CMake 4.x refuse sans cette policy de compat — cf. release.yml.
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
