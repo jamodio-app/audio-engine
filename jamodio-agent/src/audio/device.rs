@@ -51,6 +51,13 @@ static OUTPUT_CACHE: Mutex<Option<Vec<AudioDevice>>> = Mutex::new(None);
 ///
 /// N'est appelé avec `true` QUE sur le host ASIO (Windows). Sur macOS/WASAPI le
 /// flag reste `false` → énumération inchangée.
+///
+/// Invariant volontaire : pendant une reconstruction (`repair_audio_streams`) ou
+/// un park (driver ASIO gardé chaud), le flag reste `true` alors même que les
+/// streams sont momentanément fermés. C'est SÛR (ça supprime tout rechargement
+/// concurrent pendant la fenêtre vulnérable) et auto-résorbé — `close_audio_driver`
+/// le lève à la fermeture RÉELLE (stop / grâce de park expirée). Pire cas : un
+/// `GetDevices` dans cette fenêtre reçoit une liste de devices légèrement périmée.
 pub fn set_asio_stream_active(active: bool) {
     ASIO_STREAM_ACTIVE.store(active, Ordering::SeqCst);
 }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 const TARGET_SR: u32 = 48000;
 const TARGET_CHANNELS: u16 = 2;
-const TARGET_BUFFER: u32 = 128;
+// La taille de buffer cible n'est plus une constante figée : elle est pilotée
+// par `crate::audio::buffer_policy` (64 par défaut, 128 après backoff auto).
 
 /// Vérifie si le device OUTPUT expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Symétrique de
@@ -75,29 +76,24 @@ pub fn build_playback_stream(
         Err(_) => SampleFormat::F32,
     };
 
-    // Buffer size : symétrique de capture.rs (cf. sa doc détaillée — gel ASIO
-    // Focusrite 29/06).
-    //
-    // - **ASIO (Windows)** : on DÉFÈRE à la taille préférée du driver
-    //   (`BufferSize::Default`). En duplex ASIO, entrée et sortie partagent le
-    //   MÊME `ASIOCreateBuffers` : entrée et sortie DOIVENT demander la même
-    //   chose → les deux passent par `Default` (préférée) pour rester cohérents.
-    //   Forcer `Fixed(128)` hors-grille faisait halter le driver après ~75 s.
-    // - **CoreAudio / WASAPI** : INCHANGÉ — Fixed(128) si exposé, sinon Default.
-    let on_asio = crate::audio::host::kind() == crate::audio::host::HostKind::Asio;
-    let (buffer_size, fixed_buffer) = if on_asio {
-        (BufferSize::Default, None)
-    } else if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, TARGET_BUFFER) {
-        (BufferSize::Fixed(TARGET_BUFFER), Some(TARGET_BUFFER))
-    } else {
-        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-        tracing::info!(
-            target: "jamodio::playback",
-            device = %device_name,
-            "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
-        );
-        (BufferSize::Default, None)
-    };
+    // Buffer size : cible basse latence UNIFIÉE, pilotée par `buffer_policy` —
+    // strictement symétrique de capture.rs (cf. sa doc). Entrée et sortie lisent
+    // la MÊME cible → en duplex ASIO le `ASIOCreateBuffers` partagé reste cohérent.
+    // `Fixed(cible)` si le device l'expose, sinon `Default` (WASAPI shared ~10ms).
+    let target_buf = crate::audio::buffer_policy::target();
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, target_buf) {
+            (BufferSize::Fixed(target_buf), Some(target_buf))
+        } else {
+            let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+            tracing::info!(
+                target: "jamodio::playback",
+                device = %device_name,
+                target_buf,
+                "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
+            );
+            (BufferSize::Default, None)
+        };
 
     let config = StreamConfig {
         channels: TARGET_CHANNELS,

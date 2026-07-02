@@ -73,6 +73,14 @@ mod win {
             run_cpal2(monitor_secs, main_tid);
             return;
         }
+        // Mode `latency` : pour chaque taille de buffer candidate, crée les buffers
+        // et lit ASIOGetLatencies (latence in+out RÉELLE rapportée par le driver,
+        // pipeline USB/hardware inclus — pas juste le buffer). Révèle s'il y a des
+        // ms à gagner sous la taille préférée (128) → arbitrage du Niveau 2.
+        if mode == "latency" {
+            run_latency();
+            return;
+        }
         // Mode `churn` : ouvre/ferme le driver en boucle rapide (load→create→start
         // →hold→stop→dispose→destroy) — reproduit le cycle ASIOExit/ASIOInit que
         // l'agent faisait à chaque leave/rejoin (cause racine présumée 0.5.4-5,
@@ -212,7 +220,7 @@ mod win {
             let n = cb_ticks.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Overrun volontaire : spin > échéance ASIO (mode `stall`).
-            if stall && n % stall_every == 0 {
+            if stall && n.is_multiple_of(stall_every) {
                 let end = std::time::Instant::now() + Duration::from_millis(stall_ms);
                 while std::time::Instant::now() < end {
                     std::hint::spin_loop();
@@ -459,6 +467,89 @@ mod win {
             }
         }
         println!("\n=== VERDICT churn : {cycles} cycles OK, aucun wedge (driver robuste au churn en isolation) ===");
+    }
+
+    /// Mode `latency` : mesure la latence ASIO réelle (ASIOGetLatencies) à
+    /// différentes tailles de buffer. `ASIOGetLatencies` n'est pas wrappé par
+    /// asio-sys mais le symbole C est compilé dans le même objet (asio.cpp) que
+    /// `ASIOInit` & co → on le déclare nous-mêmes en extern "C". Il opère sur le
+    /// driver global chargé par asio-sys (`theAsioDriver`), donc valable après
+    /// `load_driver` + `prepare_*_stream`. Latence en samples → ms @48k.
+    fn run_latency() {
+        use asio_sys as sys;
+
+        let sr = 48_000.0f64;
+        // Sous la préférée (128) : tailles usuelles + non-alignées pour sonder la
+        // grille du driver (asio-sys ne valide QUE `<= max`, c'est ASIOCreateBuffers
+        // qui accepte/refuse selon la granularité réelle).
+        let candidates: [i32; 8] = [16, 32, 48, 64, 96, 128, 256, 512];
+        println!("=== Latence ASIO contrôlable (buffer) @ {sr} Hz — Focusrite ===");
+        println!("RTT bufferisé = 2×buffer/SR (latence in+out du buffering ASIO, hors converter USB fixe).");
+        println!("But : voir quelles tailles < 128 le driver ACCEPTE et le gain de RTT associé.\n");
+        println!("{:>8}  {:>8}  {:>12}  {:>14}  vs 128", "buf_req", "buf_act", "range", "RTT bufferisé");
+
+        let rtt_128 = 2.0 * 128.0 / sr * 1000.0;
+        for &bs in &candidates {
+            let asio = sys::Asio::new();
+            let mut chosen: Option<sys::Driver> = None;
+            for name in asio.driver_names() {
+                if let Ok(d) = asio.load_driver(&name) {
+                    if d.channels().map(|c| c.ins).unwrap_or(0) > 0 {
+                        chosen = Some(d);
+                        break;
+                    }
+                    let _ = d.destroy();
+                }
+            }
+            let Some(driver) = chosen else {
+                eprintln!("aucun driver ASIO chargeable — carte branchée / libre (agent arrêté) ?");
+                return;
+            };
+            let _ = driver.set_sample_rate(sr);
+            let (bmin, bmax) = driver.buffersize_range().unwrap_or((-1, -1));
+
+            // Ouvre RÉELLEMENT (create + start court) pour vérifier que la taille
+            // TIENT, pas juste qu'elle est acceptée à la création.
+            let built = driver
+                .prepare_input_stream(None, 2, Some(bs))
+                .and_then(|s| driver.prepare_output_stream(s.input, 2, Some(bs)));
+            match built {
+                Ok(streams) => {
+                    let actual = streams
+                        .output
+                        .as_ref()
+                        .or(streams.input.as_ref())
+                        .map(|s| s.buffer_size)
+                        .unwrap_or(bs);
+                    // Démarre 300 ms et compte les tics : une taille acceptée mais
+                    // instable (callbacks nuls) est disqualifiée.
+                    let ticks = std::sync::Arc::new(AtomicU64::new(0));
+                    let t = ticks.clone();
+                    let cb = driver.add_callback(move |_| {
+                        t.fetch_add(1, Ordering::Relaxed);
+                    });
+                    let started = driver.start().is_ok();
+                    std::thread::sleep(Duration::from_millis(300));
+                    let n = ticks.load(Ordering::Relaxed);
+                    let _ = driver.stop();
+                    driver.remove_callback(cb);
+                    let rtt = 2.0 * actual as f64 / sr * 1000.0;
+                    let stable = started && n as f64 > (0.300 * sr / actual as f64) * 0.5;
+                    println!(
+                        "{:>8}  {:>8}  {:>12}  {:>9.2} ms   {:+.2} ms  {}  ({} tics/300ms)",
+                        bs, actual, format!("{bmin}..{bmax}"), rtt, rtt - rtt_128,
+                        if stable { "OK" } else { "INSTABLE" }, n
+                    );
+                }
+                Err(e) => {
+                    println!("{bs:>8}  {:>8}  {:>12}  create_buffers REFUSÉ: {e:?}", "-", format!("{bmin}..{bmax}"));
+                }
+            }
+            let _ = driver.dispose_buffers();
+            let _ = driver.destroy();
+        }
+        println!("\nNB : buf_act peut être snappé par le driver sur sa grille. « vs 128 » = gain (−) ou coût (+)");
+        println!("de RTT bufferisé face à la taille préférée actuelle. Le converter USB (latence fixe) s'ajoute aux deux.");
     }
 
     /// Mode `cpal2` : reproduit le chemin de production (2 cpal::Stream séparés).

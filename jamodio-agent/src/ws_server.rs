@@ -611,6 +611,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // saine ; figés à 0 = cold-start muet (le watchdog l'aura déjà réparé).
         let mut prev_capture_callbacks: u64 = 0;
         let mut prev_output_callbacks: u64 = 0;
+        // 0.5.4-17 — détecteur de backoff de buffer (cf. `audio::buffer_policy`).
+        // `buffer_low_pressure` = leaky bucket (robuste aux pics isolés) ;
+        // `prev_monitor_underruns` = underruns self-monitor cumulés au tick
+        // précédent (pour le delta par fenêtre ; `saturating_sub` gère le reset
+        // du compteur quand le self-monitor est recréé à un nouveau start).
+        let mut buffer_low_pressure: u32 = 0;
+        let mut prev_monitor_underruns: u64 = 0;
         loop {
             interval.tick().await;
             let pl = perfstats_pipeline.lock().await;
@@ -664,6 +671,47 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let (mt, mu) = m.self_monitor_stats();
                 (stats, mt, mu)
             };
+
+            // ── Adaptive buffer : backoff auto 64 → 128 sous charge soutenue ────
+            // À la cible basse (64), si des drops capture OU des underruns
+            // self-monitor PERSISTENT (leaky bucket → ~ESCALATE_AT s de charge
+            // réelle, insensible aux 1-2 pics isolés), on remonte UNE fois à 128
+            // et on demande une reconstruction seamless (exécutée par le
+            // superviseur de liveness, même chemin éprouvé que la recovery). One-
+            // way : jamais de retour auto à 64 (anti-oscillation / anti-glitch
+            // répété) ; un 64 frais est re-tenté au prochain démarrage de l'agent.
+            // Filet RARE : à 64 le callback a ~100× de marge (mesuré), un drop
+            // réel suppose une machine/charge vraiment limite. Cf. `buffer_policy`.
+            {
+                use crate::audio::buffer_policy;
+                const ESCALATE_AT: u32 = 4; // ~4 s de charge soutenue
+                const DROP_BAD_PER_SEC: u64 = 10; // > 10 drops/s = vraie saturation
+                let underruns_delta = monitor_underruns.saturating_sub(prev_monitor_underruns);
+                prev_monitor_underruns = monitor_underruns;
+                let capturing = matches!(pl.state, AgentState::Capturing);
+                if capturing && buffer_policy::target() == buffer_policy::LOW {
+                    let bad = capture_drops_window > DROP_BAD_PER_SEC || underruns_delta > 0;
+                    buffer_low_pressure = if bad {
+                        buffer_low_pressure.saturating_add(1)
+                    } else {
+                        buffer_low_pressure.saturating_sub(1)
+                    };
+                    if buffer_low_pressure >= ESCALATE_AT && buffer_policy::escalate_to_safe() {
+                        buffer_policy::request_rebuild();
+                        buffer_low_pressure = 0;
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            from = buffer_policy::LOW,
+                            to = buffer_policy::SAFE,
+                            drops_per_sec = capture_drops_window,
+                            underruns_delta,
+                            "buffer bas insuffisant sous charge — passage automatique 64 → 128 (reconstruction seamless, une seule fois)"
+                        );
+                    }
+                } else {
+                    buffer_low_pressure = 0;
+                }
+            }
             // Sprint S6 — récupère les peers REMOTE instables (= > 16 drift
             // drains sur fenêtre 30 s). Le mixer purge ses VecDeque internes
             // au passage. Retour : (producer_id, events_window, drains_total).
@@ -1439,6 +1487,33 @@ async fn audio_liveness_supervisor(
             prev_out = out;
             last_progress = Instant::now();
             last_reset_seen = reset_signal.request_count();
+            // Une demande de backoff arrivée hors session est caduque : le
+            // prochain start rouvrira déjà à la cible courante. On la purge pour
+            // éviter un rebuild parasite au démarrage suivant.
+            crate::audio::buffer_policy::take_rebuild_request();
+            continue;
+        }
+
+        // 0.5.4-17 — backoff de buffer demandé par le flush `perfstats` (64 → 128
+        // insuffisant sous charge). On reconstruit les streams à la nouvelle taille
+        // via le MÊME chemin seamless que la recovery (`repair_audio_streams` :
+        // close→settle→reopen, session réseau maintenue, pas de redémarrage), MÊME
+        // si les callbacks avancent — le driver est sain, on ne change que la
+        // taille. Événement one-way et unique (cf. `buffer_policy`).
+        if crate::audio::buffer_policy::take_rebuild_request() {
+            tracing::info!(
+                target: "jamodio::ws",
+                "reconstruction des streams à la nouvelle taille de buffer (backoff auto)"
+            );
+            let _ = repair_audio_streams(&pipeline).await;
+            last_reset_seen = reset_signal.request_count();
+            last_progress = Instant::now();
+            last_repair = Some(Instant::now());
+            {
+                let pl = pipeline.lock().await;
+                prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+                prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+            }
             continue;
         }
 

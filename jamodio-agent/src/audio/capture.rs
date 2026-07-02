@@ -272,20 +272,33 @@ pub fn build_capture_stream(
     // - **CoreAudio / WASAPI** : INCHANGÉ — Fixed(128) low-latency si exposé,
     //   sinon Default. (CoreAudio ignore de toute façon la valeur et prend la
     //   taille native du device ; WASAPI shared impose la sienne.)
+    // Taille de buffer : cible basse latence UNIFIÉE (CoreAudio + ASIO), pilotée
+    // par `buffer_policy` (64 par défaut, 128 après backoff auto sous charge —
+    // cf. son doc). On demande `Fixed(cible)` si le device l'expose dans sa plage,
+    // sinon `Default` (le backend choisit ; WASAPI shared → ~10 ms, inchangé).
+    //
+    // 0.5.4-17 — l'ASIO passe de `Default`(préféré du driver, souvent 128) à
+    // `Fixed(cible)`. Le gel Focusrite venait de la RÉ-ÉNUMÉRATION concurrente
+    // (corrigée en 0.5.4-17), PAS de la taille de buffer : le driver est stable
+    // de 16 à 1024 samples (mesuré au banc). Forcer une petite taille est donc
+    // sûr et met la latence PC à parité avec le Mac. Entrée et sortie lisent la
+    // MÊME cible → cohérence du `ASIOCreateBuffers` duplex partagé.
+    let target_buf = crate::audio::buffer_policy::target();
     let on_asio = crate::audio::host::kind() == crate::audio::host::HostKind::Asio;
-    let (buffer_size, fixed_buffer) = if on_asio {
+    if on_asio {
         log_asio_buffer_range(device, channels, native_sr);
-        (BufferSize::Default, None)
-    } else if device_supports_fixed_buffer(device, channels, native_sr, 128) {
-        (BufferSize::Fixed(128), Some(128u32))
-    } else {
-        tracing::info!(
-            target: "jamodio::capture",
-            channels, native_sr,
-            "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
-        );
-        (BufferSize::Default, None)
-    };
+    }
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, channels, native_sr, target_buf) {
+            (BufferSize::Fixed(target_buf), Some(target_buf))
+        } else {
+            tracing::info!(
+                target: "jamodio::capture",
+                channels, native_sr, target_buf,
+                "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
+            );
+            (BufferSize::Default, None)
+        };
 
     let config = StreamConfig {
         channels,
