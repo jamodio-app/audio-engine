@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.4-17"
+version = "0.5.4-18"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -74,6 +74,11 @@ windows-sys = { version = "0.59", features = [
     # initialiser COM lui-même → l'énumération doit tourner sur un thread STA.
     # Cf. device.rs::enumerate_with_com.
     "Win32_System_Com",
+    # 0.5.4-18 — PowerRegisterSuspendResumeNotification (réveil de veille → re-init
+    # ASIO). Cf. audio/power_events.rs. Les constantes PBT_*/DEVICE_NOTIFY_CALLBACK
+    # vivent dans Win32_UI_WindowsAndMessaging.
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.

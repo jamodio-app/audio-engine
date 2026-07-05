@@ -75,14 +75,53 @@ enum OutputOpen {
 /// l'ENTRÉE et la SORTIE puis les démarre (sortie d'abord). Regrouper build+play
 /// des deux streams dans un seul passage évite de recréer les buffers ASIO de la
 /// sortie APRÈS un `play()` d'entrée (cold-start full-duplex muet, bug PC 28/06).
-struct BuiltDuplex {
-    /// Entrée — déjà démarrée (`play()` appelé dans la closure, après la sortie).
-    input: BuiltInput,
-    /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
-    output: OutputOpen,
-    /// 0.5.4-2 — garde du callback `kAsioResetRequest` enregistré sur le driver
-    /// d'entrée (cf. `audio::asio_reset`). Garde vide hors ASIO/Windows.
-    reset_guard: crate::audio::asio_reset::ResetCallbackGuard,
+enum BuiltDuplex {
+    /// Chemin cpal (macOS/WASAPI ; et ASIO tant que le host single-owner n'est pas
+    /// activé). Deux `cpal::Stream` séparés + garde de reset.
+    Cpal {
+        /// Entrée — déjà démarrée (`play()` appelé dans la closure, après la sortie).
+        input: BuiltInput,
+        /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
+        output: OutputOpen,
+        /// 0.5.4-2 — garde du callback `kAsioResetRequest` sur le driver d'entrée
+        /// (cf. `audio::asio_reset`). Garde vide hors ASIO/Windows.
+        reset_guard: crate::audio::asio_reset::ResetCallbackGuard,
+    },
+    /// Chemin ASIO single-owner (Windows, opt-in `JAMODIO_ASIO_HOST=1`) : un seul
+    /// objet duplex robuste (1 ASIOInit, priming, 1 create(in+out), 1 start), qui
+    /// gère lui-même son callback de reset.
+    #[cfg(target_os = "windows")]
+    Asio(AsioBuilt),
+}
+
+/// Résultat d'une ouverture via le host ASIO single-owner (cf. `AsioDuplexHost`).
+#[cfg(target_os = "windows")]
+struct AsioBuilt {
+    host: crate::audio::asio_host::AsioDuplexHost,
+    name: String,
+    resolved_id: String,
+    channels_in: u16,
+    native_sr: u32,
+    input_buf: Option<u32>,
+}
+
+/// `true` si le host ASIO single-owner est activé. **Par défaut ON sur ASIO**
+/// (Windows) : c'est désormais le chemin robuste (1 ASIOInit, priming, snap de taille,
+/// tous formats). Repli sur l'ancien chemin cpal avec `JAMODIO_ASIO_HOST=0` (secours
+/// si une interface pose problème, en attendant le retrait complet du code cpal ASIO).
+#[cfg(target_os = "windows")]
+fn asio_host_enabled() -> bool {
+    crate::audio::host::kind() == crate::audio::host::HostKind::Asio
+        && std::env::var("JAMODIO_ASIO_HOST").as_deref() != Ok("0")
+}
+
+/// Ferme un host ASIO **sur le thread COM-STA** (Windows) — le `Drop` fait
+/// stop/dispose/ASIOExit sur l'apartment créateur, comme `close_stream_on_com`.
+#[cfg(target_os = "windows")]
+fn close_host_on_com(host: Option<crate::audio::asio_host::AsioDuplexHost>) {
+    if let Some(h) = host {
+        crate::audio::com_exec::run(move || drop(h));
+    }
 }
 
 /// 0.5.4-5 — état du driver ASIO gardé « CHAUD » à travers les leave/rejoin.
@@ -202,6 +241,56 @@ fn open_duplex_on_com(
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
+
+        // --- Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`) : remplace les 2
+        //     streams cpal par un objet duplex robuste (1 ASIOInit, priming, snap de
+        //     taille, 1 create(in+out), 1 start, tous formats). ---
+        #[cfg(target_os = "windows")]
+        if asio_host_enabled() {
+            let resolved_id = input_id
+                .clone()
+                .or_else(crate::audio::device::default_input_id)
+                .ok_or_else(|| CaptureStartError::InputDeviceNotFound {
+                    requested: input_id.clone(),
+                })?;
+            // Id device = "{idx}:{name}" → nom de driver ASIO.
+            let driver_name = resolved_id
+                .split_once(':')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| resolved_id.clone());
+            let desired = crate::audio::buffer_policy::target() as i32;
+            let host = crate::audio::asio_host::AsioDuplexHost::open(
+                &driver_name,
+                desired,
+                sample_tx,
+                capture_drops,
+                capture_callbacks,
+                input_frames,
+                capture_feeding,
+                mixer,
+                output_callbacks,
+                output_frames,
+                &reset_signal,
+            )
+            .map_err(CaptureStartError::Other)?;
+            crate::audio::device::set_asio_stream_active(true);
+            let (channels_in, native_sr, buffer_size) =
+                (host.channels_in, host.native_sr, host.buffer_size);
+            tracing::info!(
+                target: "jamodio::pipeline",
+                device = %driver_name, channels_in, native_sr, buffer_size,
+                "AsioDuplexHost ouvert (chemin single-owner opt-in JAMODIO_ASIO_HOST)"
+            );
+            return Ok(BuiltDuplex::Asio(AsioBuilt {
+                host,
+                name: driver_name,
+                resolved_id,
+                channels_in,
+                native_sr,
+                input_buf: Some(buffer_size),
+            }));
+        }
+
         // --- ENTRÉE : résolution + build (SANS play) ---
         let device = match input_id.as_deref() {
             Some(id) => crate::audio::device::get_input_device(id),
@@ -280,7 +369,7 @@ fn open_duplex_on_com(
             crate::audio::device::set_asio_stream_active(true);
         }
 
-        Ok(BuiltDuplex {
+        Ok(BuiltDuplex::Cpal {
             input: BuiltInput {
                 stream: SendStream(in_stream),
                 name,
@@ -302,6 +391,20 @@ fn close_stream_on_com(stream: Option<SendStream>) {
     if let Some(s) = stream {
         crate::audio::com_exec::run(move || drop(s));
     }
+}
+
+/// 0.5.4-18 — durée d'attente entre le RÉVEIL d'une interface USB ASIO et son
+/// ouverture propre. Le 1er init après une veille interface livre une entrée
+/// FIGÉE (railée ou silence) que seul un init frais — l'interface déjà réveillée
+/// ET stabilisée (bias ADC / PLL USB) — nettoie. Seuil mesuré sur Focusrite
+/// Scarlett Solo : 4 s échoue, 5 s OK → défaut 6 s (marge de robustesse). Réglable
+/// via `JAMODIO_COLD_REINIT_SETTLE_MS`.
+pub(crate) fn cold_reinit_settle() -> std::time::Duration {
+    let ms = std::env::var("JAMODIO_COLD_REINIT_SETTLE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6000);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Erreur typée renvoyée par `start_capture`. Permet à `ws_server` de
@@ -362,6 +465,11 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
+    /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
+    /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
+    #[cfg(target_os = "windows")]
+    asio_host: Option<crate::audio::asio_host::AsioDuplexHost>,
     /// 0.5.3-5 — clone du `Sender` du canal capture→encoder, conservé pour
     /// pouvoir RECRÉER le seul stream CPAL d'entrée (sans toucher à l'encodeur,
     /// au RtpSender, au SRTP ni à la réception) quand le superviseur de liveness
@@ -398,6 +506,11 @@ pub struct PipelineState {
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
     input_device_id: Option<String>,
     output_device_id: Option<String>,
+    /// 0.5.4-18 — one-shot : demande un re-init long-settle du driver ASIO juste
+    /// après une ouverture À FROID. Posé par `prepare_audio_for_session` (chemin
+    /// froid ASIO), consommé UNE fois par `audio_liveness_supervisor`. Jamais posé
+    /// hors ASIO. Cf. la branche cold-start du superviseur.
+    cold_reinit_pending: bool,
     /// State
     pub state: AgentState,
     /// Buffer CPAL côté CAPTURE, en samples (mono), set au start_capture.
@@ -808,6 +921,8 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            #[cfg(target_os = "windows")]
+            asio_host: None,
             capture_sample_tx: None,
             reset_signal: crate::audio::asio_reset::ResetSignal::new(),
             reset_guard: None,
@@ -818,6 +933,7 @@ impl PipelineState {
             recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
+            cold_reinit_pending: false,
             state: AgentState::Idle,
             input_buffer_samples: None,
             output_buffer_samples: None,
@@ -1191,6 +1307,28 @@ impl PipelineState {
         crate::audio::host::kind() == crate::audio::host::HostKind::Asio
     }
 
+    /// Vrai si des streams audio d'entrée sont ouverts — soit les streams cpal, soit
+    /// le host ASIO single-owner. Unifie les tests « capture ouverte » des deux chemins.
+    #[cfg(target_os = "windows")]
+    fn audio_streams_open(&self) -> bool {
+        self.capture_stream.is_some() || self.asio_host.is_some()
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn audio_streams_open(&self) -> bool {
+        self.capture_stream.is_some()
+    }
+
+    /// Vrai si le host ASIO single-owner est actif (il fournit déjà la sortie, donc
+    /// on ne doit PAS ouvrir un `cpal::Stream` de sortie séparé — 2ᵉ instance Asio).
+    #[cfg(target_os = "windows")]
+    fn has_asio_host(&self) -> bool {
+        self.asio_host.is_some()
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn has_asio_host(&self) -> bool {
+        false
+    }
+
     /// 0.5.4-5 — démonte la couche SESSION (encodeur, self-monitor, réception,
     /// décodage) en GARDANT les streams audio + le canal capture. Utilisé au park
     /// (sortie de studio sur ASIO) et avant un rejoin qui réutilise le driver
@@ -1232,6 +1370,8 @@ impl PipelineState {
         self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
+        #[cfg(target_os = "windows")]
+        close_host_on_com(self.asio_host.take());
         // 0.5.4-17 — driver relâché (ASIOExit fait par le drop ci-dessus, sur
         // com_exec) : la ré-énumération redevient sûre. Posé APRÈS la fermeture
         // effective (une énumération sérialisée d'ici là aurait servi le cache,
@@ -1310,15 +1450,16 @@ impl PipelineState {
     /// 0.5.4-5 — acquiert les streams audio pour une (nouvelle) session :
     /// RÉUTILISE le driver ASIO chaud (rejoin sans ré-init = anti-churn) si host
     /// ASIO + streams ouverts + MÊMES devices ; sinon ferme tout et ouvre à froid
-    /// (un device changé = une seule ré-init propre). Encapsule tout le teardown
-    /// de la session/driver précédent·e. Renvoie les caractéristiques du device
-    /// (pour l'encodeur + `CaptureStartedInfo`) et le `Receiver` capture.
+    /// (le superviseur fera un re-init long-settle propre juste après — cf.
+    /// `cold_reinit_pending`). Encapsule tout le teardown de la session/driver
+    /// précédent·e. Renvoie les caractéristiques du device (pour l'encodeur +
+    /// `CaptureStartedInfo`) et le `Receiver` capture.
     fn prepare_audio_for_session(&mut self) -> Result<AcquiredAudio, CaptureStartError> {
         let input_id = self.input_device_id.clone();
         let output_id = self.output_device_id.clone();
 
         let reuse = Self::host_is_asio()
-            && self.capture_stream.is_some()
+            && self.audio_streams_open()
             && self
                 .warm
                 .as_ref()
@@ -1372,34 +1513,54 @@ impl PipelineState {
             self.perfstats.capture_feeding.clone(),
             self.reset_signal.clone(),
         )?;
-        let BuiltDuplex { input, output, reset_guard } = built;
-        self.reset_guard = Some(reset_guard);
-        let channels_in = input.channels;
-        let native_sr = input.native_sr;
-        let input_buf = input.input_buf;
-        let in_name = input.name;
-        let resolved_input_id = input.resolved_id;
-        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        self.capture_stream = Some(input.stream);
-        self.input_buffer_samples = input_buf;
-        match output {
-            OutputOpen::Opened { stream, buffer, name } => {
-                tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
-                self.playback_stream = Some(stream);
-                self.output_buffer_samples = buffer;
+        let (channels_in, native_sr, input_buf, in_name, resolved_input_id) = match built {
+            BuiltDuplex::Cpal { input, output, reset_guard } => {
+                self.reset_guard = Some(reset_guard);
+                tracing::info!(target: "jamodio::pipeline", device = %input.name, "input device opened");
+                self.input_buffer_samples = input.input_buf;
+                let meta = (input.channels, input.native_sr, input.input_buf, input.name, input.resolved_id);
+                self.capture_stream = Some(input.stream);
+                match output {
+                    OutputOpen::Opened { stream, buffer, name } => {
+                        tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                        self.playback_stream = Some(stream);
+                        self.output_buffer_samples = buffer;
+                    }
+                    OutputOpen::BuildFailed(e) => tracing::warn!(
+                        target: "jamodio::pipeline",
+                        error = %e,
+                        "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+                    ),
+                    OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+                    OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
+                }
+                meta
             }
-            OutputOpen::BuildFailed(e) => tracing::warn!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "ouverture du stream de sortie échouée — playback désactivé (capture active)"
-            ),
-            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
-            OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
-        }
+            #[cfg(target_os = "windows")]
+            BuiltDuplex::Asio(a) => {
+                // Host single-owner : entrée + sortie dans UN seul objet duplex. Pas de
+                // `reset_guard` (le host enregistre lui-même son callback de message).
+                self.reset_guard = None;
+                tracing::info!(target: "jamodio::pipeline", device = %a.name, "AsioDuplexHost — entrée + sortie ouvertes (single-owner)");
+                self.input_buffer_samples = a.input_buf;
+                self.output_buffer_samples = a.input_buf;
+                self.asio_host = Some(a.host);
+                (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id)
+            }
+        };
 
         // Sur ASIO : mémorise l'état chaud pour réutiliser le driver aux rejoin.
         // Hors ASIO : `warm` reste `None` → fermeture à chaque stop (historique).
         if Self::host_is_asio() {
+            // 0.5.4-18 — le re-init long-settle est DÉSACTIVÉ par défaut : il ne
+            // nettoie PAS le wedge cold-start de façon fiable (l'ADC railé + DMA figé
+            // revient ~4 s après tout init — investigation 2026-07-03). La piste
+            // retenue est la TAILLE de buffer (`Fixed(64)` déclenche le wedge, pas le
+            // préféré 128 — cf. `buffer_policy::choice`). On garde le re-init derrière
+            // `JAMODIO_COLD_REINIT=1` uniquement pour comparaison au banc.
+            if std::env::var("JAMODIO_COLD_REINIT").as_deref() == Ok("1") {
+                self.cold_reinit_pending = true;
+            }
             self.warm = Some(WarmAudio {
                 input_id,
                 output_id,
@@ -1618,7 +1779,7 @@ impl PipelineState {
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
     /// Lu par le superviseur de liveness (`audio_liveness_supervisor`).
     pub fn has_active_capture_stream(&self) -> bool {
-        self.capture_stream.is_some()
+        self.audio_streams_open()
     }
 
     /// 0.5.4-2 — clone du canal de signalisation `kAsioResetRequest`, pour que le
@@ -1626,6 +1787,41 @@ impl PipelineState {
     /// un reset. No-op sémantique hors Windows (jamais signalé).
     pub fn reset_signal(&self) -> crate::audio::asio_reset::ResetSignal {
         self.reset_signal.clone()
+    }
+
+    /// 0.5.4-18 — consomme (une seule fois) la demande de re-init long-settle posée
+    /// à la dernière ouverture ASIO à froid. Appelé par le superviseur à chaque tick.
+    pub fn take_cold_reinit_request(&mut self) -> bool {
+        std::mem::replace(&mut self.cold_reinit_pending, false)
+    }
+
+    /// 0.5.4-18 — réinitialise le JitterBuffer de découplage du self-monitor après
+    /// une discontinuité d'horloge de capture (re-init long-settle du driver ASIO :
+    /// cold-start ou réveil de veille PC, cf. `audio_liveness_supervisor`). Le volume
+    /// est préservé ; seul le tampon de gigue repart propre — sinon son drift, mal
+    /// ré-estimé à cheval sur le trou de ~6 s, produit une distorsion persistante
+    /// dans le casque.
+    pub fn reset_self_monitor(&self) {
+        self.mixer.lock().reset_local_stream();
+    }
+
+    /// 0.5.4-18 — coupe (`false`) ou rétablit (`true`) l'alimentation de l'encodeur
+    /// par le callback de capture (cf. `PerfStats::capture_feeding` : quand `false`,
+    /// le callback JETTE ses samples sans les router ni compter de drop). Utilisé
+    /// par le re-init long-settle pour ne PAS router le préfixe railé du 1er open à
+    /// froid (sinon larsen/tonalité à l'entrée studio le temps du réveil interface).
+    ///
+    /// En COUPANT (`false`), remet aussi le VU d'entrée (`input_rms`) à 0 : pendant
+    /// le settle les streams sont fermés → l'encodeur ne reçoit aucun bloc → il ne
+    /// RECALCULE pas `input_rms`, qui resterait donc épinglé sur le pic railé du
+    /// 1er open (VU « à fond » ~6 s). Le remettre à 0 ici garantit un VU muet
+    /// pendant tout le settle (l'encodeur ne le repassera au vif qu'à la réouverture).
+    pub fn set_capture_feeding(&self, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.perfstats.capture_feeding.store(on, Relaxed);
+        if !on {
+            self.input_rms.store(0, Relaxed); // 0.0_f32 → bits 0
+        }
     }
 
     /// 0.5.4-2 — PHASE 1 du reset ASIO à chaud : ferme les deux streams CPAL sur
@@ -1650,6 +1846,8 @@ impl PipelineState {
         // reconstruire.
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
+        #[cfg(target_os = "windows")]
+        close_host_on_com(self.asio_host.take());
         self.output_buffer_samples = None;
         self.input_buffer_samples = None;
     }
@@ -1692,35 +1890,50 @@ impl PipelineState {
             self.reset_signal.clone(),
         )?;
 
-        let BuiltDuplex { input, output, reset_guard } = built;
-        // Le nouveau driver a son propre callback de reset enregistré : on
-        // remplace le garde (l'ancien a déjà été droppé en phase 1).
-        self.reset_guard = Some(reset_guard);
-        self.input_buffer_samples = input.input_buf;
-        self.capture_stream = Some(input.stream);
-        match output {
-            OutputOpen::Opened { stream, buffer, name } => {
-                self.playback_stream = Some(stream);
-                self.output_buffer_samples = buffer;
+        match built {
+            BuiltDuplex::Cpal { input, output, reset_guard } => {
+                // Le nouveau driver a son propre callback de reset enregistré : on
+                // remplace le garde (l'ancien a déjà été droppé en phase 1).
+                self.reset_guard = Some(reset_guard);
+                self.input_buffer_samples = input.input_buf;
+                self.capture_stream = Some(input.stream);
+                match output {
+                    OutputOpen::Opened { stream, buffer, name } => {
+                        self.playback_stream = Some(stream);
+                        self.output_buffer_samples = buffer;
+                        tracing::info!(
+                            target: "jamodio::pipeline",
+                            device = %name,
+                            "streams audio recréés (reset ASIO)"
+                        );
+                    }
+                    // Sortie non rétablie : l'entrée prime (la capture repart), le
+                    // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
+                    OutputOpen::BuildFailed(e) => tracing::warn!(
+                        target: "jamodio::pipeline",
+                        error = %e,
+                        "recréation sortie échouée — playback désactivé (capture rétablie)"
+                    ),
+                    OutputOpen::NotFound => {
+                        return Err(CaptureStartError::OutputDeviceNotFound {
+                            requested: self.output_device_id.clone(),
+                        })
+                    }
+                    OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+                }
+            }
+            #[cfg(target_os = "windows")]
+            BuiltDuplex::Asio(a) => {
+                self.reset_guard = None;
+                self.input_buffer_samples = a.input_buf;
+                self.output_buffer_samples = a.input_buf;
+                self.asio_host = Some(a.host);
                 tracing::info!(
                     target: "jamodio::pipeline",
-                    device = %name,
-                    "streams audio recréés (reset ASIO)"
+                    device = %a.name,
+                    "AsioDuplexHost recréé (reset single-owner)"
                 );
             }
-            // Sortie non rétablie : l'entrée prime (la capture repart), le
-            // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
-            OutputOpen::BuildFailed(e) => tracing::warn!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "recréation sortie échouée — playback désactivé (capture rétablie)"
-            ),
-            OutputOpen::NotFound => {
-                return Err(CaptureStartError::OutputDeviceNotFound {
-                    requested: self.output_device_id.clone(),
-                })
-            }
-            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
         }
         // P1 — repart propre : vide les jitter buffers du périmé accumulé pendant
         // le gel de sortie (le décodage a continué de pousser jusqu'à 300 ms) et
@@ -1798,8 +2011,9 @@ impl PipelineState {
 
         // Start playback if not running. Résolution + ouverture sur le thread
         // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
-        // un id explicite échoue.
-        if self.playback_stream.is_none() {
+        // un id explicite échoue. Sur le host ASIO single-owner, la sortie est
+        // DÉJÀ fournie par le host → ne pas ouvrir un 2ᵉ stream (2ᵉ instance Asio).
+        if self.playback_stream.is_none() && !self.has_asio_host() {
             match open_output_on_com(
                 self.output_device_id.clone(),
                 self.mixer.clone(),
@@ -1849,7 +2063,7 @@ impl PipelineState {
         // Évite le bruit en idle : si rien ne tourne, on log en debug pour ne pas
         // spammer info à chaque WS disconnect du browser (le probe agent ouvre/
         // ferme une WS toutes les 30 s).
-        let was_active = self.capture_stream.is_some()
+        let was_active = self.audio_streams_open()
             || self.playback_stream.is_some()
             || !self.recv_stops.is_empty()
             || self.recorder.is_some();
@@ -2759,12 +2973,24 @@ fn process_stage_loop(
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
                 // dans son casque via le callback CPAL playback).
+                // 0.5.4-18 — pendant un re-init long-settle (`capture_feeding=false`),
+                // on force le VU à 0 et on saute le self-monitor : le préfixe railé
+                // du 1er open à froid (déjà bufferisé dans le canal) resterait sinon
+                // affiché « VU à fond » pendant tout le settle (~6 s). Même flag que
+                // le mute du routage (cf. `set_capture_feeding`).
                 if !stereo.is_empty() {
-                    let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
-                    let rms = (sum_sq / stereo.len() as f32).sqrt();
-                    input_rms
-                        .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                    mixer.lock().push_self_samples(&stereo);
+                    if perfstats
+                        .capture_feeding
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
+                        let rms = (sum_sq / stereo.len() as f32).sqrt();
+                        input_rms
+                            .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        mixer.lock().push_self_samples(&stereo);
+                    } else {
+                        input_rms.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
 
                 // v0.4.8 — observe le temps de traitement PUR du process_stage.

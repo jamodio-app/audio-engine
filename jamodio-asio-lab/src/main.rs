@@ -81,6 +81,32 @@ mod win {
             run_latency();
             return;
         }
+        // Mode `bufinfo` : dump BRUT de `ASIOGetBufferSize(min,max,pref,granularity)`
+        // + la GRILLE de tailles légales que le driver expose réellement, + les
+        // latences ASIOGetLatencies. C'est LA donnée décisive du bug cold-start :
+        // `asio-sys::create_buffers` ne valide QUE `demandé <= max` (ni min, ni
+        // granularité) → il passe un 64 potentiellement ILLÉGAL tel quel à
+        // ASIOCreateBuffers. Jamulus/JUCE, eux, refusent une taille hors grille et
+        // retombent sur `pref`. Ce mode répond donc : « 64 est-il une taille ASIO
+        // LÉGALE sur cette interface, ou est-ce qu'on force une taille interdite ? ».
+        if mode == "bufinfo" {
+            run_bufinfo();
+            return;
+        }
+        // Mode `robust` : PROTOTYPE du host single-owner robuste, toutes interfaces
+        // (invariants Jamulus + JUCE). Séquence : 1 seule instance Asio → load_driver
+        // (1 ASIOInit) → set_sample_rate → snap de la taille à la grille LÉGALE du
+        // driver → PRIMING JUCE (create dummy → start → sleep 120ms → stop → dispose,
+        // « some devices fail if we don't ») → 1 seul ASIOCreateBuffers(in+out) →
+        // callback duplex → 1 seul ASIOStart → start-timeout (attend le 1er callback).
+        // Mesure ensuite la fraîcheur de l'entrée (doit être VIVANTE dès le départ, sur
+        // TOUTE interface). C'est le code destiné à remplacer les 2 streams cpal dans
+        // l'agent. `JAMLAB_BUF` = taille désirée (défaut 64) ; `JAMLAB_NO_PRIME=1`
+        // désactive le priming (pour A/B l'effet du priming).
+        if mode == "robust" {
+            run_robust(monitor_secs.max(1), main_tid);
+            return;
+        }
         // Mode `churn` : ouvre/ferme le driver en boucle rapide (load→create→start
         // →hold→stop→dispose→destroy) — reproduit le cycle ASIOExit/ASIOInit que
         // l'agent faisait à chaque leave/rejoin (cause racine présumée 0.5.4-5,
@@ -88,6 +114,42 @@ mod win {
         // JAMLAB_HOLD_MS = durée chaude par cycle (défaut 400 ms).
         if mode == "churn" {
             run_churn(monitor_secs.max(1));
+            return;
+        }
+        // Mode `coldstart` : reproduit le TOUT PREMIER init ASIO à froid EXACTEMENT
+        // comme le fait cpal dans l'agent, et instrumente la FRAÎCHEUR de l'entrée
+        // (channel 0 = tranche instrument/guitare Focusrite). C'est le banc dédié
+        // au bug 2026-07-03 : entrée FIGÉE sur une constante quasi pleine-échelle
+        // (~0.99) au 1er démarrage à froid, nettoyée seulement par un ASIOInit frais.
+        //
+        // Paramétré par variables d'environnement pour comparer un seul facteur à
+        // la fois (chaque run = un ASIOInit/ASIOExit frais) :
+        //   JAMLAB_BUF   = 64 (défaut) | 128 | 0  (0 ⇒ None ⇒ taille préférée du driver)
+        //   JAMLAB_ORDER = agent (défaut) | out-first | single
+        //     - agent     : Create(in)·Start·[Stop·Dispose·Create(in+out)]·Start
+        //                   — MIROIR EXACT de cpal (build_input puis build_output,
+        //                     chacun appelant ASIOStart ; le 2e create stop+dispose).
+        //     - out-first : Create(out)·Start·[Stop·Dispose·Create(out+in)]·Start
+        //                   — l'entrée n'est JAMAIS démarrée seule puis détruite ;
+        //                     son DMA n'existe que dans la config duplex finale.
+        //     - single    : Create(in+out)·Start — un seul create, aucun start/stop
+        //                   intermédiaire (ce que ferait un hôte single-owner).
+        // Verdict : l'entrée est-elle VIVANTE (varie avec les tics) ou FIGÉE/railée
+        // (constante bit-exacte re-servie) sur les N premières secondes ?
+        if mode == "coldstart" {
+            run_coldstart(monitor_secs.max(1), main_tid);
+            return;
+        }
+        // Mode `dualasio` : reproduit LE pattern de l'agent — l'entrée est ouverte via
+        // une 1re instance `sys::Asio` (#A) et la sortie via une 2e instance DISTINCTE
+        // (#B). Comme un `Asio` neuf a un `Weak` vide, la #B refait un `ASIOInit` COMPLET
+        // sur le driver mono-client ALORS QUE l'entrée tourne déjà dessus (+ un
+        // `ASIOCreateBuffers` sortie qui peut disposer les buffers d'entrée). Le banc et
+        // cpal2, eux, n'utilisent qu'UNE instance. On mesure la fraîcheur de l'entrée
+        // AVANT puis APRÈS l'ouverture de la sortie : si elle fige après #B, le mécanisme
+        // (2 instances Asio = 2 ASIOInit) est prouvé — potentiellement même à chaud.
+        if mode == "dualasio" {
+            run_dualasio(monitor_secs.max(1), main_tid);
             return;
         }
 
@@ -469,6 +531,807 @@ mod win {
         println!("\n=== VERDICT churn : {cycles} cycles OK, aucun wedge (driver robuste au churn en isolation) ===");
     }
 
+    /// Mode `coldstart` : reproduit le 1er init ASIO à froid comme cpal/l'agent et
+    /// mesure la FRAÎCHEUR de l'entrée (channel 0). Cf. le gros commentaire de
+    /// dispatch pour les variables d'env (JAMLAB_BUF / JAMLAB_ORDER).
+    fn run_coldstart(monitor_secs: u64, main_tid: u32) {
+        use asio_sys as sys;
+        use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let buf_env: i32 = std::env::var("JAMLAB_BUF").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let buf_req: Option<i32> = if buf_env <= 0 { None } else { Some(buf_env) };
+        let order = std::env::var("JAMLAB_ORDER").unwrap_or_else(|_| "agent".into());
+        println!(
+            "=== coldstart === buf_req={:?} order={order} main_tid={main_tid} monitor={monitor_secs}s",
+            buf_req
+        );
+        println!("(mesure : l'entrée ch0 est-elle VIVANTE ou FIGÉE/railée sur les 1res secondes)\n");
+
+        // --- Charge le 1er driver ASIO avec entrée (= ASIOInit frais) ---
+        let asio = sys::Asio::new();
+        let mut chosen: Option<(sys::Driver, String)> = None;
+        for name in asio.driver_names() {
+            if let Ok(d) = asio.load_driver(&name) {
+                if d.channels().map(|c| c.ins).unwrap_or(0) > 0 {
+                    chosen = Some((d, name));
+                    break;
+                }
+                let _ = d.destroy();
+            }
+        }
+        let Some((driver, name)) = chosen else {
+            eprintln!("aucun driver ASIO chargeable avec entrée — carte branchée / libre ?");
+            return;
+        };
+        // Test d'hypothèse : `set_sample_rate` est-il ce qui ARME l'ADC d'entrée à
+        // froid ? Le lab le fait toujours (→ entrée vivante) ; cpal le SKIP si le SR
+        // est déjà bon (→ entrée figée dans l'agent). `JAMLAB_NO_SR=1` reproduit le
+        // comportement de cpal (skip) pour voir si ça reproduit le wedge au banc.
+        let skip_sr = std::env::var("JAMLAB_NO_SR").is_ok();
+        if skip_sr {
+            let cur = driver.sample_rate().unwrap_or(0.0);
+            println!("set_sample_rate: SKIP (JAMLAB_NO_SR) — SR courant du driver = {cur}");
+        } else {
+            let _ = driver.set_sample_rate(48_000.0);
+            println!("set_sample_rate: 48000 (appelé, comme le lab par défaut)");
+        }
+        let in_ty = driver.input_data_type().ok();
+        let in_is_int32 = matches!(in_ty, Some(sys::AsioSampleType::ASIOSTInt32LSB));
+        let ch = driver.channels().ok();
+        let n_in = (ch.as_ref().map(|c| c.ins).unwrap_or(1).max(1) as usize).clamp(1, 2);
+        let n_out = (ch.as_ref().map(|c| c.outs).unwrap_or(1).max(1) as usize).clamp(1, 2);
+        println!("driver={name} in_ty={in_ty:?} in_int32={in_is_int32} n_in={n_in} n_out={n_out}");
+        if !in_is_int32 {
+            println!("⚠ entrée non-Int32 : instrumentation d'entrée désactivée (ce banc cible le Focusrite Int32)");
+        }
+
+        // --- Séquence d'ouverture selon `order` (reproduit cpal ou une alternative) ---
+        // On enregistre le callback AVANT le 1er start pour capter les tout premiers
+        // bufferSwitch (là où l'entrée railée apparaît selon la télémétrie).
+        let ticks = Arc::new(AtomicU64::new(0));
+        let cb_tid = Arc::new(AtomicU32::new(0));
+        // Fraîcheur d'entrée ch0 :
+        let in_s0 = Arc::new(AtomicI64::new(i64::MIN)); // 1er sample du dernier bloc
+        let in_changes = Arc::new(AtomicU64::new(0)); // +1 quand s0 diffère du bloc précédent
+        let in_absmax = Arc::new(AtomicI64::new(0)); // |sample| max observé
+        let const_blocks = Arc::new(AtomicU64::new(0)); // blocs où TOUS les samples sont égaux
+        let read_blocks = Arc::new(AtomicU64::new(0)); // blocs d'entrée effectivement lus
+        let max_idx = Arc::new(AtomicUsize::new(0));
+
+        // Les buffers ASIO (create_buffers) sont détenus par ce Mutex, accès frais
+        // dans le callback (mirror cpal). On les remplace à chaque (re)création.
+        let streams: Arc<Mutex<Option<sys::AsioStreams>>> = Arc::new(Mutex::new(None));
+
+        let cb = {
+            let ticks = ticks.clone();
+            let cb_tid = cb_tid.clone();
+            let in_s0 = in_s0.clone();
+            let in_changes = in_changes.clone();
+            let in_absmax = in_absmax.clone();
+            let const_blocks = const_blocks.clone();
+            let read_blocks = read_blocks.clone();
+            let max_idx = max_idx.clone();
+            let streams = streams.clone();
+            driver.add_callback(move |info| {
+                cb_tid.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+                ticks.fetch_add(1, Ordering::Relaxed);
+                let idx = info.buffer_index as usize;
+                if idx > max_idx.load(Ordering::Relaxed) {
+                    max_idx.store(idx, Ordering::Relaxed);
+                }
+                if idx > 1 {
+                    return;
+                }
+                if !in_is_int32 {
+                    return;
+                }
+                let Ok(guard) = streams.lock() else { return };
+                let Some(st) = guard.as_ref() else { return };
+                let Some(inp) = st.input.as_ref() else { return };
+                // Channel 0 uniquement (tranche instrument/guitare).
+                let bufsz = inp.buffer_size as usize;
+                let ptr = inp.buffer_infos[0].buffers[idx] as *const i32;
+                if ptr.is_null() || bufsz == 0 {
+                    return;
+                }
+                let slice = unsafe { std::slice::from_raw_parts(ptr, bufsz) };
+                let s0 = slice[0];
+                // Bloc constant ? (tous les samples égaux au 1er — signature d'un
+                // buffer figé/DC railé).
+                let is_const = slice.iter().all(|&s| s == s0);
+                if is_const {
+                    const_blocks.fetch_add(1, Ordering::Relaxed);
+                }
+                // |max| du bloc.
+                let mut amax = 0i64;
+                for &s in slice {
+                    let a = (s as i64).abs();
+                    if a > amax {
+                        amax = a;
+                    }
+                }
+                if amax > in_absmax.load(Ordering::Relaxed) {
+                    in_absmax.store(amax, Ordering::Relaxed);
+                }
+                // Le 1er sample a-t-il changé depuis le bloc précédent ? (vivant vs figé)
+                let prev = in_s0.swap(s0 as i64, Ordering::Relaxed);
+                if prev != i64::MIN && prev != s0 as i64 {
+                    in_changes.fetch_add(1, Ordering::Relaxed);
+                }
+                read_blocks.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+
+        // Compteur de resets (comme le vrai host, pour écarter un kAsioResetRequest).
+        let resets = Arc::new(AtomicU64::new(0));
+        let msg = {
+            let r = resets.clone();
+            driver.add_message_callback(move |sel| {
+                let is_reset = matches!(sel, sys::AsioMessageSelectors::kAsioResetRequest);
+                r.fetch_add(u64::from(is_reset), Ordering::Relaxed);
+            })
+        };
+
+        // Applique une séquence de create/start et publie les streams créés dans le
+        // Mutex. Renvoie false si une étape ASIO échoue (setup foireux → on abandonne).
+        let publish = |s: sys::AsioStreams| {
+            *streams.lock().unwrap() = Some(s);
+        };
+        let ok = match order.as_str() {
+            "single" => {
+                // Un seul ASIOCreateBuffers(in+out), un seul ASIOStart.
+                match driver
+                    .prepare_input_stream(None, n_in, buf_req)
+                    .and_then(|s| driver.prepare_output_stream(s.input, n_out, buf_req))
+                {
+                    Ok(s) => {
+                        publish(s);
+                        driver.start().is_ok()
+                    }
+                    Err(e) => {
+                        eprintln!("single: create_buffers échoué : {e:?}");
+                        false
+                    }
+                }
+            }
+            "out-first" => {
+                // Sortie créée+démarrée seule, PUIS entrée (recreate in+out) + start.
+                // L'entrée n'est jamais démarrée seule puis détruite.
+                match driver.prepare_output_stream(None, n_out, buf_req) {
+                    Ok(s) => {
+                        publish(s);
+                        let started = driver.start().is_ok();
+                        let out = streams.lock().unwrap().take().and_then(|s| s.output);
+                        match driver.prepare_input_stream(out, n_in, buf_req) {
+                            Ok(s2) => {
+                                publish(s2);
+                                started && driver.start().is_ok()
+                            }
+                            Err(e) => {
+                                eprintln!("out-first: prepare_input échoué : {e:?}");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("out-first: prepare_output échoué : {e:?}");
+                        false
+                    }
+                }
+            }
+            _ => {
+                // "agent" (défaut) : MIROIR EXACT de cpal.
+                // build_input : Create(in) + Start.
+                match driver.prepare_input_stream(None, n_in, buf_req) {
+                    Ok(s) => {
+                        publish(s);
+                        let started_in = driver.start().is_ok();
+                        // build_output : prepare_output ⇒ create_buffers voit Running
+                        // ⇒ Stop + Dispose + Create(in+out), puis Start.
+                        let input = streams.lock().unwrap().take().and_then(|s| s.input);
+                        match driver.prepare_output_stream(input, n_out, buf_req) {
+                            Ok(s2) => {
+                                publish(s2);
+                                started_in && driver.start().is_ok()
+                            }
+                            Err(e) => {
+                                eprintln!("agent: prepare_output échoué : {e:?}");
+                                false
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("agent: prepare_input échoué : {e:?}");
+                        false
+                    }
+                }
+            }
+        };
+        if !ok {
+            driver.remove_callback(cb);
+            driver.remove_message_callback(msg);
+            let _ = driver.stop();
+            let _ = driver.dispose_buffers();
+            let _ = driver.destroy();
+            return;
+        }
+
+        let actual_buf = streams
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.input.as_ref().or(s.output.as_ref()))
+            .map(|s| s.buffer_size)
+            .unwrap_or(-1);
+        let expected_tps = if actual_buf > 0 { 48_000.0 / actual_buf as f64 } else { 0.0 };
+        println!(
+            "ouverture OK : buffer réel={actual_buf} (~{expected_tps:.0} tics/s attendus)\n"
+        );
+
+        // --- Surveillance : par seconde, la fraîcheur de l'entrée ---
+        let full_scale = 2_147_483_648.0_f64;
+        let mut prev_ticks = 0u64;
+        let mut prev_changes = 0u64;
+        let mut first_live_s: Option<u64> = None;
+        let mut tid_logged = false;
+        for s in 1..=monitor_secs {
+            std::thread::sleep(Duration::from_secs(1));
+            let t = ticks.load(Ordering::Relaxed);
+            let c = in_changes.load(Ordering::Relaxed);
+            let dt = t - prev_ticks;
+            let dc = c - prev_changes;
+            let amax = in_absmax.load(Ordering::Relaxed) as f64 / full_scale;
+            let cb_blocks = read_blocks.load(Ordering::Relaxed).max(1);
+            let const_ratio = const_blocks.load(Ordering::Relaxed) as f64 / cb_blocks as f64;
+            // "Vivant" cette seconde = le 1er sample a changé sur ~la majorité des blocs.
+            let live = dt > 0 && dc as f64 > dt as f64 * 0.25;
+            if live && first_live_s.is_none() {
+                first_live_s = Some(s);
+            }
+            if !tid_logged {
+                let tid = cb_tid.load(Ordering::Relaxed);
+                if tid != 0 {
+                    println!(">>> callback tid={tid} (main={main_tid}) — {}", if tid == main_tid { "STA" } else { "thread driver" });
+                    tid_logged = true;
+                }
+            }
+            println!(
+                "t={s:2}s tics/s={dt:4} chg/s={dc:4} |max|={amax:.4}({:.2}% FS) const_blk={:.0}% {}",
+                amax * 100.0,
+                const_ratio * 100.0,
+                if live { "VIVANT" } else { "— figé/railé" }
+            );
+            prev_ticks = t;
+            prev_changes = c;
+        }
+
+        let total_changes = in_changes.load(Ordering::Relaxed);
+        let amax = in_absmax.load(Ordering::Relaxed) as f64 / full_scale;
+        // ch0[0] ne varie quasiment jamais = DMA d'entrée figé (buffer re-servi).
+        let frozen = total_changes < 4;
+        let railed = frozen && amax > 0.90; // figé sur une valeur ~pleine-échelle
+        let silent = frozen && amax < 0.01; // figé sur ~0 (buffer non alimenté / 0xFF)
+        println!(
+            "\n=== VERDICT coldstart buf={actual_buf} order={order} : \
+             changes_totales={total_changes} |max|={amax:.4} first_live={:?} resets={} ===",
+            first_live_s,
+            resets.load(Ordering::Relaxed)
+        );
+        if railed {
+            println!("→ ENTRÉE FIGÉE/RAILÉE reproduite : constante quasi pleine-échelle, ne varie pas (bug 2026-07-03).");
+        } else if silent {
+            println!(
+                "→ ENTRÉE FIGÉE/SILENCE reproduite : buffer d'entrée jamais alimenté par l'ADC \
+                 (≈0xFF, changes≈0) — MÊME wedge que l'agent (armement de l'entrée en échec, order={order})."
+            );
+        } else if first_live_s.map(|s| s <= 2).unwrap_or(false) {
+            println!("→ Entrée VIVANTE dès le départ : pas de gel sur cette config (order={order}).");
+        } else {
+            println!("→ Entrée devenue vivante tardivement (warm-up ?) — cf. first_live.");
+        }
+
+        let _ = driver.stop();
+        driver.remove_callback(cb);
+        driver.remove_message_callback(msg);
+        let _ = driver.dispose_buffers();
+        let _ = driver.destroy();
+    }
+
+    /// Lit `ASIOGetBufferSize(min,max,pref,granularity)` du driver global chargé.
+    fn asio_buffer_sizes() -> Option<(i32, i32, i32, i32)> {
+        let (mut mn, mut mx, mut pf, mut gr) = (0i32, 0i32, 0i32, 0i32);
+        let rc = unsafe { ASIOGetBufferSize(&mut mn, &mut mx, &mut pf, &mut gr) };
+        if rc == 0 {
+            Some((mn, mx, pf, gr))
+        } else {
+            None
+        }
+    }
+
+    /// Snappe une taille de buffer DÉSIRÉE à une taille LÉGALE du driver (algorithme
+    /// JUCE/Jamulus) : hors `[min,max]` → taille préférée ; granularité `-1` →
+    /// puissance de 2 la plus proche ; `<= 0` → toute taille (on garde le désir) ;
+    /// sinon → multiple de `gran` le plus proche. Ne force JAMAIS une taille illégale.
+    fn snap_buffer_size(desired: i32, min: i32, max: i32, pref: i32, gran: i32) -> i32 {
+        if min <= 0 || max < min {
+            return pref.max(1);
+        }
+        if desired < min || desired > max {
+            return pref; // JUCE : hors plage → préférée
+        }
+        if gran == -1 {
+            let mut s = 1i32;
+            while s < min {
+                s = s.saturating_mul(2);
+            }
+            let mut best = s;
+            while s <= max {
+                if (s - desired).abs() < (best - desired).abs() {
+                    best = s;
+                }
+                s = s.saturating_mul(2);
+            }
+            best
+        } else if gran <= 0 {
+            desired // granularité 0/<-1 : toute taille légale
+        } else {
+            let k = ((desired - min) as f64 / gran as f64).round() as i32;
+            (min + k * gran).clamp(min, max)
+        }
+    }
+
+    /// PRIMING (JUCE) : crée des buffers, démarre brièvement, attend, arrête, dispose.
+    /// « cubase does this... some devices fail if we don't » — réveille/arme l'ADC des
+    /// interfaces qui ne délivrent rien au 1er start à froid. Aucun callback enregistré :
+    /// on ne fait que faire tourner l'horloge/DMA le temps de la réchauffe.
+    fn prime_driver(driver: &asio_sys::Driver, n_in: usize, n_out: usize, size: i32) {
+        match driver
+            .prepare_input_stream(None, n_in, Some(size))
+            .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(size)))
+        {
+            Ok(streams) => {
+                let started = driver.start().is_ok();
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let _ = driver.stop();
+                let _ = driver.dispose_buffers();
+                drop(streams);
+                println!(
+                    "  priming : create+start({})+120ms+stop+dispose OK",
+                    if started { "ok" } else { "start ÉCHOUÉ" }
+                );
+            }
+            Err(e) => println!("  priming : prepare a échoué : {e:?}"),
+        }
+    }
+
+    /// Mode `robust` : prototype du host single-owner robuste (invariants Jamulus+JUCE).
+    /// Cf. le gros commentaire de dispatch.
+    fn run_robust(monitor_secs: u64, main_tid: u32) {
+        use asio_sys as sys;
+        use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let buf_env: i32 = std::env::var("JAMLAB_BUF").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let no_prime = std::env::var("JAMLAB_NO_PRIME").is_ok();
+        println!(
+            "=== robust === buf_désiré={buf_env} priming={} main_tid={main_tid} monitor={monitor_secs}s\n\
+             (host single-owner : 1 Asio · snap taille · priming JUCE · 1 create(in+out) · 1 start · start-timeout)\n",
+            if no_prime { "OFF" } else { "ON" }
+        );
+
+        // --- 1 SEULE instance Asio, 1 seul load_driver (1 ASIOInit) ---
+        let asio = sys::Asio::new();
+        let mut chosen: Option<(sys::Driver, String)> = None;
+        for name in asio.driver_names() {
+            if let Ok(d) = asio.load_driver(&name) {
+                if d.channels().map(|c| c.ins).unwrap_or(0) > 0 {
+                    chosen = Some((d, name));
+                    break;
+                }
+                let _ = d.destroy();
+            }
+        }
+        let Some((driver, name)) = chosen else {
+            eprintln!("aucun driver ASIO chargeable avec entrée — carte branchée / libre ?");
+            return;
+        };
+        let _ = driver.set_sample_rate(48_000.0);
+        let in_is_int32 = matches!(driver.input_data_type().ok(), Some(sys::AsioSampleType::ASIOSTInt32LSB));
+        let out_is_int32 = matches!(driver.output_data_type().ok(), Some(sys::AsioSampleType::ASIOSTInt32LSB));
+        let ch = driver.channels().ok();
+        let n_in = (ch.as_ref().map(|c| c.ins).unwrap_or(1).max(1) as usize).clamp(1, 2);
+        let n_out = (ch.as_ref().map(|c| c.outs).unwrap_or(1).max(1) as usize).clamp(1, 2);
+
+        // --- Snap de la taille à la grille légale du driver ---
+        let size = match asio_buffer_sizes() {
+            Some((mn, mx, pf, gr)) => {
+                let s = snap_buffer_size(buf_env, mn, mx, pf, gr);
+                println!("driver={name} : grille min={mn} max={mx} pref={pf} gran={gr} → taille retenue={s}");
+                s
+            }
+            None => {
+                println!("driver={name} : ASIOGetBufferSize indisponible → taille désirée={buf_env}");
+                buf_env
+            }
+        };
+
+        // --- PRIMING (JUCE) ---
+        if no_prime {
+            println!("priming : DÉSACTIVÉ (JAMLAB_NO_PRIME)");
+        } else {
+            println!("priming (JUCE — arme l'ADC des interfaces récalcitrantes) :");
+            prime_driver(&driver, n_in, n_out, size);
+        }
+
+        // --- Ouverture RÉELLE : 1 seul ASIOCreateBuffers(in+out) ---
+        let streams: Arc<Mutex<Option<sys::AsioStreams>>> = match driver
+            .prepare_input_stream(None, n_in, Some(size))
+            .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(size)))
+        {
+            Ok(s) => Arc::new(Mutex::new(Some(s))),
+            Err(e) => {
+                eprintln!("ouverture réelle : create_buffers a échoué : {e:?}");
+                let _ = driver.destroy();
+                return;
+            }
+        };
+        let actual = streams
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|s| s.input.as_ref().or(s.output.as_ref()))
+            .map(|s| s.buffer_size)
+            .unwrap_or(-1);
+        println!("ouverture OK : buffer réel={actual} (~{:.0} tics/s)\n", 48_000.0 / actual.max(1) as f64);
+
+        // --- Callback duplex : lit l'entrée ch0 (mesure) + écrit la sortie (silence) ---
+        let ticks = Arc::new(AtomicU64::new(0));
+        let changes = Arc::new(AtomicU64::new(0));
+        let absmax = Arc::new(AtomicI64::new(0));
+        let prev0 = Arc::new(AtomicI64::new(i64::MIN));
+        let cb_tid = Arc::new(AtomicU32::new(0));
+        let cb = {
+            let ticks = ticks.clone();
+            let changes = changes.clone();
+            let absmax = absmax.clone();
+            let prev0 = prev0.clone();
+            let cb_tid = cb_tid.clone();
+            let streams = streams.clone();
+            driver.add_callback(move |info| {
+                cb_tid.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+                ticks.fetch_add(1, Ordering::Relaxed);
+                let idx = info.buffer_index as usize;
+                if idx > 1 {
+                    return;
+                }
+                let Ok(mut guard) = streams.lock() else { return };
+                let Some(st) = guard.as_mut() else { return };
+                // ENTRÉE : fraîcheur ch0.
+                if in_is_int32 {
+                    if let Some(inp) = st.input.as_ref() {
+                        let bufsz = inp.buffer_size as usize;
+                        let ptr = inp.buffer_infos[0].buffers[idx] as *const i32;
+                        if !ptr.is_null() && bufsz > 0 {
+                            let slice = unsafe { std::slice::from_raw_parts(ptr, bufsz) };
+                            let s0 = slice[0];
+                            let prev = prev0.swap(s0 as i64, Ordering::Relaxed);
+                            if prev != i64::MIN && prev != s0 as i64 {
+                                changes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let mut amax = 0i64;
+                            for &s in slice {
+                                let a = (s as i64).abs();
+                                if a > amax {
+                                    amax = a;
+                                }
+                            }
+                            absmax.fetch_max(amax, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // SORTIE : silence.
+                if out_is_int32 {
+                    if let Some(out) = st.output.as_mut() {
+                        let bufsz = out.buffer_size as usize;
+                        for ci in 0..out.buffer_infos.len() {
+                            let ptr = out.buffer_infos[ci].buffers[idx] as *mut i32;
+                            if !ptr.is_null() {
+                                let sl = unsafe { std::slice::from_raw_parts_mut(ptr, bufsz) };
+                                sl.fill(0);
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // --- 1 seul ASIOStart + start-timeout (attend le 1er callback ≤ 2 s) ---
+        if driver.start().is_err() {
+            eprintln!("ASIOStart a échoué");
+            driver.remove_callback(cb);
+            let _ = driver.dispose_buffers();
+            let _ = driver.destroy();
+            return;
+        }
+        let t0 = Instant::now();
+        while ticks.load(Ordering::Relaxed) == 0 && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if ticks.load(Ordering::Relaxed) == 0 {
+            println!("!! START-TIMEOUT : aucun callback en 2 s — driver muet (échec propre côté host).");
+        } else {
+            println!("1er callback reçu en {} ms — driver vivant.\n", t0.elapsed().as_millis());
+        }
+
+        // --- Surveillance de la fraîcheur de l'entrée ---
+        let full = 2_147_483_648.0_f64;
+        let (mut pt, mut pc) = (0u64, 0u64);
+        let mut first_live: Option<u64> = None;
+        let mut tid_logged = false;
+        for s in 1..=monitor_secs {
+            std::thread::sleep(Duration::from_secs(1));
+            let (t, c) = (ticks.load(Ordering::Relaxed), changes.load(Ordering::Relaxed));
+            let am = absmax.load(Ordering::Relaxed) as f64 / full;
+            let (dt, dc) = (t - pt, c - pc);
+            let live = dt > 0 && dc as f64 > dt as f64 * 0.25;
+            if live && first_live.is_none() {
+                first_live = Some(s);
+            }
+            if !tid_logged {
+                let tid = cb_tid.load(Ordering::Relaxed);
+                if tid != 0 {
+                    println!(">>> callback tid={tid} (main={main_tid}) — {}", if tid == main_tid { "STA" } else { "thread driver" });
+                    tid_logged = true;
+                }
+            }
+            println!(
+                "t={s:2}s tics/s={dt:4} chg/s={dc:4} |max|={am:.4} {}",
+                if live { "VIVANT" } else { "— figé" }
+            );
+            pt = t;
+            pc = c;
+        }
+
+        let total_changes = changes.load(Ordering::Relaxed);
+        let amax = absmax.load(Ordering::Relaxed) as f64 / full;
+        let vivant = first_live.map(|s| s <= 2).unwrap_or(false);
+        println!(
+            "\n=== VERDICT robust buf={actual} priming={} : changes={total_changes} |max|={amax:.4} first_live={first_live:?} → entrée {} ===",
+            if no_prime { "OFF" } else { "ON" },
+            if vivant { "VIVANTE dès le départ" } else { "PAS vivante d'emblée" }
+        );
+        if vivant {
+            println!("→ Host robuste OK : l'entrée est armée dès le démarrage (séquence prête à porter dans l'agent).");
+        } else {
+            println!("→ Entrée non armée d'emblée — cf. first_live / start-timeout (à analyser).");
+        }
+
+        let _ = driver.stop();
+        driver.remove_callback(cb);
+        let _ = driver.dispose_buffers();
+        let _ = driver.destroy();
+        drop(streams);
+    }
+
+    /// Mode `dualasio` : reproduit le pattern 2-instances-Asio de l'agent. Cf. le gros
+    /// commentaire de dispatch. Mesure la fraîcheur de l'entrée (instance A) avant puis
+    /// après l'ouverture de la sortie (instance B = 2e ASIOInit sur le mono-client).
+    fn run_dualasio(monitor_secs: u64, main_tid: u32) {
+        use asio_sys as sys;
+        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let buf_env: i32 = std::env::var("JAMLAB_BUF").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        let buf_req: Option<i32> = if buf_env <= 0 { None } else { Some(buf_env) };
+        let skip_sr = std::env::var("JAMLAB_NO_SR").is_ok();
+        println!(
+            "=== dualasio === buf_req={buf_req:?} main_tid={main_tid} monitor={monitor_secs}s\n\
+             (entrée via Asio#A, sortie via Asio#B = 2 ASIOInit sur le driver mono-client — mime l'agent)\n"
+        );
+
+        // --- Instance A : ENTRÉE (1er ASIOInit) ---
+        let asio_a = sys::Asio::new();
+        let mut chosen: Option<(sys::Driver, String)> = None;
+        for name in asio_a.driver_names() {
+            if let Ok(d) = asio_a.load_driver(&name) {
+                if d.channels().map(|c| c.ins).unwrap_or(0) > 0 {
+                    chosen = Some((d, name));
+                    break;
+                }
+                let _ = d.destroy();
+            }
+        }
+        let Some((driver_a, name)) = chosen else {
+            eprintln!("aucun driver ASIO chargeable avec entrée — carte branchée / libre ?");
+            return;
+        };
+        if skip_sr {
+            println!("Asio#A set_sample_rate: SKIP (JAMLAB_NO_SR)");
+        } else {
+            let _ = driver_a.set_sample_rate(48_000.0);
+        }
+        let in_is_int32 = matches!(driver_a.input_data_type().ok(), Some(sys::AsioSampleType::ASIOSTInt32LSB));
+        let ch = driver_a.channels().ok();
+        let n_in = (ch.as_ref().map(|c| c.ins).unwrap_or(1).max(1) as usize).clamp(1, 2);
+        let n_out = (ch.as_ref().map(|c| c.outs).unwrap_or(1).max(1) as usize).clamp(1, 2);
+
+        let streams_a: Arc<Mutex<Option<sys::AsioStreams>>> =
+            match driver_a.prepare_input_stream(None, n_in, buf_req) {
+                Ok(s) => Arc::new(Mutex::new(Some(s))),
+                Err(e) => {
+                    eprintln!("Asio#A prepare_input a échoué : {e:?}");
+                    let _ = driver_a.destroy();
+                    return;
+                }
+            };
+
+        // Fraîcheur de l'entrée (ch0) mesurée par le callback de A.
+        let ticks = Arc::new(AtomicU64::new(0));
+        let changes = Arc::new(AtomicU64::new(0));
+        let absmax = Arc::new(AtomicI64::new(0));
+        let prev0 = Arc::new(AtomicI64::new(i64::MIN));
+        let cb_a = {
+            let ticks = ticks.clone();
+            let changes = changes.clone();
+            let absmax = absmax.clone();
+            let prev0 = prev0.clone();
+            let streams_a = streams_a.clone();
+            driver_a.add_callback(move |info| {
+                ticks.fetch_add(1, Ordering::Relaxed);
+                let idx = info.buffer_index as usize;
+                if idx > 1 || !in_is_int32 {
+                    return;
+                }
+                let Ok(guard) = streams_a.lock() else { return };
+                let Some(st) = guard.as_ref() else { return };
+                let Some(inp) = st.input.as_ref() else { return };
+                let bufsz = inp.buffer_size as usize;
+                let ptr = inp.buffer_infos[0].buffers[idx] as *const i32;
+                if ptr.is_null() || bufsz == 0 {
+                    return;
+                }
+                // SAFETY : buffer d'entrée ch0. NB : si la création de la sortie (Asio#B)
+                // a disposé ces buffers, on lit alors une zone potentiellement recyclée —
+                // c'est EXACTEMENT ce que fait l'agent, et ce qu'on cherche à observer.
+                let slice = unsafe { std::slice::from_raw_parts(ptr, bufsz) };
+                let s0 = slice[0];
+                let prev = prev0.swap(s0 as i64, Ordering::Relaxed);
+                if prev != i64::MIN && prev != s0 as i64 {
+                    changes.fetch_add(1, Ordering::Relaxed);
+                }
+                let mut amax = 0i64;
+                for &s in slice {
+                    let a = (s as i64).abs();
+                    if a > amax {
+                        amax = a;
+                    }
+                }
+                absmax.fetch_max(amax, Ordering::Relaxed);
+            })
+        };
+        if driver_a.start().is_err() {
+            eprintln!("Asio#A ASIOStart a échoué");
+            driver_a.remove_callback(cb_a);
+            let _ = driver_a.destroy();
+            return;
+        }
+
+        let full = 2_147_483_648.0_f64;
+        // --- Phase 1 : entrée seule (1 instance Asio), 1,5 s ---
+        println!("Asio#A : entrée démarrée (1 seul ASIOInit). Mesure 1,5 s AVANT la sortie…");
+        std::thread::sleep(Duration::from_millis(1500));
+        let pre_changes = changes.load(Ordering::Relaxed);
+        let pre_amax = absmax.load(Ordering::Relaxed) as f64 / full;
+        let pre_ticks = ticks.load(Ordering::Relaxed);
+        let pre_live = pre_changes as f64 > pre_ticks as f64 * 0.25;
+        println!(
+            ">>> PRÉ-sortie : ticks={pre_ticks} changes={pre_changes} |max|={pre_amax:.4} → entrée {}\n",
+            if pre_live { "VIVANTE" } else { "FIGÉE" }
+        );
+
+        // --- Phase 2 : ouvre la SORTIE via une 2e instance Asio (= 2e ASIOInit) ---
+        println!(">>> ouverture de la sortie via Asio#B (2e instance, 2e ASIOInit sur le mono-client)…");
+        let asio_b = sys::Asio::new();
+        let mut _driver_b: Option<sys::Driver> = None;
+        let mut _streams_b: Option<Arc<Mutex<Option<sys::AsioStreams>>>> = None;
+        let mut cb_b: Option<sys::CallbackId> = None;
+        match asio_b.load_driver(&name) {
+            Ok(driver_b) => {
+                println!("    Asio#B : load_driver + ASIOInit RÉUSSI (2e init).");
+                match driver_b.prepare_output_stream(None, n_out, buf_req) {
+                    Ok(sb) => {
+                        println!("    Asio#B : prepare_output (create OUT) OK — a pu disposer les buffers d'entrée de A.");
+                        let out_int32 = matches!(driver_b.output_data_type().ok(), Some(sys::AsioSampleType::ASIOSTInt32LSB));
+                        let sb = Arc::new(Mutex::new(Some(sb)));
+                        cb_b = Some({
+                            let sb = sb.clone();
+                            driver_b.add_callback(move |info| {
+                                let idx = info.buffer_index as usize;
+                                if idx > 1 || !out_int32 {
+                                    return;
+                                }
+                                let Ok(guard) = sb.lock() else { return };
+                                let Some(st) = guard.as_ref() else { return };
+                                let Some(out) = st.output.as_ref() else { return };
+                                let bufsz = out.buffer_size as usize;
+                                for ci in 0..out.buffer_infos.len() {
+                                    let ptr = out.buffer_infos[ci].buffers[idx] as *mut i32;
+                                    if ptr.is_null() {
+                                        continue;
+                                    }
+                                    let sl = unsafe { std::slice::from_raw_parts_mut(ptr, bufsz) };
+                                    sl.fill(0);
+                                }
+                            })
+                        });
+                        let _ = driver_b.start();
+                        _streams_b = Some(sb);
+                        _driver_b = Some(driver_b);
+                    }
+                    Err(e) => println!("    Asio#B : prepare_output ÉCHOUÉ : {e:?}"),
+                }
+            }
+            Err(e) => println!("    Asio#B : load_driver ÉCHOUÉ : {e:?} — 2e ASIOInit REFUSÉ par asio-sys (≠ cpal qui, lui, réussit)."),
+        }
+        println!();
+
+        // --- Phase 3 : surveillance de la fraîcheur de l'entrée APRÈS la sortie ---
+        let mut prev_ticks = ticks.load(Ordering::Relaxed);
+        let mut prev_changes = changes.load(Ordering::Relaxed);
+        let mut post_frozen_s: Option<u64> = None;
+        for s in 1..=monitor_secs {
+            std::thread::sleep(Duration::from_secs(1));
+            let t = ticks.load(Ordering::Relaxed);
+            let c = changes.load(Ordering::Relaxed);
+            let am = absmax.load(Ordering::Relaxed) as f64 / full;
+            let dt = t - prev_ticks;
+            let dc = c - prev_changes;
+            let live = dt > 0 && dc as f64 > dt as f64 * 0.25;
+            if !live && post_frozen_s.is_none() {
+                post_frozen_s = Some(s);
+            }
+            println!(
+                "t={s:2}s (post-sortie) tics/s={dt:4} chg/s={dc:4} |max|={am:.4} {}",
+                if live { "VIVANT" } else { "— FIGÉ" }
+            );
+            prev_ticks = t;
+            prev_changes = c;
+        }
+
+        // --- Verdict ---
+        let post_changes = changes.load(Ordering::Relaxed) - pre_changes;
+        println!(
+            "\n=== VERDICT dualasio : entrée PRÉ-sortie={} ; POST-sortie={} ===",
+            if pre_live { "VIVANTE" } else { "FIGÉE" },
+            if post_frozen_s.is_some() && post_changes < 50 { "FIGÉE" } else { "VIVANTE" }
+        );
+        if pre_live && post_frozen_s.is_some() && post_changes < 50 {
+            println!("→ MÉCANISME PROUVÉ : l'entrée était VIVANTE avec 1 instance Asio, puis a FIGÉ dès l'ouverture");
+            println!("  de la sortie via une 2e instance Asio (2e ASIOInit). ⇒ le fix = partager UNE instance host/Asio.");
+        } else if pre_live {
+            println!("→ L'entrée est restée VIVANTE malgré la 2e instance Asio — le double-init n'est pas nocif dans");
+            println!("  cet état (chaud ?). À rejouer à froid, ou le mécanisme est ailleurs.");
+        } else {
+            println!("→ Entrée déjà figée avant la sortie — état inattendu (relancer ; interface libre ?).");
+        }
+
+        // --- Cleanup ---
+        let _ = driver_a.stop();
+        driver_a.remove_callback(cb_a);
+        if let (Some(db), Some(id)) = (_driver_b.as_ref(), cb_b) {
+            let _ = db.stop();
+            db.remove_callback(id);
+        }
+        let _ = driver_a.dispose_buffers();
+        let _ = driver_a.destroy();
+        drop(_streams_b);
+        drop(streams_a);
+    }
+
     /// Mode `latency` : mesure la latence ASIO réelle (ASIOGetLatencies) à
     /// différentes tailles de buffer. `ASIOGetLatencies` n'est pas wrappé par
     /// asio-sys mais le symbole C est compilé dans le même objet (asio.cpp) que
@@ -552,6 +1415,175 @@ mod win {
         println!("de RTT bufferisé face à la taille préférée actuelle. Le converter USB (latence fixe) s'ajoute aux deux.");
     }
 
+    // Fonctions host ASIO NON wrappées par asio-sys, mais compilées dans le même
+    // objet (asio.cpp du SDK) et donc résolues au link. Elles opèrent sur le driver
+    // global chargé par asio-sys (`theAsioDriver`) → valables après `load_driver`
+    // (+ `ASIOCreateBuffers` pour les latences). `long` = i32 sur Windows (LLP64),
+    // `ASIOError` = long, 0 = ASE_OK. asio.cpp est compilé en C++ → les symboles
+    // sont NAME-MANGLED MSVC (signature `long __cdecl f(long*, …)`) ; on cible le
+    // nom mangled exact via `#[link_name]` (convention __cdecl compatible extern"C").
+    extern "C" {
+        #[link_name = "?ASIOGetBufferSize@@YAJPEAJ000@Z"]
+        fn ASIOGetBufferSize(min: *mut i32, max: *mut i32, pref: *mut i32, gran: *mut i32) -> i32;
+        #[link_name = "?ASIOGetLatencies@@YAJPEAJ0@Z"]
+        fn ASIOGetLatencies(input_latency: *mut i32, output_latency: *mut i32) -> i32;
+    }
+
+    /// Mode `bufinfo` : dump de la grille de tailles de buffer ASIO du driver.
+    /// Cf. le commentaire de dispatch. Ne crée rien de durable — charge, interroge,
+    /// mesure les latences à la taille préférée, puis relâche proprement.
+    fn run_bufinfo() {
+        use asio_sys as sys;
+
+        let sr = 48_000.0f64;
+        let asio = sys::Asio::new();
+        let mut chosen: Option<(sys::Driver, String)> = None;
+        for name in asio.driver_names() {
+            if let Ok(d) = asio.load_driver(&name) {
+                if d.channels().map(|c| c.ins).unwrap_or(0) > 0 {
+                    chosen = Some((d, name));
+                    break;
+                }
+                let _ = d.destroy();
+            }
+        }
+        let Some((driver, name)) = chosen else {
+            eprintln!("aucun driver ASIO chargeable avec entrée — carte branchée / libre (agent arrêté) ?");
+            return;
+        };
+        let _ = driver.set_sample_rate(sr);
+
+        let ch = driver.channels().ok();
+        let ins = ch.as_ref().map(|c| c.ins).unwrap_or(-1);
+        let outs = ch.as_ref().map(|c| c.outs).unwrap_or(-1);
+        let in_ty = driver.input_data_type().ok();
+        let out_ty = driver.output_data_type().ok();
+        let real_sr = driver.sample_rate().unwrap_or(0.0);
+        println!("=== bufinfo === driver={name}");
+        println!("  channels : in={ins} out={outs}   sample_rate={real_sr} (demandé {sr})");
+        println!("  format   : in={in_ty:?} out={out_ty:?}");
+
+        // --- ASIOGetBufferSize brut ---
+        let (mut min, mut max, mut pref, mut gran) = (0i32, 0i32, 0i32, 0i32);
+        let rc = unsafe { ASIOGetBufferSize(&mut min, &mut max, &mut pref, &mut gran) };
+        if rc != 0 {
+            println!("  ASIOGetBufferSize a échoué (rc={rc}) — driver non prêt ?");
+            let _ = driver.destroy();
+            return;
+        }
+        println!("\n  ASIOGetBufferSize : min={min} max={max} pref={pref} granularity={gran}");
+        let gran_expl = match gran {
+            -1 => "puissances de 2 uniquement (min, 2·min, 4·min…)".to_string(),
+            0 => "0 → taille FIXE : seul `pref` est légal".to_string(),
+            g if g < -1 => format!("{g} (< -1, non conforme) → traité comme « toute taille ∈ [min,max] »"),
+            g => format!("pas de {g} samples (min, min+{g}, min+2·{g}…)"),
+        };
+        println!("  granularité       : {gran_expl}");
+
+        // --- Grille légale (algorithme JUCE addBufferSizes) ---
+        let grid = legal_buffer_sizes(min, max, pref, gran);
+        println!("  grille légale     : {grid:?}");
+
+        // --- 64 est-il légal ? (LA question du bug cold-start) ---
+        let sixty_four_legal = grid.contains(&64);
+        println!(
+            "\n  >>> 64 samples est-il une taille ASIO LÉGALE ? {}",
+            if sixty_four_legal { "OUI" } else { "NON" }
+        );
+        if !sixty_four_legal {
+            println!(
+                "      → SMOKING GUN : forcer Fixed(64) passe une taille HORS grille à\n\
+                 \x20       ASIOCreateBuffers (asio-sys ne valide que `<= max`). C'est très\n\
+                 \x20       probablement la cause du wedge cold-start. Fix = snapper à une\n\
+                 \x20       taille légale (idéalement {pref} = préférée), comme Jamulus/JUCE."
+            );
+        } else {
+            println!(
+                "      → 64 est légal ici. Si l'entrée rail quand même à froid, la cause\n\
+                 \x20       n'est PAS la valeur de taille mais le churn create→start→create\n\
+                 \x20       de cpal (le host single-owner reste le fix)."
+            );
+        }
+
+        // --- Latences réelles à la taille préférée ---
+        println!("\n  latences ASIO à la taille préférée ({pref} samples) :");
+        let n_in = (ins.max(0) as usize).clamp(1, 2);
+        let n_out = (outs.max(0) as usize).clamp(1, 2);
+        match driver
+            .prepare_input_stream(None, n_in, Some(pref))
+            .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(pref)))
+        {
+            Ok(_streams) => {
+                let (mut li, mut lo) = (0i32, 0i32);
+                let rc = unsafe { ASIOGetLatencies(&mut li, &mut lo) };
+                if rc == 0 {
+                    let ms = |samp: i32| samp as f64 / sr * 1000.0;
+                    println!(
+                        "    input={li} samples ({:.2} ms)  output={lo} samples ({:.2} ms)  \
+                         RTT total ≈ {:.2} ms",
+                        ms(li),
+                        ms(lo),
+                        ms(li + lo)
+                    );
+                    println!(
+                        "    (ces latences incluent le pipeline USB/converter FIXE du driver, \
+                         pas seulement le buffer)"
+                    );
+                } else {
+                    println!("    ASIOGetLatencies a échoué (rc={rc})");
+                }
+                let _ = driver.dispose_buffers();
+            }
+            Err(e) => println!("    create_buffers @pref a échoué : {e:?}"),
+        }
+
+        let _ = driver.destroy();
+        println!("\n=== fin bufinfo ===");
+    }
+
+    /// Énumère les tailles de buffer légales exposées par le driver, façon JUCE
+    /// `addBufferSizes` (respecte la granularité). Sert à dire si une taille donnée
+    /// (64) est réellement atteignable. Liste bornée pour rester lisible.
+    fn legal_buffer_sizes(min: i32, max: i32, pref: i32, gran: i32) -> Vec<i32> {
+        let mut sizes = Vec::new();
+        if min <= 0 || max < min {
+            return sizes;
+        }
+        if gran == -1 {
+            // Puissances de 2 dans [min, max].
+            let mut s = 1i32;
+            while s < min {
+                s = s.saturating_mul(2);
+            }
+            while s <= max && sizes.len() < 32 {
+                sizes.push(s);
+                s = s.saturating_mul(2);
+            }
+        } else if gran <= 0 {
+            // gran == 0 : taille fixe (pref) ; gran < -1 : non conforme → on montre
+            // les bornes + pref (toute taille intermédiaire supposée légale).
+            for v in [min, pref, max] {
+                if v >= min && v <= max && !sizes.contains(&v) {
+                    sizes.push(v);
+                }
+            }
+            sizes.sort_unstable();
+        } else {
+            // Pas de `gran` samples à partir de `min`.
+            let step = gran.max(1);
+            let mut s = min;
+            while s <= max && sizes.len() < 64 {
+                sizes.push(s);
+                s = s.saturating_add(step);
+            }
+            if !sizes.contains(&pref) && pref >= min && pref <= max {
+                sizes.push(pref);
+                sizes.sort_unstable();
+            }
+        }
+        sizes
+    }
+
     /// Mode `cpal2` : reproduit le chemin de production (2 cpal::Stream séparés).
     /// Ouvre l'ENTRÉE et la SORTIE comme capture.rs/playback.rs (format natif i32,
     /// BufferSize::Default = préféré du driver), démarre la sortie PUIS l'entrée
@@ -609,15 +1641,42 @@ mod win {
         let out_cb = Arc::new(AtomicU64::new(0));
         let in_tid = Arc::new(AtomicU32::new(0));
         let out_tid = Arc::new(AtomicU32::new(0));
+        // Fraîcheur de l'entrée ch0 — isole cpal : reproduit-il le figé de l'agent
+        // (que le chemin asio-sys direct, lui, n'a jamais) ?
+        use std::sync::atomic::AtomicI64;
+        let in_changes = Arc::new(AtomicU64::new(0));
+        let in_absmax = Arc::new(AtomicI64::new(0));
+        let in_prev0 = Arc::new(AtomicI64::new(i64::MIN));
+        let in_nch = (in_conf.channels as usize).max(1);
 
         let in_cb_w = in_cb.clone();
         let in_tid_w = in_tid.clone();
+        let in_changes_w = in_changes.clone();
+        let in_absmax_w = in_absmax.clone();
+        let in_prev0_w = in_prev0.clone();
         let input_stream = in_dev
             .build_input_stream(
                 &in_conf,
-                move |_data: &[i32], _: &cpal::InputCallbackInfo| {
+                move |data: &[i32], _: &cpal::InputCallbackInfo| {
                     in_tid_w.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
                     in_cb_w.fetch_add(1, Ordering::Relaxed);
+                    // Fraîcheur ch0 (indices 0, nch, 2·nch…) : varie = vivant ; figé = wedge.
+                    if let Some(&s0) = data.first() {
+                        let prev = in_prev0_w.swap(s0 as i64, Ordering::Relaxed);
+                        if prev != i64::MIN && prev != s0 as i64 {
+                            in_changes_w.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let mut amax = 0i64;
+                        let mut i = 0;
+                        while i < data.len() {
+                            let a = (data[i] as i64).abs();
+                            if a > amax {
+                                amax = a;
+                            }
+                            i += in_nch;
+                        }
+                        in_absmax_w.fetch_max(amax, Ordering::Relaxed);
+                    }
                 },
                 |e| eprintln!("cpal input error: {e}"),
                 None,
@@ -678,6 +1737,23 @@ mod win {
         );
         if wedged {
             println!("→ WEDGE reproduit : un des deux flux a cessé (chemin 2-streams de prod).");
+        }
+
+        // LE test : cpal reproduit-il le figé de l'entrée (que l'agent a et le lab
+        // asio-sys direct n'a jamais) ?
+        let full = 2_147_483_648.0_f64;
+        let ch = in_changes.load(Ordering::Relaxed);
+        let am = in_absmax.load(Ordering::Relaxed) as f64 / full;
+        let cbn = in_cb.load(Ordering::Relaxed).max(1);
+        let live_ratio = ch as f64 / cbn as f64;
+        println!(
+            "\n=== fraîcheur ENTRÉE cpal2 : changes={ch} callbacks={cbn} live_ratio={:.0}% |max|={am:.4} ===",
+            live_ratio * 100.0
+        );
+        if live_ratio < 0.05 {
+            println!("→ ENTRÉE FIGÉE via cpal (2 streams séparés) — REPRODUIT le wedge de l'agent ⇒ cpal est en cause (le chemin asio-sys direct, lui, arme l'entrée).");
+        } else {
+            println!("→ Entrée VIVANTE via cpal — le figé ne vient PAS de cpal seul ; suspect = contexte agent (énumérations boot / keep-warm / réutilisation de l'ASIOInit du boot).");
         }
 
         let _ = input_stream.pause();
