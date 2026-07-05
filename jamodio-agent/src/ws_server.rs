@@ -1540,29 +1540,21 @@ async fn audio_liveness_supervisor(
             continue;
         }
 
-        // 0.5.4-18 — RE-INIT « long-settle » du driver ASIO. Deux déclencheurs, MÊME
-        // traitement : (a) COLD-START — toute ouverture à froid (`cold_reinit_pending`,
-        // l'interface a pu s'endormir) ; (b) RÉVEIL DE VEILLE PC (mid-session). Dans
-        // les deux cas le 1er init livre une entrée WEDGÉE (railée/silence) que seul
-        // un ASIOInit frais, l'interface DÉJÀ réveillée + stabilisée (~6 s : bias ADC
-        // / PLL USB ; mesuré 4 s KO, 5 s OK), nettoie. Séquence : MUTE (pas de préfixe
-        // railé routé → pas de larsen) → fermeture (ASIOExit) → SETTLE → réouverture
-        // → RESET du JitterBuffer self-monitor (le trou d'horloge fausserait sinon son
-        // drift → distorsion persistante au casque) → démute. Délai réglable via
-        // `JAMODIO_COLD_REINIT_SETTLE_MS` (défaut 6000). Aucune inspection de contenu.
-        // On garde volontairement le 1er open OUVERT jusqu'ici (la session s'y bâtit
-        // ~0.5 s) : fermer immédiatement re-wedge l'interface (regression mesurée).
-        // ASIO uniquement (flag jamais posé hors ASIO ; resume seulement sur Windows).
-        let cold_reinit = { pipeline.lock().await.take_cold_reinit_request() };
+        // RE-INIT « long-settle » au RÉVEIL DE VEILLE PC (mid-session) : au réveil,
+        // l'interface a pu se rendormir et livrer une entrée wedgée que seul un ASIOInit
+        // frais, l'interface réveillée + stabilisée (~6 s : bias ADC / PLL USB), nettoie.
+        // Séquence : MUTE (pas de préfixe railé routé → pas de larsen) → fermeture
+        // (ASIOExit) → SETTLE → réouverture (le host single-owner re-prime) → RESET du
+        // JitterBuffer self-monitor (le trou d'horloge fausserait sinon son drift →
+        // distorsion persistante au casque) → démute. Délai réglable via
+        // `JAMODIO_RESUME_SETTLE_MS` (défaut 6000). Windows/ASIO uniquement.
         let resumed = resume_signal.resume_count() != last_resume_seen;
-        if cold_reinit || resumed {
-            let cause = if cold_reinit { "cold-start" } else { "réveil de veille PC" };
-            let settle = crate::pipeline::cold_reinit_settle().as_millis() as u64;
+        if resumed {
+            let settle = crate::pipeline::resume_reinit_settle().as_millis() as u64;
             tracing::info!(
                 target: "jamodio::ws",
-                cause,
                 settle_ms = settle,
-                "re-init long-settle du driver ASIO : mute → fermeture → settle → réouverture → reset self-monitor"
+                "réveil de veille PC : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
             );
             {
                 let mut pl = pipeline.lock().await;
@@ -1580,15 +1572,14 @@ async fn audio_liveness_supervisor(
             match res {
                 Ok(()) => tracing::info!(
                     target: "jamodio::ws",
-                    cause,
-                    "re-init long-settle du driver ASIO : streams reconstruits"
+                    "réveil de veille PC : streams reconstruits"
                 ),
                 // Échec (mono-client pas encore relâché ?) : le filet de liveness
                 // ci-dessous (streams tombés → flatline) relancera avec backoff.
                 Err(e) => tracing::warn!(
                     target: "jamodio::ws",
                     error = %e,
-                    "re-init long-settle du driver ASIO : reconstruction échouée (le filet de liveness relancera)"
+                    "réveil de veille PC : reconstruction échouée (le filet de liveness relancera)"
                 ),
             }
             last_reset_seen = reset_signal.request_count();

@@ -80,15 +80,11 @@ pub fn build_playback_stream(
     // strictement symétrique de capture.rs (cf. sa doc). Entrée et sortie lisent
     // la MÊME cible → en duplex ASIO le `ASIOCreateBuffers` partagé reste cohérent.
     // `Fixed(cible)` si le device l'expose, sinon `Default` (WASAPI shared ~10ms).
-    use crate::audio::buffer_policy::BufferChoice;
-    let (buffer_size, fixed_buffer) = match crate::audio::buffer_policy::choice() {
-        BufferChoice::PreferDriver => (BufferSize::Default, None),
-        BufferChoice::Fixed(target_buf)
-            if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, target_buf) =>
-        {
+    let target_buf = crate::audio::buffer_policy::target();
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, target_buf) {
             (BufferSize::Fixed(target_buf), Some(target_buf))
-        }
-        BufferChoice::Fixed(target_buf) => {
+        } else {
             let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
             tracing::info!(
                 target: "jamodio::playback",
@@ -97,8 +93,7 @@ pub fn build_playback_stream(
                 "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
             );
             (BufferSize::Default, None)
-        }
-    };
+        };
 
     let config = StreamConfig {
         channels: TARGET_CHANNELS,

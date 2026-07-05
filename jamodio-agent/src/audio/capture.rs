@@ -73,41 +73,6 @@ fn on_capture_err(err: cpal::StreamError) {
     tracing::error!(target: "jamodio::capture", error = %err, "CPAL capture error");
 }
 
-/// 0.5.4-3 — logue la plage de buffer ASIO exposée par le driver (min/max) pour
-/// le couple `(channels, sr)`. Diagnostic du gel Focusrite : permet de comparer
-/// la cible `buffer_policy` à la grille native du driver, et de connaître la
-/// taille réellement retenue (croisé avec `log_first_callback`).
-/// Appelé uniquement sur le chemin ASIO. No-op si le device ne renseigne pas de
-/// `Range`.
-fn log_asio_buffer_range(device: &Device, channels: u16, sr: u32) {
-    use cpal::SupportedBufferSize;
-    let Ok(configs) = device.supported_input_configs() else {
-        return;
-    };
-    let target_sr = SampleRate(sr);
-    for cfg in configs {
-        if cfg.channels() == channels
-            && cfg.min_sample_rate() <= target_sr
-            && cfg.max_sample_rate() >= target_sr
-        {
-            if let SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
-                tracing::info!(
-                    target: "jamodio::capture",
-                    asio_buffer_min = *min,
-                    asio_buffer_max = *max,
-                    target_buf = crate::audio::buffer_policy::target(),
-                    channels,
-                    sr,
-                    "plage de buffer ASIO du driver — on vise Fixed(cible buffer_policy : 64 par défaut), \
-                     backoff auto one-way 128 si drops/underruns soutenus, repli Default si la cible \
-                     n'est pas dans la plage exposée"
-                );
-            }
-            return;
-        }
-    }
-}
-
 /// Pousse un bloc de samples f32 entrelacés vers le thread encoder. Factorisé
 /// pour être réutilisé par chaque callback typé (f32/i32/i16) — seule la
 /// conversion vers f32 diffère, la comptabilité des drops est commune.
@@ -191,38 +156,6 @@ fn log_first_callback(
         channels,
         "taille du 1er callback capture livrée par le driver (granularité de la rafale d'émission)"
     );
-}
-
-// 0.5.4-18 — la sonde diagnostic cold-start (entrée railée) vit désormais dans
-// `super::cold_probe` : trace temporelle FINE (timeline silence→figé→railé +
-// instants exacts + valeur bit-exacte) au lieu d'un unique verdict agrégé. Le
-// hot-path (`feed`) reste atomique pur ; l'émission `tracing` est déléguée à un
-// thread de flush. Le calcul par bloc (`ch0_stats`) reste ici car il dépend du
-// format natif (i32/i16/f32).
-use super::cold_probe::ColdStartProbe;
-
-/// Calcule `(bit-pattern du 1er sample ch0, |max| ch0 normalisé)` sur un bloc
-/// entrelacé. ch0 = indices `0, channels, 2*channels…`. `to_frac`/`to_key`
-/// dépendent du format natif (i32/i16/f32).
-#[inline]
-fn ch0_stats<T: Copy>(
-    data: &[T],
-    channels: u16,
-    to_frac: impl Fn(T) -> f32,
-    to_key: impl Fn(T) -> i64,
-) -> (i64, f32) {
-    let ch = channels.max(1) as usize;
-    let key0 = data.first().map(|&s| to_key(s)).unwrap_or(0);
-    let mut amax = 0.0f32;
-    let mut i = 0;
-    while i < data.len() {
-        let a = to_frac(data[i]).abs();
-        if a > amax {
-            amax = a;
-        }
-        i += ch;
-    }
-    (key0, amax)
 }
 
 /// Start capturing audio from the given device.
@@ -318,34 +251,22 @@ pub fn build_capture_stream(
     // de 16 à 1024 samples (mesuré au banc). Forcer une petite taille est donc
     // sûr et met la latence PC à parité avec le Mac. Entrée et sortie lisent la
     // MÊME cible → cohérence du `ASIOCreateBuffers` duplex partagé.
-    let on_asio = crate::audio::host::kind() == crate::audio::host::HostKind::Asio;
-    if on_asio {
-        log_asio_buffer_range(device, channels, native_sr);
-    }
-    use crate::audio::buffer_policy::BufferChoice;
-    let (buffer_size, fixed_buffer) = match crate::audio::buffer_policy::choice() {
-        BufferChoice::PreferDriver => {
-            tracing::info!(
-                target: "jamodio::capture",
-                channels, native_sr,
-                "buffer ASIO = taille PRÉFÉRÉE du driver (BufferSize::Default) — évite le wedge cold-start de Fixed(64)"
-            );
-            (BufferSize::Default, None)
-        }
-        BufferChoice::Fixed(target_buf)
-            if device_supports_fixed_buffer(device, channels, native_sr, target_buf) =>
-        {
+    // Taille basse latence pilotée par `buffer_policy::target()` (64 par défaut, 128
+    // après backoff auto sous charge) : `Fixed(cible)` si le device l'expose, sinon
+    // `Default` (WASAPI shared ~10 ms). Chemin CoreAudio/WASAPI uniquement — l'ASIO
+    // passe par `audio::asio_host`, qui gère sa propre taille (snap grille légale).
+    let target_buf = crate::audio::buffer_policy::target();
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, channels, native_sr, target_buf) {
             (BufferSize::Fixed(target_buf), Some(target_buf))
-        }
-        BufferChoice::Fixed(target_buf) => {
+        } else {
             tracing::info!(
                 target: "jamodio::capture",
                 channels, native_sr, target_buf,
                 "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
             );
             (BufferSize::Default, None)
-        }
-    };
+        };
 
     let config = StreamConfig {
         channels,
@@ -361,12 +282,6 @@ pub fn build_capture_stream(
     // 0.5.3 — partagé entre toutes les tentatives de build : on logue la taille
     // du tout premier callback effectif (diagnostic rafale, cf. log_first_callback).
     let first_block_logged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 0.5.4-18 — sonde diagnostic cold-start (entrée railée), ASIO uniquement.
-    // `None` hors ASIO → aucun coût, macOS/WASAPI strictement inchangés. Fenêtre de
-    // ~10 s : le gel railé du standby-wake Focusrite se manifeste plusieurs secondes
-    // après l'ouverture (silence figé ~7 s puis bascule railée) — 1 s le ratait.
-    let cold_probe: Option<Arc<ColdStartProbe>> =
-        on_asio.then(|| ColdStartProbe::spawn(native_sr, native_sr as u64 * 10));
     let build_one = || {
         let attempt = attempts.get() + 1;
         attempts.set(attempt);
@@ -376,7 +291,6 @@ pub fn build_capture_stream(
         let input_frames = input_frames.clone();
         let capture_feeding = capture_feeding.clone();
         let first_logged = first_block_logged.clone();
-        let cold_probe = cold_probe.clone();
         // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
         // On ouvre le stream au format NATIF du driver puis on convertit chaque
         // bloc en f32 normalisé [-1,1] (ce que la pipeline encoder attend).
@@ -385,12 +299,6 @@ pub fn build_capture_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
-                    if let Some(p) = &cold_probe {
-                        if p.active() {
-                            let (k, a) = ch0_stats(data, channels, |s| s, |s| s.to_bits() as i64);
-                            p.feed(k, a, data.len() / channels.max(1) as usize);
-                        }
-                    }
                     forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
@@ -401,32 +309,6 @@ pub fn build_capture_stream(
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
-                    if let Some(p) = &cold_probe {
-                        if p.active() {
-                            // Stats par canal (ch0..ch3) : ch0_stats(&data[c..], …) lit
-                            // le canal c. Discrimine « instrument seul figé » vs « toutes
-                            // les entrées figées » (armement global de l'ADC).
-                            let nch = (channels as usize).clamp(1, 4);
-                            let mut stats = [(0i64, 0f32); 4];
-                            for (c, slot) in stats.iter_mut().take(nch).enumerate() {
-                                *slot = ch0_stats(&data[c..], channels, |s| s as f32 * SCALE, |s| s as i64);
-                            }
-                            let (k, a) = stats[0];
-                            // Dump périodique du CONTENU de ch0 (bit-exact) : révèle si
-                            // le buffer d'entrée contient l'audio, le pattern d'init non
-                            // écrit (0xFF), ou de la mémoire parasite (texte de logs).
-                            if p.wants_snapshot() {
-                                let ch = channels.max(1) as usize;
-                                let mut ch0 = [0i32; 32];
-                                for (i, slot) in ch0.iter_mut().enumerate() {
-                                    *slot = data.get(i * ch).copied().unwrap_or(0);
-                                }
-                                p.fill_snapshot(&ch0, data.as_ptr() as usize);
-                            }
-                            p.feed_channels(&stats[..nch]);
-                            p.feed(k, a, data.len() / channels.max(1) as usize);
-                        }
-                    }
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
                     forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
@@ -438,12 +320,6 @@ pub fn build_capture_stream(
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
-                    if let Some(p) = &cold_probe {
-                        if p.active() {
-                            let (k, a) = ch0_stats(data, channels, |s| s as f32 * SCALE, |s| s as i64);
-                            p.feed(k, a, data.len() / channels.max(1) as usize);
-                        }
-                    }
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
                     forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
