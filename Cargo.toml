@@ -5,9 +5,6 @@ members = [
   "jamodio-agent",
   "jamodio-au-host",
   "jamodio-vst3-host",
-  # Banc de diagnostic ASIO full-duplex (Windows only, contenu no-op ailleurs).
-  # Jetable — supprimé quand le vrai AsioDuplexHost est en place.
-  "jamodio-asio-lab",
 ]
 # au-host-poc/ et vst3-host-poc/ restent hors workspace (bacs à sable, supprimés
 # une fois les crates in-workspace stables).

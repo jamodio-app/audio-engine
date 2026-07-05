@@ -105,14 +105,13 @@ struct AsioBuilt {
     input_buf: Option<u32>,
 }
 
-/// `true` si le host ASIO single-owner est activé. **Par défaut ON sur ASIO**
-/// (Windows) : c'est désormais le chemin robuste (1 ASIOInit, priming, snap de taille,
-/// tous formats). Repli sur l'ancien chemin cpal avec `JAMODIO_ASIO_HOST=0` (secours
-/// si une interface pose problème, en attendant le retrait complet du code cpal ASIO).
+/// `true` si le host ASIO single-owner doit être utilisé (host actif = ASIO/Windows).
+/// C'est le chemin unique sur ASIO : 1 ASIOInit, priming, snap de taille légale, un
+/// seul `ASIOCreateBuffers(in+out)`, tous formats. Le chemin cpal ne sert plus qu'à
+/// CoreAudio/WASAPI.
 #[cfg(target_os = "windows")]
 fn asio_host_enabled() -> bool {
     crate::audio::host::kind() == crate::audio::host::HostKind::Asio
-        && std::env::var("JAMODIO_ASIO_HOST").as_deref() != Ok("0")
 }
 
 /// Ferme un host ASIO **sur le thread COM-STA** (Windows) — le `Drop` fait
@@ -279,7 +278,7 @@ fn open_duplex_on_com(
             tracing::info!(
                 target: "jamodio::pipeline",
                 device = %driver_name, channels_in, native_sr, buffer_size,
-                "AsioDuplexHost ouvert (chemin single-owner opt-in JAMODIO_ASIO_HOST)"
+                "AsioDuplexHost ouvert (chemin ASIO single-owner)"
             );
             return Ok(BuiltDuplex::Asio(AsioBuilt {
                 host,
@@ -393,14 +392,13 @@ fn close_stream_on_com(stream: Option<SendStream>) {
     }
 }
 
-/// 0.5.4-18 — durée d'attente entre le RÉVEIL d'une interface USB ASIO et son
-/// ouverture propre. Le 1er init après une veille interface livre une entrée
-/// FIGÉE (railée ou silence) que seul un init frais — l'interface déjà réveillée
-/// ET stabilisée (bias ADC / PLL USB) — nettoie. Seuil mesuré sur Focusrite
-/// Scarlett Solo : 4 s échoue, 5 s OK → défaut 6 s (marge de robustesse). Réglable
-/// via `JAMODIO_COLD_REINIT_SETTLE_MS`.
-pub(crate) fn cold_reinit_settle() -> std::time::Duration {
-    let ms = std::env::var("JAMODIO_COLD_REINIT_SETTLE_MS")
+/// Durée d'attente entre le RÉVEIL DE VEILLE PC et la réouverture propre du driver
+/// ASIO. Après une veille, le 1er init peut livrer une entrée FIGÉE (railée/silence)
+/// que seul un init frais — l'interface réveillée ET stabilisée (bias ADC / PLL USB) —
+/// nettoie. Seuil mesuré sur Focusrite Scarlett Solo : 4 s échoue, 5 s OK → défaut 6 s
+/// (marge de robustesse). Réglable via `JAMODIO_RESUME_SETTLE_MS`.
+pub(crate) fn resume_reinit_settle() -> std::time::Duration {
+    let ms = std::env::var("JAMODIO_RESUME_SETTLE_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(6000);
@@ -506,11 +504,6 @@ pub struct PipelineState {
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
     input_device_id: Option<String>,
     output_device_id: Option<String>,
-    /// 0.5.4-18 — one-shot : demande un re-init long-settle du driver ASIO juste
-    /// après une ouverture À FROID. Posé par `prepare_audio_for_session` (chemin
-    /// froid ASIO), consommé UNE fois par `audio_liveness_supervisor`. Jamais posé
-    /// hors ASIO. Cf. la branche cold-start du superviseur.
-    cold_reinit_pending: bool,
     /// State
     pub state: AgentState,
     /// Buffer CPAL côté CAPTURE, en samples (mono), set au start_capture.
@@ -933,7 +926,6 @@ impl PipelineState {
             recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
-            cold_reinit_pending: false,
             state: AgentState::Idle,
             input_buffer_samples: None,
             output_buffer_samples: None,
@@ -1450,10 +1442,10 @@ impl PipelineState {
     /// 0.5.4-5 — acquiert les streams audio pour une (nouvelle) session :
     /// RÉUTILISE le driver ASIO chaud (rejoin sans ré-init = anti-churn) si host
     /// ASIO + streams ouverts + MÊMES devices ; sinon ferme tout et ouvre à froid
-    /// (le superviseur fera un re-init long-settle propre juste après — cf.
-    /// `cold_reinit_pending`). Encapsule tout le teardown de la session/driver
-    /// précédent·e. Renvoie les caractéristiques du device (pour l'encodeur +
-    /// `CaptureStartedInfo`) et le `Receiver` capture.
+    /// (sur ASIO, via le host single-owner qui prime l'interface à l'ouverture).
+    /// Encapsule tout le teardown de la session/driver précédent·e. Renvoie les
+    /// caractéristiques du device (pour l'encodeur + `CaptureStartedInfo`) et le
+    /// `Receiver` capture.
     fn prepare_audio_for_session(&mut self) -> Result<AcquiredAudio, CaptureStartError> {
         let input_id = self.input_device_id.clone();
         let output_id = self.output_device_id.clone();
@@ -1552,15 +1544,6 @@ impl PipelineState {
         // Sur ASIO : mémorise l'état chaud pour réutiliser le driver aux rejoin.
         // Hors ASIO : `warm` reste `None` → fermeture à chaque stop (historique).
         if Self::host_is_asio() {
-            // 0.5.4-18 — le re-init long-settle est DÉSACTIVÉ par défaut : il ne
-            // nettoie PAS le wedge cold-start de façon fiable (l'ADC railé + DMA figé
-            // revient ~4 s après tout init — investigation 2026-07-03). La piste
-            // retenue est la TAILLE de buffer (`Fixed(64)` déclenche le wedge, pas le
-            // préféré 128 — cf. `buffer_policy::choice`). On garde le re-init derrière
-            // `JAMODIO_COLD_REINIT=1` uniquement pour comparaison au banc.
-            if std::env::var("JAMODIO_COLD_REINIT").as_deref() == Ok("1") {
-                self.cold_reinit_pending = true;
-            }
             self.warm = Some(WarmAudio {
                 input_id,
                 output_id,
@@ -1787,12 +1770,6 @@ impl PipelineState {
     /// un reset. No-op sémantique hors Windows (jamais signalé).
     pub fn reset_signal(&self) -> crate::audio::asio_reset::ResetSignal {
         self.reset_signal.clone()
-    }
-
-    /// 0.5.4-18 — consomme (une seule fois) la demande de re-init long-settle posée
-    /// à la dernière ouverture ASIO à froid. Appelé par le superviseur à chaque tick.
-    pub fn take_cold_reinit_request(&mut self) -> bool {
-        std::mem::replace(&mut self.cold_reinit_pending, false)
     }
 
     /// 0.5.4-18 — réinitialise le JitterBuffer de découplage du self-monitor après

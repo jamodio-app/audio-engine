@@ -61,34 +61,6 @@ pub fn target() -> u32 {
     TARGET.load(Ordering::Acquire)
 }
 
-/// Choix de taille de buffer à l'ouverture d'un stream.
-pub enum BufferChoice {
-    /// Demander `BufferSize::Fixed(n)` si le device l'expose, sinon `Default`.
-    Fixed(u32),
-    /// Forcer `BufferSize::Default` = **taille PRÉFÉRÉE du driver** (souvent 128 sur
-    /// Focusrite). C'est le comportement d'avant 0.5.4-17 ; `Fixed(64)` déclenche le
-    /// wedge cold-start (ADC railé + DMA figé, bug 2026-07-03) que 128/préféré n'a pas.
-    PreferDriver,
-}
-
-/// Choix de buffer courant, avec override d'environnement `JAMODIO_ASIO_BUFFER` :
-///   - `default` (ou `pref`) → `PreferDriver` (taille préférée du driver)
-///   - `<nombre>`            → `Fixed(nombre)`
-///   - absent                → `Fixed(target())` (cible basse latence, 64 par défaut)
-///
-/// Permet de trancher au banc si c'est bien la taille `Fixed(64)` qui déclenche le
-/// wedge cold-start Focusrite, sans rebuild.
-pub fn choice() -> BufferChoice {
-    match std::env::var("JAMODIO_ASIO_BUFFER").ok().as_deref() {
-        Some("default") | Some("Default") | Some("pref") => BufferChoice::PreferDriver,
-        Some(s) => match s.parse::<u32>() {
-            Ok(n) if n > 0 => BufferChoice::Fixed(n),
-            _ => BufferChoice::Fixed(target()),
-        },
-        None => BufferChoice::Fixed(target()),
-    }
-}
-
 /// Escalade one-way [`LOW`] → [`SAFE`]. Renvoie `true` UNIQUEMENT si la cible a
 /// effectivement changé (première escalade) — permet au caller de ne déclencher
 /// la reconstruction et le log qu'une seule fois. Idempotent ensuite.
