@@ -62,6 +62,15 @@ impl ResetSignal {
         self.requests.load(Ordering::Relaxed)
     }
 
+    /// Signale un `kAsioResetRequest` (incrément atomique + réveil du superviseur).
+    /// Appelable depuis un callback de message ASIO enregistré directement via
+    /// `asio-sys` (host single-owner), sans passer par un `cpal::Device`. Sûr sur le
+    /// thread du driver : aucune allocation, aucun verrou bloquant.
+    pub fn signal(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
     /// Handle pour `select!`/`.notified().await` côté superviseur.
     pub fn notify_handle(&self) -> Arc<Notify> {
         self.notify.clone()

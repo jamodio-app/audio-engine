@@ -187,6 +187,25 @@ impl AudioMixer {
         self.streams.remove(SELF_MONITOR_ID);
     }
 
+    /// 0.5.4-18 — réinitialise le JitterBuffer du self-monitor en préservant le
+    /// volume. À appeler après une discontinuité d'horloge de capture (re-init ASIO
+    /// mid-session sur réveil de veille PC) : le buffer de gigue repart propre, son
+    /// estimateur de drift n'est plus faussé par le trou → plus de distorsion
+    /// persistante au casque. No-op si le self-monitor n'existe pas.
+    pub fn reset_local_stream(&mut self) {
+        if !self.streams.contains_key(SELF_MONITOR_ID) {
+            return;
+        }
+        let volume = self
+            .streams
+            .get(SELF_MONITOR_ID)
+            .map(|s| s.volume)
+            .unwrap_or(0.0);
+        self.remove_local_stream();
+        self.add_local_stream();
+        self.set_self_monitor_volume(volume);
+    }
+
     /// Override le volume du self-monitor (0.0 = silence, 1.0 = unity, 1.5 = max).
     /// Appelé par le handler `SetSelfMonitorVolume` côté ws_server.
     pub fn set_self_monitor_volume(&mut self, volume: f32) {
