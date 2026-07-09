@@ -6,6 +6,419 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.4-17] — 2026-07-02
+
+> **Pré-release — CAUSE RACINE DU GEL ASIO TROUVÉE + correctif chirurgical.**
+> Premier débogage sur un vrai PC Windows + Focusrite (avant : dev sur Mac À
+> L'AVEUGLE). Un banc de diagnostic isolé (`jamodio-asio-lab`) prouve que le
+> moteur duplex maison est **fondamentalement sain** (90 s de callbacks réguliers
+> sur le vrai Scarlett, 1 `ASIOCreateBuffers`, sortie servie) — et que le chemin
+> cpal à 2 flux tient AUSSI 90 s en isolation. **La structure des streams n'était
+> donc PAS la cause.** La vraie cause, reproduite à l'identique (mode `enum-during`
+> : gel à t=1 s, ~375 tics puis plat, `resets=0` — exactement les logs de l'agent) :
+> **une ré-énumération ASIO concurrente**. `cpal input_devices()` appelle asio-sys
+> `load_driver`→`ASIOInit` sur le driver **mono-client global au process** ALORS
+> qu'un stream tourne dessus → ré-init sous les pieds du stream → callbacks gelés
+> en silence. Déclencheur dans l'agent : le `GetDevices` du browser pendant une
+> session. (Explique aussi pourquoi le keep-warm 0.5.4-5 aidait sans corriger : il
+> tuait le churn leave/rejoin, pas le rechargement par énumération.)
+
+### Fixed
+- **`audio::device` — cache d'énumération ASIO : plus aucun rechargement du driver
+  mono-client pendant qu'un stream est actif.** Tant qu'un stream ASIO est ouvert
+  (`ASIO_STREAM_ACTIVE`, posé/levé par le pipeline SUR le thread `com_exec` →
+  sérialisé avec l'énumération, pas de course), `list_inputs`/`list_outputs`
+  servent le **dernier cache connu** au lieu de rappeler `input_devices()` (qui
+  rechargerait le driver → gel). Le flag est posé dans la closure com_exec de
+  `open_duplex_on_com` (après ouverture réussie) et levé dans `close_audio_driver`
+  (après ASIOExit). **macOS/CoreAudio + WASAPI strictement inchangés** : le flag
+  n'y est jamais posé → énumération fraîche à chaque appel, comportement historique.
+  Test unitaire `asio_active_serves_cache_and_never_reloads` (headless, sans matériel).
+
+### Added
+- **`jamodio-asio-lab` (crate, Windows only, JETABLE)** — banc de diagnostic ASIO
+  full-duplex minimal (asio-sys direct, marshalling de buffer réutilisé de cpal
+  MIT). Modes : `baseline`, `cpal2` (2 flux cpal = chemin de prod), `coexist[-live]`,
+  `stall`, `churn`, `enum-during`. A permis de trancher empiriquement (au lieu de
+  raisonner à l'aveugle) : le duplex isolé est robuste, seul l'`enum-during`
+  reproduit le gel. Contenu no-op hors Windows → workspace buildable sur Mac.
+- **`scripts/win-cargo.ps1`** — enveloppe de build Windows (charge vcvars64 +
+  `CPAL_ASIO_DIR`/`LIBCLANG_PATH` requis par asio-sys/bindgen, puis lance cargo).
+
+### Changed
+- **Buffer audio unifié bas-latence, automatique (`audio::buffer_policy`).** La
+  cible passe de 128 (préféré ASIO / demandé CoreAudio) à **64 samples** (1,33 ms
+  vs 2,67 ms/direction), demandée en `BufferSize::Fixed(64)` sur les chemins pro
+  (CoreAudio ET ASIO) quand le device l'expose, sinon repli `Default`. WASAPI
+  shared inchangé (~10 ms, imposé par Windows). Le gain vient d'un fait mesuré :
+  le Focusrite est stable de 16 à 1024 samples ; la latence se pilote par le
+  buffer, pas par une réécriture du host. **−2,67 ms de RTT, cohérence Mac ↔ PC.**
+- **Backoff automatique 64 → 128 sous charge (pas de slider utilisateur).** Si
+  des drops/underruns PERSISTENT à 64 (détecteur leaky-bucket dans le flush
+  `perfstats`, insensible aux pics isolés), l'agent remonte **une seule fois** à
+  128 via une reconstruction **seamless** des streams (même chemin éprouvé que la
+  recovery de liveness : pas de redémarrage, session réseau maintenue). One-way
+  (anti-oscillation / anti-glitch répété) ; un 64 frais est re-tenté au prochain
+  démarrage. Remplace le « slider buffer » des concurrents par de l'auto-tuning.
+- `AudioDevice` dérive désormais `Clone` (nécessaire au cache d'énumération).
+
+## [0.5.4-16] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE v4 : sortie servie via le pattern ÉPROUVÉ de cpal.**
+> Le probe sert de nouveau la sortie (le test pertinent : un duplex correctement
+> servi tient-il ?) mais cette fois en RÉUTILISANT le pattern de marshalling de
+> cpal (MIT) — accès buffer FRAIS dans le callback via `Arc<Mutex<AsioStreams>>`
+> (jamais de pointeur pré-extrait, la faute probable du BSOD 0.5.4-14), slice
+> `from_raw_parts_mut`, bornes strictes (Int32LSB, index 0/1, non-null). **OPT-IN**
+> (var d'env `JAMODIO_ASIO_PROBE` OU fichier `%APPDATA%\Jamodio\asio_probe.on`) →
+> un démarrage normal ne touche JAMAIS à l'ASIO. cfg(windows), aucun impact Mac.
+
+### Changed
+- `audio::asio_probe` — le `bufferSwitch` remplit la sortie de silence via le
+  pattern cpal (`Arc<Mutex<AsioStreams>>` + `from_raw_parts_mut(buffers[idx],
+  buffer_size)`), au lieu du `write_bytes` sur pointeur pré-extrait qui a BSOD.
+- Déclenchement du probe aussi par **fichier marqueur** `%APPDATA%\Jamodio\asio_probe.on`
+  (plus simple que la var d'env), en plus de `JAMODIO_ASIO_PROBE`. Sans marqueur : no-op.
+
+## [0.5.4-15] — 2026-07-01
+
+> **Pré-release — SÉCURITÉ : probe rendu inerte après un BSOD.** La 0.5.4-14
+> écrivait du silence dans les buffers de sortie ASIO (accès pointeur brut) et a
+> provoqué un **BSOD** (crash kernel du driver Focusrite) sur la machine de Ben.
+> On revient à un probe SÛR : plus aucune écriture buffer, et lancement de nouveau
+> opt-in par variable d'environnement (démarrage normal = sûr, le probe ne tourne
+> pas). Leçon : le marshalling des buffers ASIO ne se développera plus à l'aveugle
+> sur une machine de prod — il faut un environnement où un crash est contenu.
+
+### Fixed / Changed
+- `audio::asio_probe` — le `bufferSwitch` **ne touche plus aux buffers** (suppression
+  de l'écriture de sortie `write_bytes` et du wrapper `SendPtr` responsables du BSOD) ;
+  il ne fait que compter les callbacks. `spawn_probe_at_startup` **re-gaté sur la var
+  d'env `JAMODIO_ASIO_PROBE`** (plus de lancement automatique) → un démarrage normal
+  n'exécute AUCUN accès ASIO du probe. cfg(windows), aucun impact Mac.
+
+## [0.5.4-14] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE (v3) : le callback SERT la sortie.** Résultat du
+> probe 0.5.4-13 sur le Focusrite : `ASIOCreateBuffers` duplex OK (buffer 128,
+> Int32LSB) mais les callbacks **gelaient à ~1 s** (373 tics puis plus rien).
+> Différence avec cpal (qui tient ~20 s) : le probe ne remplissait PAS la sortie.
+> Un hôte ASIO doit servir la sortie à chaque tick. Le probe remplit désormais la
+> sortie de silence → test de la vraie question : un duplex CORRECTEMENT SERVI
+> tient-il ? Verdict honnête (`survived`/`last_growth_s`) au lieu du message fixe.
+
+### Changed
+- `audio::asio_probe` — le `bufferSwitch` écrit du silence dans les buffers de
+  sortie (`write_bytes` 0, Int32LSB, `buffer_size` échantillons/canal) à chaque
+  tick, en plus de compter. Verdict basé sur la dernière tranche où les tics ont
+  progressé (`last_growth_s`, `survived = last_growth_s >= 55`). Toujours cfg(windows),
+  jetable, aucun impact Mac.
+
+## [0.5.4-13] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE (fix sélection driver).** Le probe 0.5.4-12 prenait
+> le PREMIER driver ASIO de la liste (`Blackmagic Audio`, sans matériel → échec
+> immédiat) au lieu du Focusrite. Corrigé : on itère et on retient le 1er driver
+> qui se charge ET expose une entrée. Reste une build-probe jetable (auto au
+> démarrage), aucun impact Mac.
+
+### Fixed
+- `audio::asio_probe` — sélection du driver : itère sur `driver_names()` et retient
+  le premier qui `load_driver` OK **et** `channels().ins > 0` (ignore les drivers
+  fantômes : Blackmagic / Focusrite Thunderbolt sans matériel). Le 0.5.4-12 échouait
+  sur le 1er nom de la liste. (NB : le probe a bien COMPILÉ et TOURNÉ sur Windows en
+  0.5.4-12 — l'API asio-sys directe fonctionne, seule la sélection était naïve.)
+
+## [0.5.4-12] — 2026-07-01
+
+> **Pré-release — BUILD-PROBE : le spike ASIO duplex se lance AUTOMATIQUEMENT au
+> démarrage** (plus besoin de la variable d'environnement). Build dédiée au test :
+> à l'ouverture, l'agent ouvre le Focusrite en duplex direct (asio-sys) et logge la
+> survie des callbacks sur ~60 s (l'ASIO est monopolisé le temps du test puis
+> relâché — usage normal possible ensuite). But : savoir si le moteur duplex TIENT
+> là où cpal wedge (~20 s). Aucun impact Mac (`#[cfg(windows)]`), jamais câblé au
+> pipeline. À désinstaller après le test.
+
+### Changed
+- `audio::asio_probe` — `spawn_if_requested` → `spawn_probe_at_startup` : lancement
+  automatique au démarrage (la var `JAMODIO_ASIO_PROBE` n'est plus requise). Délai de
+  settle 3 s avant d'ouvrir le driver (évite la contention avec l'énumération CPAL du
+  boot, ASIO mono-client). Log d'en-tête explicite `BUILD-PROBE`. Jetable (supprimé en P2.1).
+
+## [0.5.4-11] — 2026-07-01
+
+> **Pré-release — P2.0 : spike de faisabilité du host ASIO duplex maison
+> (diagnostic, Windows only).** Première marche du socle ASIO robuste
+> (cf. `internal-docs/plans/PLAN-ASIO-HOST-DUPLEX-2026-07.md`). Vérifie que le
+> moteur duplex (1 `ASIOCreateBuffers` in+out, 1 `bufferSwitch`, comme
+> Jamulus/JUCE/RtAudio) SURVIT là où le chemin cpal à 2 flux séparés meurt (~20 s,
+> wedge Focusrite). **N'est pas câblé au pipeline, ne s'active que via la variable
+> d'environnement `JAMODIO_ASIO_PROBE`.** Aucun impact Mac (module `#[cfg(windows)]`).
+
+### Added
+- `audio::asio_probe` (Windows only, opt-in `JAMODIO_ASIO_PROBE`) — ouvre le driver
+  ASIO en **duplex direct via `asio-sys`** (chaînage `prepare_input_stream` →
+  `prepare_output_stream` = un seul `ASIOCreateBuffers` couvrant entrée+sortie),
+  enregistre UN callback `bufferSwitch` qui compte les tics + le callback de message
+  (`kAsioResetRequest`), démarre, et logge la survie des callbacks sur 60 s
+  (`target: jamodio::asioprobe`). Zéro accès buffer brut, zéro `unsafe` : le but est
+  de prouver la survie du moteur duplex, pas encore de router l'audio. **Jetable** —
+  remplacé par le vrai `AsioDuplexHost` (câblé `sample_tx`/`mixer`) en P2.1. Pendant
+  les 60 s le spike monopolise l'interface ASIO (mono-client) : ne pas rejoindre un
+  studio en même temps, juste lire les logs.
+
+## [0.5.4-10] — 2026-07-01
+
+> **Pré-release — Robustesse Windows P0 + P1** (analyse de 3 sessions réelles
+> PC↔Mac). Le réseau était hors de cause (gigue réseau réelle ~0,6 ms, 0 perte) ;
+> deux défauts côté PC dégradaient l'expérience. **P0** : sous charge (éditeur de
+> plugin, batterie), le worker tokio qui horodate les paquets entrants est préempté
+> → un horodatage tardif faisait bondir la queue de gigue à 15-100 ms alors que le
+> réseau était bon, et l'ancien peak-hold épinglait le buffer à 40 ms **sans jamais
+> redescendre** (« le lien se dégrade, on ne se suit plus »). **P1** : sur mort
+> silencieuse du driver Focusrite, la détection du gel prenait ~2 s et le décodage
+> remplissait le buffer de périmé (jusqu'à 300 ms). Aucune régression Mac.
+
+### Changed
+- **(P0)** `sync::jitter` — l'estimateur de queue passe d'un **peak-hold** à un **écart
+  inter-percentile `p95 − p10` du transit sur une fenêtre glissante de 512 paquets
+  (~1,3 s)**. Trois propriétés : (1) **récupération naturelle** (une valeur sort de
+  la fenêtre après ~1,3 s, fini le release lent + ratchet) ; (2) **robuste aux
+  outliers isolés** (un stall touchant < 5 % des paquets n'bouge pas le p95 → le
+  plancher ne gonfle pas ; le trou audio réel reste couvert par le filet réactif) ;
+  (3) **répond au vrai besoin** (une lateness fréquente/soutenue monte le p95 → le
+  buffer grandit). Dimensionné sur le transit (pas `|D|`, aveugle à la durée d'une
+  rafale) ; l'offset d'horloge + le drift lent se simplifient dans `p95 − p10`.
+  Recalcul trié amorti ~12×/s (cache), `jitter_tail_ms()` reste O(1) par-paquet,
+  zéro alloc en régime. API publique inchangée (consommateurs `ring_buffer`/wire
+  intacts). 4 tests ajoutés/refondus (spike isolé ignoré, récupération après
+  perturbation, lateness récurrente captée, burst local bref absorbé).
+  Constantes (fenêtre 512, p95/p10) = premier jet, à calibrer sur lien bursty réel.
+- **(P1)** `ws_server::audio_liveness_supervisor` — détection du gel de callbacks
+  ASIO accélérée : `FLATLINE_MS` 1500 → **800** (≫ période ASIO 2,7 ms → ~290
+  callbacks/800 ms, faux positif quasi impossible), `TICK_MS` 500 → **250**.
+  Économise ~1 s de trou audio par mort ASIO silencieuse.
+
+### Added
+- **(P1)** `JitterBuffer::reset_for_recovery` + `Mixer::reset_streams_for_recovery`
+  — appelés après une reconstruction réussie des streams (`rebuild_audio_streams`) :
+  vident le périmé accumulé pendant le gel de sortie (jusqu'à 300 ms) et re-priment
+  à la cible de démarrage, filet réactif purgé. Repart propre et déterministe au
+  rétablissement (le drift-drain de `pull` le faisait déjà tôt ou tard). Ne touche
+  ni aux modes ni aux compteurs cumulés. Test `reset_for_recovery_flushes_and_reprimes`.
+
+## [0.5.4-9] — 2026-06-30
+
+> **Pré-release — VU self stéréo (niveaux L/R indépendants).** Le VU « moi »
+> affichait le même niveau sur les 2 barres (un seul RMS global) même quand le
+> signal n'était que d'un côté. L'agent pousse désormais un RMS gauche ET droite
+> séparés. Aucun impact sur le flux audio ni la latence (calcul sur le plan de
+> contrôle StreamLevels 10 Hz).
+
+### Added
+- `StreamLevel.rmsL` / `rmsL` (wire, optionnels, `skip_serializing_if` → back-compat
+  browser ancien) : RMS par canal (L = samples pairs, R = impairs de l'entrelacé).
+  Mixer : `StreamState.rms_l/rms_r` calculés dans `push_samples`, `stream_rms()`
+  retourne `(id, rms, rms_l, rms_r)`. Test `rms_par_canal_l_r_independants`.
+
+## [0.5.4-8] — 2026-06-30
+
+> **Pré-release — Capture d'une PAIRE stéréo arbitraire.** L'agent peut désormais
+> capturer n'importe quelle paire stéréo (3+4, 5+6 …) d'une interface multi-canaux,
+> et plus seulement 1+2. Pour un synthé/clavier stéréo branché ailleurs que sur les
+> deux premiers canaux. (Côté browser : sélecteur paires/mono + libellés, et fix
+> attack/release du talkback + bannière « N interfaces · M entrées » — monorepo.)
+
+### Added
+- `StartCapture.stereoStart` (wire, `default` serde → rétro-compatible) : capture
+  la paire stéréo `L=ch[N]`, `R=ch[N+1]`. Enum interne `ChannelSel`
+  (`Default`/`Mono`/`StereoPair`) threadé jusqu'à `remap_to_stereo`, indices
+  validés contre `channels_in` (repli stéréo défaut si hors plage). Tests
+  `remap_tests` (mono / paire / défaut / mono-source / hors-plage).
+
+## [0.5.4-7] — 2026-06-30
+
+> **Pré-release — Faux « agent saturé / drops/s » pendant le park supprimé.**
+> Test PC 0.5.4-6 : keep-warm **validé** (logs `réutilisé à chaud` à chaque
+> rejoin, 0 `pipeline stopped`, churn éliminé). Mais un effet de bord : pendant le
+> PARK (driver gardé chaud), le callback de capture continuait de pousser des
+> samples alors que l'encodeur était démonté → canal sans consommateur plein →
+> ~250 « drops/s » comptés comme « encoder saturé (CPU?) » → **toast trompeur**
+> « agent saturé, ferme des apps ou choisis un plugin moins lourd » à chaque
+> commutation rapide de studio (alors qu'aucune surcharge, aucun plugin).
+
+### Fixed
+- Flag `capture_feeding` : pendant le park (pas d'encodeur consommateur), le
+  callback du driver chaud **jette ses samples sans compter de drop** (la liveness
+  `capture_callbacks` continue, elle, d'incrémenter — le driver EST vivant). Plus
+  de faux drops, plus de toast « saturé » lors des leave/rejoin. Aucun impact sur
+  la détection des VRAIS drops en session active.
+
+## [0.5.4-6] — 2026-06-30
+
+> **Pré-release — Fix « double-leave » qui annulait le keep-warm.** Test PC du
+> 30/06 (autre Focusrite, 20 canaux) : le keep-warm fonctionnait (logs `réutilisé
+> à chaud`) mais la plupart des rejoins repassaient en cold (`input device
+> opened`). Cause : une sortie de studio déclenche DEUX appels (`Stop` du browser
+> PUIS fermeture de sa WebSocket) ; le 1er parkait (driver gardé chaud), mais le
+> 2e — état déjà `Idle` — tombait dans `stop_all` et **refermait le driver**.
+> Résultat : le churn ASIOExit/ASIOInit n'était supprimé qu'une fois sur deux.
+
+### Fixed
+- `leave_session` : tant qu'un driver ASIO **chaud** existe, un 2e leave redondant
+  est désormais **inerte** (park seulement si une capture tourne ; no-op si déjà
+  parké). La fermeture du driver est laissée à la **grâce** (~30 s) — plus aucun
+  leave ne referme le chaud. Les rejoins rapides réutilisent donc TOUJOURS le
+  driver (zéro ré-init). macOS/WASAPI inchangés (`stop_all` comme avant).
+
+## [0.5.4-5] — 2026-06-30
+
+> **Pré-release — Driver ASIO gardé « CHAUD » à travers les leave/rejoin (cause
+> racine du PC injouable).** Analyse des sessions du 29/06 : le buffer n'était PAS
+> le problème (le Focusrite préfère 128 = ce qu'on lui donnait). La vraie cause :
+> notre code **fermait/rouvrait le driver (ASIOExit/ASIOInit) à CHAQUE sortie/
+> entrée de studio**. Le Focusrite USB ASIO se dégrade sous ces cycles rapides —
+> il gèle ses callbacks OU les garde vivants mais ne livre que du SILENCE (« ni
+> son ni vumètre » au rejoin, prouvé par `output_peak≈0` alors que `cap_cb=374`).
+> Décisif : l'état corrompu **survit à un relaunch de l'agent** → c'est le driver,
+> pas notre code. Un DAW ouvre l'interface une fois et la garde ; on fait pareil.
+
+### Changed
+- **Sur ASIO/Windows, le driver reste OUVERT à travers les leave/rejoin.** À la
+  sortie de studio on ne démonte que la couche SESSION (encodeur, SFU, réception,
+  décodage) via un nouveau `park` ; les streams capture+sortie restent chauds. Au
+  rejoin sur le MÊME device → réutilisation **instantanée** (zéro ASIOExit/ASIOInit
+  = zéro churn). Le canal capture→encodeur devient stable (Receiver cloné par
+  session, drainé du périmé au rejoin) ; le callback RT de capture est **inchangé**.
+- **Relâche du driver** (ASIOExit propre, libère l'interface pour un DAW) : après
+  une **grâce de 30 s** hors studio sans rejoin (minuteur dans le superviseur de
+  liveness), ou si le device d'entrée/sortie **change** (une seule ré-init propre),
+  ou à l'arrêt. Un rejoin dans les 30 s annule la grâce et réutilise le chaud.
+- **macOS/CoreAudio + WASAPI : strictement INCHANGÉS** — le keep-warm est gaté à
+  l'exécution sur le host ASIO (`warm = None` ailleurs → fermeture à chaque stop,
+  comportement historique). Refactor purement additif : `stop_all` factorisé en
+  `teardown_session` + `close_audio_driver`, chemin à froid identique.
+- Filets conservés : watchdog flatline (gel) + reset coopératif `kAsioResetRequest`
+  restent en secours — mais ne doivent quasi plus servir, le churn étant supprimé.
+
+> **Note** : le buffer préféré du driver (0.5.4-3) et la latence honnête (0.5.4-4)
+> restent — corrects et robustes pour tout l'écosystème ASIO, même si pour ce
+> Focusrite la préférée valait déjà 128.
+
+## [0.5.4-4] — 2026-06-29
+
+> **Pré-release — Télémétrie de latence HONNÊTE : on mesure la taille de buffer
+> réelle.** Le calcul de latence utilisait la taille DEMANDÉE (`Fixed(128)`), pas
+> celle réellement servie par le driver. Conséquences : (1) sur Mac on
+> sur-estimait l'entrée (~+1,3 ms — on demandait 128, CoreAudio servait 64) ;
+> (2) depuis 0.5.4-3 (ASIO → taille préférée du driver, valeur a priori inconnue),
+> le calcul retombait sur le fallback conservateur de 10 ms/côté → latence ASIO
+> gonflée à tort.
+
+### Changed
+- **La latence est calculée sur la taille de buffer RÉELLE**, mesurée au 1er
+  callback CPAL (entrée ET sortie, `perfstats.input_frames`/`output_frames`).
+  Ordre de priorité : taille mesurée → taille demandée (Fixed) → fallback 10 ms.
+  Les champs wire `inputBufferMs`/`outputBufferMs` reflètent désormais la mesure
+  (présents même sur ASIO en `Default`). Re-mesuré à chaque (re)construction de
+  stream ; remis à zéro à l'arrêt capture (pas de valeur périmée au re-join).
+  Coût hot-path : un `store(Relaxed)` u32 par callback (négligeable).
+
+## [0.5.4-3] — 2026-06-29
+
+> **Pré-release — Gel ASIO Focusrite Windows : on ne force plus la taille de
+> buffer.** Analyse des sessions du 29/06 (Ben PC Focusrite injouable vs Ben Mac
+> Scarlett parfait) : sur Windows ASIO, les callbacks du driver **haltaient après
+> ~75-85 s** de streaming continu (pas de surcharge CPU, pipeline saine, RTT
+> stable, et même en SOLO sans pair). Cause racine : on demandait
+> `BufferSize::Fixed(128)`, mais `asio-sys` ne valide QUE `demandé ≤ max` — il
+> **ignore le min, la taille préférée ET la granularité** du driver. 128
+> hors-grille était accepté par le Focusrite puis le déstabilisait. Le Mac ne
+> gelait pas car **CoreAudio ignore la valeur** et prend la taille native du
+> device (64). Confirmé par JUCE/SonoBus, RtAudio/JackTrip et Jamulus : tous
+> snappent sur la grille du driver / utilisent sa taille préférée, aucun ne force
+> une taille arbitraire.
+
+### Changed
+- **ASIO (Windows) : on défère à la taille de buffer PRÉFÉRÉE du driver**
+  (`BufferSize::Default` → `asio-sys` utilise `ASIOGetBufferSize().pref`), au lieu
+  de forcer `Fixed(128)`. En duplex ASIO, entrée et sortie partagent le même
+  `ASIOCreateBuffers` → les deux passent par `Default` pour rester cohérents.
+  CoreAudio / WASAPI **inchangés** (Fixed(128) low-latency si exposé, sinon
+  Default). 128 n'était qu'un choix de latence : ni Opus (encodeur à accumulateur
+  → frames 120) ni les plugins (process_stage re-bloque) ne dépendent de la taille
+  de capture.
+
+### Added
+- Log `plage de buffer ASIO du driver` (min/max) au démarrage capture +
+  `frames_per_callback` réel → révèle la taille préférée effective du Focusrite et
+  confirme si l'ancien 128 était hors-grille. Diagnostic de la prochaine session.
+
+## [0.5.4-2] — 2026-06-29
+
+> **Pré-release — Recovery ASIO Windows : cause racine du wedge dur traitée.**
+> Le watchdog de 0.5.3-5 détectait la mort des callbacks ASIO et recréait les
+> streams (OK sur cold-start « soft »), mais sur un **wedge dur** (driver
+> Focusrite USB complètement bloqué) la recréation échouait et l'utilisateur
+> devait DÉBRANCHER/REBRANCHER physiquement son interface. Cause racine prouvée :
+> **cpal 0.15 n'enregistre aucun callback de message ASIO** → quand le driver
+> émet `kAsioResetRequest`, asio-sys lui répond « 1 » (« host gère le reset »)
+> mais n'exécute rien → le driver halte ses callbacks et attend un reset qui ne
+> vient jamais. Le replug USB n'était qu'une rustine matérielle pour un reset
+> logiciel jamais effectué.
+
+### Added
+- **Callback de message ASIO** (`audio/asio_reset.rs`) : on enregistre, via le
+  `Driver` que cpal possède déjà (`Device::as_inner()` → `DeviceInner::Asio` →
+  champ `pub driver`), le callback que cpal omet — **sans forker cpal**. À chaque
+  `kAsioResetRequest`, le driver nous réveille IMMÉDIATEMENT (`Notify`) et on
+  exécute le reset propre, au moment où il le demande (et non 1,5 s plus tard via
+  le sondage de liveness). Garde RAII (`Weak<Driver>`) pour retirer le callback
+  sans empêcher l'`ASIOExit`. No-op hors Windows/ASIO.
+
+### Changed
+- **Reset ASIO robuste, borné, avec settle + backoff** (`repair_audio_streams`) :
+  fermeture des streams (→ `ASIOExit` = dé-init complète) puis reconstruction
+  avec un délai initial (~350 ms, laisse le driver USB relâcher — cause des échecs
+  immédiats sur wedge dur) puis backoff [600/1200/2500 ms]. `restart_audio_streams`
+  est scindé en `close_audio_streams_for_reset` + `rebuild_audio_streams` (erreur
+  TYPÉE portant le code/texte ASIO exact pour le diagnostic).
+- **Plus de cascade Shutdown/relaunch** : en cas d'échec après les essais, on
+  **n'appelle plus `stop_all`** (qui démontait la session → « pipeline stopped »
+  → relaunch). On passe en mode DÉGRADÉ, session réseau/SFU maintenue, avec une
+  relance lente en arrière-plan (~8 s) jusqu'au retour du driver. Le rebranchement
+  de l'interface relance alors l'audio SANS re-handshake réseau ni redémarrage de
+  l'agent. Le filet de liveness (flatline > 1,5 s) reste en secours des morts
+  silencieuses qui n'émettraient pas de reset request.
+
+## [0.5.4-1] — 2026-06-28
+
+> **Pré-release — Chantier #1 : plancher jitter buffer « tail-aware » (Phase 1).**
+> Notre seul vrai retard vs les concurrents était la sophistication du jitter
+> buffer : on dimensionnait le plancher sur la gigue MOYENNE (RFC 3550), trop
+> basse sur réseau bursty → on underrun PUIS on réagit (1 glitch par rafale). Les
+> concurrents pilotent sur le pire-cas réel. **CONSTANTES À CALIBRER sur lien réel.**
+
+### Changed
+- **Le plancher du jitter buffer est désormais piloté par la QUEUE de gigue**
+  (pire-cas récent), pas la moyenne. `JitterEstimator` gagne un estimateur de
+  queue (peak-hold attaque rapide / release lent ~4 s) ; `floor = clamp(MIN,
+  K_TAIL·queue + headroom, MAX)` (K_TAIL=1, headroom=3 ms — calibration). Effet :
+  sur lien bursty le plancher couvre la queue PROACTIVEMENT → moins d'underruns,
+  buffer stable plus bas au lieu d'osciller. Sur lien propre (queue ≈ 0) →
+  plancher ≈ MIN, identique à l'historique (zéro régression).
+- **Garde-fous** : le filet réactif (+5 ms/underrun) reste en backstop (jamais
+  pire qu'avant) ; réseau UNIQUEMENT (le self-monitor local n'est pas touché) ;
+  MIN 5 / MAX 40 conservés.
+
+### Added
+- Télémétrie `jitter_tail_ms` (log `jamodio::netstats` + wire `jitterTailMs`) pour
+  calibrer K_TAIL / headroom / release sur réseau réel.
+
+### Notes
+- Phase 1 du chantier ; Phase 2 (baseline appris par taux de glitch + hystérésis)
+  conditionnelle à la mesure. Cf. `internal-docs/plans/PLAN-CHANTIER-1-JITTER-2026-06.md`.
+
 ## [0.5.3] — 2026-06-28
 
 > **Release temps-réel Windows : réception + émission RT (Windows jouable) +

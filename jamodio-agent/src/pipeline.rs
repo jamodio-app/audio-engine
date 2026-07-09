@@ -75,11 +75,106 @@ enum OutputOpen {
 /// l'ENTRÉE et la SORTIE puis les démarre (sortie d'abord). Regrouper build+play
 /// des deux streams dans un seul passage évite de recréer les buffers ASIO de la
 /// sortie APRÈS un `play()` d'entrée (cold-start full-duplex muet, bug PC 28/06).
-struct BuiltDuplex {
-    /// Entrée — déjà démarrée (`play()` appelé dans la closure, après la sortie).
-    input: BuiltInput,
-    /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
-    output: OutputOpen,
+enum BuiltDuplex {
+    /// Chemin cpal (macOS/WASAPI ; et ASIO tant que le host single-owner n'est pas
+    /// activé). Deux `cpal::Stream` séparés + garde de reset.
+    Cpal {
+        /// Entrée — déjà démarrée (`play()` appelé dans la closure, après la sortie).
+        input: BuiltInput,
+        /// Sortie — déjà démarrée si `Opened` ; `Skipped` si un playback existait.
+        output: OutputOpen,
+        /// 0.5.4-2 — garde du callback `kAsioResetRequest` sur le driver d'entrée
+        /// (cf. `audio::asio_reset`). Garde vide hors ASIO/Windows.
+        reset_guard: crate::audio::asio_reset::ResetCallbackGuard,
+    },
+    /// Chemin ASIO single-owner (Windows, opt-in `JAMODIO_ASIO_HOST=1`) : un seul
+    /// objet duplex robuste (1 ASIOInit, priming, 1 create(in+out), 1 start), qui
+    /// gère lui-même son callback de reset.
+    #[cfg(target_os = "windows")]
+    Asio(AsioBuilt),
+}
+
+/// Résultat d'une ouverture via le host ASIO single-owner (cf. `AsioDuplexHost`).
+#[cfg(target_os = "windows")]
+struct AsioBuilt {
+    host: crate::audio::asio_host::AsioDuplexHost,
+    name: String,
+    resolved_id: String,
+    channels_in: u16,
+    native_sr: u32,
+    input_buf: Option<u32>,
+}
+
+/// `true` si le host ASIO single-owner doit être utilisé (host actif = ASIO/Windows).
+/// C'est le chemin unique sur ASIO : 1 ASIOInit, priming, snap de taille légale, un
+/// seul `ASIOCreateBuffers(in+out)`, tous formats. Le chemin cpal ne sert plus qu'à
+/// CoreAudio/WASAPI.
+#[cfg(target_os = "windows")]
+fn asio_host_enabled() -> bool {
+    crate::audio::host::kind() == crate::audio::host::HostKind::Asio
+}
+
+/// Ferme un host ASIO **sur le thread COM-STA** (Windows) — le `Drop` fait
+/// stop/dispose/ASIOExit sur l'apartment créateur, comme `close_stream_on_com`.
+#[cfg(target_os = "windows")]
+fn close_host_on_com(host: Option<crate::audio::asio_host::AsioDuplexHost>) {
+    if let Some(h) = host {
+        crate::audio::com_exec::run(move || drop(h));
+    }
+}
+
+/// 0.5.4-5 — état du driver ASIO gardé « CHAUD » à travers les leave/rejoin.
+///
+/// # Pourquoi (bug PC 29/06)
+/// Le driver Focusrite USB ASIO se dégrade sous des cycles `ASIOExit/ASIOInit`
+/// RAPIDES — soit il gèle ses callbacks, soit il les garde vivants mais ne livre
+/// que du SILENCE (« ni son ni vumètre » au rejoin). C'est exactement ce que
+/// provoquait notre teardown COMPLET à chaque sortie de studio. Un DAW, lui,
+/// ouvre l'interface une fois et la garde. On fait pareil : on garde les streams
+/// capture+sortie ouverts et on ne reconstruit que la couche SESSION (encodeur,
+/// SFU, réception) au rejoin.
+///
+/// # Cycle de vie
+/// Présent UNIQUEMENT sur ASIO/Windows quand les streams sont ouverts (session
+/// active OU parkée). Sur macOS/CoreAudio + WASAPI il reste `None` → fermeture à
+/// chaque stop, comportement strictement inchangé. Relâché (ASIOExit propre)
+/// quand : grâce expirée (~30 s hors studio), device changé, ou arrêt agent.
+struct WarmAudio {
+    /// Devices pour lesquels les streams chauds sont ouverts. Un rejoin sur un
+    /// device DIFFÉRENT force fermeture+réouverture (une seule ré-init, pas du
+    /// churn).
+    input_id: Option<String>,
+    output_id: Option<String>,
+    /// Caractéristiques mémorisées à l'ouverture, pour reconstruire l'encodeur +
+    /// renvoyer `CaptureStartedInfo` au rejoin SANS rouvrir le driver.
+    channels_in: u16,
+    native_sr: u32,
+    resolved_input_id: String,
+    in_name: String,
+    input_buf: Option<u32>,
+    /// Receiver STABLE du canal capture→encodeur. Le stream d'entrée (toujours
+    /// ouvert) pousse sur le `Sender` correspondant (conservé dans
+    /// `capture_sample_tx`). Au rejoin : on draine le périmé puis on clone ce
+    /// Receiver pour le nouvel encodeur. Le callback RT de capture est INCHANGÉ.
+    sample_rx: Receiver<Vec<f32>>,
+    /// `Some(t)` = PARKÉ (hors studio, en attente d'un rejoin ou de la fermeture
+    /// de grâce à `t + GRACE`). `None` = session active utilisant ces streams.
+    parked_since: Option<std::time::Instant>,
+}
+
+/// 0.5.4-5 — caractéristiques audio renvoyées par `prepare_audio_for_session`,
+/// que la capture soit ouverte à froid ou réutilisée à chaud. Permet à
+/// `start_capture` de construire l'encodeur + `CaptureStartedInfo` de façon
+/// uniforme, sans savoir si le driver a été (ré)ouvert ou réutilisé.
+struct AcquiredAudio {
+    /// `Receiver` du canal capture→encodeur (clone du canal stable côté chaud,
+    /// ou frais côté froid). Déplacé dans le thread encodeur.
+    sample_rx: Receiver<Vec<f32>>,
+    channels_in: u16,
+    native_sr: u32,
+    input_buf: Option<u32>,
+    in_name: String,
+    resolved_input_id: String,
 }
 
 /// Résout le device de sortie + ouvre le stream playback **sur le thread
@@ -91,6 +186,7 @@ fn open_output_on_com(
     output_id: Option<String>,
     mixer: Arc<Mutex<AudioMixer>>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> OutputOpen {
     crate::audio::com_exec::run(move || {
         use cpal::traits::{DeviceTrait, StreamTrait};
@@ -105,7 +201,7 @@ fn open_output_on_com(
         // Volet B : build (sans play) puis play, sur le thread COM-STA. Sur ce
         // chemin (add_stream / sortie seule, capture déjà chaude) il n'y a pas
         // de cold-start full-duplex à éviter, donc build+play immédiat suffit.
-        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks) {
+        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks, output_frames) {
             Ok((stream, buffer)) => match stream.play() {
                 Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
                 Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
@@ -120,7 +216,7 @@ fn open_output_on_com(
 /// PUIS on démarre la sortie puis l'entrée. Construire `build_output`
 /// (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers en cours
 /// de route → callbacks muets. Primitif partagé par `start_capture` (1er start)
-/// et `restart_audio_streams` (recréation à chaud après mort des callbacks ASIO).
+/// et `rebuild_audio_streams` (recréation à chaud après mort des callbacks ASIO).
 ///
 /// `build_output=false` ⇒ un playback tourne déjà (re-start à chaud) → on ne
 /// reconstruit que l'entrée, la sortie revient en `OutputOpen::Skipped`.
@@ -137,9 +233,63 @@ fn open_duplex_on_com(
     capture_drops: Arc<std::sync::atomic::AtomicU64>,
     capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    input_frames: Arc<std::sync::atomic::AtomicU32>,
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
+    capture_feeding: Arc<std::sync::atomic::AtomicBool>,
+    reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
+
+        // --- Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`) : remplace les 2
+        //     streams cpal par un objet duplex robuste (1 ASIOInit, priming, snap de
+        //     taille, 1 create(in+out), 1 start, tous formats). ---
+        #[cfg(target_os = "windows")]
+        if asio_host_enabled() {
+            let resolved_id = input_id
+                .clone()
+                .or_else(crate::audio::device::default_input_id)
+                .ok_or_else(|| CaptureStartError::InputDeviceNotFound {
+                    requested: input_id.clone(),
+                })?;
+            // Id device = "{idx}:{name}" → nom de driver ASIO.
+            let driver_name = resolved_id
+                .split_once(':')
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| resolved_id.clone());
+            let desired = crate::audio::buffer_policy::target() as i32;
+            let host = crate::audio::asio_host::AsioDuplexHost::open(
+                &driver_name,
+                desired,
+                sample_tx,
+                capture_drops,
+                capture_callbacks,
+                input_frames,
+                capture_feeding,
+                mixer,
+                output_callbacks,
+                output_frames,
+                &reset_signal,
+            )
+            .map_err(CaptureStartError::Other)?;
+            crate::audio::device::set_asio_stream_active(true);
+            let (channels_in, native_sr, buffer_size) =
+                (host.channels_in, host.native_sr, host.buffer_size);
+            tracing::info!(
+                target: "jamodio::pipeline",
+                device = %driver_name, channels_in, native_sr, buffer_size,
+                "AsioDuplexHost ouvert (chemin ASIO single-owner)"
+            );
+            return Ok(BuiltDuplex::Asio(AsioBuilt {
+                host,
+                name: driver_name,
+                resolved_id,
+                channels_in,
+                native_sr,
+                input_buf: Some(buffer_size),
+            }));
+        }
+
         // --- ENTRÉE : résolution + build (SANS play) ---
         let device = match input_id.as_deref() {
             Some(id) => crate::audio::device::get_input_device(id),
@@ -160,6 +310,8 @@ fn open_duplex_on_com(
                 sample_tx,
                 capture_drops,
                 capture_callbacks,
+                input_frames,
+                capture_feeding,
             )
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
 
@@ -177,7 +329,7 @@ fn open_duplex_on_com(
                 }
                 Some(d) => {
                     let out_name = d.name().unwrap_or_default();
-                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks) {
+                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames) {
                         // Démarre la SORTIE d'abord (buffers tous créés).
                         Ok((out_stream, buffer)) => match out_stream.play() {
                             Ok(()) => OutputOpen::Opened {
@@ -201,7 +353,22 @@ fn open_duplex_on_com(
             .play()
             .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
 
-        Ok(BuiltDuplex {
+        // 0.5.4-2 — enregistre le callback `kAsioResetRequest` sur le driver
+        // d'entrée (no-op hors ASIO). Sur ce thread COM-STA, `device` tient
+        // encore le driver vivant. Le garde rendu est conservé tant que le
+        // stream vit (cf. `reset_guard` côté PipelineState).
+        let reset_guard = crate::audio::asio_reset::register(&device, &reset_signal);
+
+        // 0.5.4-17 — driver ASIO désormais TENU par ce stream : interdit toute
+        // ré-énumération (rechargement du driver mono-client = gel des callbacks,
+        // cause racine prouvée). Posé ICI, sur le thread com_exec, donc sérialisé
+        // avant tout `list_inputs`/`list_outputs` ultérieur (pas de course). No-op
+        // sémantique hors ASIO (le flag n'est jamais lu ailleurs que sur ASIO).
+        if crate::audio::host::kind() == crate::audio::host::HostKind::Asio {
+            crate::audio::device::set_asio_stream_active(true);
+        }
+
+        Ok(BuiltDuplex::Cpal {
             input: BuiltInput {
                 stream: SendStream(in_stream),
                 name,
@@ -211,6 +378,7 @@ fn open_duplex_on_com(
                 input_buf,
             },
             output,
+            reset_guard,
         })
     })
 }
@@ -222,6 +390,19 @@ fn close_stream_on_com(stream: Option<SendStream>) {
     if let Some(s) = stream {
         crate::audio::com_exec::run(move || drop(s));
     }
+}
+
+/// Durée d'attente entre le RÉVEIL DE VEILLE PC et la réouverture propre du driver
+/// ASIO. Après une veille, le 1er init peut livrer une entrée FIGÉE (railée/silence)
+/// que seul un init frais — l'interface réveillée ET stabilisée (bias ADC / PLL USB) —
+/// nettoie. Seuil mesuré sur Focusrite Scarlett Solo : 4 s échoue, 5 s OK → défaut 6 s
+/// (marge de robustesse). Réglable via `JAMODIO_RESUME_SETTLE_MS`.
+pub(crate) fn resume_reinit_settle() -> std::time::Duration {
+    let ms = std::env::var("JAMODIO_RESUME_SETTLE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6000);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Erreur typée renvoyée par `start_capture`. Permet à `ws_server` de
@@ -282,12 +463,30 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
+    /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
+    /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
+    #[cfg(target_os = "windows")]
+    asio_host: Option<crate::audio::asio_host::AsioDuplexHost>,
     /// 0.5.3-5 — clone du `Sender` du canal capture→encoder, conservé pour
     /// pouvoir RECRÉER le seul stream CPAL d'entrée (sans toucher à l'encodeur,
     /// au RtpSender, au SRTP ni à la réception) quand le superviseur de liveness
     /// détecte que les callbacks ASIO se sont arrêtés en cours de session
-    /// (`restart_audio_streams`). `None` hors capture.
+    /// (`rebuild_audio_streams`). `None` hors capture.
     capture_sample_tx: Option<Sender<Vec<f32>>>,
+    /// 0.5.4-2 — canal de signalisation `kAsioResetRequest` (cf.
+    /// `audio::asio_reset`). Partagé avec le superviseur de liveness, qui exécute
+    /// le reset différé dès qu'un driver ASIO le demande. No-op hors Windows.
+    reset_signal: crate::audio::asio_reset::ResetSignal,
+    /// 0.5.4-2 — garde RAII de l'enregistrement du callback de reset ASIO sur le
+    /// driver courant. `Some` pendant la capture (entrée ouverte). Droppé AVANT
+    /// les streams à la fermeture/recréation pour retirer proprement le callback
+    /// sans empêcher l'`ASIOExit`.
+    reset_guard: Option<crate::audio::asio_reset::ResetCallbackGuard>,
+    /// 0.5.4-5 — driver ASIO gardé chaud à travers les leave/rejoin (cf.
+    /// `WarmAudio`). `Some` ⇔ streams ASIO ouverts (session active ou parkée).
+    /// `None` hors ASIO/Windows et hors capture → comportement historique.
+    warm: Option<WarmAudio>,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
@@ -432,8 +631,11 @@ pub struct PipelineState {
 pub struct ProducerNetStats {
     /// Dérive d'horloge sender↔nous, en ppm. Cf. [`sync::drift::DriftEstimator`].
     pub drift_ppm: f64,
-    /// Gigue réseau lissée, en ms (RFC 3550). Cf. [`sync::jitter::JitterEstimator`].
+    /// Gigue réseau MOYENNE lissée, en ms (RFC 3550). Cf. [`sync::jitter::JitterEstimator`].
     pub jitter_ms: f64,
+    /// Chantier #1 — gigue de QUEUE (pire-cas récent), en ms. C'est elle qui
+    /// pilote le plancher du jitter buffer ; exposée pour la calibration.
+    pub jitter_tail_ms: f64,
 }
 
 /// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
@@ -489,6 +691,22 @@ pub struct PerfHandles {
     /// pour la sortie : si la sortie ne pull pas (jitter buffer overflow en
     /// cascade), ce compteur reste figé → le watchdog le détecte.
     pub output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    /// 0.5.4-4 — taille RÉELLE du callback CPAL d'ENTRÉE en frames/canal, mesurée
+    /// au 1er callback effectivement livré par le driver. `0` = pas encore mesuré.
+    /// Sert à la télémétrie de latence HONNÊTE : depuis qu'on défère à la taille
+    /// préférée du driver sur ASIO (`BufferSize::Default`), la valeur DEMANDÉE est
+    /// inconnue (`None`) — seule la mesure réelle dit la latence vraie. Corrige
+    /// aussi la sur-estimation Mac historique (on demandait 128, CoreAudio servait
+    /// 64). Re-mesuré à chaque (re)construction de stream.
+    pub input_frames: Arc<std::sync::atomic::AtomicU32>,
+    /// 0.5.4-4 — taille RÉELLE du callback CPAL de SORTIE en frames/canal. Idem.
+    pub output_frames: Arc<std::sync::atomic::AtomicU32>,
+    /// 0.5.4-7 — `true` quand un encodeur consomme le canal capture (session
+    /// active). `false` quand le driver est PARKÉ (gardé chaud, mais pas de
+    /// session) : le callback de capture continue de tourner (liveness) mais
+    /// JETTE ses samples sans compter de drop — sinon le canal sans consommateur
+    /// se remplit et déclenche un faux « agent saturé / drops/s » (cf. forward_samples).
+    pub capture_feeding: Arc<std::sync::atomic::AtomicBool>,
     pub net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     /// Chantier C (v0.4.14) — pic ABSOLU de la sortie post-plugin (pré-soft-clip)
     /// sur la fenêtre courante, en bits f32 (≥ 0 → ordre des bits monotone, OK
@@ -520,6 +738,9 @@ impl PerfHandles {
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            output_frames: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            capture_feeding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             net_stats_by_producer: Arc::new(Mutex::new(HashMap::new())),
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -693,7 +914,12 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            #[cfg(target_os = "windows")]
+            asio_host: None,
             capture_sample_tx: None,
+            reset_signal: crate::audio::asio_reset::ResetSignal::new(),
+            reset_guard: None,
+            warm: None,
             encoder_stop: None,
             recv_stops: HashMap::new(),
             decode_thread: None,
@@ -1030,6 +1256,7 @@ impl PipelineState {
             self.output_device_id.clone(),
             self.mixer.clone(),
             self.perfstats.output_callbacks.clone(),
+            self.perfstats.output_frames.clone(),
         ) {
             OutputOpen::Opened { stream, buffer, name } => {
                 self.playback_stream = Some(stream);
@@ -1066,13 +1293,290 @@ impl PipelineState {
         self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
     }
 
+    /// 0.5.4-5 — host audio actif = ASIO (Windows) ? Gouverne le keep-warm.
+    /// Faux sur macOS/CoreAudio + WASAPI → fermeture à chaque stop (historique).
+    fn host_is_asio() -> bool {
+        crate::audio::host::kind() == crate::audio::host::HostKind::Asio
+    }
+
+    /// Vrai si des streams audio d'entrée sont ouverts — soit les streams cpal, soit
+    /// le host ASIO single-owner. Unifie les tests « capture ouverte » des deux chemins.
+    #[cfg(target_os = "windows")]
+    fn audio_streams_open(&self) -> bool {
+        self.capture_stream.is_some() || self.asio_host.is_some()
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn audio_streams_open(&self) -> bool {
+        self.capture_stream.is_some()
+    }
+
+    /// Vrai si le host ASIO single-owner est actif (il fournit déjà la sortie, donc
+    /// on ne doit PAS ouvrir un `cpal::Stream` de sortie séparé — 2ᵉ instance Asio).
+    #[cfg(target_os = "windows")]
+    fn has_asio_host(&self) -> bool {
+        self.asio_host.is_some()
+    }
+    #[cfg(not(target_os = "windows"))]
+    fn has_asio_host(&self) -> bool {
+        false
+    }
+
+    /// 0.5.4-5 — démonte la couche SESSION (encodeur, self-monitor, réception,
+    /// décodage) en GARDANT les streams audio + le canal capture. Utilisé au park
+    /// (sortie de studio sur ASIO) et avant un rejoin qui réutilise le driver
+    /// chaud. NE touche NI au driver (`capture_stream`/`playback_stream`), NI au
+    /// `reset_guard`, NI à `warm`, NI à `capture_sample_tx`.
+    fn teardown_session(&mut self) {
+        // 0.5.4-7 — plus d'encodeur consommateur : le callback du driver chaud
+        // doit JETER ses samples (anti faux « agent saturé / drops/s » pendant le
+        // park). Doit précéder l'arrêt de l'encodeur.
+        self.perfstats
+            .capture_feeding
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(stop) = self.encoder_stop.take() {
+            let _ = stop.send(());
+        }
+        // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
+        self.mixer.lock().remove_local_stream();
+        // Coupe les réceptions pair + le thread de décodage RT partagé.
+        let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
+        for id in ids {
+            self.remove_stream(&id);
+        }
+        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
+            let _ = tx.send(DecodeMsg::Shutdown);
+            drop(tx);
+            let _ = join.join();
+        }
+    }
+
+    /// 0.5.4-5 — ferme COMPLÈTEMENT le driver audio : streams capture+sortie (sur
+    /// le thread COM-STA → ASIOExit propre), garde de reset, canal capture, état
+    /// `warm`, buffers et tailles mesurées. Relâche l'interface (dispo pour un
+    /// DAW). NE touche PAS à la session (à appeler après `teardown_session`).
+    fn close_audio_driver(&mut self) {
+        // Retire le callback de reset TANT QUE le driver est encore tenu par les
+        // streams (Weak::upgrade OK → retrait propre du registre global).
+        self.reset_guard = None;
+        self.perfstats.input_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
+        close_stream_on_com(self.capture_stream.take());
+        close_stream_on_com(self.playback_stream.take());
+        #[cfg(target_os = "windows")]
+        close_host_on_com(self.asio_host.take());
+        // 0.5.4-17 — driver relâché (ASIOExit fait par le drop ci-dessus, sur
+        // com_exec) : la ré-énumération redevient sûre. Posé APRÈS la fermeture
+        // effective (une énumération sérialisée d'ici là aurait servi le cache,
+        // ce qui reste sûr). No-op hors ASIO (le flag était déjà false).
+        crate::audio::device::set_asio_stream_active(false);
+        self.capture_sample_tx = None;
+        self.warm = None;
+        self.output_buffer_samples = None;
+        self.input_buffer_samples = None;
+    }
+
+    /// 0.5.4-5 — PARK : sortie de studio sur ASIO en gardant le driver CHAUD.
+    /// Démonte la session mais garde les streams ouverts + marque l'instant de
+    /// park (fermeture de grâce ~30 s plus tard si pas de rejoin). Élimine le
+    /// churn ASIOExit/ASIOInit qui dégradait le Focusrite (gel / silence).
+    fn park(&mut self) {
+        if self.recorder.is_some() {
+            tracing::warn!(target: "jamodio::pipeline", "park during recording — files discarded");
+            let _ = self.stop_recording();
+        }
+        self.teardown_session();
+        if let Some(w) = self.warm.as_mut() {
+            w.parked_since = Some(std::time::Instant::now());
+        }
+        self.input_buffer_samples = None;
+        self.state = AgentState::Idle;
+        tracing::info!(
+            target: "jamodio::pipeline",
+            "studio quitté — driver ASIO gardé chaud (rejoin instantané, relâche dans ~30 s)"
+        );
+    }
+
+    /// 0.5.4-5 — sortie de studio. Point d'entrée unique appelé par ws_server
+    /// (Stop + WS disconnect). Sur ASIO avec un driver CHAUD présent : on le
+    /// GARDE (park si on capture ; **no-op si déjà parké**). Sinon `stop_all`
+    /// complet (macOS/WASAPI, ou rien à préserver).
+    ///
+    /// 0.5.4-6 — fix double-leave : une sortie de studio déclenche souvent DEUX
+    /// appels (le `Stop` du browser PUIS la fermeture de sa WS). Avant, le 2e
+    /// (état déjà Idle après park) tombait dans `stop_all` et **refermait le
+    /// driver chaud** → la plupart des rejoins repassaient en cold (churn non
+    /// supprimé). Désormais, tant qu'un driver chaud existe, un 2e leave est
+    /// inerte : c'est la **grâce** (~30 s) qui relâche, pas un leave redondant.
+    pub fn leave_session(&mut self) {
+        if Self::host_is_asio() && self.warm.is_some() {
+            // Driver chaud présent : on le préserve. Park seulement si une
+            // capture tourne encore ; sinon (déjà parké) on ne fait RIEN.
+            if matches!(self.state, AgentState::Capturing) {
+                self.park();
+            }
+        } else {
+            self.stop_all();
+        }
+    }
+
+    /// 0.5.4-5 — relâche le driver chaud si la grâce est expirée (parké depuis ≥
+    /// `grace`). Appelé périodiquement par le superviseur de liveness. Renvoie
+    /// `true` si une fermeture a eu lieu.
+    pub fn close_warm_if_grace_expired(&mut self, grace: std::time::Duration) -> bool {
+        let expired = self
+            .warm
+            .as_ref()
+            .and_then(|w| w.parked_since)
+            .is_some_and(|t| t.elapsed() >= grace);
+        if expired {
+            tracing::info!(
+                target: "jamodio::pipeline",
+                grace_s = grace.as_secs(),
+                "grâce expirée — driver ASIO relâché (interface libérée pour un autre logiciel)"
+            );
+            self.close_audio_driver();
+        }
+        expired
+    }
+
+    /// 0.5.4-5 — acquiert les streams audio pour une (nouvelle) session :
+    /// RÉUTILISE le driver ASIO chaud (rejoin sans ré-init = anti-churn) si host
+    /// ASIO + streams ouverts + MÊMES devices ; sinon ferme tout et ouvre à froid
+    /// (sur ASIO, via le host single-owner qui prime l'interface à l'ouverture).
+    /// Encapsule tout le teardown de la session/driver précédent·e. Renvoie les
+    /// caractéristiques du device (pour l'encodeur + `CaptureStartedInfo`) et le
+    /// `Receiver` capture.
+    fn prepare_audio_for_session(&mut self) -> Result<AcquiredAudio, CaptureStartError> {
+        let input_id = self.input_device_id.clone();
+        let output_id = self.output_device_id.clone();
+
+        let reuse = Self::host_is_asio()
+            && self.audio_streams_open()
+            && self
+                .warm
+                .as_ref()
+                .is_some_and(|w| w.input_id == input_id && w.output_id == output_id);
+
+        if reuse {
+            // Rejoin sur driver chaud : on démonte SEULEMENT la session, on GARDE
+            // les streams + le canal. Zéro ASIOExit/ASIOInit = zéro churn.
+            self.teardown_session();
+            let w = self.warm.as_mut().expect("reuse ⇒ warm présent");
+            w.parked_since = None; // session active → annule la fermeture de grâce
+            // Draine les buffers périmés accumulés pendant le park (le stream a
+            // continué à pousser sans consommateur → vieux audio dans le canal).
+            while w.sample_rx.try_recv().is_ok() {}
+            self.input_buffer_samples = w.input_buf;
+            tracing::info!(
+                target: "jamodio::pipeline",
+                device = %w.in_name,
+                "driver ASIO réutilisé à chaud (rejoin sans ré-init)"
+            );
+            return Ok(AcquiredAudio {
+                sample_rx: w.sample_rx.clone(),
+                channels_in: w.channels_in,
+                native_sr: w.native_sr,
+                input_buf: w.input_buf,
+                in_name: w.in_name.clone(),
+                resolved_input_id: w.resolved_input_id.clone(),
+            });
+        }
+
+        // Pas de réutilisation (à froid, device changé, ou hors ASIO) :
+        // fermeture COMPLÈTE de la session + du driver, puis ouverture.
+        self.teardown_session();
+        self.close_audio_driver();
+
+        let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
+        self.capture_sample_tx = Some(sample_tx.clone());
+
+        // playback_stream vient d'être fermé → on (re)construit la sortie aussi.
+        let built = open_duplex_on_com(
+            input_id.clone(),
+            output_id.clone(),
+            true,
+            self.mixer.clone(),
+            sample_tx,
+            self.perfstats.capture_drops.clone(),
+            self.perfstats.capture_callbacks.clone(),
+            self.perfstats.output_callbacks.clone(),
+            self.perfstats.input_frames.clone(),
+            self.perfstats.output_frames.clone(),
+            self.perfstats.capture_feeding.clone(),
+            self.reset_signal.clone(),
+        )?;
+        let (channels_in, native_sr, input_buf, in_name, resolved_input_id) = match built {
+            BuiltDuplex::Cpal { input, output, reset_guard } => {
+                self.reset_guard = Some(reset_guard);
+                tracing::info!(target: "jamodio::pipeline", device = %input.name, "input device opened");
+                self.input_buffer_samples = input.input_buf;
+                let meta = (input.channels, input.native_sr, input.input_buf, input.name, input.resolved_id);
+                self.capture_stream = Some(input.stream);
+                match output {
+                    OutputOpen::Opened { stream, buffer, name } => {
+                        tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                        self.playback_stream = Some(stream);
+                        self.output_buffer_samples = buffer;
+                    }
+                    OutputOpen::BuildFailed(e) => tracing::warn!(
+                        target: "jamodio::pipeline",
+                        error = %e,
+                        "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+                    ),
+                    OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+                    OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
+                }
+                meta
+            }
+            #[cfg(target_os = "windows")]
+            BuiltDuplex::Asio(a) => {
+                // Host single-owner : entrée + sortie dans UN seul objet duplex. Pas de
+                // `reset_guard` (le host enregistre lui-même son callback de message).
+                self.reset_guard = None;
+                tracing::info!(target: "jamodio::pipeline", device = %a.name, "AsioDuplexHost — entrée + sortie ouvertes (single-owner)");
+                self.input_buffer_samples = a.input_buf;
+                self.output_buffer_samples = a.input_buf;
+                self.asio_host = Some(a.host);
+                (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id)
+            }
+        };
+
+        // Sur ASIO : mémorise l'état chaud pour réutiliser le driver aux rejoin.
+        // Hors ASIO : `warm` reste `None` → fermeture à chaque stop (historique).
+        if Self::host_is_asio() {
+            self.warm = Some(WarmAudio {
+                input_id,
+                output_id,
+                channels_in,
+                native_sr,
+                resolved_input_id: resolved_input_id.clone(),
+                in_name: in_name.clone(),
+                input_buf,
+                sample_rx: sample_rx.clone(),
+                parked_since: None,
+            });
+        }
+
+        Ok(AcquiredAudio {
+            sample_rx,
+            channels_in,
+            native_sr,
+            input_buf,
+            in_name,
+            resolved_input_id,
+        })
+    }
+
     /// Start the capture pipeline: CPAL → accumulator → Opus → RTP → UDP.
     /// `channel_index` : si `Some(i)`, extrait le canal physique i et duplique
     /// L=R=canal[i] avant encodage Opus (mode mono propre, centré à la lecture).
-    /// Si `None`, capture stéréo standard (canaux 1+2 du device).
+    /// `stereo_start` : si `Some(N)` (et channel_index None), capture la PAIRE
+    /// stéréo L=ch[N], R=ch[N+1] (synthé/clavier stéréo sur 3+4, 5+6, …).
+    /// Si les deux sont `None`, capture stéréo standard (canaux 1+2 du device).
     /// `sfu_srtp` : clés SRTP du SFU (chiffrement RTP entrant côté agent).
     /// Returns `(local_port, agent_srtp)` — le browser relaie `agent_srtp`
     /// au SFU via `connect-plain-transport`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_capture(
         &mut self,
         ssrc: u32,
@@ -1080,18 +1584,24 @@ impl PipelineState {
         sfu_port: u16,
         payload_type: u8,
         channel_index: Option<u8>,
+        stereo_start: Option<u8>,
         sfu_srtp: SrtpParameters,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
-        // 1. STOP toute capture en cours D'ABORD. ASIO est mono-client :
-        // impossible d'ouvrir un second stream tant que l'ancien tient le
-        // driver ; et la fermeture doit se faire sur le thread COM-STA (cf.
-        // stop_capture → close_stream_on_com). Sur macOS, sans effet de bord.
-        // (Le build du nouveau stream, plus bas, EST la validation du device :
-        // on n'alloue le socket UDP qu'ensuite mais un échec retombe proprement
-        // via `?`, RAII relâche tout.)
-        self.stop_capture();
-
-        let input_id = self.input_device_id.clone();
+        // 1. ACQUISITION AUDIO — réutilise le driver ASIO gardé CHAUD (rejoin sans
+        //    ré-init = anti-churn Focusrite), ou ouvre à froid. Encapsule TOUT le
+        //    teardown de la session/driver précédent·e + ouvre/réutilise les
+        //    streams (validation du device incluse : `?` ⇒ échec propre, RAII
+        //    relâche tout ; le socket UDP n'est alloué qu'après). ASIO mono-client
+        //    respecté (le chaud N'EST réutilisé que pour le MÊME device, sinon
+        //    fermé d'abord). Cf. `prepare_audio_for_session`.
+        let AcquiredAudio {
+            sample_rx,
+            channels_in,
+            native_sr,
+            input_buf,
+            in_name,
+            resolved_input_id,
+        } = self.prepare_audio_for_session()?;
 
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -1110,12 +1620,9 @@ impl PipelineState {
         // Pas de punch ici : le 1er paquet audio chiffré (sous 10 ms) sert de punch
         // pour comedia. Un punch en clair serait rejeté par le SFU (enableSrtp:true).
 
-        // 4. Channels
-        let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
-        // 0.5.3-5 — on conserve un clone du Sender pour pouvoir RECRÉER le stream
-        // d'entrée (sans relancer l'encodeur) si les callbacks ASIO meurent en
-        // cours de session (cf. `restart_audio_streams`).
-        self.capture_sample_tx = Some(sample_tx.clone());
+        // 4. Couche session : encodeur RT. Le canal capture (`sample_rx`) et le
+        //    `capture_sample_tx` sont gérés par `prepare_audio_for_session`
+        //    (stables tant que le driver chaud vit ; frais à froid).
         let input_rms = self.input_rms.clone();
         // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
         // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
@@ -1125,69 +1632,43 @@ impl PipelineState {
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
-        // 5. RÉSOLUTION + OUVERTURE DU STREAM CPAL, atomiquement sur le thread
-        //    COM-STA (cf. `com_exec`). Le `cpal::Device` est !Send et ne doit
-        //    pas quitter ce thread : on résout l'id, on ouvre le stream, et on
-        //    ne renvoie que des données `Send` (+ le handle `SendStream`).
-        //    Résolution STRICTE : l'id du browser DOIT pointer sur un device
-        //    courant (pas de fallback default, sauf AUCUN id sélectionné =
-        //    premier lancement). Une erreur de build (driver, sample-rate) est
-        //    technique pure, pas une erreur de sélection user.
-        //
-        //    CPAL est ouvert dans TOUS les modes (AUDIO et MIDI) : en MIDI ses
-        //    samples sont écrasés par 0 côté `process_stage` (le plugin
-        //    instrument génère l'audio depuis les events MIDI) → aucun swap de
-        //    source pendant les bascules MIDI↔AUDIO, donc aucun craquement.
-        //
-        //    Sprint S1 — `capture_drops` partagé avec le callback CPAL :
-        //    incrémenté quand `sample_tx` est plein, lu+reset par ws_server au
-        //    flush 1 Hz pour publier `dropsPerSec` dans PerfStats.
-        //
-        //    Volet B (0.5.3-4) — on construit l'ENTRÉE **et** la SORTIE puis on
-        //    les démarre (sortie d'abord, entrée ensuite) dans CE seul passage
-        //    COM-STA. Sur un device ASIO full-duplex, appeler `build_output`
-        //    (ASIOCreateBuffers) APRÈS un `play()` d'entrée recréait les buffers
-        //    en cours → callbacks muets (cold-start raté). En créant tous les
-        //    buffers avant de démarrer, on évite ce recreate. La sortie n'est
-        //    (re)construite que si aucun playback ne tourne déjà (cold path).
-        let need_output = self.playback_stream.is_none();
-        let built = open_duplex_on_com(
-            input_id,
-            self.output_device_id.clone(),
-            need_output,
-            self.mixer.clone(),
-            sample_tx,
-            self.perfstats.capture_drops.clone(),
-            self.perfstats.capture_callbacks.clone(),
-            self.perfstats.output_callbacks.clone(),
-        )?;
-        let BuiltDuplex { input: built_input, output: built_output } = built;
-        let in_name = built_input.name;
-        let resolved_input_id = built_input.resolved_id;
-        let channels_in = built_input.channels;
-        let native_sr = built_input.native_sr;
-        let input_buf = built_input.input_buf;
-        tracing::info!(target: "jamodio::pipeline", device = %in_name, "input device opened");
-        self.capture_stream = Some(built_input.stream);
+        // 5. (Streams CPAL ouverts/réutilisés en 1. via prepare_audio_for_session,
+        //    sur le thread COM-STA. Volet B cold-start, garde de reset ASIO et
+        //    mémorisation du chaud y sont gérés.)
         tracing::info!(
             target: "jamodio::pipeline",
-            channels_in, native_sr, ?channel_index,
+            channels_in, native_sr, ?channel_index, ?stereo_start,
             needs_resample = native_sr != 48000,
             "input config"
         );
 
-        // Valider que le canal mono demandé existe bien sur le device
-        let effective_channel = channel_index.and_then(|idx| {
-            if (idx as u16) < channels_in { Some(idx) } else {
+        // Sélection effective, validée contre channels_in. Mono prioritaire
+        // (mutuellement exclusif côté browser), puis paire stéréo, sinon défaut.
+        let effective_sel = if let Some(idx) = channel_index {
+            if (idx as u16) < channels_in {
+                ChannelSel::Mono(idx)
+            } else {
                 tracing::warn!(
                     target: "jamodio::pipeline",
-                    requested_channel = idx,
-                    available_channels = channels_in,
+                    requested_channel = idx, available_channels = channels_in,
                     "channel_index hors plage — fallback stéréo"
                 );
-                None
+                ChannelSel::Default
             }
-        });
+        } else if let Some(start) = stereo_start {
+            if (start as u16 + 1) < channels_in {
+                ChannelSel::StereoPair(start)
+            } else {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested_pair_start = start, available_channels = channels_in,
+                    "stereo_start hors plage (besoin de N et N+1) — fallback stéréo"
+                );
+                ChannelSel::Default
+            }
+        } else {
+            ChannelSel::Default
+        };
 
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         //
@@ -1231,7 +1712,7 @@ impl PipelineState {
             .spawn(move || {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
-                    channels_in, native_sr, effective_channel, mixer_for_encoder, input_cut_for_encoder,
+                    channels_in, native_sr, effective_sel, mixer_for_encoder, input_cut_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
@@ -1244,31 +1725,15 @@ impl PipelineState {
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
 
-        // 7. (Émission RT — cf. section 4 : le thread d'encode chiffre + envoie
-        //    directement, il n'y a plus de tâche UDP tokio.)
+        // 0.5.4-7 — l'encodeur consomme désormais le canal capture : le callback
+        // peut pousser (et compter de vrais drops). Mis APRÈS le spawn pour que le
+        // park (qui repasse à false) et ce point encadrent exactement la session.
+        self.perfstats
+            .capture_feeding
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // 8. Stream de sortie (playback) — déjà CONSTRUIT + DÉMARRÉ dans le
-        //    passage COM-STA ci-dessus (Volet B : build entrée+sortie avant de
-        //    démarrer, sortie d'abord). Ici on ne fait que router le résultat :
-        //    - Opened → on conserve le handle (RAII) + le buffer télémétrie ;
-        //    - NotFound → DÉJÀ remonté en erreur depuis la closure (fatal) ;
-        //    - BuildFailed → NON FATAL : la capture (entrée) prime, le playback/
-        //      self-monitor sera indisponible jusqu'à nouvelle sélection ;
-        //    - Skipped → un playback tournait déjà, conservé tel quel.
-        match built_output {
-            OutputOpen::Opened { stream, buffer, name } => {
-                tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
-                self.playback_stream = Some(stream);
-                self.output_buffer_samples = buffer;
-            }
-            OutputOpen::BuildFailed(e) => tracing::warn!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "ouverture du stream de sortie échouée — playback désactivé (capture active)"
-            ),
-            OutputOpen::Skipped => {}
-            OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
-        }
+        // 7. (Émission RT — le thread d'encode chiffre + envoie directement.
+        //    Stream de sortie ouvert/réutilisé en 1. via prepare_audio_for_session.)
 
         self.state = AgentState::Capturing;
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
@@ -1297,74 +1762,160 @@ impl PipelineState {
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
     /// Lu par le superviseur de liveness (`audio_liveness_supervisor`).
     pub fn has_active_capture_stream(&self) -> bool {
-        self.capture_stream.is_some()
+        self.audio_streams_open()
     }
 
-    /// 0.5.3-5 — RECRÉE uniquement les streams CPAL (entrée + sortie) sans toucher
-    /// au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception, mixer
-    /// avec ses streams pairs + self-monitor). Appelé par le superviseur de
-    /// liveness quand les callbacks ASIO se sont arrêtés EN COURS de session
-    /// (driver Focusrite qui émet un `kAsioResetRequest` que CPAL n'honore pas →
-    /// le driver halte ses callbacks silencieusement ; recréer les streams = la
-    /// réinitialisation ASIO que la spec impose, et que CPAL omet).
+    /// 0.5.4-2 — clone du canal de signalisation `kAsioResetRequest`, pour que le
+    /// superviseur de liveness sache (immédiatement) quand un driver ASIO demande
+    /// un reset. No-op sémantique hors Windows (jamais signalé).
+    pub fn reset_signal(&self) -> crate::audio::asio_reset::ResetSignal {
+        self.reset_signal.clone()
+    }
+
+    /// 0.5.4-18 — réinitialise le JitterBuffer de découplage du self-monitor après
+    /// une discontinuité d'horloge de capture (re-init long-settle du driver ASIO :
+    /// cold-start ou réveil de veille PC, cf. `audio_liveness_supervisor`). Le volume
+    /// est préservé ; seul le tampon de gigue repart propre — sinon son drift, mal
+    /// ré-estimé à cheval sur le trou de ~6 s, produit une distorsion persistante
+    /// dans le casque.
+    pub fn reset_self_monitor(&self) {
+        self.mixer.lock().reset_local_stream();
+    }
+
+    /// 0.5.4-18 — coupe (`false`) ou rétablit (`true`) l'alimentation de l'encodeur
+    /// par le callback de capture (cf. `PerfStats::capture_feeding` : quand `false`,
+    /// le callback JETTE ses samples sans les router ni compter de drop). Utilisé
+    /// par le re-init long-settle pour ne PAS router le préfixe railé du 1er open à
+    /// froid (sinon larsen/tonalité à l'entrée studio le temps du réveil interface).
     ///
-    /// La nouvelle entrée se re-branche sur le MÊME canal `sample_tx` → l'encodeur
-    /// continue sans rien savoir. Aucun re-handshake SFU (le socket/port/SRTP TX
-    /// sont préservés) → pas de coupure réseau, juste un trou audio de ~100-300 ms.
+    /// En COUPANT (`false`), remet aussi le VU d'entrée (`input_rms`) à 0 : pendant
+    /// le settle les streams sont fermés → l'encodeur ne reçoit aucun bloc → il ne
+    /// RECALCULE pas `input_rms`, qui resterait donc épinglé sur le pic railé du
+    /// 1er open (VU « à fond » ~6 s). Le remettre à 0 ici garantit un VU muet
+    /// pendant tout le settle (l'encodeur ne le repassera au vif qu'à la réouverture).
+    pub fn set_capture_feeding(&self, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.perfstats.capture_feeding.store(on, Relaxed);
+        if !on {
+            self.input_rms.store(0, Relaxed); // 0.0_f32 → bits 0
+        }
+    }
+
+    /// 0.5.4-2 — PHASE 1 du reset ASIO à chaud : ferme les deux streams CPAL sur
+    /// le thread COM-STA. Le drop du dernier `Arc<Driver>` déclenche `ASIOExit` +
+    /// `removeCurrentDriver` — la dé-initialisation COMPLÈTE que la spec ASIO
+    /// impose sur `kAsioResetRequest`, et que `restart` blind ne garantissait que
+    /// par effet de bord. Séparée de la reconstruction pour permettre au
+    /// superviseur de LIBÉRER le verrou pipeline pendant le délai de settle (le
+    /// driver USB a besoin de quelques centaines de ms pour relâcher après
+    /// `ASIOExit`) et entre deux essais.
     ///
-    /// No-op (Ok) hors état `Capturing`. Erreur claire si la recréation échoue
-    /// (le superviseur la borne et remonte au browser — jamais de silence).
-    pub fn restart_audio_streams(&mut self) -> Result<(), String> {
-        if !matches!(self.state, AgentState::Capturing) || self.capture_stream.is_none() {
+    /// Le garde du callback de reset est retiré AVANT la fermeture des streams :
+    /// le driver est alors encore vivant (`Weak::upgrade` réussit) → retrait
+    /// propre du callback du registre global, sans tenir de référence forte qui
+    /// bloquerait l'`ASIOExit`.
+    pub fn close_audio_streams_for_reset(&mut self) {
+        // Retire le callback de reset pendant que le driver est encore tenu par
+        // les streams (upgrade Weak OK).
+        self.reset_guard = None;
+        // Ferme les streams CPAL sur l'apartment créateur (ASIO stop/dispose/exit
+        // sur le thread COM-STA). ASIO étant mono-client, on ferme TOUT avant de
+        // reconstruire.
+        close_stream_on_com(self.capture_stream.take());
+        close_stream_on_com(self.playback_stream.take());
+        #[cfg(target_os = "windows")]
+        close_host_on_com(self.asio_host.take());
+        self.output_buffer_samples = None;
+        self.input_buffer_samples = None;
+    }
+
+    /// 0.5.4-2 — PHASE 2 du reset ASIO à chaud : reconstruit entrée + sortie sans
+    /// toucher au reste de la pipeline (encodeur, RtpSender, SRTP, SFU, réception,
+    /// mixer avec ses streams pairs + self-monitor). La nouvelle entrée se
+    /// re-branche sur le MÊME canal `sample_tx` → l'encodeur continue sans rien
+    /// savoir ; aucun re-handshake SFU → pas de coupure réseau, juste un trou
+    /// audio le temps du reset.
+    ///
+    /// Renvoie l'erreur TYPÉE (`CaptureStartError`, qui porte le texte/code ASIO
+    /// exact remonté par CPAL) afin que le superviseur puisse logger précisément
+    /// et décider d'un nouvel essai. No-op (`Ok`) hors état `Capturing`.
+    ///
+    /// PRÉ-REQUIS : `close_audio_streams_for_reset()` a été appelé (streams
+    /// fermés, `ASIOExit` effectué) — sinon ASIO mono-client refuserait l'ouverture.
+    pub fn rebuild_audio_streams(&mut self) -> Result<(), CaptureStartError> {
+        if !matches!(self.state, AgentState::Capturing) {
             return Ok(());
         }
         let Some(sample_tx) = self.capture_sample_tx.clone() else {
-            return Err("restart_audio_streams: pas de canal capture (incohérent)".into());
+            return Err(CaptureStartError::Other(
+                "rebuild_audio_streams: pas de canal capture (incohérent)".into(),
+            ));
         };
 
-        // Ferme les deux streams CPAL sur le thread COM-STA (ASIO stop/dispose sur
-        // l'apartment créateur) AVANT de reconstruire (ASIO mono-client).
-        close_stream_on_com(self.capture_stream.take());
-        close_stream_on_com(self.playback_stream.take());
-        self.output_buffer_samples = None;
-
-        // Reconstruit entrée + sortie (les deux, le playback ayant été fermé) via
-        // le primitif partagé : build des deux puis play sortie→entrée.
         let built = open_duplex_on_com(
             self.input_device_id.clone(),
             self.output_device_id.clone(),
-            true, // playback fermé ci-dessus → on le reconstruit
+            true, // playback fermé en phase 1 → on le reconstruit
             self.mixer.clone(),
             sample_tx,
             self.perfstats.capture_drops.clone(),
             self.perfstats.capture_callbacks.clone(),
             self.perfstats.output_callbacks.clone(),
-        )
-        .map_err(|e| format!("recréation des streams audio: {}", e))?;
+            self.perfstats.input_frames.clone(),
+            self.perfstats.output_frames.clone(),
+            self.perfstats.capture_feeding.clone(),
+            self.reset_signal.clone(),
+        )?;
 
-        let BuiltDuplex { input, output } = built;
-        self.input_buffer_samples = input.input_buf;
-        self.capture_stream = Some(input.stream);
-        match output {
-            OutputOpen::Opened { stream, buffer, name } => {
-                self.playback_stream = Some(stream);
-                self.output_buffer_samples = buffer;
+        match built {
+            BuiltDuplex::Cpal { input, output, reset_guard } => {
+                // Le nouveau driver a son propre callback de reset enregistré : on
+                // remplace le garde (l'ancien a déjà été droppé en phase 1).
+                self.reset_guard = Some(reset_guard);
+                self.input_buffer_samples = input.input_buf;
+                self.capture_stream = Some(input.stream);
+                match output {
+                    OutputOpen::Opened { stream, buffer, name } => {
+                        self.playback_stream = Some(stream);
+                        self.output_buffer_samples = buffer;
+                        tracing::info!(
+                            target: "jamodio::pipeline",
+                            device = %name,
+                            "streams audio recréés (reset ASIO)"
+                        );
+                    }
+                    // Sortie non rétablie : l'entrée prime (la capture repart), le
+                    // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
+                    OutputOpen::BuildFailed(e) => tracing::warn!(
+                        target: "jamodio::pipeline",
+                        error = %e,
+                        "recréation sortie échouée — playback désactivé (capture rétablie)"
+                    ),
+                    OutputOpen::NotFound => {
+                        return Err(CaptureStartError::OutputDeviceNotFound {
+                            requested: self.output_device_id.clone(),
+                        })
+                    }
+                    OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
+                }
+            }
+            #[cfg(target_os = "windows")]
+            BuiltDuplex::Asio(a) => {
+                self.reset_guard = None;
+                self.input_buffer_samples = a.input_buf;
+                self.output_buffer_samples = a.input_buf;
+                self.asio_host = Some(a.host);
                 tracing::info!(
                     target: "jamodio::pipeline",
-                    device = %name,
-                    "streams audio recréés (recovery liveness ASIO)"
+                    device = %a.name,
+                    "AsioDuplexHost recréé (reset single-owner)"
                 );
             }
-            // Sortie non rétablie : l'entrée prime (la capture repart), le
-            // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
-            OutputOpen::BuildFailed(e) => tracing::warn!(
-                target: "jamodio::pipeline",
-                error = %e,
-                "recréation sortie échouée — playback désactivé (capture rétablie)"
-            ),
-            OutputOpen::NotFound => return Err("output device introuvable à la recréation".into()),
-            OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
         }
+        // P1 — repart propre : vide les jitter buffers du périmé accumulé pendant
+        // le gel de sortie (le décodage a continué de pousser jusqu'à 300 ms) et
+        // re-prime à la cible de démarrage. Évite de rejouer le retard accumulé.
+        self.mixer.lock().reset_streams_for_recovery();
         Ok(())
     }
 
@@ -1437,12 +1988,14 @@ impl PipelineState {
 
         // Start playback if not running. Résolution + ouverture sur le thread
         // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
-        // un id explicite échoue.
-        if self.playback_stream.is_none() {
+        // un id explicite échoue. Sur le host ASIO single-owner, la sortie est
+        // DÉJÀ fournie par le host → ne pas ouvrir un 2ᵉ stream (2ᵉ instance Asio).
+        if self.playback_stream.is_none() && !self.has_asio_host() {
             match open_output_on_com(
                 self.output_device_id.clone(),
                 self.mixer.clone(),
                 self.perfstats.output_callbacks.clone(),
+                self.perfstats.output_frames.clone(),
             ) {
                 OutputOpen::Opened { stream, buffer, .. } => {
                     self.playback_stream = Some(stream);
@@ -1472,57 +2025,33 @@ impl PipelineState {
         }
     }
 
-    fn stop_capture(&mut self) {
-        // Drop du stream CPAL sur le thread COM-STA (ASIO : stop/Release doivent
-        // tourner sur l'apartment qui a créé le driver). macOS : inline.
-        close_stream_on_com(self.capture_stream.take());
-        // L'encodeur va s'arrêter → le canal capture n'a plus de consommateur.
-        self.capture_sample_tx = None;
-        if let Some(stop) = self.encoder_stop.take() {
-            let _ = stop.send(());
-        }
-        // Retire le stream self-monitor (créé dans start_capture).
-        // Sans ça, le stream subsisterait dans le mixer avec son volume courant
-        // et continuerait à mixer son ring buffer résiduel jusqu'à underrun.
-        self.mixer.lock().remove_local_stream();
-        // Le buffer input n'a plus de sens hors capture (capture_stream droppé).
-        // L'output reste actif (peut continuer à jouer les peers reçus), on
-        // garde donc `output_buffer_samples` tel quel jusqu'au `stop_all`.
-        self.input_buffer_samples = None;
-    }
-
+    /// Arrêt COMPLET : démonte la session ET ferme le driver audio (ASIOExit,
+    /// relâche l'interface). Utilisé pour un vrai arrêt — macOS/WASAPI à chaque
+    /// sortie de studio (comportement historique), device introuvable, ou
+    /// fermeture forcée. Sur ASIO, la sortie de studio passe plutôt par
+    /// `leave_session` → `park` (driver gardé chaud) ; `stop_all` n'y intervient
+    /// que pour la fermeture définitive.
+    ///
+    /// = `teardown_session` (encodeur, self-monitor, réception, décodage) +
+    /// `close_audio_driver` (streams + reset + canal + `warm` + buffers). L'ordre
+    /// (session AVANT driver) garantit que le retrait du callback de reset se fait
+    /// pendant que le driver est encore tenu par les streams.
     pub fn stop_all(&mut self) {
-        // Évite le bruit en idle : si rien ne tourne, on log en debug pour
-        // pas spammer info à chaque WS disconnect du browser (le probe agent
-        // ouvre/ferme une WS toutes les 30 s, ce qui appelait stop_all).
-        let was_active = self.capture_stream.is_some()
+        // Évite le bruit en idle : si rien ne tourne, on log en debug pour ne pas
+        // spammer info à chaque WS disconnect du browser (le probe agent ouvre/
+        // ferme une WS toutes les 30 s).
+        let was_active = self.audio_streams_open()
             || self.playback_stream.is_some()
             || !self.recv_stops.is_empty()
             || self.recorder.is_some();
-        // REC-3 : si un recording était en cours, on l'arrête proprement
-        // (les fichiers sont produits mais perdus — l'utilisateur a quitté).
-        // Évite de laisser un thread record orphelin tenir des ressources.
+        // REC-3 : si un recording était en cours, on l'arrête proprement (fichiers
+        // produits mais perdus — l'utilisateur a quitté). Pas de thread orphelin.
         if self.recorder.is_some() {
             tracing::warn!(target: "jamodio::pipeline", "stop_all during recording — files discarded");
             let _ = self.stop_recording();
         }
-        self.stop_capture();
-        let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
-        for id in ids {
-            self.remove_stream(&id);
-        }
-        // 0.5.3-2 — arrête le thread de décodage RT partagé. Shutdown (il nettoie
-        // les streams mixer + net_stats restants) puis join (sortie immédiate sur
-        // le message). On drop le Sender pour fermer le MPSC côté principal ; les
-        // io tasks restantes (oneshots déjà envoyés ci-dessus) verront Err à leur
-        // prochain send et sortiront.
-        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
-            let _ = tx.send(DecodeMsg::Shutdown);
-            drop(tx);
-            let _ = join.join();
-        }
-        close_stream_on_com(self.playback_stream.take()); // drop sur le thread COM-STA (ASIO)
-        self.output_buffer_samples = None;
+        self.teardown_session();
+        self.close_audio_driver();
         self.state = AgentState::Idle;
         if was_active {
             tracing::info!(target: "jamodio::pipeline", "pipeline stopped");
@@ -1534,23 +2063,48 @@ impl PipelineState {
 
 // ─── Encoder thread (std::thread, real-time priority) ──────────────
 
+/// Sélection de canal d'entrée appliquée au remap stéréo. Calculée (et validée
+/// contre `channels_in`) dans `start_capture`, puis threadée jusqu'au remap.
+#[derive(Clone, Copy, Debug)]
+pub enum ChannelSel {
+    /// Stéréo par défaut : ch0 = L, ch1 = R (ou mono centré si channels_in = 1).
+    Default,
+    /// Mono : canal `i` dupliqué L = R = ch[i].
+    Mono(u8),
+    /// Paire stéréo : L = ch[start], R = ch[start + 1].
+    StereoPair(u8),
+}
+
 /// Convertit un bloc PCM entrelacé N canaux vers stéréo entrelacé (L, R, L, R, …).
-/// - `channel_index = Some(i)` : extraction pure du canal i, dupliqué L=R=ch[i]
+/// - `ChannelSel::Mono(i)` : extraction pure du canal i, dupliqué L=R=ch[i]
 ///   (signal mono centré, parfait pour un instrument mono branché sur un seul
 ///   canal d'une interface multi-canaux).
-/// - `channel_index = None` :
+/// - `ChannelSel::StereoPair(start)` : L=ch[start], R=ch[start+1] (paire stéréo
+///   arbitraire — clavier/synthé stéréo branché sur 3+4, 5+6, …).
+/// - `ChannelSel::Default` :
 ///     - si source mono (channels_in = 1) → L=R=sample (centrage)
 ///     - sinon → prend les 2 premiers canaux (ch0 = L, ch1 = R)
 ///
+/// Les indices sont supposés déjà validés contre `channels_in` (cf.
+/// `start_capture`) ; un index hors plage retomberait sur Default par sécurité.
+///
 /// Sortie : un `Vec<f32>` de longueur `frames × 2` (interleaved stéréo).
-fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -> Vec<f32> {
+fn remap_to_stereo(src: &[f32], channels_in: usize, sel: ChannelSel) -> Vec<f32> {
     if channels_in == 0 {
         return Vec::new();
     }
     let frames = src.len() / channels_in;
     let mut out = Vec::with_capacity(frames * 2);
-    match channel_index {
-        Some(idx) => {
+    // Garde-fou ultime : indices hors plage → Default (ne devrait pas arriver,
+    // validé en amont, mais évite tout panic d'indexation dans le thread RT).
+    let sel = match sel {
+        ChannelSel::Mono(i) if (i as usize) < channels_in => ChannelSel::Mono(i),
+        ChannelSel::StereoPair(s) if (s as usize + 1) < channels_in => ChannelSel::StereoPair(s),
+        ChannelSel::Default => ChannelSel::Default,
+        _ => ChannelSel::Default,
+    };
+    match sel {
+        ChannelSel::Mono(idx) => {
             let i = idx as usize;
             for f in 0..frames {
                 let s = src[f * channels_in + i];
@@ -1558,7 +2112,15 @@ fn remap_to_stereo(src: &[f32], channels_in: usize, channel_index: Option<u8>) -
                 out.push(s);
             }
         }
-        None => {
+        ChannelSel::StereoPair(start) => {
+            let l = start as usize;
+            let r = l + 1;
+            for f in 0..frames {
+                out.push(src[f * channels_in + l]);
+                out.push(src[f * channels_in + r]);
+            }
+        }
+        ChannelSel::Default => {
             if channels_in == 1 {
                 for &s in src.iter().take(frames) {
                     out.push(s);
@@ -1677,7 +2239,7 @@ fn encoder_thread(
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
     native_sr: u32,
-    channel_index: Option<u8>,
+    channel_sel: ChannelSel,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
@@ -1712,7 +2274,7 @@ fn encoder_thread(
                 stop_cap,
                 channels_in,
                 native_sr,
-                channel_index,
+                channel_sel,
                 perfstats_cap,
                 out_name_cap,
             );
@@ -1830,7 +2392,7 @@ fn capture_stage_loop(
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     channels_in: u16,
     native_sr: u32,
-    channel_index: Option<u8>,
+    channel_sel: ChannelSel,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
 ) {
@@ -1902,7 +2464,7 @@ fn capture_stage_loop(
                 // s'arrête juste avant out_tx.send (= AVANT l'entrée en file
                 // dans le ringbuf du process_stage).
                 let t_stage_start = t_block_start;
-                let mut stereo = remap_to_stereo(&samples, channels_in, channel_index);
+                let mut stereo = remap_to_stereo(&samples, channels_in, channel_sel);
 
                 // RESAMPLE (Windows 44.1 → 48k). Bypass total si natif = 48k.
                 if let Some(rs) = resampler.as_mut() {
@@ -2388,12 +2950,24 @@ fn process_stage_loop(
 
                 // RMS + self-monitor (= ce que l'utilisateur entend wet
                 // dans son casque via le callback CPAL playback).
+                // 0.5.4-18 — pendant un re-init long-settle (`capture_feeding=false`),
+                // on force le VU à 0 et on saute le self-monitor : le préfixe railé
+                // du 1er open à froid (déjà bufferisé dans le canal) resterait sinon
+                // affiché « VU à fond » pendant tout le settle (~6 s). Même flag que
+                // le mute du routage (cf. `set_capture_feeding`).
                 if !stereo.is_empty() {
-                    let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
-                    let rms = (sum_sq / stereo.len() as f32).sqrt();
-                    input_rms
-                        .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                    mixer.lock().push_self_samples(&stereo);
+                    if perfstats
+                        .capture_feeding
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let sum_sq: f32 = stereo.iter().map(|s| s * s).sum();
+                        let rms = (sum_sq / stereo.len() as f32).sqrt();
+                        input_rms
+                            .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        mixer.lock().push_self_samples(&stereo);
+                    } else {
+                        input_rms.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
 
                 // v0.4.8 — observe le temps de traitement PUR du process_stage.
@@ -2803,18 +3377,21 @@ fn decode_one_packet(
     let current = ProducerNetStats {
         drift_ppm: st.drift.drift_ppm(),
         jitter_ms: st.jitter.jitter_ms(),
+        jitter_tail_ms: st.jitter.jitter_tail_ms(),
     };
     if (current.drift_ppm - st.last_pushed.drift_ppm).abs() > 1.0
         || (current.jitter_ms - st.last_pushed.jitter_ms).abs() > 0.5
+        || (current.jitter_tail_ms - st.last_pushed.jitter_tail_ms).abs() > 0.5
     {
         net_stats_by_producer.lock().insert(producer_id.to_string(), current);
         st.last_pushed = current;
     }
-    // Phase B — pilote la cible du jitter buffer avec la gigue mesurée, ~10×/s
-    // (1 paquet sur 40) et seulement une fois l'estimateur fiable (warmup).
+    // Chantier #1 — pilote le plancher du jitter buffer avec la gigue de QUEUE
+    // (pire-cas récent, pas la moyenne), ~10×/s (1 paquet sur 40) et seulement
+    // une fois l'estimateur fiable (warmup).
     if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
-        let jitter_ms = st.jitter.jitter_ms();
-        mixer.lock().observe_jitter(producer_id, jitter_ms);
+        let jitter_tail_ms = st.jitter.jitter_tail_ms();
+        mixer.lock().observe_jitter(producer_id, jitter_tail_ms);
     }
     // Détection de perte → PLC
     if let Some(prev) = st.last_seq {
@@ -3101,6 +3678,56 @@ mod plugin_control_tests {
             ctrl.instrument_plugin_info.lock().is_none(),
             "info reste None après échec de load"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// remap_to_stereo — mono / paire stéréo / défaut (cross-platform)
+// ═══════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod remap_tests {
+    use super::{remap_to_stereo, ChannelSel};
+
+    // Bloc 3 canaux × 2 frames : frame0 = [10,20,30], frame1 = [11,21,31].
+    fn block_3ch() -> Vec<f32> {
+        vec![10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
+    }
+
+    #[test]
+    fn mono_duplique_le_canal_sur_l_et_r() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::Mono(1)); // canal 2
+        // L=R=ch1 pour chaque frame
+        assert_eq!(out, vec![20.0, 20.0, 21.0, 21.0]);
+    }
+
+    #[test]
+    fn stereo_pair_mappe_n_et_n_plus_1() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::StereoPair(1)); // 2+3
+        // L=ch1, R=ch2
+        assert_eq!(out, vec![20.0, 30.0, 21.0, 31.0]);
+    }
+
+    #[test]
+    fn default_prend_les_deux_premiers() {
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::Default);
+        assert_eq!(out, vec![10.0, 20.0, 11.0, 21.0]);
+    }
+
+    #[test]
+    fn default_mono_source_centre() {
+        // channels_in=1 : L=R=sample.
+        let out = remap_to_stereo(&[5.0, 6.0], 1, ChannelSel::Default);
+        assert_eq!(out, vec![5.0, 5.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn indices_hors_plage_retombent_sur_default() {
+        // StereoPair(2) sur 3 canaux : besoin de ch2 ET ch3 → ch3 absent → Default.
+        let out = remap_to_stereo(&block_3ch(), 3, ChannelSel::StereoPair(2));
+        assert_eq!(out, vec![10.0, 20.0, 11.0, 21.0]);
+        // Mono(5) hors plage → Default.
+        let out2 = remap_to_stereo(&block_3ch(), 3, ChannelSel::Mono(5));
+        assert_eq!(out2, vec![10.0, 20.0, 11.0, 21.0]);
     }
 }
 

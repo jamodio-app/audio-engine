@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
@@ -525,9 +525,18 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // captures (Pipeline::new), donc Some(...) toujours valides côté agent
             // — le serializer écrira `null`/absent uniquement si l'utilisateur veut
             // un payload minimaliste (back-compat).
-            let input_rms = f32::from_bits(
-                pl.input_rms.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            // 0.5.4-18 — pendant un re-init long-settle du driver ASIO, l'alim
+            // encodeur est coupée (`capture_feeding=false`) et les streams fermés :
+            // on force le VU d'entrée à 0 pour toute la durée du settle. Sinon le
+            // browser afficherait le pic RAILÉ figé du 1er open à froid (VU « à fond »
+            // ~6 s). Garantie au niveau AFFICHAGE → insensible à toute course sur
+            // `input_rms` côté thread encodeur.
+            let feeding = pl.perfstats.capture_feeding.load(std::sync::atomic::Ordering::Relaxed);
+            let input_rms = if feeding {
+                f32::from_bits(pl.input_rms.load(std::sync::atomic::Ordering::Relaxed))
+            } else {
+                0.0
+            };
             let midi_active = pl.midi_active.load(std::sync::atomic::Ordering::Relaxed);
             drop(pl);
             // Push si on a soit des niveaux peers, soit un signal self (RMS > 0
@@ -536,7 +545,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             if !rms_data.is_empty() || has_self_signal {
                 let levels: Vec<StreamLevel> = rms_data
                     .into_iter()
-                    .map(|(producer_id, rms)| StreamLevel { producer_id, rms })
+                    .map(|(producer_id, rms, rms_l, rms_r)| StreamLevel {
+                        producer_id,
+                        rms,
+                        rms_l: Some(rms_l),
+                        rms_r: Some(rms_r),
+                    })
                     .collect();
                 let msg = AgentMessage::StreamLevels {
                     levels,
@@ -606,6 +620,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // saine ; figés à 0 = cold-start muet (le watchdog l'aura déjà réparé).
         let mut prev_capture_callbacks: u64 = 0;
         let mut prev_output_callbacks: u64 = 0;
+        // 0.5.4-17 — détecteur de backoff de buffer (cf. `audio::buffer_policy`).
+        // `buffer_low_pressure` = leaky bucket (robuste aux pics isolés) ;
+        // `prev_monitor_underruns` = underruns self-monitor cumulés au tick
+        // précédent (pour le delta par fenêtre ; `saturating_sub` gère le reset
+        // du compteur quand le self-monitor est recréé à un nouveau start).
+        let mut buffer_low_pressure: u32 = 0;
+        let mut prev_monitor_underruns: u64 = 0;
         loop {
             interval.tick().await;
             let pl = perfstats_pipeline.lock().await;
@@ -659,6 +680,47 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let (mt, mu) = m.self_monitor_stats();
                 (stats, mt, mu)
             };
+
+            // ── Adaptive buffer : backoff auto 64 → 128 sous charge soutenue ────
+            // À la cible basse (64), si des drops capture OU des underruns
+            // self-monitor PERSISTENT (leaky bucket → ~ESCALATE_AT s de charge
+            // réelle, insensible aux 1-2 pics isolés), on remonte UNE fois à 128
+            // et on demande une reconstruction seamless (exécutée par le
+            // superviseur de liveness, même chemin éprouvé que la recovery). One-
+            // way : jamais de retour auto à 64 (anti-oscillation / anti-glitch
+            // répété) ; un 64 frais est re-tenté au prochain démarrage de l'agent.
+            // Filet RARE : à 64 le callback a ~100× de marge (mesuré), un drop
+            // réel suppose une machine/charge vraiment limite. Cf. `buffer_policy`.
+            {
+                use crate::audio::buffer_policy;
+                const ESCALATE_AT: u32 = 4; // ~4 s de charge soutenue
+                const DROP_BAD_PER_SEC: u64 = 10; // > 10 drops/s = vraie saturation
+                let underruns_delta = monitor_underruns.saturating_sub(prev_monitor_underruns);
+                prev_monitor_underruns = monitor_underruns;
+                let capturing = matches!(pl.state, AgentState::Capturing);
+                if capturing && buffer_policy::target() == buffer_policy::LOW {
+                    let bad = capture_drops_window > DROP_BAD_PER_SEC || underruns_delta > 0;
+                    buffer_low_pressure = if bad {
+                        buffer_low_pressure.saturating_add(1)
+                    } else {
+                        buffer_low_pressure.saturating_sub(1)
+                    };
+                    if buffer_low_pressure >= ESCALATE_AT && buffer_policy::escalate_to_safe() {
+                        buffer_policy::request_rebuild();
+                        buffer_low_pressure = 0;
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            from = buffer_policy::LOW,
+                            to = buffer_policy::SAFE,
+                            drops_per_sec = capture_drops_window,
+                            underruns_delta,
+                            "buffer bas insuffisant sous charge — passage automatique 64 → 128 (reconstruction seamless, une seule fois)"
+                        );
+                    }
+                } else {
+                    buffer_low_pressure = 0;
+                }
+            }
             // Sprint S6 — récupère les peers REMOTE instables (= > 16 drift
             // drains sur fenêtre 30 s). Le mixer purge ses VecDeque internes
             // au passage. Retour : (producer_id, events_window, drains_total).
@@ -833,6 +895,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         producer_id,
                         drift_ppm: net.drift_ppm,
                         jitter_ms: net.jitter_ms,
+                        jitter_tail_ms: net.jitter_tail_ms,
                         buffer_target_ms: target_ms,
                         underruns,
                         drift_drops,
@@ -847,6 +910,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     target: "jamodio::netstats",
                     producer = &p.producer_id[..8.min(p.producer_id.len())],
                     jitter_ms = p.jitter_ms,
+                    jitter_tail_ms = p.jitter_tail_ms,
                     drift_ppm = p.drift_ppm,
                     buffer_target_ms = p.buffer_target_ms,
                     underruns = p.underruns,
@@ -1179,10 +1243,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         )
         .await
         {
-            Ok(mut pl) => pl.stop_all(),
+            // 0.5.4-5 — déconnexion WS = sortie de studio : on PARK (driver ASIO
+            // gardé chaud pour un rejoin rapide, relâché après grâce) au lieu de
+            // tout fermer. Sur macOS/WASAPI, `leave_session` retombe sur stop_all.
+            Ok(mut pl) => pl.leave_session(),
             Err(_) => tracing::warn!(
                 target: "jamodio::ws",
-                "pipeline lock timeout during cleanup — stop_all skipped (next client will see stale state)"
+                "pipeline lock timeout during cleanup — leave_session skipped (next client will see stale state)"
             ),
         }
         // Libère le slot. Note : on ne `take()` PAS notre Sender dans
@@ -1315,146 +1382,365 @@ async fn try_lock_pipeline(
     }
 }
 
-/// 0.5.3-5 — SUPERVISEUR de liveness des callbacks audio (ASIO/CoreAudio).
+/// 0.5.4-2 — SUPERVISEUR de liveness + RESET COOPÉRATIF des callbacks audio ASIO.
 ///
-/// # Pourquoi (bug PC 28/06, cause racine prouvée)
-/// Sur certains drivers ASIO full-duplex (Focusrite), ~21 s après un 1er start
-/// « à froid », le driver émet un `kAsioResetRequest` (resync horloge/buffer USB)
-/// que **CPAL 0.15 n'honore pas** (il n'enregistre aucun callback de message
-/// ASIO). La spec impose alors `ASIOStop→dispose→réinit` ; CPAL ne le fait pas →
-/// le driver **arrête silencieusement ses deux callbacks** (entrée+sortie). La
-/// pipeline réseau/tokio survit (recv OK), mais la capture ne produit plus rien
-/// et la sortie ne pull plus le mixer (overflow peer en cascade). Un restart
-/// manuel (ou un rebranchement) recrée les streams = la réinit que CPAL a omise.
+/// # Cause racine (bug PC 28/06)
+/// Sur certains drivers ASIO full-duplex (Focusrite), le driver émet un
+/// `kAsioResetRequest` (resync horloge/buffer USB). Le protocole ASIO impose à
+/// l'hôte d'honorer ce message : répondre « 1 » PUIS exécuter lui-même
+/// `ASIOExit→ASIOInit→CreateBuffers→Start`. Or **cpal 0.15 n'enregistre aucun
+/// callback de message ASIO** → asio-sys répond « 1 » au driver mais n'exécute
+/// rien → le driver halte ses callbacks et attend un reset qui ne vient jamais
+/// (wedge ; jusqu'ici seul un replug USB le débloquait).
 ///
-/// Ce superviseur AUTOMATISE cette réinit : il observe les compteurs de callbacks
-/// (`capture_callbacks`/`output_callbacks`) en continu ; si l'un se fige > ~1,5 s
-/// en état `Capturing`, il appelle `restart_audio_streams()` (recrée UNIQUEMENT
-/// les streams CPAL, garde encodeur/SFU/réseau → pas de re-handshake, ~100-300 ms
-/// de trou). Couvre la cause ASIO-reset ET toute autre mort silencieuse, et un
-/// cold-start qui ne démarrerait jamais.
+/// # Deux niveaux de défense
+/// 1. **Reset coopératif (cause racine)** : `audio::asio_reset` enregistre le
+///    callback que cpal omet (via le `Driver` que cpal possède déjà). À chaque
+///    `kAsioResetRequest`, le driver nous réveille IMMÉDIATEMENT (`Notify`) et on
+///    exécute le reset propre — au moment où le driver le demande.
+/// 2. **Filet de liveness (morts silencieuses)** : on observe les compteurs de
+///    callbacks ; un flatline > ~1,5 s en capture active déclenche le même reset.
+///    Couvre les drivers qui halteraient sans émettre de reset request.
 ///
-/// # Garde-fous (règles Jamodio)
-/// - Recréation **bornée** (`MAX_RECOVERIES` consécutives) → pas de thrash. Le
-///   compteur se remet à zéro dès que les callbacks repartent.
-/// - Au-delà → `stop_all` + `CaptureError` CLAIRE au browser (JAMAIS un silence).
-/// - macOS/Linux : les callbacks ne s'arrêtent pas → jamais de recovery, no-op.
+/// # Robustesse du reset (cas dur)
+/// Le reset est BORNÉ avec settle + backoff (`repair_audio_streams`) : le 1er
+/// essai attend que le driver USB relâche après l'`ASIOExit` (cause des échecs
+/// immédiats observés). Si tous les essais échouent (driver bloqué au niveau
+/// matériel USB), on **n'arrête PAS la session** (pas de `stop_all` → pas de
+/// cascade Shutdown/relaunch) : on passe en mode DÉGRADÉ et on relance lentement
+/// en arrière-plan. Le rebranchement de l'interface relance alors l'audio SANS
+/// re-handshake réseau ni redémarrage de l'agent.
+///
+/// macOS/Linux : pas d'ASIO, les callbacks ne meurent pas et le canal de reset
+/// n'est jamais signalé → ce superviseur reste inerte (no-op).
 async fn audio_liveness_supervisor(
     pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
-    out_tx: tokio_mpsc::Sender<AgentMessage>,
+    // Conservé pour un éventuel feedback browser ; aucun message envoyé pour
+    // l'instant (décision produit : on analyse via les logs avant toute UI).
+    _out_tx: tokio_mpsc::Sender<AgentMessage>,
 ) {
     use std::sync::atomic::Ordering;
-    // Cadence d'échantillonnage des compteurs.
-    const TICK_MS: u64 = 500;
+    // Cadence du filet de liveness (le reset coopératif, lui, réagit via Notify).
+    // P1 (01/07) — 250 ms (vs 500) : réaction plus fine au gel de callbacks ASIO
+    // (mort silencieuse du driver Focusrite), coût négligeable (4 locks brefs/s).
+    const TICK_MS: u64 = 250;
     // Flatline confirmé si aucun callback pendant ce délai en capture active.
-    // ≫ période ASIO (2,7 ms) et > le démarrage d'un stream sain → faux positif
-    // quasi impossible (un stream vivant produit ~185 callbacks en 500 ms).
-    const FLATLINE_MS: u128 = 1500;
-    // Recréations consécutives tolérées avant d'abandonner (erreur au browser).
-    const MAX_RECOVERIES: u32 = 4;
+    // P1 (01/07) — 800 ms (vs 1500) : sur la mort silencieuse ASIO le gel dure ~2 s
+    // avant détection à l'ancien seuil → ~1 s de trou audio en trop. 800 ms reste
+    // ≫ période ASIO (2,7 ms) → un stream vivant produit ~290 callbacks/800 ms,
+    // faux positif quasi impossible (aucun gap légitime de cet ordre observé).
+    const FLATLINE_MS: u128 = 800;
+    // Intervalle minimal entre deux séquences de réparation (anti-thrash). En
+    // régime nominal le reset s'exécute une fois et réussit ; ce garde borne le
+    // rythme si le driver re-demande des resets en rafale.
+    const MIN_REPAIR_INTERVAL: Duration = Duration::from_secs(2);
+    // En mode dégradé (driver dur-bloqué), on relance LENTEMENT en arrière-plan
+    // jusqu'au replug — heartbeat de récupération, jamais une boucle serrée.
+    const DEGRADED_RETRY_INTERVAL: Duration = Duration::from_secs(8);
+    // 0.5.4-5 — délai de grâce avant de relâcher le driver ASIO gardé chaud
+    // (parké, hors studio). Couvre les leave/rejoin rapides (anti-churn Focusrite)
+    // puis libère l'interface pour un autre logiciel (DAW). Cf. `park`.
+    const PARK_GRACE: Duration = Duration::from_secs(30);
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(TICK_MS));
+    // Canal de signalisation kAsioResetRequest (stable pour la vie du pipeline).
+    let reset_signal = { pipeline.lock().await.reset_signal() };
+    let reset_notify = reset_signal.notify_handle();
+
+    // 0.5.4-18 — écoute des réveils de veille Windows. Au resume système, le
+    // driver ASIO peut revenir muet OU vivant-mais-figé (contenu railé) : la
+    // seule réponse générique (tous modèles) est un re-init propre. On réutilise
+    // exactement le chemin de reset borné (`repair_audio_streams`). No-op hors
+    // Windows (le signal n'est jamais déclenché). Idempotent.
+    let resume_signal = crate::audio::power_events::register();
+    let resume_notify = resume_signal.notify_handle();
+    let mut last_resume_seen = resume_signal.resume_count();
+
+    let mut interval = tokio::time::interval(Duration::from_millis(TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // État inter-ticks.
-    let mut was_capturing = false;
+    // État inter-réveils.
+    let mut session_active = false;
     let mut prev_cap = 0u64;
     let mut prev_out = 0u64;
     let mut last_progress = Instant::now();
-    let mut recoveries = 0u32;
+    let mut last_reset_seen = reset_signal.request_count();
+    let mut degraded = false;
+    let mut last_repair: Option<Instant> = None;
 
     loop {
-        interval.tick().await;
-        let mut pl = pipeline.lock().await;
+        // Réveil : tick périodique (filet de liveness) OU demande de reset
+        // immédiate émise par le driver (chemin cause-racine). Les deux futures
+        // sont cancel-safe ; la source de vérité reste `request_count()` + les
+        // compteurs, donc une notification « manquée » est rattrapée au tick.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = reset_notify.notified() => {}
+            _ = resume_notify.notified() => {}
+        }
 
-        let capturing =
-            matches!(pl.state, AgentState::Capturing) && pl.has_active_capture_stream();
-        let cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
-        let out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+        // 0.5.4-5 — relâche le driver ASIO gardé chaud si la grâce de park est
+        // expirée (≥ 30 s hors studio sans rejoin) → libère l'interface. No-op si
+        // pas parké / hors ASIO.
+        {
+            let mut pl = pipeline.lock().await;
+            pl.close_warm_if_grace_expired(PARK_GRACE);
+        }
 
-        // Hors capture (ou transition) : on (ré)initialise la base et on attend.
-        if !capturing || !was_capturing {
-            was_capturing = capturing;
-            recoveries = 0;
+        // Observation atomique (lock bref).
+        let (state_capturing, has_stream, cap, out) = {
+            let pl = pipeline.lock().await;
+            (
+                matches!(pl.state, AgentState::Capturing),
+                pl.has_active_capture_stream(),
+                pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
+                pl.perfstats.output_callbacks.load(Ordering::Relaxed),
+            )
+        };
+
+        // Hors session, ou transition Idle→Capturing : base propre, on oublie
+        // tout état dégradé, on attend.
+        if !state_capturing || !session_active {
+            session_active = state_capturing;
+            degraded = false;
             prev_cap = cap;
             prev_out = out;
             last_progress = Instant::now();
+            last_reset_seen = reset_signal.request_count();
+            // Un réveil survenu hors session est sans objet (le prochain start
+            // rouvrira à froid) → on le consomme pour ne pas réparer à vide.
+            last_resume_seen = resume_signal.resume_count();
+            // Une demande de backoff arrivée hors session est caduque : le
+            // prochain start rouvrira déjà à la cible courante. On la purge pour
+            // éviter un rebuild parasite au démarrage suivant.
+            crate::audio::buffer_policy::take_rebuild_request();
             continue;
         }
 
-        // Les DEUX compteurs avancent ⇒ session saine.
-        if cap > prev_cap && out > prev_out {
-            prev_cap = cap;
-            prev_out = out;
-            last_progress = Instant::now();
-            if recoveries > 0 {
-                tracing::info!(
-                    target: "jamodio::ws",
-                    after_recoveries = recoveries,
-                    "callbacks audio rétablis — recovery liveness réussie"
-                );
-                recoveries = 0;
-            }
-            continue;
-        }
-
-        // Au moins un compteur est figé. On mémorise les valeurs et on attend que
-        // le flatline dépasse le seuil avant d'agir (anti faux-positif).
-        prev_cap = cap;
-        prev_out = out;
-        if last_progress.elapsed().as_millis() < FLATLINE_MS {
-            continue;
-        }
-
-        // Flatline confirmé : les callbacks ASIO sont morts en cours de session.
-        if recoveries >= MAX_RECOVERIES {
-            tracing::error!(
+        // 0.5.4-17 — backoff de buffer demandé par le flush `perfstats` (64 → 128
+        // insuffisant sous charge). On reconstruit les streams à la nouvelle taille
+        // via le MÊME chemin seamless que la recovery (`repair_audio_streams` :
+        // close→settle→reopen, session réseau maintenue, pas de redémarrage), MÊME
+        // si les callbacks avancent — le driver est sain, on ne change que la
+        // taille. Événement one-way et unique (cf. `buffer_policy`).
+        if crate::audio::buffer_policy::take_rebuild_request() {
+            tracing::info!(
                 target: "jamodio::ws",
-                recoveries,
-                "callbacks audio toujours morts après recovery — arrêt + erreur au browser"
+                "reconstruction des streams à la nouvelle taille de buffer (backoff auto)"
             );
-            pl.stop_all();
-            drop(pl);
-            let _ = out_tx
-                .send(AgentMessage::CaptureError {
-                    reason: "asio-callbacks-stalled".into(),
-                    requested_device: None,
-                    detail: Some(
-                        "le moteur audio ASIO a cessé de répondre — reconnectez la session ou rebranchez l'interface".into(),
-                    ),
-                })
-                .await;
-            // On cesse de superviser jusqu'à une nouvelle capture.
-            was_capturing = false;
-            recoveries = 0;
-            continue;
-        }
-
-        recoveries += 1;
-        tracing::warn!(
-            target: "jamodio::ws",
-            recovery = recoveries,
-            max = MAX_RECOVERIES,
-            flatline_ms = last_progress.elapsed().as_millis() as u64,
-            "callbacks audio figés (driver ASIO arrêté ?) — recréation des streams"
-        );
-        match pl.restart_audio_streams() {
-            Ok(()) => {
-                // Repart sur une base propre + fenêtre de grâce (les callbacks
-                // recréés mettent quelques ms à démarrer).
+            let _ = repair_audio_streams(&pipeline).await;
+            last_reset_seen = reset_signal.request_count();
+            last_resume_seen = resume_signal.resume_count();
+            last_progress = Instant::now();
+            last_repair = Some(Instant::now());
+            {
+                let pl = pipeline.lock().await;
                 prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
                 prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
-                last_progress = Instant::now();
             }
-            Err(e) => {
-                tracing::error!(
+            continue;
+        }
+
+        // RE-INIT « long-settle » au RÉVEIL DE VEILLE PC (mid-session) : au réveil,
+        // l'interface a pu se rendormir et livrer une entrée wedgée que seul un ASIOInit
+        // frais, l'interface réveillée + stabilisée (~6 s : bias ADC / PLL USB), nettoie.
+        // Séquence : MUTE (pas de préfixe railé routé → pas de larsen) → fermeture
+        // (ASIOExit) → SETTLE → réouverture (le host single-owner re-prime) → RESET du
+        // JitterBuffer self-monitor (le trou d'horloge fausserait sinon son drift →
+        // distorsion persistante au casque) → démute. Délai réglable via
+        // `JAMODIO_RESUME_SETTLE_MS` (défaut 6000). Windows/ASIO uniquement.
+        let resumed = resume_signal.resume_count() != last_resume_seen;
+        if resumed {
+            let settle = crate::pipeline::resume_reinit_settle().as_millis() as u64;
+            tracing::info!(
+                target: "jamodio::ws",
+                settle_ms = settle,
+                "réveil de veille PC : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
+            );
+            {
+                let mut pl = pipeline.lock().await;
+                pl.set_capture_feeding(false);
+                pl.close_audio_streams_for_reset();
+            }
+            tokio::time::sleep(Duration::from_millis(settle)).await;
+            let res = {
+                let mut pl = pipeline.lock().await;
+                let r = pl.rebuild_audio_streams();
+                pl.reset_self_monitor(); // buffer de gigue propre sur la nouvelle horloge
+                pl.set_capture_feeding(true);
+                r
+            };
+            match res {
+                Ok(()) => tracing::info!(
+                    target: "jamodio::ws",
+                    "réveil de veille PC : streams reconstruits"
+                ),
+                // Échec (mono-client pas encore relâché ?) : le filet de liveness
+                // ci-dessous (streams tombés → flatline) relancera avec backoff.
+                Err(e) => tracing::warn!(
                     target: "jamodio::ws",
                     error = %e,
-                    "recréation des streams audio échouée"
+                    "réveil de veille PC : reconstruction échouée (le filet de liveness relancera)"
+                ),
+            }
+            last_reset_seen = reset_signal.request_count();
+            last_resume_seen = resume_signal.resume_count();
+            last_progress = Instant::now();
+            last_repair = Some(Instant::now());
+            {
+                let pl = pipeline.lock().await;
+                prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+                prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        // Un kAsioResetRequest est-il arrivé depuis la dernière observation ?
+        let reqs = reset_signal.request_count();
+        let reset_requested = reqs != last_reset_seen;
+
+        // Les DEUX compteurs avancent ET aucun reset en attente ⇒ session saine.
+        let advancing = cap > prev_cap && out > prev_out;
+        prev_cap = cap;
+        prev_out = out;
+        if advancing && !reset_requested {
+            last_progress = Instant::now();
+            if degraded {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    "callbacks audio rétablis — moteur ASIO récupéré"
+                );
+                degraded = false;
+            }
+            continue;
+        }
+
+        // Réparation requise si : le driver l'a demandé, OU les streams sont tombés
+        // (rebuild précédent échoué), OU flatline confirmé. (Le cold-start et le
+        // réveil de veille PC sont déjà traités plus haut par le re-init long-settle.)
+        let flatline = !advancing && last_progress.elapsed().as_millis() >= FLATLINE_MS;
+        if !(reset_requested || !has_stream || flatline) {
+            continue;
+        }
+
+        // Throttle : burst initial, puis relance lente en dégradé. Jamais de
+        // boucle serrée.
+        let min_gap = if degraded { DEGRADED_RETRY_INTERVAL } else { MIN_REPAIR_INTERVAL };
+        if let Some(t) = last_repair {
+            if t.elapsed() < min_gap {
+                continue;
+            }
+        }
+        last_repair = Some(Instant::now());
+
+        if reset_requested {
+            tracing::warn!(
+                target: "jamodio::ws",
+                "kAsioResetRequest reçu — reset coopératif du driver ASIO"
+            );
+        } else {
+            tracing::warn!(
+                target: "jamodio::ws",
+                flatline_ms = last_progress.elapsed().as_millis() as u64,
+                has_stream,
+                "callbacks audio figés — reset du driver ASIO"
+            );
+        }
+
+        // Reset borné avec settle + backoff (verrou pipeline relâché pendant les
+        // attentes → les heartbeats browser restent servis).
+        let repaired = repair_audio_streams(&pipeline).await;
+
+        // Consomme la demande de reset/réveil traitée + fenêtre de grâce (les
+        // callbacks recréés mettent quelques ms à démarrer) + re-baseline compteurs.
+        last_reset_seen = reset_signal.request_count();
+        last_resume_seen = resume_signal.resume_count();
+        last_progress = Instant::now();
+        {
+            let pl = pipeline.lock().await;
+            prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+            prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+        }
+
+        match repaired {
+            Ok(()) => {
+                if degraded {
+                    tracing::info!(
+                        target: "jamodio::ws",
+                        "moteur ASIO reconstruit après période dégradée"
+                    );
+                    degraded = false;
+                }
+            }
+            Err(last_err) => {
+                if !degraded {
+                    // Transition → dégradé : un seul ERROR, actionnable (analyse).
+                    tracing::error!(
+                        target: "jamodio::ws",
+                        asio_error = %last_err,
+                        "reset ASIO en échec — driver probablement bloqué au niveau USB. \
+                         Session maintenue, relance auto en arrière-plan (rebrancher \
+                         l'interface relancera l'audio sans coupure réseau)."
+                    );
+                    degraded = true;
+                } else {
+                    tracing::debug!(
+                        target: "jamodio::ws",
+                        asio_error = %last_err,
+                        "reset ASIO toujours en échec (dégradé)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 0.5.4-2 — exécute un reset ASIO à chaud, BORNÉ. Ferme les streams (→ `ASIOExit`
+/// au dernier drop = dé-init complète exigée par la spec) puis tente la
+/// reconstruction avec un délai de settle initial + backoff. Relâche le verrou
+/// pipeline pendant les attentes. Renvoie l'erreur ASIO du dernier essai si tous
+/// échouent (le superviseur passe alors en mode dégradé sans couper la session).
+async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>) -> Result<(), String> {
+    // Délais AVANT chaque tentative de reconstruction. Le 1er (~350 ms) laisse le
+    // driver USB relâcher après l'`ASIOExit` — c'est la cause des échecs immédiats
+    // de reconstruction sur wedge dur (recréer sur un driver pas encore relâché
+    // échoue). Les suivants montent pour absorber un blocage transitoire plus long.
+    const BACKOFF_MS: [u64; 4] = [350, 600, 1200, 2500];
+
+    // Phase 1 : fermeture (ASIOExit au dernier drop) — lock bref.
+    {
+        let mut pl = pipeline.lock().await;
+        pl.close_audio_streams_for_reset();
+    }
+
+    let mut last_err = String::from("inconnu");
+    for (i, delay) in BACKOFF_MS.iter().enumerate() {
+        tokio::time::sleep(Duration::from_millis(*delay)).await;
+        let res = {
+            let mut pl = pipeline.lock().await;
+            pl.rebuild_audio_streams()
+        };
+        match res {
+            Ok(()) => {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    attempt = i + 1,
+                    "reset ASIO : streams reconstruits"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                tracing::warn!(
+                    target: "jamodio::ws",
+                    attempt = i + 1,
+                    max = BACKOFF_MS.len(),
+                    asio_error = %last_err,
+                    "reset ASIO : reconstruction échouée, nouvel essai"
                 );
             }
         }
     }
+    Err(last_err)
 }
 
 async fn handle_message(
@@ -1491,13 +1777,14 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, srtp_parameters } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc,
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 ?input_device,
                 ?channel_index,
+                ?stereo_start,
                 "StartCapture"
             );
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
@@ -1514,7 +1801,7 @@ async fn handle_message(
             // La liveness des callbacks ASIO (cold-start ET mort en cours de
             // session) est surveillée en continu par `audio_liveness_supervisor`,
             // qui recrée les streams au besoin (cf. la fonction).
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, srtp_parameters).await {
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters).await {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser
@@ -1654,17 +1941,32 @@ async fn handle_message(
             });
 
             // Real latency from CPAL buffer: samples / 48000 * 1000.
-            // input/output sont des Option<u32> côté pipeline (Some si
-            // BufferSize::Fixed appliqué, None si fallback Default — taille
-            // réelle inconnue côté agent). Pour les composants de la latence
-            // totale on est obligés d'estimer le None — on prend 10 ms
-            // (= 480 samples / 48), la valeur conservatrice WASAPI shared
-            // standard, alignée sur les recommandations FarPlay/Jamulus pour
-            // ce mode. Les champs wire `inputBufferMs` / `outputBufferMs`
-            // restent absents (= None) pour ne pas mentir.
+            //
+            // 0.5.4-4 — on privilégie la taille RÉELLE mesurée au 1er callback
+            // (`perfstats.input_frames`/`output_frames`, frames/canal ; 0 = pas
+            // encore mesuré). C'est la latence HONNÊTE : depuis qu'on défère à la
+            // taille préférée du driver sur ASIO (`BufferSize::Default`), la valeur
+            // DEMANDÉE est inconnue (`input_buffer_samples = None`) → seule la
+            // mesure dit la vérité. Corrige aussi la sur-estimation Mac historique
+            // (on demandait 128, CoreAudio servait 64). Ordre de priorité :
+            //   1) taille mesurée au callback, 2) taille demandée (Fixed),
+            //   3) fallback conservateur 10 ms (= 480/48, valeur WASAPI shared).
+            // Les champs wire `inputBufferMs`/`outputBufferMs` reflètent désormais
+            // la mesure dès qu'elle est dispo (présents même sur ASIO).
             const DEFAULT_BUF_MS_FALLBACK: f32 = 10.0;
-            let input_buf_ms_opt: Option<f32> = pl.input_buffer_samples.map(|n| n as f32 / 48.0);
-            let output_buf_ms_opt: Option<f32> = pl.output_buffer_samples.map(|n| n as f32 / 48.0);
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let measured_in = pl.perfstats.input_frames.load(AtomicOrdering::Relaxed);
+            let measured_out = pl.perfstats.output_frames.load(AtomicOrdering::Relaxed);
+            let input_buf_ms_opt: Option<f32> = if measured_in > 0 {
+                Some(measured_in as f32 / 48.0)
+            } else {
+                pl.input_buffer_samples.map(|n| n as f32 / 48.0)
+            };
+            let output_buf_ms_opt: Option<f32> = if measured_out > 0 {
+                Some(measured_out as f32 / 48.0)
+            } else {
+                pl.output_buffer_samples.map(|n| n as f32 / 48.0)
+            };
             let input_buf_ms_est = input_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             let output_buf_ms_est = output_buf_ms_opt.unwrap_or(DEFAULT_BUF_MS_FALLBACK);
             // Latence algorithmique Opus = lookahead encodeur. En mode
@@ -1713,7 +2015,9 @@ async fn handle_message(
             let Some(mut pl) = try_lock_pipeline(pipeline).await else {
                 return vec![AgentMessage::Error { message: "agent overloaded".into() }];
             };
-            pl.stop_all();
+            // 0.5.4-5 — sortie de studio : PARK sur ASIO (driver gardé chaud →
+            // rejoin instantané, anti-churn Focusrite), stop_all complet ailleurs.
+            pl.leave_session();
             vec![make_status(AgentState::Idle)]
         }
 

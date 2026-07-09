@@ -58,6 +58,12 @@ pub enum BrowserMessage {
         /// Canal mono à extraire (0..N-1). Si `None`, capture stéréo standard.
         #[serde(rename = "channelIndex", default)]
         channel_index: Option<u8>,
+        /// Canal de départ d'une PAIRE stéréo (L = ch[N], R = ch[N+1]). Si
+        /// `None`, paire 1+2 par défaut (comportement historique). Mutuellement
+        /// exclusif avec `channel_index` (mono). `default` = rétro-compatible
+        /// avec les browsers qui n'envoient pas encore ce champ.
+        #[serde(rename = "stereoStart", default)]
+        stereo_start: Option<u8>,
         /// Clés SRTP du SFU (chiffrement des paquets SFU → agent).
         /// Le browser les a reçues dans `plain-transport-created`.
         #[serde(rename = "srtpParameters")]
@@ -663,10 +669,13 @@ pub struct PeerPerf {
     pub producer_id: String,
     #[serde(rename = "driftPpm")]
     pub drift_ppm: f64,
-    /// Gigue réseau mesurée (RFC 3550, EWMA), en ms. Capteur du jitter buffer
-    /// adaptatif : sert à dimensionner `bufferTargetMs` (Phase B).
+    /// Gigue réseau MOYENNE mesurée (RFC 3550, EWMA), en ms.
     #[serde(rename = "jitterMs")]
     pub jitter_ms: f64,
+    /// Chantier #1 — gigue de QUEUE (pire-cas récent), en ms. C'est elle qui
+    /// dimensionne désormais `bufferTargetMs` ; exposée pour la calibration.
+    #[serde(rename = "jitterTailMs")]
+    pub jitter_tail_ms: f64,
     #[serde(rename = "bufferTargetMs")]
     pub buffer_target_ms: usize,
     pub underruns: u64,
@@ -703,10 +712,17 @@ pub struct RecordedFileWire {
 pub struct StreamLevel {
     #[serde(rename = "producerId")]
     pub producer_id: String,
+    /// Niveau global (mono) — VU peers (1 valeur sur 2 barres).
     pub rms: f32,
+    /// Niveaux par canal L/R — VU self stéréo (2 barres indépendantes).
+    /// Omis du JSON si absent (back-compat browser ancien : ignore ces champs).
+    #[serde(rename = "rmsL", skip_serializing_if = "Option::is_none")]
+    pub rms_l: Option<f32>,
+    #[serde(rename = "rmsR", skip_serializing_if = "Option::is_none")]
+    pub rms_r: Option<f32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AudioDevice {
     /// Identifiant stable au sein d'une enumeration : `"{index}:{name}"`.
     /// L'index disambigue les devices à nom identique (deux cartes USB

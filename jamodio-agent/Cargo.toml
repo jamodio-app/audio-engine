@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.3"
+version = "0.5.4-19"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -54,6 +54,15 @@ tauri-plugin-updater = "2"
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.15", features = ["asio"] }
+# Accès DIRECT à l'API ASIO bas-niveau que cpal n'expose pas : enregistrement
+# du callback de message ASIO (`Driver::add_message_callback`) pour honorer
+# `kAsioResetRequest`. cpal 0.15 ne pose AUCUN message callback → quand le
+# driver demande un reset, asio-sys lui répond « 1 » (host gère) mais n'exécute
+# rien → le driver halte ses callbacks silencieusement (wedge). On rétablit le
+# handshake en se branchant sur le même registre global via le `Driver` que cpal
+# possède déjà (cf. audio/asio_reset.rs). Version PINNÉE sur celle de cpal 0.15.3
+# (= asio-sys 0.2.x) pour partager exactement le même crate (registre/types).
+asio-sys = "0.2"
 # Hôte VST3 plugins — Windows uniquement (parité fonctionnelle avec AU sur macOS).
 jamodio-vst3-host = { path = "../jamodio-vst3-host" }
 # Sprint S2 — MMCSS "Pro Audio" pour la priorité RT du thread encoder
@@ -65,6 +74,11 @@ windows-sys = { version = "0.59", features = [
     # initialiser COM lui-même → l'énumération doit tourner sur un thread STA.
     # Cf. device.rs::enumerate_with_com.
     "Win32_System_Com",
+    # 0.5.4-19 — PowerRegisterSuspendResumeNotification (réveil de veille → re-init
+    # ASIO). Cf. audio/power_events.rs. Les constantes PBT_*/DEVICE_NOTIFY_CALLBACK
+    # vivent dans Win32_UI_WindowsAndMessaging.
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
