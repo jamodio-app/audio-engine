@@ -6,6 +6,31 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.5-1] — 2026-07-09
+
+> **Pré-release de test — Option B : métronome de référence synthétisé par l'agent.**
+> Le métronome sort désormais par le chemin de sortie de l'agent (ASIO/CoreAudio,
+> latence CONNUE) au lieu du navigateur, pour une synchro inter-peers juste sur
+> toutes les machines (le navigateur sous-rapporte sa latence de sortie sur
+> Windows/WASAPI). À valider au micro (PC+Scarlett ↔ Mac). Cf.
+> `internal-docs/plans/PLAN-OPTION-B-B0-DESIGN.md`.
+
+### Added
+- **Source « référence » dans le mixer** (`jamodio-audio-core/mixer/reference.rs`) —
+  synthèse du clic métronome à l'échantillon près, à partir d'une grille exprimée
+  en frames de sortie de l'agent. Synthèse extensible (son / figure rythmique) ;
+  un seul preset câblé pour l'instant. Mixée à un point dédié : exclue du MIX
+  enregistré, non duckée par le DIM, suit le master.
+- **Ancrage horloge échantillon↔mural** exposé au navigateur (`reference-clock-pong`)
+  — le navigateur mappe la grille serveur → l'échantillon de sortie exact.
+- **Protocole** : `reference-clock-ping/pong` + `reference-config/grid/stop`.
+- **Horloge monotone process-wide** (`sync/clock.rs`) — domaine commun ancre↔pong.
+
+### Notes
+- Bénéfice garanti sur ASIO/CoreAudio (latence de sortie connue). Sur WASAPI sans
+  interface, le navigateur retombe sur la compensation locale (Option A).
+- Le backing track suivra (streamé vers l'agent) une fois le métronome validé.
+
 ## [0.5.4] — 2026-07-09
 
 > **Host ASIO duplex « maison » + robustesse Windows + télémétrie de latence honnête.**
