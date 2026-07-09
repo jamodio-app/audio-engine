@@ -271,6 +271,47 @@ pub enum BrowserMessage {
     },
     /// Arrête la référence (métronome) et coupe ses voix en cours.
     ReferenceStop,
+
+    // ─── Option B / B4 — backing track via l'agent ────────────────────────
+    /// Début de chargement d'un backing : l'agent réserve `totalFrames` frames
+    /// stéréo. Suivi de N `ReferenceBackingChunk` puis `ReferenceBackingEnd`.
+    ReferenceBackingBegin {
+        #[serde(rename = "totalFrames")]
+        total_frames: u64,
+    },
+    /// Chunk de PCM stéréo entrelacé **int16 little-endian** encodé base64. L'agent
+    /// décode + convertit en f32 et l'ajoute au buffer backing.
+    ReferenceBackingChunk {
+        #[serde(rename = "dataB64")]
+        data_b64: String,
+    },
+    /// Fin de chargement → le backing devient lisible.
+    ReferenceBackingEnd,
+    /// Décharge le backing courant (libère le PCM).
+    ReferenceBackingUnload,
+    /// Lance la lecture : le frame backing `anchorBackingFrame` doit émerger au
+    /// frame de sortie `anchorOutputFrame` (calculé par le browser via l'ancre).
+    ReferenceBackingPlay {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
+    ReferenceBackingPause,
+    /// Repositionne la lecture (seek) — snap immédiat à la position ancrée.
+    ReferenceBackingSeek {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
+    /// Re-ancrage périodique (= DLL du backing) : cible du servo anti-dérive.
+    ReferenceBackingSync {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
 }
 
 /// Spec d'un stem à enregistrer, transmise par le browser au start.
@@ -877,6 +918,55 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-stop"}"#).unwrap(),
             BrowserMessage::ReferenceStop
+        ));
+    }
+
+    #[test]
+    fn reference_backing_messages_parse_from_wire() {
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-begin","totalFrames":144000}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingBegin { total_frames: 144000 }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-chunk","dataB64":"AAAA"}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingChunk { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-end"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingEnd
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-unload"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingUnload
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-pause"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingPause
+        ));
+        match serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"reference-backing-play","anchorBackingFrame":1000.0,"anchorOutputFrame":4800.0}"#
+        ).unwrap() {
+            BrowserMessage::ReferenceBackingPlay { anchor_backing_frame, anchor_output_frame } => {
+                assert_eq!(anchor_backing_frame, 1000.0);
+                assert_eq!(anchor_output_frame, 4800.0);
+            }
+            _ => panic!("attendu ReferenceBackingPlay"),
+        }
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-seek","anchorBackingFrame":0.0,"anchorOutputFrame":0.0}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingSeek { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-sync","anchorBackingFrame":0.0,"anchorOutputFrame":0.0}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingSync { .. }
         ));
     }
 

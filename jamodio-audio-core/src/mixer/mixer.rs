@@ -17,6 +17,10 @@ pub const SELF_MONITOR_ID: &str = "self";
 /// entrée de la map `streams` (cf. [`AudioMixer::reference`]).
 pub const REFERENCE_ID: &str = "reference";
 
+/// Id réservé de la sous-source backing (B4). Volume/pan pilotés par le browser
+/// via `SetVolume`/`SetPan` avec ce producer_id (tranche backing de la mixette).
+pub const BACKING_ID: &str = "backing";
+
 /// Cible jitter buffer du self-monitor (ms). 5 = MIN_TARGET_MS du ring buffer ;
 /// le signal vient du même process que la capture, donc pas de gigue réseau,
 /// on prend le minimum stable.
@@ -250,6 +254,10 @@ impl AudioMixer {
             self.reference.set_volume(volume);
             return;
         }
+        if producer_id == BACKING_ID {
+            self.reference.set_backing_volume(volume);
+            return;
+        }
         // Garde NaN alignée sur set_pan/set_dim/set_master_gain :
         // NaN.clamp() = NaN → silence définitif du stream sinon.
         let v = if volume.is_finite() { volume.clamp(0.0, 1.5) } else { 1.0 };
@@ -271,6 +279,10 @@ impl AudioMixer {
     pub fn set_pan(&mut self, producer_id: &str, pan: f32) {
         if producer_id == REFERENCE_ID {
             self.reference.set_pan(pan);
+            return;
+        }
+        if producer_id == BACKING_ID {
+            self.reference.set_backing_pan(pan);
             return;
         }
         let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
@@ -322,6 +334,32 @@ impl AudioMixer {
     /// agent) pour construire `reference-clock-pong`.
     pub fn output_anchor(&self) -> OutputAnchor {
         self.reference.anchor()
+    }
+
+    // ─── Backing (B4) — délégué à la source référence ─────────────────────────
+    pub fn backing_begin(&mut self, total_frames: usize) {
+        self.reference.backing_begin(total_frames);
+    }
+    pub fn backing_push(&mut self, samples: &[f32]) {
+        self.reference.backing_push(samples);
+    }
+    pub fn backing_end(&mut self) {
+        self.reference.backing_end();
+    }
+    pub fn backing_unload(&mut self) {
+        self.reference.backing_unload();
+    }
+    pub fn backing_play(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_play(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn backing_pause(&mut self) {
+        self.reference.backing_pause();
+    }
+    pub fn backing_seek(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_seek(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn backing_sync(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_sync(anchor_backing_frame, anchor_output_frame);
     }
 
     /// Phase B — transmet la gigue réseau mesurée (RFC 3550, ms) au jitter
