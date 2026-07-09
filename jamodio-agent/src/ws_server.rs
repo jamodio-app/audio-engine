@@ -2142,6 +2142,87 @@ async fn handle_message(
             vec![]
         }
 
+        // ─── Option B / B4 — backing track via l'agent ────────────────────
+        BrowserMessage::ReferenceBackingBegin { total_frames } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_begin(total_frames as usize);
+            tracing::debug!(target: "jamodio::ws", total_frames, "ReferenceBackingBegin");
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingChunk { data_b64 } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            // base64 → PCM int16 LE → f32 (stéréo entrelacé).
+            let b64 = base64::engine::general_purpose::STANDARD;
+            match b64.decode(data_b64.as_bytes()) {
+                Ok(bytes) => {
+                    let mut samples = Vec::with_capacity(bytes.len() / 2);
+                    for pair in bytes.chunks_exact(2) {
+                        let s = i16::from_le_bytes([pair[0], pair[1]]);
+                        samples.push(s as f32 / 32768.0);
+                    }
+                    pl.mixer.lock().backing_push(&samples);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "jamodio::ws", error = %e, "ReferenceBackingChunk base64 invalide");
+                }
+            }
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingEnd => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_end();
+            tracing::debug!(target: "jamodio::ws", "ReferenceBackingEnd");
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingUnload => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_unload();
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingPlay { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_play(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingPause => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_pause();
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingSeek { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_seek(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingSync { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_sync(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
         // Sprint INSERT — 6 handlers plugin (AU sur macOS, VST3 sur Windows).
         // Sur les OS sans host plugin (linux test), fallback "not supported".
         BrowserMessage::ListPlugins => {

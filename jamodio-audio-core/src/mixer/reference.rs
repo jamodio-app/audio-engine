@@ -36,6 +36,17 @@ const DECAY_TAU_S: f32 = 0.030; // 30 ms
 const DURATION_S: f32 = 0.120; // 120 ms (queue inaudible ensuite)
 const DURATION_FRAMES: u64 = (DURATION_S as f64 * SR) as u64;
 
+// ─── Backing (B4) ─────────────────────────────────────────────────────────
+/// Gain proportionnel du servo varispeed du backing (erreur en frames → écart de
+/// vitesse). Réglé pour que l'erreur juste sous le seuil de snap sature la borne.
+const BACKING_SERVO_GAIN: f64 = 5.0e-6;
+/// Borne de varispeed (±) : 1 % max → pitch inaudible, dérive inter-peers (~50 ppm)
+/// largement couverte.
+const BACKING_SERVO_CLAMP: f64 = 0.01;
+/// Au-delà de cette erreur d'alignement (frames), on SNAP (seek) au lieu de servo.
+/// 2400 frames = 50 ms @48k.
+const BACKING_SNAP_FRAMES: f64 = 2400.0;
+
 /// Rôle rythmique d'un onset — pilote timbre/niveau du grain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
@@ -155,6 +166,158 @@ impl Metro {
     }
 }
 
+/// Sous-source BACKING (B4) : le browser détient/décode le fichier et pousse son
+/// PCM stéréo (48 kHz entrelacé) UNE FOIS (begin/chunk/end) ; l'agent le rejoue
+/// aligné sur la grille de sortie, avec un **servo varispeed** anti-dérive
+/// inter-peers (verrouille la tête de lecture sur une cible `frame backing ↔
+/// frame de sortie` rafraîchie périodiquement par le browser). Le tap record
+/// reste 100 % côté browser (non-négociable #2) — l'agent ne reçoit qu'une copie
+/// monitoring.
+struct Backing {
+    /// PCM stéréo entrelacé @48 kHz. Rempli par begin/push_chunk/end.
+    pcm: Vec<f32>,
+    /// true une fois `end` reçu → lisible.
+    ready: bool,
+    playing: bool,
+    volume: f32,
+    pan: f32,
+    /// Tête de lecture en FRAMES (fractionnaire → interpolation linéaire).
+    play_head: f64,
+    /// Vitesse de lecture (servo). ~1.0 ; ajustée pour verrouiller la grille.
+    rs_speed: f64,
+    /// Cible d'alignement : le frame backing `anchor_backing_frame` doit émerger
+    /// au frame de sortie `anchor_output_frame`.
+    anchor_backing_frame: f64,
+    anchor_output_frame: f64,
+    anchored: bool,
+    /// Force un SNAP de la tête au prochain bloc (play / seek).
+    snap_pending: bool,
+}
+
+impl Backing {
+    fn new() -> Self {
+        Self {
+            pcm: Vec::new(),
+            ready: false,
+            playing: false,
+            volume: 1.0,
+            pan: 0.0,
+            play_head: 0.0,
+            rs_speed: 1.0,
+            anchor_backing_frame: 0.0,
+            anchor_output_frame: 0.0,
+            anchored: false,
+            snap_pending: false,
+        }
+    }
+
+    fn begin(&mut self, total_frames: usize) {
+        self.pcm.clear();
+        self.pcm.reserve(total_frames.saturating_mul(2));
+        self.ready = false;
+        self.playing = false;
+        self.anchored = false;
+        self.play_head = 0.0;
+        self.rs_speed = 1.0;
+    }
+    fn push_chunk(&mut self, samples: &[f32]) {
+        self.pcm.extend_from_slice(samples);
+    }
+    fn end(&mut self) {
+        self.ready = true;
+    }
+    fn unload(&mut self) {
+        self.pcm.clear();
+        self.ready = false;
+        self.playing = false;
+        self.anchored = false;
+    }
+    fn set_anchor(&mut self, abf: f64, aof: f64) {
+        if abf.is_finite() && aof.is_finite() {
+            self.anchor_backing_frame = abf;
+            self.anchor_output_frame = aof;
+            self.anchored = true;
+        }
+    }
+    fn play(&mut self, abf: f64, aof: f64) {
+        self.set_anchor(abf, aof);
+        self.playing = true;
+        self.snap_pending = true;
+    }
+    fn pause(&mut self) {
+        self.playing = false;
+    }
+    fn seek(&mut self, abf: f64, aof: f64) {
+        self.set_anchor(abf, aof);
+        self.snap_pending = true;
+    }
+    fn sync(&mut self, abf: f64, aof: f64) {
+        self.set_anchor(abf, aof);
+    }
+    fn set_volume(&mut self, v: f32) {
+        self.volume = if v.is_finite() { v.clamp(0.0, 1.5) } else { 1.0 };
+    }
+    fn set_pan(&mut self, p: f32) {
+        self.pan = if p.is_finite() { p.clamp(-1.0, 1.0) } else { 0.0 };
+    }
+
+    /// Échantillon stéréo interpolé linéairement à la tête `head` (frames).
+    fn sample_at(&self, head: f64) -> (f32, f32) {
+        let n = self.pcm.len() / 2;
+        if n == 0 {
+            return (0.0, 0.0);
+        }
+        let i = head.floor().max(0.0) as usize;
+        if i + 1 >= n {
+            let li = 2 * (n - 1);
+            return (self.pcm[li], self.pcm[li + 1]);
+        }
+        let frac = (head - i as f64) as f32;
+        let l0 = self.pcm[2 * i];
+        let r0 = self.pcm[2 * i + 1];
+        let l1 = self.pcm[2 * i + 2];
+        let r1 = self.pcm[2 * i + 3];
+        (l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac)
+    }
+
+    /// Additionne le backing dans `output` pour le bloc démarrant au frame de
+    /// sortie `block_start`. Verrouille la tête sur la grille (snap ou servo).
+    fn generate(&mut self, output: &mut [f32], block_start: u64) {
+        if !self.ready || !self.playing || self.pcm.len() < 2 {
+            return;
+        }
+        let pcm_frames = (self.pcm.len() / 2) as f64;
+
+        if self.anchored {
+            let target = self.anchor_backing_frame + (block_start as f64 - self.anchor_output_frame);
+            let err = target - self.play_head;
+            if self.snap_pending || err.abs() > BACKING_SNAP_FRAMES {
+                self.play_head = target.clamp(0.0, pcm_frames);
+                self.rs_speed = 1.0;
+                self.snap_pending = false;
+            } else {
+                // Servo proportionnel : rapproche la tête de la cible sans clic.
+                self.rs_speed = (1.0 + BACKING_SERVO_GAIN * err)
+                    .clamp(1.0 - BACKING_SERVO_CLAMP, 1.0 + BACKING_SERVO_CLAMP);
+            }
+        }
+
+        let gain_l = self.volume * (1.0 - self.pan).min(1.0);
+        let gain_r = self.volume * (1.0 + self.pan).min(1.0);
+        let frames = output.len() / 2;
+        for i in 0..frames {
+            if self.play_head >= pcm_frames - 1.0 {
+                self.playing = false; // fin de piste
+                break;
+            }
+            let (l, r) = self.sample_at(self.play_head);
+            output[i * 2] += l * gain_l;
+            output[i * 2 + 1] += r * gain_r;
+            self.play_head += self.rs_speed;
+        }
+    }
+}
+
 /// Source référence : synthétise la grille métro dans le flux de sortie, tout en
 /// maintenant le compteur de frames absolu + l'ancre exposée au browser.
 ///
@@ -172,6 +335,8 @@ pub struct ReferenceSource {
     anchor: OutputAnchor,
     metro: Metro,
     voices: Vec<Voice>,
+    /// Sous-source backing (B4) — rejoue le PCM poussé par le browser, aligné.
+    backing: Backing,
 }
 
 impl Default for ReferenceSource {
@@ -192,6 +357,7 @@ impl ReferenceSource {
             // Cap ~8 : à 120 bpm un clic (120 ms) ne chevauche jamais plus de
             // 1-2 beats ; large marge pour les futures subdivisions.
             voices: Vec::with_capacity(8),
+            backing: Backing::new(),
         }
     }
 
@@ -261,6 +427,45 @@ impl ReferenceSource {
         self.anchor
     }
 
+    // ─── Backing (B4) — pilotage depuis les handlers wire ─────────────────────
+    /// Démarre le chargement d'un nouveau backing (réserve `total_frames` frames).
+    pub fn backing_begin(&mut self, total_frames: usize) {
+        self.backing.begin(total_frames);
+    }
+    /// Ajoute un chunk de PCM stéréo entrelacé (déjà converti en f32 côté handler).
+    pub fn backing_push(&mut self, samples: &[f32]) {
+        self.backing.push_chunk(samples);
+    }
+    /// Fin de chargement → le backing devient lisible.
+    pub fn backing_end(&mut self) {
+        self.backing.end();
+    }
+    /// Décharge le backing (libère le PCM).
+    pub fn backing_unload(&mut self) {
+        self.backing.unload();
+    }
+    /// Lance la lecture : le frame backing `abf` doit émerger au frame de sortie `aof`.
+    pub fn backing_play(&mut self, abf: f64, aof: f64) {
+        self.backing.play(abf, aof);
+    }
+    pub fn backing_pause(&mut self) {
+        self.backing.pause();
+    }
+    /// Repositionne (seek) : snap au prochain bloc.
+    pub fn backing_seek(&mut self, abf: f64, aof: f64) {
+        self.backing.seek(abf, aof);
+    }
+    /// Re-ancrage périodique (= DLL du backing) : ajuste la cible du servo.
+    pub fn backing_sync(&mut self, abf: f64, aof: f64) {
+        self.backing.sync(abf, aof);
+    }
+    pub fn set_backing_volume(&mut self, v: f32) {
+        self.backing.set_volume(v);
+    }
+    pub fn set_backing_pan(&mut self, p: f32) {
+        self.backing.set_pan(p);
+    }
+
     /// Avance le compteur de frames, rafraîchit l'ancre (avec `mono_ms` fourni
     /// par le mixer), et additionne la synthèse métro dans `output` (stéréo
     /// entrelacé). Appelé à CHAQUE `mix_into`, même désactivé, pour que l'ancre
@@ -278,6 +483,8 @@ impl ReferenceSource {
         if !self.voices.is_empty() {
             self.render(output, block_start, block_end);
         }
+        // Backing (B4) — mixé au même point (donc mêmes garanties record/DIM/master).
+        self.backing.generate(output, block_start);
         self.frames_rendered = block_end;
     }
 
@@ -475,6 +682,119 @@ mod tests {
         assert_eq!(MetroSound::from_wire("inconnu"), MetroSound::Click);
         assert_eq!(Figure::from_wire("q").offsets, FIGURE_QUARTER.offsets);
         assert_eq!(Figure::from_wire("bizarre").offsets, FIGURE_QUARTER.offsets);
+    }
+
+    // ─── Backing (B4) ─────────────────────────────────────────────────────
+    /// Charge une rampe (valeur du frame = frame/frames) pour tester la position.
+    fn load_ramp(r: &mut ReferenceSource, frames: usize) {
+        r.backing_begin(frames);
+        let mut pcm = Vec::with_capacity(frames * 2);
+        for f in 0..frames {
+            let v = f as f32 / frames as f32;
+            pcm.push(v);
+            pcm.push(v);
+        }
+        r.backing_push(&pcm);
+        r.backing_end();
+    }
+
+    #[test]
+    fn backing_silent_until_ready_then_playing() {
+        let mut r = ReferenceSource::new();
+        r.backing_begin(100);
+        r.backing_push(&[0.5_f32; 200]);
+        // Pas de end() → pas lisible.
+        let mut out = block(64);
+        r.backing_play(0.0, 0.0);
+        r.advance_and_generate(&mut out, 0.0);
+        assert_eq!(rms(&out), 0.0, "silencieux tant que non chargé (end)");
+        // end + play → audible.
+        r.backing_end();
+        r.backing_play(0.0, r.anchor().frame as f64); // ancre au frame de sortie courant
+        let mut out2 = block(64);
+        r.advance_and_generate(&mut out2, 1.0);
+        assert!(rms(&out2) > 0.3, "audible une fois chargé + play");
+        assert!((out2[0] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn backing_pause_silences() {
+        let mut r = ReferenceSource::new();
+        r.backing_begin(1000);
+        r.backing_push(&[0.5_f32; 2000]);
+        r.backing_end();
+        r.backing_play(0.0, 0.0);
+        r.advance_and_generate(&mut block(64), 0.0);
+        r.backing_pause();
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 64.0);
+        assert_eq!(rms(&out), 0.0, "pause coupe le backing");
+    }
+
+    #[test]
+    fn backing_reaches_end_and_stops() {
+        let mut r = ReferenceSource::new();
+        r.backing_begin(10);
+        r.backing_push(&[0.5_f32; 20]); // 10 frames
+        r.backing_end();
+        r.backing_play(0.0, 0.0);
+        r.advance_and_generate(&mut block(64), 0.0); // 64 > 10 → fin de piste
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 64.0);
+        assert_eq!(rms(&out), 0.0, "arrêt en fin de piste");
+    }
+
+    #[test]
+    fn backing_seek_snaps_to_position() {
+        let mut r = ReferenceSource::new();
+        load_ramp(&mut r, 48_000); // valeur = frame/48000
+        r.backing_play(0.0, 0.0);
+        r.advance_and_generate(&mut block(64), 0.0);
+        r.backing_seek(24_000.0, 64.0); // milieu, ancré au bloc suivant (frame 64)
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 64.0);
+        assert!((out[0] - 0.5).abs() < 0.01, "seek snappe à la position (got {})", out[0]);
+    }
+
+    #[test]
+    fn backing_pan_hard_right_silences_left() {
+        let mut r = ReferenceSource::new();
+        r.backing_begin(1000);
+        r.backing_push(&[0.5_f32; 2000]);
+        r.backing_end();
+        r.set_backing_pan(1.0);
+        r.backing_play(0.0, 0.0);
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 0.0);
+        let l: f32 = out.iter().step_by(2).map(|s| s.abs()).sum();
+        let rr: f32 = out.iter().skip(1).step_by(2).map(|s| s.abs()).sum();
+        assert!(rr > 0.0, "canal droit audible");
+        assert!(l < 1e-6, "pan full right ⇒ gauche muette");
+    }
+
+    #[test]
+    fn backing_unload_clears() {
+        let mut r = ReferenceSource::new();
+        r.backing_begin(1000);
+        r.backing_push(&[0.5_f32; 2000]);
+        r.backing_end();
+        r.backing_play(0.0, 0.0);
+        r.backing_unload();
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 0.0);
+        assert_eq!(rms(&out), 0.0, "unload → silencieux");
+    }
+
+    #[test]
+    fn metro_and_backing_coexist() {
+        // Les deux sous-sources s'additionnent sans s'exclure.
+        let mut r = ReferenceSource::new();
+        load_ramp(&mut r, 48_000);
+        r.backing_play(0.5, 0.0); // audible immédiatement (rampe ≈0.5 en milieu)
+        r.set_config(true, 1.0, 0.0, 120.0, 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 0.0);
+        assert!(rms(&out) > 0.0, "métro + backing produisent du son");
     }
 
     #[test]
