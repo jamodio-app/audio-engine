@@ -57,6 +57,7 @@ impl ResumeSignal {
 
     /// Signale un réveil (incrément + notification). Appelé depuis le callback
     /// système Windows (thread arbitraire) — donc strictement non bloquant.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // appelé uniquement côté power events (Windows)
     fn signal(&self) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
