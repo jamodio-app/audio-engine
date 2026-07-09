@@ -66,6 +66,7 @@ impl ResetSignal {
     /// Appelable depuis un callback de message ASIO enregistré directement via
     /// `asio-sys` (host single-owner), sans passer par un `cpal::Device`. Sûr sur le
     /// thread du driver : aucune allocation, aucun verrou bloquant.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // appelé uniquement côté ASIO (Windows)
     pub fn signal(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
