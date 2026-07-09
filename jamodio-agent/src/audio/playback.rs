@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 const TARGET_SR: u32 = 48000;
 const TARGET_CHANNELS: u16 = 2;
-const TARGET_BUFFER: u32 = 128;
+// La taille de buffer cible n'est plus une constante figée : elle est pilotée
+// par `crate::audio::buffer_policy` (64 par défaut, 128 après backoff auto).
 
 /// Vérifie si le device OUTPUT expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Symétrique de
@@ -44,6 +45,9 @@ pub fn build_playback_stream(
     mixer: Arc<Mutex<AudioMixer>>,
     // 0.5.3-4 — liveness : +1 par callback de sortie (cf. watchdog cold-start).
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
+    // 0.5.4-4 — taille réelle du callback de sortie (frames/canal), publiée à
+    // chaque callback pour la télémétrie de latence honnête.
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<(cpal::Stream, Option<u32>), cpal::BuildStreamError> {
     // Diagnostic SR : on force CPAL en 48 kHz mais si le device préfère un
     // autre rate (Mac casque jack 44.1, BlackHole 2ch, etc.), CoreAudio fait
@@ -72,25 +76,24 @@ pub fn build_playback_stream(
         Err(_) => SampleFormat::F32,
     };
 
-    // Buffer size : symétrique de capture.rs. On essaye Fixed(128) (= ~2.7 ms
-    // low-latency) si le device output l'expose dans son SupportedBufferSize::Range
-    // (CoreAudio mac + ASIO Windows + souvent WASAPI exclusive Win 11). Sinon
-    // fallback BufferSize::Default — sans ce filet, `build_output_stream`
-    // échouait avec StreamConfigNotSupported sur les sorties Windows shared
-    // qui imposent leur propre buffer (jack onboard Realtek, HDMI typique →
-    // Range { min: 480, max: 480 } ou Unknown). Symétrie complète avec la
-    // logique input de capture.rs.
-    let (buffer_size, fixed_buffer) = if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, TARGET_BUFFER) {
-        (BufferSize::Fixed(TARGET_BUFFER), Some(TARGET_BUFFER))
-    } else {
-        let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-        tracing::info!(
-            target: "jamodio::playback",
-            device = %device_name,
-            "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
-        );
-        (BufferSize::Default, None)
-    };
+    // Buffer size : cible basse latence UNIFIÉE, pilotée par `buffer_policy` —
+    // strictement symétrique de capture.rs (cf. sa doc). Entrée et sortie lisent
+    // la MÊME cible → en duplex ASIO le `ASIOCreateBuffers` partagé reste cohérent.
+    // `Fixed(cible)` si le device l'expose, sinon `Default` (WASAPI shared ~10ms).
+    let target_buf = crate::audio::buffer_policy::target();
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, TARGET_CHANNELS, TARGET_SR, target_buf) {
+            (BufferSize::Fixed(target_buf), Some(target_buf))
+        } else {
+            let device_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+            tracing::info!(
+                target: "jamodio::playback",
+                device = %device_name,
+                target_buf,
+                "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
+            );
+            (BufferSize::Default, None)
+        };
 
     let config = StreamConfig {
         channels: TARGET_CHANNELS,
@@ -109,10 +112,12 @@ pub fn build_playback_stream(
     let stream = match sample_format {
         SampleFormat::F32 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             device.build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     mixer.lock().mix_into(data);
                 },
                 on_playback_err,
@@ -121,11 +126,13 @@ pub fn build_playback_stream(
         }
         SampleFormat::I32 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);
@@ -139,11 +146,13 @@ pub fn build_playback_stream(
         }
         SampleFormat::I16 => {
             let output_callbacks = output_callbacks.clone();
+            let output_frames = output_frames.clone();
             let mut scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
+                    output_frames.store(data.len() as u32 / TARGET_CHANNELS as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(data.len(), 0.0);
                     mixer.lock().mix_into(&mut scratch);

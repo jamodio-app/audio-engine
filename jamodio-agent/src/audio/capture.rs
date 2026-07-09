@@ -1,7 +1,7 @@
 use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use crossbeam_channel::{Sender, TrySendError};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,11 +82,19 @@ fn forward_samples(
     sample_tx: &Sender<Vec<f32>>,
     capture_drops: &AtomicU64,
     capture_callbacks: &AtomicU64,
+    capture_feeding: &std::sync::atomic::AtomicBool,
 ) {
     // 0.5.3-4 — liveness : +1 par callback CPAL d'entrée effectivement délivré
     // par le driver. Lu par le watchdog cold-start ASIO (cf. ws_server). Un seul
-    // load+store Relaxed = négligeable sur le hot-path RT.
+    // load+store Relaxed = négligeable sur le hot-path RT. TOUJOURS incrémenté,
+    // même parké (le driver chaud est bien vivant).
     capture_callbacks.fetch_add(1, Ordering::Relaxed);
+    // 0.5.4-7 — driver PARKÉ (gardé chaud, pas d'encodeur consommateur) : on JETTE
+    // sans pousser ni compter de drop. Sinon le canal sans consommateur se remplit
+    // → faux « agent saturé / drops/s » à chaque commutation rapide de studio.
+    if !capture_feeding.load(Ordering::Relaxed) {
+        return;
+    }
     let n = samples.len();
     match sample_tx.try_send(samples) {
         Ok(_) => {}
@@ -127,14 +135,20 @@ fn forward_samples(
 #[inline]
 fn log_first_callback(
     logged: &std::sync::atomic::AtomicBool,
+    input_frames: &AtomicU32,
     samples_interleaved: usize,
     channels: u16,
 ) {
     use std::sync::atomic::Ordering;
+    // 0.5.4-4 — publie la taille RÉELLE du buffer (frames/canal) pour la
+    // télémétrie de latence honnête. Stocké à chaque callback (store Relaxed ≈ 0
+    // coût) → robuste à un éventuel changement de taille ; le log, lui, reste
+    // one-shot via le flag `logged`.
+    let frames = samples_interleaved / (channels.max(1) as usize);
+    input_frames.store(frames as u32, Ordering::Relaxed);
     if logged.load(Ordering::Relaxed) || logged.swap(true, Ordering::Relaxed) {
         return;
     }
-    let frames = samples_interleaved / (channels.max(1) as usize);
     tracing::info!(
         target: "jamodio::capture",
         frames_per_callback = frames,
@@ -186,6 +200,11 @@ pub fn build_capture_stream(
     capture_drops: Arc<AtomicU64>,
     // 0.5.3-4 — liveness : +1 par callback effectif (cf. `forward_samples`).
     capture_callbacks: Arc<AtomicU64>,
+    // 0.5.4-4 — taille réelle du callback (frames/canal), publiée au 1er callback.
+    input_frames: Arc<AtomicU32>,
+    // 0.5.4-7 — `false` = driver parké (gardé chaud) → le callback jette ses
+    // samples sans compter de drop (anti faux « agent saturé »).
+    capture_feeding: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(cpal::Stream, u16, u32, Option<u32>), cpal::BuildStreamError> {
     // Interroger la config par défaut pour connaître le nombre réel de canaux
     // physiques + le sample rate natif (cf. doc fonction).
@@ -204,21 +223,50 @@ pub fn build_capture_stream(
     // (CoreAudio/WASAPI : f32 natif → la branche F32 est prise, inchangé.)
     let sample_format = default_cfg.sample_format();
 
-    // Buffer size : on essaye Fixed(128) (= ~2.7ms low-latency, accepté par
-    // CoreAudio mac + ASIO Windows + parfois WASAPI exclusive Win 11) et on
-    // fallback sur Default si le device n'expose pas ce range (= WASAPI
-    // shared sur mic onboard typique, qui impose ~10ms min). Le fallback
-    // évite l'erreur `StreamConfigNotSupported` qui bloquait v0.3.0 sur PC.
-    let (buffer_size, fixed_buffer) = if device_supports_fixed_buffer(device, channels, native_sr, 128) {
-        (BufferSize::Fixed(128), Some(128u32))
-    } else {
-        tracing::info!(
-            target: "jamodio::capture",
-            channels, native_sr,
-            "device n'expose pas Fixed(128) — fallback BufferSize::Default (WASAPI shared ~10ms)"
-        );
-        (BufferSize::Default, None)
-    };
+    // Buffer size — stratégie PAR HOST (cause racine du gel ASIO Focusrite,
+    // sessions du 29/06) :
+    //
+    // - **ASIO (Windows)** : on DÉFÈRE à la taille PRÉFÉRÉE du driver
+    //   (`BufferSize::Default` → asio-sys utilise `ASIOGetBufferSize().pref`),
+    //   exactement comme un DAW et comme JUCE/RtAudio/Jamulus. Forcer `Fixed(128)`
+    //   était fautif : asio-sys ne valide QUE `demandé ≤ max` (il IGNORE le min,
+    //   la taille préférée ET la granularité du driver). Sur le Focusrite USB,
+    //   128 hors-grille était accepté par `ASIOCreateBuffers` mais faisait HALTER
+    //   les callbacks après ~75 s de streaming → studio injouable. La taille
+    //   réellement retenue par le driver est révélée par `log_first_callback`.
+    //   La basse latence (128 = 2,7 ms) n'était qu'un choix : ni Opus (encodeur à
+    //   accumulateur → frames 120) ni les plugins (process_stage re-bloque en
+    //   sous-blocs) ne dépendent de la taille de capture.
+    // - **CoreAudio / WASAPI** : INCHANGÉ — Fixed(128) low-latency si exposé,
+    //   sinon Default. (CoreAudio ignore de toute façon la valeur et prend la
+    //   taille native du device ; WASAPI shared impose la sienne.)
+    // Taille de buffer : cible basse latence UNIFIÉE (CoreAudio + ASIO), pilotée
+    // par `buffer_policy` (64 par défaut, 128 après backoff auto sous charge —
+    // cf. son doc). On demande `Fixed(cible)` si le device l'expose dans sa plage,
+    // sinon `Default` (le backend choisit ; WASAPI shared → ~10 ms, inchangé).
+    //
+    // 0.5.4-17 — l'ASIO passe de `Default`(préféré du driver, souvent 128) à
+    // `Fixed(cible)`. Le gel Focusrite venait de la RÉ-ÉNUMÉRATION concurrente
+    // (corrigée en 0.5.4-17), PAS de la taille de buffer : le driver est stable
+    // de 16 à 1024 samples (mesuré au banc). Forcer une petite taille est donc
+    // sûr et met la latence PC à parité avec le Mac. Entrée et sortie lisent la
+    // MÊME cible → cohérence du `ASIOCreateBuffers` duplex partagé.
+    // Taille basse latence pilotée par `buffer_policy::target()` (64 par défaut, 128
+    // après backoff auto sous charge) : `Fixed(cible)` si le device l'expose, sinon
+    // `Default` (WASAPI shared ~10 ms). Chemin CoreAudio/WASAPI uniquement — l'ASIO
+    // passe par `audio::asio_host`, qui gère sa propre taille (snap grille légale).
+    let target_buf = crate::audio::buffer_policy::target();
+    let (buffer_size, fixed_buffer) =
+        if device_supports_fixed_buffer(device, channels, native_sr, target_buf) {
+            (BufferSize::Fixed(target_buf), Some(target_buf))
+        } else {
+            tracing::info!(
+                target: "jamodio::capture",
+                channels, native_sr, target_buf,
+                "device n'expose pas Fixed(cible) — fallback BufferSize::Default (WASAPI shared ~10ms)"
+            );
+            (BufferSize::Default, None)
+        };
 
     let config = StreamConfig {
         channels,
@@ -240,6 +288,8 @@ pub fn build_capture_stream(
         let sample_tx = sample_tx.clone();
         let capture_drops = capture_drops.clone();
         let capture_callbacks = capture_callbacks.clone();
+        let input_frames = input_frames.clone();
+        let capture_feeding = capture_feeding.clone();
         let first_logged = first_block_logged.clone();
         // `None` = pas de timeout côté callback CPAL (le retry concerne l'init).
         // On ouvre le stream au format NATIF du driver puis on convertit chaque
@@ -248,8 +298,8 @@ pub fn build_capture_stream(
             SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    log_first_callback(&first_logged, data.len(), channels);
-                    forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks);
+                    log_first_callback(&first_logged, &input_frames, data.len(), channels);
+                    forward_samples(data.to_vec(), &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,
@@ -257,10 +307,10 @@ pub fn build_capture_stream(
             SampleFormat::I32 => device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    log_first_callback(&first_logged, data.len(), channels);
+                    log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,
@@ -268,10 +318,10 @@ pub fn build_capture_stream(
             SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    log_first_callback(&first_logged, data.len(), channels);
+                    log_first_callback(&first_logged, &input_frames, data.len(), channels);
                     const SCALE: f32 = 1.0 / 32_768.0; // 1 / 2^15
                     let f: Vec<f32> = data.iter().map(|&s| s as f32 * SCALE).collect();
-                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks);
+                    forward_samples(f, &sample_tx, &capture_drops, &capture_callbacks, &capture_feeding);
                 },
                 on_capture_err,
                 None,

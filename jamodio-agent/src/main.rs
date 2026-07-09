@@ -202,6 +202,13 @@ fn main() {
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             audio::device::log_devices();
 
+            // ─── P2.0 — spike host ASIO duplex (Windows, opt-in JAMODIO_ASIO_PROBE) ───
+            // 0.5.4-15 : retour à l'opt-in par var d'env après le BSOD (la 0.5.4-14
+            // écrivait dans les buffers ASIO → crash kernel). No-op sans la var.
+            // Diagnostic isolé (comptage seul), jamais câblé au pipeline.
+            #[cfg(target_os = "windows")]
+            audio::asio_probe::spawn_probe_at_startup();
+
             // ─── Attach menu to config-based tray icon ──────
             // i18n minimal : libellés FR si la locale OS est FR, EN sinon
             // (couvre la première impression utilisateur EN — cf. ToDo audit 17/05).
