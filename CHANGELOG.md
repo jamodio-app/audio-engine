@@ -6,6 +6,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.5-2] — 2026-07-09
+
+> **Pré-release de test — B4 : backing track joué par l'agent.** Ajoute au métro
+> (0.5.5-1) le backing rejoué par l'agent, aligné sur la grille serveur en continu
+> (servo varispeed anti-dérive), à latence connue. Nécessite le SFU à jour
+> (`metroOriginServerMs` / `backingPositionAtServerMs`) pour le late-join.
+
+### Added
+- **Sous-source backing dans le mixer** — le navigateur pousse le PCM stéréo 48k
+  une fois (`reference-backing-begin/chunk/end`), l'agent le rejoue aligné sur la
+  grille de sortie avec un servo varispeed anti-dérive inter-peers (snap sur seek,
+  ±1 % de vitesse sinon). Mixé au même point que le métro (exclu record, non ducké,
+  suit master). Volume/pan via `producerId 'backing'`.
+- **Protocole** : `reference-backing-*` (begin/chunk/end/unload/play/pause/seek/sync).
+
 ## [0.5.5-1] — 2026-07-09
 
 > **Pré-release de test — Option B : métronome de référence synthétisé par l'agent.**
