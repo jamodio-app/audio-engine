@@ -2053,6 +2053,176 @@ async fn handle_message(
             vec![]
         }
 
+        // ─── Option B — référence (métronome) via l'agent ─────────────────
+        BrowserMessage::ReferenceClockPing { ping_id, client_send_ms } => {
+            // Réponse IMMÉDIATE : l'ancre échantillon↔mural + l'horloge agent.
+            // `outMs` = latence de sortie CONNUE (buffer CPAL mesuré) ; c'est ce
+            // que Chrome ne sait pas sur WASAPI. Le browser gate déjà l'Option B
+            // sur `audioHost ∈ {asio, coreaudio}` → sur WASAPI il ignore ce pong
+            // (fallback Option A). Cf. B0 §3.4.
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            const DEFAULT_BUF_MS_FALLBACK: f32 = 10.0;
+            let measured_out = pl.perfstats.output_frames.load(AtomicOrdering::Relaxed);
+            let out_ms: f32 = if measured_out > 0 {
+                measured_out as f32 / 48.0
+            } else {
+                pl.output_buffer_samples
+                    .map(|n| n as f32 / 48.0)
+                    .unwrap_or(DEFAULT_BUF_MS_FALLBACK)
+            };
+            let anchor = pl.mixer.lock().output_anchor();
+            drop(pl);
+            // Stampé au plus près de la réception (même epoch que `anchor.mono_ms`).
+            let agent_mono_ms = jamodio_audio_core::sync::clock::mono_now_ms();
+            vec![AgentMessage::ReferenceClockPong {
+                ping_id,
+                client_send_ms,
+                agent_mono_ms,
+                anchor_frame: anchor.frame,
+                anchor_emerge_mono_ms: anchor.mono_ms + out_ms as f64,
+                sample_rate: 48_000,
+                out_ms,
+            }]
+        }
+
+        BrowserMessage::ReferenceConfig {
+            enabled,
+            volume,
+            pan,
+            bpm,
+            beats_per_accent,
+            sound,
+            figure,
+            anchor_beat_frame,
+            anchor_beat_index,
+        } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            use jamodio_audio_core::mixer::reference::{Figure, MetroSound};
+            pl.mixer.lock().set_reference_config(
+                enabled,
+                volume,
+                pan,
+                bpm,
+                beats_per_accent,
+                MetroSound::from_wire(&sound),
+                Figure::from_wire(&figure),
+                anchor_beat_frame,
+                anchor_beat_index,
+            );
+            tracing::debug!(
+                target: "jamodio::ws",
+                enabled, bpm, beats_per_accent,
+                anchor_beat_frame, anchor_beat_index,
+                "ReferenceConfig"
+            );
+            vec![]
+        }
+
+        BrowserMessage::ReferenceGrid { anchor_beat_frame, anchor_beat_index } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer
+                .lock()
+                .set_reference_grid(anchor_beat_frame, anchor_beat_index);
+            vec![]
+        }
+
+        BrowserMessage::ReferenceStop => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().reference_stop();
+            tracing::debug!(target: "jamodio::ws", "ReferenceStop");
+            vec![]
+        }
+
+        // ─── Option B / B4 — backing track via l'agent ────────────────────
+        BrowserMessage::ReferenceBackingBegin { total_frames } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_begin(total_frames as usize);
+            tracing::debug!(target: "jamodio::ws", total_frames, "ReferenceBackingBegin");
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingChunk { data_b64 } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            // base64 → PCM int16 LE → f32 (stéréo entrelacé).
+            let b64 = base64::engine::general_purpose::STANDARD;
+            match b64.decode(data_b64.as_bytes()) {
+                Ok(bytes) => {
+                    let mut samples = Vec::with_capacity(bytes.len() / 2);
+                    for pair in bytes.chunks_exact(2) {
+                        let s = i16::from_le_bytes([pair[0], pair[1]]);
+                        samples.push(s as f32 / 32768.0);
+                    }
+                    pl.mixer.lock().backing_push(&samples);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "jamodio::ws", error = %e, "ReferenceBackingChunk base64 invalide");
+                }
+            }
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingEnd => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_end();
+            tracing::debug!(target: "jamodio::ws", "ReferenceBackingEnd");
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingUnload => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_unload();
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingPlay { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_play(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingPause => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_pause();
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingSeek { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_seek(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
+        BrowserMessage::ReferenceBackingSync { anchor_backing_frame, anchor_output_frame } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().backing_sync(anchor_backing_frame, anchor_output_frame);
+            vec![]
+        }
+
         // Sprint INSERT — 6 handlers plugin (AU sur macOS, VST3 sur Windows).
         // Sur les OS sans host plugin (linux test), fallback "not supported".
         BrowserMessage::ListPlugins => {

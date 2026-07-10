@@ -1,5 +1,7 @@
+use super::reference::{Figure, MetroSound, OutputAnchor, ReferenceSource};
 use super::ring_buffer::JitterBuffer;
 use crate::record::RecordCmd;
+use crate::sync::clock::mono_now_ms;
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
 
@@ -8,6 +10,16 @@ use std::collections::HashMap;
 /// browser à 25 ms). Mixé comme un stream normal mais exclu des stats remote
 /// (stream_count, total_underruns, mean_target_ms) pour ne pas polluer l'UI.
 pub const SELF_MONITOR_ID: &str = "self";
+
+/// Id réservé de la source « référence » (métronome/backing via l'agent —
+/// Option B). Le browser pilote son volume/pan via `SetVolume`/`SetPan` avec ce
+/// producer_id (comme "self" pour le self-monitor). La source n'est PAS une
+/// entrée de la map `streams` (cf. [`AudioMixer::reference`]).
+pub const REFERENCE_ID: &str = "reference";
+
+/// Id réservé de la sous-source backing (B4). Volume/pan pilotés par le browser
+/// via `SetVolume`/`SetPan` avec ce producer_id (tranche backing de la mixette).
+pub const BACKING_ID: &str = "backing";
 
 /// Cible jitter buffer du self-monitor (ms). 5 = MIN_TARGET_MS du ring buffer ;
 /// le signal vient du même process que la capture, donc pas de gigue réseau,
@@ -43,6 +55,12 @@ pub struct AudioMixer {
     /// d'écoute locaux dim/master. Cohérent avec le tap browser sur
     /// `instrumentMixBus` qui est aussi pre-dim/pre-master.
     dim_factor: f32,
+    /// Source « référence » (métronome via l'agent — Option B). Mixée dans
+    /// `mix_into` à un point DÉDIÉ (après le tap record, après le DIM, avant le
+    /// master), donc HORS de la map `streams`. Toujours présente ; inerte tant
+    /// qu'elle n'est pas configurée (`set_reference_config`). Cf.
+    /// `mixer/reference.rs` + `PLAN-OPTION-B-B0-DESIGN.md`.
+    reference: ReferenceSource,
 }
 
 struct StreamState {
@@ -90,6 +108,7 @@ impl AudioMixer {
             record_tx: None,
             master_gain: 1.0,
             dim_factor: 1.0,
+            reference: ReferenceSource::new(),
         }
     }
 
@@ -230,6 +249,15 @@ impl AudioMixer {
 
     /// Set per-stream volume (0.0 to 1.5).
     pub fn set_volume(&mut self, producer_id: &str, volume: f32) {
+        // La référence (métronome) n'est pas dans `streams` : route explicite.
+        if producer_id == REFERENCE_ID {
+            self.reference.set_volume(volume);
+            return;
+        }
+        if producer_id == BACKING_ID {
+            self.reference.set_backing_volume(volume);
+            return;
+        }
         // Garde NaN alignée sur set_pan/set_dim/set_master_gain :
         // NaN.clamp() = NaN → silence définitif du stream sinon.
         let v = if volume.is_finite() { volume.clamp(0.0, 1.5) } else { 1.0 };
@@ -249,10 +277,89 @@ impl AudioMixer {
     /// envoie producer_id="self".
     /// No-op si le stream n'existe pas (peer parti, race).
     pub fn set_pan(&mut self, producer_id: &str, pan: f32) {
+        if producer_id == REFERENCE_ID {
+            self.reference.set_pan(pan);
+            return;
+        }
+        if producer_id == BACKING_ID {
+            self.reference.set_backing_pan(pan);
+            return;
+        }
         let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
         if let Some(stream) = self.streams.get_mut(producer_id) {
             stream.pan = p;
         }
+    }
+
+    /// Configure la source référence (métronome via l'agent — Option B).
+    /// Handler `reference-config`. Les `String` wire (`sound`/`figure`) sont
+    /// parsées côté ws_server en `MetroSound`/`Figure` pour garder cette API typée.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_reference_config(
+        &mut self,
+        enabled: bool,
+        volume: f32,
+        pan: f32,
+        bpm: f32,
+        beats_per_accent: u32,
+        sound: MetroSound,
+        figure: Figure,
+        anchor_beat_frame: f64,
+        anchor_beat_index: u64,
+    ) {
+        self.reference.set_config(
+            enabled,
+            volume,
+            pan,
+            bpm,
+            beats_per_accent,
+            sound,
+            figure,
+            anchor_beat_frame,
+            anchor_beat_index,
+        );
+    }
+
+    /// Re-ancrage périodique de la grille référence (= DLL) — handler `reference-grid`.
+    pub fn set_reference_grid(&mut self, anchor_beat_frame: f64, anchor_beat_index: u64) {
+        self.reference.set_grid(anchor_beat_frame, anchor_beat_index);
+    }
+
+    /// Arrête la référence et coupe ses voix — handler `reference-stop`.
+    pub fn reference_stop(&mut self) {
+        self.reference.stop();
+    }
+
+    /// Ancre échantillon↔mural courante (frame de sortie ↔ instant monotone
+    /// agent) pour construire `reference-clock-pong`.
+    pub fn output_anchor(&self) -> OutputAnchor {
+        self.reference.anchor()
+    }
+
+    // ─── Backing (B4) — délégué à la source référence ─────────────────────────
+    pub fn backing_begin(&mut self, total_frames: usize) {
+        self.reference.backing_begin(total_frames);
+    }
+    pub fn backing_push(&mut self, samples: &[f32]) {
+        self.reference.backing_push(samples);
+    }
+    pub fn backing_end(&mut self) {
+        self.reference.backing_end();
+    }
+    pub fn backing_unload(&mut self) {
+        self.reference.backing_unload();
+    }
+    pub fn backing_play(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_play(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn backing_pause(&mut self) {
+        self.reference.backing_pause();
+    }
+    pub fn backing_seek(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_seek(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn backing_sync(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.backing_sync(anchor_backing_frame, anchor_output_frame);
     }
 
     /// Phase B — transmet la gigue réseau mesurée (RFC 3550, ms) au jitter
@@ -447,6 +554,17 @@ impl AudioMixer {
                 *sample *= d;
             }
         }
+
+        // Référence (métronome via l'agent — Option B). Ajoutée ICI, à un point
+        // DÉDIÉ hors de la boucle streams :
+        //   - APRÈS le tap record push_mix ⇒ EXCLUE du MIX enregistré (parité
+        //     browser : métro/backing hors `instrumentMixBus`) ;
+        //   - APRÈS le DIM ⇒ le clic n'est PAS ducké par le talkback (parité
+        //     browser : métro→masterBus direct, pas via `instrumentDimGain`) ;
+        //   - AVANT le master + le clamp ⇒ suit le fader master et reste borné.
+        // Appelée à CHAQUE bloc (même métro coupé) pour tenir à jour l'ancre
+        // échantillon↔mural exposée au browser (`output_anchor`).
+        self.reference.advance_and_generate(output, mono_now_ms());
 
         // Master gain global (fader MASTER côté UI). Appliqué AVANT le clamp
         // pour qu'un master à 0.5 atténue proprement un mix qui aurait dépassé

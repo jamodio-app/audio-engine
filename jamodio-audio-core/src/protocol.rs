@@ -232,6 +232,86 @@ pub enum BrowserMessage {
     /// `Shutdown{reason:"relaunch"}` puis `app.restart()`. Pas de réponse
     /// directe (la WS tombe puis reconnecte sur l'agent relancé).
     RelaunchNow,
+
+    // ─── Option B — référence (métronome) via l'agent ─────────────────────
+    /// Ping d'ancrage horloge. L'agent répond IMMÉDIATEMENT `ReferenceClockPong`
+    /// en stampant son horloge monotone + l'ancre de sortie. Le browser en dérive
+    /// l'offset agent-mono ↔ mur, filtré min-RTT (cf. B0 §3.2).
+    ReferenceClockPing {
+        #[serde(rename = "pingId")]
+        ping_id: u32,
+        #[serde(rename = "clientSendMs")]
+        client_send_ms: f64,
+    },
+    /// Configure/allume la grille métronome synthétisée par l'agent. La grille
+    /// est exprimée en **frames de sortie de l'agent** : le browser reste maître
+    /// (il calcule `anchorBeatFrame` depuis l'offset serveur + l'ancre exposée).
+    /// `sound`/`figure` sont extensibles (B1 : "click" / "q").
+    ReferenceConfig {
+        enabled: bool,
+        volume: f32,
+        pan: f32,
+        bpm: f32,
+        #[serde(rename = "beatsPerAccent")]
+        beats_per_accent: u32,
+        sound: String,
+        figure: String,
+        #[serde(rename = "anchorBeatFrame")]
+        anchor_beat_frame: f64,
+        #[serde(rename = "anchorBeatIndex")]
+        anchor_beat_index: u64,
+    },
+    /// Re-ancrage périodique de la grille (= la DLL côté browser) : le beat
+    /// `anchorBeatIndex` doit émerger au frame de sortie `anchorBeatFrame`.
+    ReferenceGrid {
+        #[serde(rename = "anchorBeatFrame")]
+        anchor_beat_frame: f64,
+        #[serde(rename = "anchorBeatIndex")]
+        anchor_beat_index: u64,
+    },
+    /// Arrête la référence (métronome) et coupe ses voix en cours.
+    ReferenceStop,
+
+    // ─── Option B / B4 — backing track via l'agent ────────────────────────
+    /// Début de chargement d'un backing : l'agent réserve `totalFrames` frames
+    /// stéréo. Suivi de N `ReferenceBackingChunk` puis `ReferenceBackingEnd`.
+    ReferenceBackingBegin {
+        #[serde(rename = "totalFrames")]
+        total_frames: u64,
+    },
+    /// Chunk de PCM stéréo entrelacé **int16 little-endian** encodé base64. L'agent
+    /// décode + convertit en f32 et l'ajoute au buffer backing.
+    ReferenceBackingChunk {
+        #[serde(rename = "dataB64")]
+        data_b64: String,
+    },
+    /// Fin de chargement → le backing devient lisible.
+    ReferenceBackingEnd,
+    /// Décharge le backing courant (libère le PCM).
+    ReferenceBackingUnload,
+    /// Lance la lecture : le frame backing `anchorBackingFrame` doit émerger au
+    /// frame de sortie `anchorOutputFrame` (calculé par le browser via l'ancre).
+    ReferenceBackingPlay {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
+    ReferenceBackingPause,
+    /// Repositionne la lecture (seek) — snap immédiat à la position ancrée.
+    ReferenceBackingSeek {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
+    /// Re-ancrage périodique (= DLL du backing) : cible du servo anti-dérive.
+    ReferenceBackingSync {
+        #[serde(rename = "anchorBackingFrame")]
+        anchor_backing_frame: f64,
+        #[serde(rename = "anchorOutputFrame")]
+        anchor_output_frame: f64,
+    },
 }
 
 /// Spec d'un stem à enregistrer, transmise par le browser au start.
@@ -620,6 +700,29 @@ pub enum AgentMessage {
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
     },
+    /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
+    /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de
+    /// sortie `anchorFrame` émerge à l'instant monotone agent `anchorEmergeMonoMs`
+    /// (= instant de rendu du bloc + latence de sortie connue `outMs`). Combiné à
+    /// `agentMonoMs` (horloge agent à la réception du ping) et `clientSendMs`
+    /// (echo pour le RTT), le browser relie l'horloge agent à son mur (min-RTT)
+    /// puis mappe tout instant serveur → frame de sortie (cf. B0 §3.3).
+    ReferenceClockPong {
+        #[serde(rename = "pingId")]
+        ping_id: u32,
+        #[serde(rename = "clientSendMs")]
+        client_send_ms: f64,
+        #[serde(rename = "agentMonoMs")]
+        agent_mono_ms: f64,
+        #[serde(rename = "anchorFrame")]
+        anchor_frame: u64,
+        #[serde(rename = "anchorEmergeMonoMs")]
+        anchor_emerge_mono_ms: f64,
+        #[serde(rename = "sampleRate")]
+        sample_rate: u32,
+        #[serde(rename = "outMs")]
+        out_ms: f32,
+    },
 }
 
 /// Sprint S1 — Métriques d'un INSERT plugin actif (process_stereo wall-clock).
@@ -775,5 +878,113 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    // Contrat wire Option B — les tags kebab-case + champs (camelCase) doivent
+    // rester stables (matchés par studio-metronome.js / groupe.js côté browser).
+    #[test]
+    fn reference_messages_parse_from_wire() {
+        let ping = serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"reference-clock-ping","pingId":7,"clientSendMs":123.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ping,
+            BrowserMessage::ReferenceClockPing { ping_id: 7, .. }
+        ));
+
+        let cfg = serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"reference-config","enabled":true,"volume":0.6,"pan":0.0,
+                "bpm":120.0,"beatsPerAccent":4,"sound":"click","figure":"q",
+                "anchorBeatFrame":4800.0,"anchorBeatIndex":0}"#,
+        )
+        .unwrap();
+        match cfg {
+            BrowserMessage::ReferenceConfig { enabled, bpm, beats_per_accent, .. } => {
+                assert!(enabled);
+                assert_eq!(bpm, 120.0);
+                assert_eq!(beats_per_accent, 4);
+            }
+            _ => panic!("attendu ReferenceConfig"),
+        }
+
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-grid","anchorBeatFrame":9600.0,"anchorBeatIndex":2}"#
+            )
+            .unwrap(),
+            BrowserMessage::ReferenceGrid { anchor_beat_index: 2, .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-stop"}"#).unwrap(),
+            BrowserMessage::ReferenceStop
+        ));
+    }
+
+    #[test]
+    fn reference_backing_messages_parse_from_wire() {
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-begin","totalFrames":144000}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingBegin { total_frames: 144000 }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-chunk","dataB64":"AAAA"}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingChunk { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-end"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingEnd
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-unload"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingUnload
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(r#"{"type":"reference-backing-pause"}"#).unwrap(),
+            BrowserMessage::ReferenceBackingPause
+        ));
+        match serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"reference-backing-play","anchorBackingFrame":1000.0,"anchorOutputFrame":4800.0}"#
+        ).unwrap() {
+            BrowserMessage::ReferenceBackingPlay { anchor_backing_frame, anchor_output_frame } => {
+                assert_eq!(anchor_backing_frame, 1000.0);
+                assert_eq!(anchor_output_frame, 4800.0);
+            }
+            _ => panic!("attendu ReferenceBackingPlay"),
+        }
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-seek","anchorBackingFrame":0.0,"anchorOutputFrame":0.0}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingSeek { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<BrowserMessage>(
+                r#"{"type":"reference-backing-sync","anchorBackingFrame":0.0,"anchorOutputFrame":0.0}"#
+            ).unwrap(),
+            BrowserMessage::ReferenceBackingSync { .. }
+        ));
+    }
+
+    #[test]
+    fn reference_clock_pong_serializes_camel_case() {
+        let pong = AgentMessage::ReferenceClockPong {
+            ping_id: 7,
+            client_send_ms: 123.5,
+            agent_mono_ms: 456.0,
+            anchor_frame: 4800,
+            anchor_emerge_mono_ms: 460.0,
+            sample_rate: 48_000,
+            out_ms: 1.33,
+        };
+        let json = serde_json::to_string(&pong).unwrap();
+        assert!(json.contains(r#""type":"reference-clock-pong""#));
+        assert!(json.contains(r#""pingId":7"#));
+        assert!(json.contains(r#""anchorEmergeMonoMs":460"#));
+        assert!(json.contains(r#""outMs":1.33"#));
     }
 }
