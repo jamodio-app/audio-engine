@@ -6,6 +6,38 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-1] — 2026-07-10
+
+> **Pré-release de test — robustesse sous charge (lock pipeline + erreurs corrélées).**
+> Corrige la RACINE côté agent des symptômes observés à 3+ peers sur PC/ASIO
+> Focusrite : instrument muet au join d'un 3e peer, bascule MIDI/audio cassée
+> obligeant un relaunch, liste de plugins bloquée en « Scan… ». Complète le
+> mitigation browser de 0.5.5 (barrière + sérialisation add-stream). À valider au
+> banc PC Focusrite ↔ Mac (jusqu'à ~4 peers + swap device + load plugin
+> simultanés). Cf. `internal-docs/plans/PLAN-AGENT-0.5.6-ROBUSTESSE.md`.
+
+### Fixed
+- **Les handlers de SETUP CRITIQUE ne sont plus DROPPÉS sur contention du lock**
+  (`ws_server.rs`). `StartCapture`, `AddStream`, `RemoveStream`, `SelectDevices`,
+  `SetInputSource` (bascule MIDI/audio), `Load/UnloadInstrumentPlugin`,
+  `ListPlugins`, `Start/StopRecording`, `Stop` **attendent** désormais le lock
+  (`lock_pipeline_wait`, timeout long borné sous le watchdog browser) au lieu de
+  répondre `overloaded` au bout de 200 ms. Le hot-path idempotent (SetVolume/Pan/
+  Dim, GetStats, Reference*, éditeur plugin) garde le skip 200 ms. Cause des flux
+  jamais montés (« ghost/orphan ») et des tranches figées jusqu'au relaunch.
+- **Erreurs agent CORRÉLÉES** — `AgentMessage::Error` porte une clé optionnelle
+  (`producerId` pour `add-stream`, `""` pour `start-capture`). Le navigateur
+  rejette alors UNIQUEMENT la requête concernée. Une erreur non corrélée ne
+  déclenche PLUS `_rejectAllPending` côté browser : un handler lent n'empoisonne
+  plus les requêtes de setup en vol (l'amplificateur historique).
+- **Liste de plugins qui ne se débloque jamais** — sur contention, `ListPlugins`
+  renvoie désormais `PluginList{ scanning:true }` (au lieu d'aucun message) et
+  l'UI repolle de façon bornée, avec un bouton « Réessayer » en dernier recours.
+
+### Changed
+- Browser : retry-on-`overloaded` borné (15 × 200 ms) appliqué aussi à
+  `start-capture` (join initial + swap device en session), en plus d'`add-stream`.
+
 ## [0.5.5] — 2026-07-09
 
 > **Option B — la référence (métronome + backing) est jouée par l'AGENT**, sur son
