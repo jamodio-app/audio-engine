@@ -389,9 +389,9 @@ async fn handle_one_message(
                 payload = truncated,
                 "invalid browser message"
             );
-            let err = AgentMessage::Error {
-                message: format!("Invalid message: {} (parse error: {})", truncated, e),
-            };
+            let err = AgentMessage::error(
+                format!("Invalid message: {} (parse error: {})", truncated, e),
+            );
             let _ = out_tx.send(err).await;
             return true;
         }
@@ -1310,9 +1310,9 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
                             );
                             AgentMessage::LogsArchive { content, files, truncated, log_dir }
                         }
-                        Err(e) => AgentMessage::Error {
-                            message: format!("logs archive task failed: {e}"),
-                        },
+                        Err(e) => AgentMessage::error(
+                            format!("logs archive task failed: {e}"),
+                        ),
                     };
                     let _ = ws_tx
                         .send(Message::Text(serde_json::to_string(&payload).unwrap()))
@@ -1323,9 +1323,9 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
                 #[allow(unreachable_patterns)]
                 _ => {
                     // Tout autre message est refusé : ce canal est read-only.
-                    let err = AgentMessage::Error {
-                        message: "logs-only connection: only get-logs-archive is allowed".into(),
-                    };
+                    let err = AgentMessage::error(
+                        "logs-only connection: only get-logs-archive is allowed",
+                    );
                     let _ = ws_tx
                         .send(Message::Text(serde_json::to_string(&err).unwrap()))
                         .await;
@@ -1361,6 +1361,12 @@ fn plugin_ops_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,
 /// retourne None et le caller répond Error{overloaded} au lieu de bloquer.
+///
+/// Réservé au **hot-path idempotent** (SetVolume/Pan/Dim, GetStats, Reference*,
+/// éditeur plugin…) : ces messages sont fréquents et/ou rejoués, donc en
+/// dropper un sur contention est sans conséquence. Pour le SETUP CRITIQUE
+/// (StartCapture, AddStream, SelectDevices, SetInputSource, Load/Unload plugin,
+/// ListPlugins, Start/StopRecording, Stop) → `lock_pipeline_wait` (on ATTEND).
 async fn try_lock_pipeline(
     pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
 ) -> Option<tokio::sync::MutexGuard<'_, PipelineState>> {
@@ -1376,6 +1382,41 @@ async fn try_lock_pipeline(
                 target: "jamodio::ws",
                 timeout_ms = LOCK_TIMEOUT_MS,
                 "pipeline.lock() timeout — agent overloaded, skipping handler"
+            );
+            None
+        }
+    }
+}
+
+/// P0 (0.5.6) — acquisition du lock pour les handlers de **SETUP CRITIQUE**.
+///
+/// Contrairement au hot-path, on ne DROPPE PAS ces handlers sur contention :
+/// dropper un `AddStream`/`StartCapture`/swap-device laisse un flux muet ou une
+/// tranche figée jusqu'au relaunch (symptômes A/B). On ATTEND donc le lock avec
+/// un timeout LONG. Comme la receive loop est sérielle, le seul concurrent
+/// possible est une tâche de fond (superviseur de liveness pendant un reset ASIO,
+/// borné ~2 s) : l'attente aboutit quasi toujours.
+///
+/// Le timeout reste sous le watchdog browser (5 s) : si l'agent est réellement
+/// bloqué au-delà de `LOCK_WAIT_CRITICAL_MS`, on rend une `Error` (idéalement
+/// corrélée) que le browser peut retenter, plutôt que de pendre indéfiniment.
+const LOCK_WAIT_CRITICAL_MS: u64 = 3000;
+
+async fn lock_pipeline_wait(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+) -> Option<tokio::sync::MutexGuard<'_, PipelineState>> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(LOCK_WAIT_CRITICAL_MS),
+        pipeline.lock(),
+    )
+    .await
+    {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            tracing::warn!(
+                target: "jamodio::ws",
+                timeout_ms = LOCK_WAIT_CRITICAL_MS,
+                "pipeline.lock() timeout on CRITICAL handler — still contended after wait"
             );
             None
         }
@@ -1770,8 +1811,9 @@ async fn handle_message(
         }
 
         BrowserMessage::SelectDevices { input_id, output_id } => {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique (swap device) : on ATTEND le lock, jamais de drop.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error("agent overloaded")];
             };
             pl.select_devices(input_id, output_id);
             vec![make_status(AgentState::Idle)]
@@ -1787,8 +1829,11 @@ async fn handle_message(
                 ?stereo_start,
                 "StartCapture"
             );
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique : on ATTEND le lock (jamais de drop → sinon tranche
+            // figée jusqu'au relaunch). Erreur corrélée à la clé vide "" (comme
+            // LocalPort/CaptureError) → pas de reject collatéral côté browser.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error_keyed("agent overloaded", "")];
             };
             // Le browser passe l'id du device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
@@ -1862,7 +1907,9 @@ async fn handle_message(
                             detail: Some(msg),
                         }]
                     } else {
-                        vec![AgentMessage::Error { message: msg }]
+                        // Corrélé à la clé vide "" (comme LocalPort/CaptureError)
+                        // → le browser rejette seulement la requête StartCapture.
+                        vec![AgentMessage::error_keyed(msg, "")]
                     }
                 }
             }
@@ -1875,8 +1922,12 @@ async fn handle_message(
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 "AddStream"
             );
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique du montage d'un flux entrant (join d'un peer) : on
+            // ATTEND le lock, jamais de drop (sinon flux jamais monté → peer muet,
+            // cf. symptôme A "ghost/orphan"). Erreurs corrélées au producer_id
+            // → le browser rejette SEULEMENT cette requête (pas ses voisines).
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
             };
             match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
@@ -1884,13 +1935,14 @@ async fn handle_message(
                     port: local_port,
                     srtp_parameters: agent_srtp,
                 }],
-                Err(e) => vec![AgentMessage::Error { message: e }],
+                Err(e) => vec![AgentMessage::error_keyed(e, producer_id)],
             }
         }
 
         BrowserMessage::RemoveStream { producer_id } => {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique (teardown d'un flux au leave d'un peer) : on ATTEND.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
             };
             pl.remove_stream(&producer_id);
             vec![]
@@ -1929,8 +1981,11 @@ async fn handle_message(
             // GetStats est appelé en heartbeat (toutes les 1.5 s). Si on ne peut
             // pas acquérir le lock dans 200 ms, on répond Error pour que le
             // browser sache que l'agent est saturé (au lieu de timeout watchdog 3 s).
+            // Hot-path (heartbeat 1.5 s) : skip OK, mais erreur NON corrélée
+            // (`error()`) → avec le fix P1 browser, elle ne rejette plus les
+            // requêtes de setup en vol (plus d'amplificateur).
             let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+                return vec![AgentMessage::error("agent overloaded")];
             };
             let is_capturing = matches!(pl.state, AgentState::Capturing);
             let stream_count = pl.recv_stops.len();
@@ -2012,8 +2067,10 @@ async fn handle_message(
         }
 
         BrowserMessage::Stop => {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique (sortie de studio) : on ATTEND pour garantir un
+            // leave_session propre (park ASIO) plutôt que de figer l'état.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error("agent overloaded")];
             };
             // 0.5.4-5 — sortie de studio : PARK sur ASIO (driver gardé chaud →
             // rejoin instantané, anti-churn Focusrite), stop_all complet ailleurs.
@@ -2228,8 +2285,13 @@ async fn handle_message(
         BrowserMessage::ListPlugins => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
-                    return vec![];
+                // P2 — ne JAMAIS laisser l'UI bloquée en « Scan… » : on ATTEND le
+                // lock, et si l'agent est vraiment contendu on répond quand même
+                // un PluginList `scanning:true` (au lieu de `vec![]` = aucun
+                // message → l'UI restait figée). Le browser reçoit un signal
+                // explicite « toujours en cours » et repolle.
+                let Some(pl) = lock_pipeline_wait(pipeline).await else {
+                    return vec![AgentMessage::PluginList { items: vec![], scanning: true }];
                 };
                 let (items, scanning) = pl.list_instrument_plugins();
                 vec![AgentMessage::PluginList { items, scanning }]
@@ -2247,8 +2309,11 @@ async fn handle_message(
                 // load natif (0,4–4 s) : on clone le bundle d'Arcs (cheap) puis
                 // on relâche immédiatement. Le thread audio passe en dry
                 // (handle=None + try_lock) et perfstats_task n'est pas bloqué.
+                // Setup critique : on ATTEND le lock COURT (juste cloner le
+                // bundle d'Arcs). Le load natif lent (0,4–4 s) se fait ensuite
+                // HORS lock (spawn_blocking) — cf. plus bas.
                 let ctrl = {
-                    let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
                         return vec![AgentMessage::InstrumentPluginError {
                             message: "agent overloaded".into(),
                         }];
@@ -2319,8 +2384,10 @@ async fn handle_message(
                 // relâche le lock PipelineState, teardown natif sur le pool
                 // blocking (le thread audio est déjà passé en dry dès que
                 // PluginControl::unload pose handle=None).
+                // Setup critique : on ATTEND le lock COURT (clone du bundle),
+                // le teardown natif lent se fait ensuite HORS lock.
                 let ctrl = {
-                    let Some(pl) = try_lock_pipeline(pipeline).await else {
+                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
                         return vec![];
                     };
                     pl.plugin_control()
@@ -2406,7 +2473,9 @@ async fn handle_message(
         BrowserMessage::SetInputSource { source, midi_device_id } => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                // Setup critique (bascule MIDI ↔ audio, symptôme B) : on ATTEND
+                // le lock pour ne pas laisser la tranche figée jusqu'au relaunch.
+                let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
                     return vec![AgentMessage::InputSourceError {
                         message: "agent overloaded".into(),
                     }];
@@ -2514,8 +2583,10 @@ async fn handle_message(
         }
 
         BrowserMessage::StartRecording { stems } => {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
-                return vec![AgentMessage::Error { message: "agent overloaded".into() }];
+            // Setup critique (armement REC) : on ATTEND, et on rend une
+            // RecordingError (corrélée dans l'UI REC) plutôt qu'un Error générique.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::RecordingError { message: "agent overloaded".into() }];
             };
             // Convertit le wire StemSpec → record::StemSpec (même contenu,
             // module différent pour découpler le protocol du core record).
@@ -2617,9 +2688,9 @@ async fn handle_message(
                         log_dir,
                     }]
                 }
-                Err(e) => vec![AgentMessage::Error {
-                    message: format!("logs archive task failed: {e}"),
-                }],
+                Err(e) => vec![AgentMessage::error(
+                    format!("logs archive task failed: {e}"),
+                )],
             }
         }
 
