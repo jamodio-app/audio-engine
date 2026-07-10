@@ -435,6 +435,17 @@ pub enum AgentMessage {
     },
     Error {
         message: String,
+        /// P1 (0.5.6) — clé de corrélation OPTIONNELLE. Quand `Some(k)`, le
+        /// browser rejette UNIQUEMENT la requête en attente sur cette clé
+        /// (`_pending.get(k)`) au lieu de `_rejectAllPending`. Conventions :
+        /// `Some(producer_id)` pour un échec `AddStream` ; `Some("")` pour un
+        /// échec `StartCapture` (corrélé côté browser par la clé vide, comme
+        /// `LocalPort`/`CaptureError`). `None` = erreur générique NON corrélée
+        /// → le browser log et laisse le timeout par-requête (5 s) agir, sans
+        /// empoisonner ses voisins. `skip_serializing_if` → back-compat wire :
+        /// absent = ancien format.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        key: Option<String>,
     },
     /// Confirmation explicite de la capture démarrée. Permet au browser de
     /// vérifier que le device ouvert correspond bien à celui demandé.
@@ -723,6 +734,22 @@ pub enum AgentMessage {
         #[serde(rename = "outMs")]
         out_ms: f32,
     },
+}
+
+impl AgentMessage {
+    /// Erreur générique NON corrélée. Le browser la log sans rejeter les autres
+    /// requêtes en vol (cf. `key` sur `AgentMessage::Error`). À utiliser quand
+    /// on ne sait pas à quelle requête browser l'erreur se rattache.
+    pub fn error(message: impl Into<String>) -> Self {
+        AgentMessage::Error { message: message.into(), key: None }
+    }
+
+    /// Erreur CORRÉLÉE à une requête browser précise (clé = `producer_id` pour
+    /// `AddStream`, `""` pour `StartCapture`). Le browser rejette uniquement la
+    /// requête sur cette clé → un handler lent n'empoisonne plus ses voisins.
+    pub fn error_keyed(message: impl Into<String>, key: impl Into<String>) -> Self {
+        AgentMessage::Error { message: message.into(), key: Some(key.into()) }
+    }
 }
 
 /// Sprint S1 — Métriques d'un INSERT plugin actif (process_stereo wall-clock).
