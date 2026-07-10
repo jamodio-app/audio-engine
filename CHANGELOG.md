@@ -6,6 +6,46 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.5-2] — 2026-07-09
+
+> **Pré-release de test — B4 : backing track joué par l'agent.** Ajoute au métro
+> (0.5.5-1) le backing rejoué par l'agent, aligné sur la grille serveur en continu
+> (servo varispeed anti-dérive), à latence connue. Nécessite le SFU à jour
+> (`metroOriginServerMs` / `backingPositionAtServerMs`) pour le late-join.
+
+### Added
+- **Sous-source backing dans le mixer** — le navigateur pousse le PCM stéréo 48k
+  une fois (`reference-backing-begin/chunk/end`), l'agent le rejoue aligné sur la
+  grille de sortie avec un servo varispeed anti-dérive inter-peers (snap sur seek,
+  ±1 % de vitesse sinon). Mixé au même point que le métro (exclu record, non ducké,
+  suit master). Volume/pan via `producerId 'backing'`.
+- **Protocole** : `reference-backing-*` (begin/chunk/end/unload/play/pause/seek/sync).
+
+## [0.5.5-1] — 2026-07-09
+
+> **Pré-release de test — Option B : métronome de référence synthétisé par l'agent.**
+> Le métronome sort désormais par le chemin de sortie de l'agent (ASIO/CoreAudio,
+> latence CONNUE) au lieu du navigateur, pour une synchro inter-peers juste sur
+> toutes les machines (le navigateur sous-rapporte sa latence de sortie sur
+> Windows/WASAPI). À valider au micro (PC+Scarlett ↔ Mac). Cf.
+> `internal-docs/plans/PLAN-OPTION-B-B0-DESIGN.md`.
+
+### Added
+- **Source « référence » dans le mixer** (`jamodio-audio-core/mixer/reference.rs`) —
+  synthèse du clic métronome à l'échantillon près, à partir d'une grille exprimée
+  en frames de sortie de l'agent. Synthèse extensible (son / figure rythmique) ;
+  un seul preset câblé pour l'instant. Mixée à un point dédié : exclue du MIX
+  enregistré, non duckée par le DIM, suit le master.
+- **Ancrage horloge échantillon↔mural** exposé au navigateur (`reference-clock-pong`)
+  — le navigateur mappe la grille serveur → l'échantillon de sortie exact.
+- **Protocole** : `reference-clock-ping/pong` + `reference-config/grid/stop`.
+- **Horloge monotone process-wide** (`sync/clock.rs`) — domaine commun ancre↔pong.
+
+### Notes
+- Bénéfice garanti sur ASIO/CoreAudio (latence de sortie connue). Sur WASAPI sans
+  interface, le navigateur retombe sur la compensation locale (Option A).
+- Le backing track suivra (streamé vers l'agent) une fois le métronome validé.
+
 ## [0.5.4] — 2026-07-09
 
 > **Host ASIO duplex « maison » + robustesse Windows + télémétrie de latence honnête.**

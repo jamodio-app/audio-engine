@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.5.4"
+version = "0.5.5-2"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
