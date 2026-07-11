@@ -6,6 +6,17 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-2] — 2026-07-11
+
+> **Pré-release de test — lisibilité UI + validation terrain 0.5.6-1.**
+> Code de robustesse identique à 0.5.6-1 (validé au banc : scan plugins débloqué,
+> bascule MIDI/audio OK). Seul le badge de version de la fenêtre agent change.
+
+### Changed
+- **Badge de version de l'agent plus lisible** (`ui/style.css`) : 9 → 12 px, et
+  couleur `--muted`/0.5 → `--text2`/0.9. La version était quasi invisible, gênant
+  pour identifier un build de test en cours.
+
 ## [0.5.6-1] — 2026-07-10
 
 > **Pré-release de test — robustesse sous charge (lock pipeline + erreurs corrélées).**
