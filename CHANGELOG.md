@@ -6,6 +6,18 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-3] — 2026-07-11
+
+> **Pré-release de test — éditeur plugin VST3 : re-clic ramène la fenêtre au premier plan (PC).**
+
+### Fixed
+- **Éditeur plugin (Windows/VST3)** : re-cliquer sur le nom d'un plugin déjà chargé,
+  alors que sa fenêtre était cachée derrière le navigateur ou minimisée, ne faisait
+  rien (il fallait passer par l'icône Audio Engine de la barre des tâches).
+  `open_editor` ramène désormais la fenêtre EXISTANTE au premier plan (restore si
+  minimisée + bring-to-front fiable, même chemin que l'ouverture). macOS (AU) le
+  faisait déjà — mise à parité.
+
 ## [0.5.6-2] — 2026-07-11
 
 > **Pré-release de test — lisibilité UI + validation terrain 0.5.6-1.**

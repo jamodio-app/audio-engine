@@ -57,9 +57,9 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
-        RegisterClassExW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, GWL_EXSTYLE,
-        GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, SW_SHOW, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
+        IsIconic, RegisterClassExW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
+        GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SW_RESTORE, SW_SHOW, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
         WM_DESTROY, WM_SIZE, WM_SIZING, WNDCLASSEXW, WS_CAPTION, WS_EX_DLGMODALFRAME, WS_MINIMIZEBOX,
         WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE,
     },
@@ -297,6 +297,35 @@ impl EditorWindow {
     /// close explicite) — permet au Vst3Host d'autoriser une réouverture.
     pub fn is_closed(&self) -> bool {
         self.shared.state.load(Ordering::SeqCst) == STATE_CLOSED
+    }
+
+    /// Ramène la fenêtre éditeur EXISTANTE au premier plan. Appelé quand
+    /// l'utilisateur re-clique sur le nom du plugin alors que la fenêtre est
+    /// déjà ouverte mais cachée/minimisée (bug PC : `open_editor` retournait
+    /// Ok sans rien montrer → il fallait passer par l'icône barre des tâches).
+    /// Restaure si minimisée puis applique le même bring-to-front fiable que
+    /// l'ouverture (toggle TOPMOST + SetForegroundWindow). No-op si HWND pas
+    /// encore créée (setup en cours) ou déjà détruite. Posté sur vst3-main.
+    pub fn focus(&self) {
+        let shared = self.shared.clone();
+        main_thread::post(move || {
+            let hwnd = shared.hwnd.load(Ordering::SeqCst);
+            if hwnd.is_null() {
+                return;
+            }
+            let hwnd = hwnd as HWND;
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_SHOW);
+                }
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            tracing::debug!(target: "jamodio::vst3::editor", "editor re-focus (bring to front)");
+        });
     }
 
     /// Détruit la fenêtre. Posté en FIFO sur vst3-main : si le job

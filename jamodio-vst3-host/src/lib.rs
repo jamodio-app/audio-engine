@@ -356,7 +356,11 @@ impl PluginHost for Vst3Host {
         if entry.editor.as_ref().is_some_and(|e| e.is_closed()) {
             entry.editor = None;
         }
-        if entry.editor.is_some() {
+        // Déjà ouverte : re-clic sur le nom du plugin → on la RAMÈNE au premier
+        // plan (elle pouvait être cachée derrière le browser ou minimisée) au
+        // lieu de ne rien faire. Corrige le bug PC (Mac AU le faisait déjà).
+        if let Some(editor) = entry.editor.as_ref() {
+            editor.focus();
             return Ok(());
         }
         let title = format!("{} — Jamodio", entry.instance.class.name);
