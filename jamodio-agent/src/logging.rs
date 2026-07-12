@@ -29,6 +29,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 pub const DEFAULT_LOG_ARCHIVE_DAYS: u32 = 3;
 pub const DEFAULT_LOG_ARCHIVE_BYTES: u64 = 5_000_000;
 
+/// Nombre de fichiers journaliers `agent.log.*` conservés sur disque.
+/// `rolling::daily` ne purge jamais : sans ça les fichiers s'accumulent
+/// indéfiniment (constaté : ~150 MB / 60 fichiers en prod). L'export support
+/// n'en lit que `DEFAULT_LOG_ARCHIVE_DAYS` (3) ; on garde une marge confortable
+/// pour le diagnostic manuel tout en bornant l'espace disque.
+pub const LOG_RETENTION_FILES: usize = 14;
+
 /// Retourne le dossier où les logs sont écrits. Crée le dossier si absent.
 pub fn log_dir() -> PathBuf {
     let dir = base_log_dir();
@@ -94,7 +101,49 @@ pub fn init() -> WorkerGuard {
         "Jamodio Audio Engine starting"
     );
 
+    // Purge des vieux fichiers journaliers (rétention bornée). Une fois au boot :
+    // le fichier du jour est toujours dans les plus récents, jamais supprimé.
+    prune_old_logs(&dir, LOG_RETENTION_FILES);
+
     guard
+}
+
+/// Supprime les fichiers `agent.log.*` les plus anciens en ne gardant que les
+/// `keep` plus récents. Le nommage `agent.log.YYYY-MM-DD` trie
+/// chronologiquement par ordre lexical, donc pas de parsing de date fragile.
+/// Best-effort : toute erreur d'I/O est ignorée (ne doit jamais bloquer le boot).
+fn prune_old_logs(dir: &std::path::Path, keep: usize) {
+    let mut names: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("agent.log."))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if names.len() <= keep {
+        return;
+    }
+    names.sort(); // ordre lexical == chronologique (YYYY-MM-DD)
+    let to_remove = names.len() - keep;
+    let mut removed = 0usize;
+    for path in names.into_iter().take(to_remove) {
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            target: "jamodio::support",
+            removed,
+            kept = keep,
+            "purge des anciens fichiers de logs"
+        );
+    }
 }
 
 /// Récupère les `max_days` derniers fichiers de logs et les concatène en

@@ -6,6 +6,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-4] — 2026-07-12
+
+> **Pré-release de test — purge de rétention des logs de l'agent.**
+> Volet agent du chantier « logs nickel » BETA (le volet navigateur est dans une
+> PR web séparée). Aucun changement fonctionnel audio/robustesse par rapport à
+> 0.5.6-3.
+
+### Fixed
+- **Accumulation illimitée des fichiers de logs** (`logging.rs`) : `rolling::daily`
+  ne purgeait jamais les anciens `agent.log.*` → accumulation constatée à ~150 Mo
+  (60 fichiers) sur macOS. L'agent conserve désormais les **14 fichiers les plus
+  récents** (purge best-effort une fois au démarrage, tri lexical = chronologique,
+  ne touche jamais le fichier du jour). L'export support ne lit que 3 jours ; la
+  marge à 14 couvre le diagnostic manuel.
+
 ## [0.5.6-3] — 2026-07-11
 
 > **Pré-release de test — éditeur plugin VST3 : re-clic ramène la fenêtre au premier plan (PC).**
