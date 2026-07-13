@@ -212,8 +212,14 @@ impl Backing {
     }
 
     fn begin(&mut self, total_frames: usize) {
+        // Garde-fou anti-DoS (review pré-BETA) : total_frames vient du wire ; sans
+        // borne, une valeur absurde (u64::MAX → usize) faisait reserve() → échec
+        // d'alloc → abort du process EN UN SEUL message. On plafonne la
+        // pré-réservation à 30 min @ 48kHz ; le Vec grandit à la demande si un
+        // backing légitime dépasse (rare).
+        const MAX_BACKING_FRAMES: usize = 48_000 * 60 * 30;
         self.pcm.clear();
-        self.pcm.reserve(total_frames.saturating_mul(2));
+        self.pcm.reserve(total_frames.min(MAX_BACKING_FRAMES).saturating_mul(2));
         self.ready = false;
         self.playing = false;
         self.anchored = false;
