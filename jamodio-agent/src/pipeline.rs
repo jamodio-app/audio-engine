@@ -1933,6 +1933,16 @@ impl PipelineState {
         // Remove existing if any
         self.remove_stream(&producer_id);
 
+        // Garde-fou anti-DoS (review pré-BETA) : borne le nombre de flux entrants
+        // (contextes SRTP + sockets UDP). Un client légitime en monte ≤ quelques
+        // (nombre de pairs) ; ce cap dur évite l'exhaustion mémoire/fd par un flot
+        // d'AddStream. Le remove ci-dessus garantit qu'un ré-ajout du même
+        // producer ne compte pas double.
+        const MAX_RECV_STREAMS: usize = 16;
+        if self.recv_stops.len() >= MAX_RECV_STREAMS {
+            return Err(format!("too many streams (max {})", MAX_RECV_STREAMS));
+        }
+
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
             .map_err(|e| format!("Bad SFU address: {}", e))?;
