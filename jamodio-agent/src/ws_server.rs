@@ -27,9 +27,15 @@ use crate::pipeline::{PipelineState, ProducerNetStats};
 /// pic CPU local sans perdre la session.
 const LOCK_TIMEOUT_MS: u64 = 200;
 
+/// Suffixe du scope Vercel de l'équipe Jamodio (previews). Seul ce compte peut
+/// déployer sous ce suffixe → un projet tiers `jamodio-*.vercel.app` d'un autre
+/// scope est rejeté. ⚠️ Doit rester synchro avec le SFU (server/sfu.js
+/// VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
+const VERCEL_TEAM_SUFFIX: &str = "-bengo82-9540s-projects.vercel.app";
+
 /// Vérifie l'origin de la requête WS upgrade. On accepte uniquement :
 ///   - https://jamodio.com (prod)
-///   - https://*.vercel.app (preview branches)
+///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope Jamodio)
 ///   - http://localhost:* / http://127.0.0.1:* (dev local + browser-side dev)
 ///   - tauri://localhost ou http://tauri.localhost (UI WEBVIEW INTERNE
 ///     de l'agent — Tauri 2 sert sa webview sous ces schemes selon l'OS).
@@ -37,24 +43,30 @@ const LOCK_TIMEOUT_MS: u64 = 200;
 ///     origins, car la webview interne est un client légitime en plus du
 ///     browser jamodio.com (lecture-seule des stats, pas de race possible).
 ///   - file:// (cas webview embedded historique)
-///   - Origin absent (clients "raw" comme tests CLI) — toléré, log warn
+///   - Origin absent : toléré en DEBUG (tests CLI), REFUSÉ en release (C5)
 ///
 /// Empêche une page web random sur localhost:1234 de piloter l'agent
 /// silencieusement.
 fn origin_allowed(origin: Option<&str>) -> bool {
     let Some(origin) = origin else {
-        // Origin absent : clients non-browser (tests). On tolère mais on log.
-        return true;
+        // Origin absent : un navigateur envoie TOUJOURS un en-tête Origin ;
+        // seul un client non-browser (test CLI) ou un process natif local peut
+        // l'omettre. En RELEASE on REFUSE (sinon un malware local se ferait
+        // admettre sans condition en omettant l'Origin) ; en debug on tolère
+        // pour les tests. Cf. review pré-BETA 2026-07-12 (C5).
+        return cfg!(debug_assertions);
     };
     // Origins de PRODUCTION (build release ET debug).
     if origin == "https://jamodio.com"
         || origin == "https://www.jamodio.com"
-        // Previews Vercel : on EXIGE le nom de projet Jamodio dans le sous-
-        // domaine. `ends_with(".vercel.app")` seul whitelisterait TOUT
-        // vercel.app — n'importe qui déploie `evil.vercel.app` (gratuit) et
-        // pilote l'agent depuis une page drive-by. Les URLs de preview Vercel
-        // sont de la forme `jamodio-<hash|git-branch>-<scope>.vercel.app`.
-        || (origin.starts_with("https://jamodio") && origin.ends_with(".vercel.app"))
+        // Previews Vercel : on épingle le SCOPE de l'équipe Jamodio. Un
+        // `ends_with(".vercel.app")` — ou même `starts_with("https://jamodio")`
+        // — laisserait n'importe qui enregistrer `jamodio-x.vercel.app` (gratuit)
+        // et piloter l'agent en drive-by. Les URLs de preview sont
+        // `jamodio-<hash|git-branch>-<scope>.vercel.app` ; seul VERCEL_TEAM_SUFFIX
+        // (le scope de l'équipe) n'est pas usurpable. ⚠️ Doit rester synchro avec
+        // le SFU (server/sfu.js VERCEL_PREVIEW_RE).
+        || (origin.starts_with("https://jamodio-") && origin.ends_with(VERCEL_TEAM_SUFFIX))
         || is_internal_client_origin(origin)
         || origin == "file://"
     {
@@ -1829,6 +1841,28 @@ async fn handle_message(
                 ?stereo_start,
                 "StartCapture"
             );
+            // Validation de la destination (M-agent-2, review pré-BETA 2026-07-12).
+            // Le browser fournit sfu_ip/sfu_port ; on refuse une IP invalide ou
+            // manifestement bogue avant d'ouvrir le flux. En release on rejette
+            // aussi loopback (jamais un vrai POP SFU depuis l'agent) ; en debug on
+            // tolère (SFU local sur 127.0.0.1). L'auth d'origine (C5) reste la
+            // barrière principale contre la redirection du flux micro.
+            match sfu_ip.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    let mut bogus = ip.is_unspecified() || ip.is_multicast();
+                    if cfg!(not(debug_assertions)) {
+                        bogus = bogus || ip.is_loopback();
+                    }
+                    if bogus {
+                        tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : destination SFU invalide");
+                        return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : sfu_ip non parseable");
+                    return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
+                }
+            }
             // Setup critique : on ATTEND le lock (jamais de drop → sinon tranche
             // figée jusqu'au relaunch). Erreur corrélée à la clé vide "" (comme
             // LocalPort/CaptureError) → pas de reject collatéral côté browser.

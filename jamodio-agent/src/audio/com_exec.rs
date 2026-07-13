@@ -57,7 +57,13 @@ mod imp {
                         CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32)
                     };
                     while let Ok(job) = rx.recv() {
-                        job();
+                        // Défense en profondeur : un panic dans une closure driver
+                        // (ASIO tiers, unwrap interne cpal, Drop de stream/host) ne
+                        // doit JAMAIS tuer ce thread. S'il mourait, TOUTE opération
+                        // audio Windows ultérieure (énumération, open/close stream)
+                        // échouerait pour la vie du process. Même leçon que
+                        // main_thread.rs:169 côté VST3. Cf. review pré-BETA (C7).
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                     }
                 })
                 .expect("spawn audio-com-sta thread");
@@ -66,20 +72,35 @@ mod imp {
     }
 
     /// Exécute `f` sur le thread STA et renvoie son résultat (bloquant).
+    ///
+    /// Si `f` panique, le thread STA SURVIT (catch_unwind) et le panic est
+    /// re-propagé au thread appelant — pour les handlers ws il est absorbé en
+    /// amont par `spawn_blocking`/`JoinError`. L'audio Windows reste opérationnel
+    /// pour les appels suivants (contrairement à l'ancien `.expect` qui figeait
+    /// tout après le premier panic). Cf. review pré-BETA 2026-07-12 (C7).
     pub fn run<R, F>(f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (rtx, rrx) = channel::<R>();
+        let (rtx, rrx) = channel::<std::thread::Result<R>>();
         let job: Job = Box::new(move || {
-            // Si le caller a abandonné (rrx droppé), l'envoi échoue : on ignore.
-            let _ = rtx.send(f());
+            // f est exécutée sous catch_unwind : un panic est capturé et renvoyé
+            // au caller au lieu de dérouler le thread STA. Si le caller a
+            // abandonné (rrx droppé), l'envoi échoue : on ignore.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = rtx.send(result);
         });
         sender()
             .send(job)
             .expect("audio-com-sta thread vivant");
-        rrx.recv().expect("résultat du thread audio-com-sta")
+        match rrx.recv() {
+            Ok(Ok(val)) => val,
+            // La closure a paniqué : thread STA préservé, on re-panique le caller.
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            // Thread STA mort : ne devrait plus arriver (catch_unwind ci-dessus).
+            Err(_) => panic!("audio-com-sta thread mort"),
+        }
     }
 }
 
