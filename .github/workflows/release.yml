@@ -67,15 +67,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # SHA épinglé (branche stable) — cf. review pré-BETA 2026-07-12 (M-infra-1).
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: stable   # requis quand l'action est épinglée à un SHA : le ref @stable n'indique plus le canal
           targets: ${{ matrix.target }}
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: './ -> target'
           key: ${{ matrix.target }}
@@ -144,7 +146,9 @@ jobs:
         run: rm -f .cargo/config.toml
 
       - name: Build + upload (tauri-action)
-        uses: tauri-apps/tauri-action@v0
+        # SHA épinglé — cette action reçoit la CLÉ PRIVÉE de l'updater ; un tag
+        # @v0 repointé exfiltrerait la clé. Cf. review pré-BETA 2026-07-12 (M-infra-1).
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           # Requis pour créer / uploader la release via l'API GitHub.
           # Injecté automatiquement par Actions, mais doit être explicitement

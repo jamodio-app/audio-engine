@@ -6,6 +6,30 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-5] — 2026-07-13
+
+> **Pré-release de test — durcissement sécurité (review pré-BETA).**
+> Volet agent du LOT 1 du code review pré-BETA (volets web/SFU dans le monorepo).
+> À valider sur le build Windows avant toute promotion.
+
+### Sécurité
+- **WS de contrôle local** : refus des connexions sans en-tête `Origin` en build
+  release (un navigateur en envoie toujours un — seul un client natif l'omettait
+  pour se faire admettre), et whitelist des previews Vercel épinglée au **scope
+  de l'équipe** (`…-bengo82-9540s-projects.vercel.app`) au lieu de tout
+  `jamodio*.vercel.app`. Ferme le drive-by web distant (exfiltration micro). (C5)
+- **StartCapture** : validation de l'IP de destination SFU (rejet des IP
+  invalides / loopback en release). (M-agent-2)
+
+### Robustesse
+- **Thread COM-STA (Windows/ASIO)** : isolation de panic (`catch_unwind`) — un
+  panic dans une closure driver n'empoisonne plus tout l'audio pour la vie du
+  process ; le panic est propagé proprement à l'appelant. (C7)
+
+### CI
+- Actions GitHub épinglées à un SHA de commit (protège la clé privée de l'updater
+  contre un tag/branche repointé). (M-infra-1)
+
 ## [0.5.6-4] — 2026-07-12
 
 > **Pré-release de test — purge de rétention des logs de l'agent.**
