@@ -6,6 +6,22 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+## [0.5.6-6] — 2026-07-14
+
+> **Pré-release de test.** À valider sur le build Windows avant promotion.
+
+### Corrigé
+- **MIDI — source poussée au (re)connexion.** L'agent envoie désormais sa source
+  d'entrée courante (audio / MIDI) à chaque connexion browser, comme il push déjà
+  l'état du plugin. Sans ça, après un rejoin (bascule « mode agent » en session,
+  2ᵉ onglet Jamodio, reload de page), le browser supposait `audio` alors que
+  l'agent était en MIDI → le clavier MIDI (physique **ou** virtuel) restait
+  indisponible jusqu'à un re-toggle manuel audio↔midi.
+
+### Robustesse
+- **Clamps anti-DoS** (review pré-BETA, bloc vert) : bornes défensives sur la
+  pipeline et le mixer de référence.
+
 ## [0.5.6-5] — 2026-07-13
 
 > **Pré-release de test — durcissement sécurité (review pré-BETA).**
