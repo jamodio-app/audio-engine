@@ -496,6 +496,37 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     }
 
+    // Sync la SOURCE d'entrée (audio / MIDI) au (re)connect, comme on push déjà
+    // l'état du plugin ci-dessus. Sans ça, le browser assume 'audio' alors que
+    // l'agent peut être en MIDI (multi-onglet, rejoin « Basculer », reload page)
+    // → le clavier MIDI (physique OU virtuel) restait indisponible jusqu'à un
+    // re-toggle audio↔midi manuel (symptôme Ben 14/07). On envoie le même
+    // message InputSourceChanged que pour un set explicite → aucun handler
+    // browser à modifier.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let src = { handle.pipeline.lock().await.current_input_source() };
+        let (src_str, dev_id, dev_name) = match &src {
+            crate::pipeline::InputSource::Audio => ("audio".to_string(), None, None),
+            crate::pipeline::InputSource::Midi(id) => {
+                let name = crate::audio::midi::list_devices()
+                    .into_iter()
+                    .find(|d| &d.id == id)
+                    .map(|d| d.name);
+                ("midi".to_string(), Some(id.clone()), name)
+            }
+        };
+        let src_msg = AgentMessage::InputSourceChanged {
+            source: src_str,
+            midi_device_id: dev_id,
+            midi_device_name: dev_name,
+        };
+        let _ = ws_tx
+            .send(Message::Text(serde_json::to_string(&src_msg).unwrap()))
+            .await;
+        tracing::info!(target: "jamodio::ws", "pushed input source state on connect");
+    }
+
     // Channel for outgoing messages (from message handler + periodic tasks)
     let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(64);
 
