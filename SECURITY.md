@@ -53,7 +53,7 @@ Inclure si possible :
 Ce repo héberge **uniquement l'agent desktop** (Rust + Tauri + AU
 host) qui tourne en local sur la machine de l'user et expose :
 
-- Un WebSocket local `127.0.0.1:38901` (commande/contrôle browser
+- Un WebSocket local `127.0.0.1:9876` (commande/contrôle browser
   ↔ agent).
 - Des sockets UDP RTP/SRTP vers le SFU Jamodio (audio temps réel).
 - Le pont CoreAudio (capture micro/instrument, playback).

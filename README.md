@@ -5,7 +5,7 @@ carte son du musicien et le SFU Jamodio :
 
 ```
 Carte son (CoreAudio / ASIO)
-    ↓ CPAL capture (buffer 128 samples, ~2.7 ms)
+    ↓ CPAL capture (buffer 64 samples, ~1,33 ms — repli 128 si la machine ne tient pas)
     ↓ Opus encode (10 ms)
     ↓ RTP / UDP comedia punch
     ↓ mediasoup SFU (sfu.jamodio.com)
@@ -83,201 +83,32 @@ sélectionné dans l'agent, pas de prompt).
 
 ---
 
-## Setup local (développement)
+## Build & release
 
-### Prérequis
+Ce dépôt est **source-available** (voir [LICENSE](./LICENSE)) : le code est
+visible pour la distribution des binaires et le fonctionnement de l'updater,
+mais n'est pas ouvert à la contribution externe. Les instructions de build
+local et le process de publication des releases sont maintenus en interne par
+Jamodio.
 
-- **Rust stable** : `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- **Tauri CLI** : `cargo install tauri-cli --version "^2.0" --locked`
-- **Node** (pour le dev server de la vue UI) : non nécessaire, l'UI est statique
-
-### macOS Apple Silicon — particularité libopus
-
-Homebrew fourni sous Rosetta donne libopus x86_64 uniquement. Ce repo
-embarque [`deps/opus-arm64/`](./deps/opus-arm64) — une libopus ARM
-pré-compilée — et utilise [`.cargo/config.toml`](.cargo/config.toml) pour
-pointer `PKG_CONFIG_PATH` dessus. **Rien à faire** en local, ça marche.
-
-Si tu n'es pas sur Apple Silicon : supprime `deps/opus-arm64/` et
-`.cargo/config.toml`, puis `brew install opus pkg-config` (macOS Intel) ou
-via vcpkg (Windows). Le crate `audiopus` détectera libopus système.
-
-### Régénérer les icônes (app + tray)
-
-Les icônes sources sont des SVG dans [`jamodio-agent/icons/src/`](./jamodio-agent/icons/src/) (logo V5 + tray monochrome). Pour régénérer tous les formats attendus par Tauri (`32x32.png`, `128x128.png`, `icon.icns`, `icon.ico`, `tray.png`) :
-
-```bash
-# Prérequis une seule fois
-brew install librsvg imagemagick
-
-# Régénération depuis les SVG
-./jamodio-agent/icons/src/regenerate.sh
-```
-
-À relancer chaque fois que tu modifies les SVG sources. Les PNG/ICNS/ICO générés sont commités tels quels (Tauri attend les rasters).
-
-### Build local
-
-```bash
-# Depuis la racine du workspace
-cd jamodio-agent
-
-# Dev (hot reload de l'UI)
-cargo tauri dev
-
-# Release build (produit le .dmg / .exe dans target/release/bundle/)
-cargo tauri build
-```
-
-Les artefacts (la version dans le nom suit `tauri.conf.json`) :
-- macOS Apple Silicon : `target/release/bundle/dmg/Jamodio Audio Engine_<version>_aarch64.dmg`
-- Windows : `target/release/bundle/msi/Jamodio Audio Engine_<version>_x64_en-US.msi`
-
----
-
-## Release (publication d'une nouvelle version)
-
-### Principe
-
-Toute release est **déclenchée par un tag Git** `vX.Y.Z`. Le workflow
-[`release.yml`](.github/workflows/release.yml) tourne sur GitHub Actions :
-
-1. **2 runners en parallèle** compilent l'agent :
-   - `macos-14` → cible `aarch64-apple-darwin` (Apple Silicon)
-   - `windows-2022` → cible `x86_64-pc-windows-msvc`
-2. Chaque build signe l'updater Tauri (avec `TAURI_SIGNING_PRIVATE_KEY`).
-3. Le job `publish` renomme les artefacts en noms stables :
-   - `Jamodio-Audio-Engine-macOS-AppleSilicon.dmg`
-   - `Jamodio-Audio-Engine-Windows.msi`
-4. Le draft devient une release publiée.
-
-**Tu n'as besoin que de ta machine de dev** — GitHub fournit les 2 runners.
-Temps total : ~10–15 min après le push du tag. 0 € pour les repos publics.
-
-### Setup initial (une seule fois)
-
-#### 1. Générer la keypair Tauri updater
-
-```bash
-cd jamodio-agent
-cargo tauri signer generate -w ~/.tauri/jamodio-updater.key
-```
-
-Le CLI affiche la **public key** (longue chaîne base64). Copie-la dans
-[`tauri.conf.json`](./jamodio-agent/tauri.conf.json) à la clé `plugins.updater.pubkey`.
-
-```json
-"plugins": {
-  "updater": {
-    "endpoints": ["https://github.com/jamodio-app/audio-engine/releases/latest/download/latest.json"],
-    "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6..."
-  }
-}
-```
-
-#### 2. Ajouter les secrets GitHub
-
-`github.com/jamodio-app/audio-engine` → **Settings** → **Secrets and variables** → **Actions** → **New repository secret** :
-
-| Nom | Valeur |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | Contenu complet du fichier `~/.tauri/jamodio-updater.key` |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Le password choisi à l'étape 1 |
-
-### Publier une version
-
-1. **Bump version** — la version vit dans **5 fichiers** (les 4 `Cargo.toml` du
-   workspace + [`jamodio-agent/tauri.conf.json`](./jamodio-agent/tauri.conf.json)).
-   Le script du monorepo parent les met à jour en lockstep et abort si elles ne
-   sont pas déjà cohérentes :
-   ```bash
-   # depuis la racine du monorepo jamodio (parent de ce repo)
-   node scripts/bump-agent-version.js patch    # ou minor | major | X.Y.Z
-   ```
-   Puis rafraîchir `Cargo.lock` (les 4 crates du workspace).
-
-2. **Ajouter une entrée au [CHANGELOG.md](./CHANGELOG.md)** (voir format plus bas).
-
-3. **Commit + tag + push** (nommer la branche/tag explicitement évite l'erreur
-   « no upstream branch ») :
-   ```bash
-   git add -A
-   git commit -m "chore(agent): bump to vX.Y.Z"
-   git tag vX.Y.Z
-   git push origin main
-   git push origin vX.Y.Z
-   ```
-
-4. **Monitoring du build** : onglet **Actions** du repo. En cas d'échec sur
-   un runner, cliquer sur le job pour voir les logs. Les erreurs les plus
-   courantes : dépendances libopus manquantes (voir step "Install libopus"
-   dans le workflow), ou keypair updater mal configurée.
-
-5. Quand tout est vert (✓), la release apparaît sur la page du repo avec les
-   3 artefacts renommés. Les URLs `releases/latest/download/<stable-name>`
-   commencent immédiatement à pointer sur la nouvelle version → l'app web et
-   l'updater Tauri reçoivent la mise à jour sans modification de code.
-
-### Signature Apple / notarisation (optionnel, plus tard)
-
-Sans Apple Developer certificat ($99/an), l'utilisateur macOS voit
-Gatekeeper au 1er lancement (voir section **Permissions système** plus haut).
-Pour supprimer cette friction :
-
-1. Acheter un certificat "Developer ID Application" sur
-   [developer.apple.com](https://developer.apple.com).
-
-2. Exporter le .p12 (cert + clé privée) avec password.
-
-3. Ajouter les secrets GitHub :
-   - `APPLE_CERTIFICATE` (contenu du .p12 en base64)
-   - `APPLE_CERTIFICATE_PASSWORD`
-   - `APPLE_SIGNING_IDENTITY` (ex: `Developer ID Application: Nom (TEAM_ID)`)
-   - `APPLE_ID` (email du compte Apple Developer)
-   - `APPLE_ID_PASSWORD` (app-specific password, pas le mot de passe iCloud)
-   - `APPLE_TEAM_ID`
-
-4. Remplacer `"signingIdentity": "-"` par
-   `"signingIdentity": "Developer ID Application: ..."` dans
-   [`tauri.conf.json`](./jamodio-agent/tauri.conf.json).
-
-5. Ajouter les entitlements **Hardened Runtime** (requis pour la notarisation)
-   dans [`entitlements.plist`](./jamodio-agent/entitlements.plist) :
-   ```xml
-   <key>com.apple.security.cs.allow-jit</key>
-   <true/>
-   <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-   <true/>
-   <key>com.apple.security.cs.disable-library-validation</key>
-   <true/>
-   ```
-
-6. Décommenter les 6 lignes correspondantes dans
-   [`release.yml`](.github/workflows/release.yml).
-
-tauri-action gère automatiquement le processus signature + notarisation
-(upload à Apple, attente de l'agrafe ~15 min, stapling). Le DMG produit
-s'ouvre alors par double-clic sur n'importe quel Mac sans avertissement.
-
-### Signature Windows Authenticode (optionnel, plus tard)
-
-Même logique : acheter un certificat EV Code Signing (~300 €/an),
-l'ajouter en secret GitHub, ajouter un step de signature dans le workflow.
-Supprime l'écran SmartScreen au 1er lancement.
+Les releases sont produites automatiquement par GitHub Actions
+([`release.yml`](.github/workflows/release.yml)) au push d'un tag `vX.Y.Z` :
+compilation macOS (Apple Silicon) + Windows, signature de l'updater Tauri, et
+publication des 2 installeurs sous des noms stables.
 
 ---
 
 ## Intégration côté web
 
-Le frontend jamodio.com (app + landing) pointe sur les 2 URLs stables :
+Le site [jamodio.com](https://jamodio.com) propose le téléchargement de l'agent
+via les 2 URLs de release stables (elles pointent toujours sur la dernière
+version publiée) :
 
 ```
 /releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg
 /releases/latest/download/Jamodio-Audio-Engine-Windows.msi
 ```
 
-La détection ARM/Intel côté browser utilise :
-1. `navigator.userAgentData.getHighEntropyValues(['architecture'])` (Chrome/Edge)
-2. Fallback WebGL `WEBGL_debug_renderer_info` (détecte « Apple M1/M2 »)
-
-Voir [`jamodio/app/js/lib/agent-status.js`](https://github.com/bengo82/jamodio/blob/main/app/js/lib/agent-status.js) dans le repo principal.
+Une fois installé, l'agent est détecté automatiquement par l'app web grâce au
+WebSocket local `ws://localhost:9876`, qui bascule le mode audio du navigateur
+(WebRTC) vers le mode agent (RTP direct).

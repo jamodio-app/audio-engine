@@ -6,115 +6,60 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
-## [0.5.6-6] — 2026-07-14
+## [0.5.6] — 2026-07-15
 
-> **Pré-release de test.** À valider sur le build Windows avant promotion.
-
-### Corrigé
-- **MIDI — source poussée au (re)connexion.** L'agent envoie désormais sa source
-  d'entrée courante (audio / MIDI) à chaque connexion browser, comme il push déjà
-  l'état du plugin. Sans ça, après un rejoin (bascule « mode agent » en session,
-  2ᵉ onglet Jamodio, reload de page), le browser supposait `audio` alors que
-  l'agent était en MIDI → le clavier MIDI (physique **ou** virtuel) restait
-  indisponible jusqu'à un re-toggle manuel audio↔midi.
-
-### Robustesse
-- **Clamps anti-DoS** (review pré-BETA, bloc vert) : bornes défensives sur la
-  pipeline et le mixer de référence.
-
-## [0.5.6-5] — 2026-07-13
-
-> **Pré-release de test — durcissement sécurité (review pré-BETA).**
-> Volet agent du LOT 1 du code review pré-BETA (volets web/SFU dans le monorepo).
-> À valider sur le build Windows avant toute promotion.
+> **Première version BETA publique.** Consolide les itérations de pré-release
+> 0.5.6-1 → 0.5.6-6 : robustesse sous charge (3+ peers sur ASIO/Focusrite),
+> durcissement sécurité pré-BETA, et corrections MIDI / éditeur plugin / logs.
 
 ### Sécurité
-- **WS de contrôle local** : refus des connexions sans en-tête `Origin` en build
-  release (un navigateur en envoie toujours un — seul un client natif l'omettait
-  pour se faire admettre), et whitelist des previews Vercel épinglée au **scope
-  de l'équipe** (`…-bengo82-9540s-projects.vercel.app`) au lieu de tout
-  `jamodio*.vercel.app`. Ferme le drive-by web distant (exfiltration micro). (C5)
+- **WS de contrôle local durci** : en build release, refus des connexions sans
+  en-tête `Origin` (un navigateur en envoie toujours un — seul un client natif
+  l'omettait pour se faire admettre) et whitelist des previews Vercel épinglée au
+  scope de l'équipe. Ferme le drive-by web distant (exfiltration micro).
 - **StartCapture** : validation de l'IP de destination SFU (rejet des IP
-  invalides / loopback en release). (M-agent-2)
+  invalides / loopback en release).
 
 ### Robustesse
+- **Setup critique sous charge** : `StartCapture`, `AddStream`, `RemoveStream`,
+  `SelectDevices`, `SetInputSource` (bascule MIDI/audio), `Load/UnloadInstrumentPlugin`,
+  `ListPlugins`, `Start/StopRecording`, `Stop` **attendent** désormais le lock
+  pipeline au lieu de répondre `overloaded` au bout de 200 ms. Corrige, à 3+ peers
+  sur ASIO/Focusrite : instrument muet au join d'un 3ᵉ peer, bascule MIDI/audio
+  cassée obligeant un relaunch, liste de plugins bloquée en « Scan… ». Le hot-path
+  idempotent (volume/pan/dim, stats, éditeur plugin) garde le skip 200 ms.
+- **Erreurs agent corrélées** : `Error` porte une clé optionnelle (`producerId`
+  pour `add-stream`) → le navigateur ne rejette que la requête concernée. Un
+  handler lent n'empoisonne plus les requêtes de setup en vol.
+- **Liste de plugins** : sur contention, `ListPlugins` renvoie `scanning:true` et
+  l'UI repolle de façon bornée (bouton « Réessayer » en dernier recours) — elle
+  ne reste plus bloquée indéfiniment.
 - **Thread COM-STA (Windows/ASIO)** : isolation de panic (`catch_unwind`) — un
-  panic dans une closure driver n'empoisonne plus tout l'audio pour la vie du
-  process ; le panic est propagé proprement à l'appelant. (C7)
+  panic dans une closure driver ne détruit plus l'audio pour la vie du process.
+- **Clamps anti-DoS** : bornes défensives sur la pipeline et le mixer de référence.
+
+### Corrigé
+- **MIDI — source poussée au (re)connexion** : l'agent envoie sa source d'entrée
+  courante (audio / MIDI) à chaque connexion browser. Sans ça, après un rejoin
+  (bascule mode agent, 2ᵉ onglet Jamodio, reload de page), le clavier MIDI
+  (physique ou virtuel) restait indisponible jusqu'à un re-toggle manuel.
+- **Éditeur plugin VST3 (Windows)** : re-cliquer sur un plugin déjà chargé ramène
+  sa fenêtre au premier plan (restore si minimisée + bring-to-front fiable), même
+  cachée derrière le navigateur — mise à parité avec macOS (AU).
+- **Rétention des logs** : `rolling::daily` ne purgeait jamais les anciens
+  `agent.log.*` (~150 Mo / 60 fichiers constatés sur macOS) ; l'agent conserve
+  désormais les 14 fichiers les plus récents (purge best-effort au démarrage, ne
+  touche jamais le fichier du jour).
+
+### Modifié
+- **Retry-on-`overloaded` borné** (navigateur, 15 × 200 ms) étendu à
+  `start-capture` (join initial + swap device en session), en plus d'`add-stream`.
+- **Badge de version de l'agent plus lisible** (9 → 12 px, contraste renforcé) —
+  facilite l'identification d'un build en cours.
 
 ### CI
 - Actions GitHub épinglées à un SHA de commit (protège la clé privée de l'updater
-  contre un tag/branche repointé). (M-infra-1)
-
-## [0.5.6-4] — 2026-07-12
-
-> **Pré-release de test — purge de rétention des logs de l'agent.**
-> Volet agent du chantier « logs nickel » BETA (le volet navigateur est dans une
-> PR web séparée). Aucun changement fonctionnel audio/robustesse par rapport à
-> 0.5.6-3.
-
-### Fixed
-- **Accumulation illimitée des fichiers de logs** (`logging.rs`) : `rolling::daily`
-  ne purgeait jamais les anciens `agent.log.*` → accumulation constatée à ~150 Mo
-  (60 fichiers) sur macOS. L'agent conserve désormais les **14 fichiers les plus
-  récents** (purge best-effort une fois au démarrage, tri lexical = chronologique,
-  ne touche jamais le fichier du jour). L'export support ne lit que 3 jours ; la
-  marge à 14 couvre le diagnostic manuel.
-
-## [0.5.6-3] — 2026-07-11
-
-> **Pré-release de test — éditeur plugin VST3 : re-clic ramène la fenêtre au premier plan (PC).**
-
-### Fixed
-- **Éditeur plugin (Windows/VST3)** : re-cliquer sur le nom d'un plugin déjà chargé,
-  alors que sa fenêtre était cachée derrière le navigateur ou minimisée, ne faisait
-  rien (il fallait passer par l'icône Audio Engine de la barre des tâches).
-  `open_editor` ramène désormais la fenêtre EXISTANTE au premier plan (restore si
-  minimisée + bring-to-front fiable, même chemin que l'ouverture). macOS (AU) le
-  faisait déjà — mise à parité.
-
-## [0.5.6-2] — 2026-07-11
-
-> **Pré-release de test — lisibilité UI + validation terrain 0.5.6-1.**
-> Code de robustesse identique à 0.5.6-1 (validé au banc : scan plugins débloqué,
-> bascule MIDI/audio OK). Seul le badge de version de la fenêtre agent change.
-
-### Changed
-- **Badge de version de l'agent plus lisible** (`ui/style.css`) : 9 → 12 px, et
-  couleur `--muted`/0.5 → `--text2`/0.9. La version était quasi invisible, gênant
-  pour identifier un build de test en cours.
-
-## [0.5.6-1] — 2026-07-10
-
-> **Pré-release de test — robustesse sous charge (lock pipeline + erreurs corrélées).**
-> Corrige la RACINE côté agent des symptômes observés à 3+ peers sur PC/ASIO
-> Focusrite : instrument muet au join d'un 3e peer, bascule MIDI/audio cassée
-> obligeant un relaunch, liste de plugins bloquée en « Scan… ». Complète le
-> mitigation browser de 0.5.5 (barrière + sérialisation add-stream). À valider au
-> banc PC Focusrite ↔ Mac (jusqu'à ~4 peers + swap device + load plugin
-> simultanés). Cf. `internal-docs/plans/PLAN-AGENT-0.5.6-ROBUSTESSE.md`.
-
-### Fixed
-- **Les handlers de SETUP CRITIQUE ne sont plus DROPPÉS sur contention du lock**
-  (`ws_server.rs`). `StartCapture`, `AddStream`, `RemoveStream`, `SelectDevices`,
-  `SetInputSource` (bascule MIDI/audio), `Load/UnloadInstrumentPlugin`,
-  `ListPlugins`, `Start/StopRecording`, `Stop` **attendent** désormais le lock
-  (`lock_pipeline_wait`, timeout long borné sous le watchdog browser) au lieu de
-  répondre `overloaded` au bout de 200 ms. Le hot-path idempotent (SetVolume/Pan/
-  Dim, GetStats, Reference*, éditeur plugin) garde le skip 200 ms. Cause des flux
-  jamais montés (« ghost/orphan ») et des tranches figées jusqu'au relaunch.
-- **Erreurs agent CORRÉLÉES** — `AgentMessage::Error` porte une clé optionnelle
-  (`producerId` pour `add-stream`, `""` pour `start-capture`). Le navigateur
-  rejette alors UNIQUEMENT la requête concernée. Une erreur non corrélée ne
-  déclenche PLUS `_rejectAllPending` côté browser : un handler lent n'empoisonne
-  plus les requêtes de setup en vol (l'amplificateur historique).
-- **Liste de plugins qui ne se débloque jamais** — sur contention, `ListPlugins`
-  renvoie désormais `PluginList{ scanning:true }` (au lieu d'aucun message) et
-  l'UI repolle de façon bornée, avec un bouton « Réessayer » en dernier recours.
-
-### Changed
-- Browser : retry-on-`overloaded` borné (15 × 200 ms) appliqué aussi à
-  `start-capture` (join initial + swap device en session), en plus d'`add-stream`.
+  contre un tag/branche repointé).
 
 ## [0.5.5] — 2026-07-09
 
