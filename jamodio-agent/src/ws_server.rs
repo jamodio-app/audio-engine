@@ -1466,6 +1466,25 @@ async fn lock_pipeline_wait(
     }
 }
 
+/// Validation de la destination SFU fournie par le browser (M-agent-2, review
+/// pré-BETA 2026-07-12) : c'est la frontière contre une redirection du flux
+/// micro. Refuse une IP non parseable, unspecified ou multicast ; en release
+/// refuse aussi le loopback (jamais un vrai POP SFU depuis l'agent), toléré en
+/// debug pour un SFU local. Partagé par `StartCapture` et `StartVoiceCapture`
+/// (le flux voix mérite EXACTEMENT la même garde que l'instrument).
+fn is_valid_sfu_dest(sfu_ip: &str) -> bool {
+    match sfu_ip.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let mut bogus = ip.is_unspecified() || ip.is_multicast();
+            if cfg!(not(debug_assertions)) {
+                bogus = bogus || ip.is_loopback();
+            }
+            !bogus
+        }
+        Err(_) => false,
+    }
+}
+
 /// 0.5.4-2 — SUPERVISEUR de liveness + RESET COOPÉRATIF des callbacks audio ASIO.
 ///
 /// # Cause racine (bug PC 28/06)
@@ -1878,21 +1897,9 @@ async fn handle_message(
             // aussi loopback (jamais un vrai POP SFU depuis l'agent) ; en debug on
             // tolère (SFU local sur 127.0.0.1). L'auth d'origine (C5) reste la
             // barrière principale contre la redirection du flux micro.
-            match sfu_ip.parse::<std::net::IpAddr>() {
-                Ok(ip) => {
-                    let mut bogus = ip.is_unspecified() || ip.is_multicast();
-                    if cfg!(not(debug_assertions)) {
-                        bogus = bogus || ip.is_loopback();
-                    }
-                    if bogus {
-                        tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : destination SFU invalide");
-                        return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : sfu_ip non parseable");
-                    return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
-                }
+            if !is_valid_sfu_dest(&sfu_ip) {
+                tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : destination SFU invalide");
+                return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
             }
             // Setup critique : on ATTEND le lock (jamais de drop → sinon tranche
             // figée jusqu'au relaunch). Erreur corrélée à la clé vide "" (comme
@@ -1978,6 +1985,59 @@ async fn handle_message(
                     }
                 }
             }
+        }
+
+        // ─── Talkback (Lot 2, v0.5.7) — 2e producteur voix via l'agent ───
+        BrowserMessage::StartVoiceCapture { ssrc, sfu_ip, sfu_port, payload_type: _, channel_index, srtp_parameters } => {
+            tracing::info!(
+                target: "jamodio::ws",
+                ssrc, channel_index,
+                sfu = format!("{}:{}", sfu_ip, sfu_port),
+                "StartVoiceCapture"
+            );
+            // Même garde de destination que l'instrument. Erreurs corrélées à la
+            // clé "voice" (comme le LocalPort renvoyé) → le browser ne rejette
+            // QUE la requête voix en vol, jamais l'instrument.
+            if !is_valid_sfu_dest(&sfu_ip) {
+                tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartVoiceCapture rejeté : destination SFU invalide");
+                return vec![AgentMessage::error_keyed("invalid sfu destination", "voice")];
+            }
+            // Setup critique (greffe d'un flux) : on ATTEND le lock.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![AgentMessage::error_keyed("agent overloaded", "voice")];
+            };
+            match pl.start_voice_capture(ssrc, sfu_ip, sfu_port, 111, channel_index, srtp_parameters).await {
+                Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
+                    producer_id: "voice".into(),
+                    port: local_port,
+                    srtp_parameters: agent_srtp,
+                }],
+                Err(msg) => {
+                    tracing::warn!(target: "jamodio::ws", detail = %msg, "StartVoiceCapture rejeté");
+                    vec![AgentMessage::error_keyed(msg, "voice")]
+                }
+            }
+        }
+
+        BrowserMessage::StopVoiceCapture => {
+            // Toggle talkback OFF / device-canal changé. Fiabilité > vitesse
+            // (une voix restée ouverte est pire qu'une courte attente) → wait.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
+                return vec![];
+            };
+            pl.stop_voice_capture();
+            vec![]
+        }
+
+        BrowserMessage::SetVoiceGain { gain } => {
+            // Hot-path idempotent (l'auto-mute le pilote à ~10 Hz) : try-lock,
+            // skip OK si contention (la prochaine cible rattrapera). L'atomique
+            // clampe/écrit sans toucher au thread RT voix.
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.set_voice_gain(gain);
+            vec![]
         }
 
         BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, .. } => {

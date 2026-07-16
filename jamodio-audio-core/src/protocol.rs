@@ -69,6 +69,43 @@ pub enum BrowserMessage {
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
     },
+    /// Talkback via l'agent (Lot 2, v0.5.7) — ajoute un SECOND producteur
+    /// Opus/RTP (la voix) qui extrait un canal mono du MÊME buffer ASIO que
+    /// l'instrument, sans repasser par le plugin/monitor et sans redémarrer la
+    /// capture instrument. Requiert une capture instrument déjà active
+    /// (`StartCapture` reçu avant) : le tap voix se greffe sur le
+    /// `capture_stage` en cours. La voix a sa PROPRE destination SFU
+    /// (ssrc/port/SRTP distincts). Réponse browser : `LocalPort` avec
+    /// `producer_id = "voice"`.
+    StartVoiceCapture {
+        ssrc: u32,
+        #[serde(rename = "sfuIp")]
+        sfu_ip: String,
+        #[serde(rename = "sfuPort")]
+        sfu_port: u16,
+        #[serde(rename = "payloadType")]
+        payload_type: u8,
+        /// Canal mono du micro talkback (0..N-1), extrait du buffer multicanal.
+        /// Peut être identique au canal instrument (l'utilisateur s'entend
+        /// alors parler dans son micro d'instrument) — c'est un choix UI, pas
+        /// une contrainte agent.
+        #[serde(rename = "channelIndex")]
+        channel_index: u8,
+        /// Clés SRTP du SFU pour le flux voix (reçues dans un 2e
+        /// `plain-transport-created` côté browser).
+        #[serde(rename = "srtpParameters")]
+        srtp_parameters: SrtpParameters,
+    },
+    /// Retire le producteur voix (toggle talkback OFF, ou device/canal changé).
+    /// No-op si aucune voix active. NE touche PAS à la capture instrument.
+    StopVoiceCapture,
+    /// Gain appliqué au producteur voix AVANT encodage Opus, lissé par-sample
+    /// côté agent (anti-clic). Pilote l'auto-mute talkback : la DÉCISION reste
+    /// côté browser (`studio-mixer.js`), l'agent ne fait qu'appliquer la cible.
+    /// `1.0` = voix ouverte, `0.0` = coupée. No-op si aucune voix active.
+    SetVoiceGain {
+        gain: f32,
+    },
     AddStream {
         #[serde(rename = "producerId")]
         producer_id: String,
