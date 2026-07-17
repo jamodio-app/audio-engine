@@ -561,7 +561,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
-            let rms_data = pl.mixer.lock().stream_rms();
+            let (rms_data, master_mix) = {
+                let m = pl.mixer.lock();
+                (m.stream_rms(), m.master_mix_rms())
+            };
             // Sprint B talkback auto-mute : lit input_rms (instrument self post-plugin)
             // et midi_active (Note ON dans les ~200 dernières ms) pour piloter le
             // détecteur d'activité côté browser. Ces 2 valeurs sont reset entre les
@@ -586,7 +589,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // ou MIDI actif). En idle complet, on saute le push.
             let has_self_signal = input_rms > 0.0 || midi_active;
             if !rms_data.is_empty() || has_self_signal {
-                let levels: Vec<StreamLevel> = rms_data
+                let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
                     .map(|(producer_id, rms, rms_l, rms_r)| StreamLevel {
                         producer_id,
@@ -595,6 +598,23 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         rms_r: Some(rms_r),
                     })
                     .collect();
+                // Point 3 (Lot 2) — niveaux MASTER + MIX en VRAI stéréo, mesurés
+                // sur la sortie réelle du mixer (pan + faders reflétés). Le
+                // browser les consomme pour les VU master/mix (au lieu d'un proxy
+                // mono). `rms` global = max des 2 canaux (back-compat affichage).
+                let (master_l, master_r, mix_l, mix_r) = master_mix;
+                levels.push(StreamLevel {
+                    producer_id: "master".into(),
+                    rms: master_l.max(master_r),
+                    rms_l: Some(master_l),
+                    rms_r: Some(master_r),
+                });
+                levels.push(StreamLevel {
+                    producer_id: "mix".into(),
+                    rms: mix_l.max(mix_r),
+                    rms_l: Some(mix_l),
+                    rms_r: Some(mix_r),
+                });
                 let msg = AgentMessage::StreamLevels {
                     levels,
                     input_rms: Some(input_rms),

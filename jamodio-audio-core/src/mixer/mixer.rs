@@ -74,6 +74,30 @@ pub struct AudioMixer {
     /// qu'elle n'est pas configurée (`set_reference_config`). Cf.
     /// `mixer/reference.rs` + `PLAN-OPTION-B-B0-DESIGN.md`.
     reference: ReferenceSource,
+    /// Point 3 (Lot 2) — RMS L/R du VRAI mix, mesuré dans `mix_into` sur la
+    /// sortie réelle → le VU MASTER/MIX du browser reflète pan + faders (le
+    /// browser ne pouvait que proxymer via un max mono). `master_*` = sortie
+    /// finale (post dim/master/clamp) ; `mix_*` = tap MIX post-fader
+    /// (pré-dim/master, parité browser `instrumentMixBus`). Lus par le
+    /// `stream-levels` sender (100 ms) via `master_mix_rms()`.
+    master_rms_l: f32,
+    master_rms_r: f32,
+    mix_rms_l: f32,
+    mix_rms_r: f32,
+}
+
+/// RMS par canal d'un buffer stéréo entrelacé (L,R,L,R…). `(0,0)` si vide.
+fn stereo_rms(buf: &[f32]) -> (f32, f32) {
+    let frames = buf.len() / 2;
+    if frames == 0 {
+        return (0.0, 0.0);
+    }
+    let (mut sq_l, mut sq_r) = (0.0f32, 0.0f32);
+    for pair in buf.chunks_exact(2) {
+        sq_l += pair[0] * pair[0];
+        sq_r += pair[1] * pair[1];
+    }
+    ((sq_l / frames as f32).sqrt(), (sq_r / frames as f32).sqrt())
 }
 
 struct StreamState {
@@ -122,7 +146,19 @@ impl AudioMixer {
             master_gain: 1.0,
             dim_factor: 1.0,
             reference: ReferenceSource::new(),
+            master_rms_l: 0.0,
+            master_rms_r: 0.0,
+            mix_rms_l: 0.0,
+            mix_rms_r: 0.0,
         }
+    }
+
+    /// Point 3 (Lot 2) — RMS L/R du MASTER (sortie finale) et du MIX (tap
+    /// post-fader), mesurés au dernier `mix_into`. `(master_l, master_r,
+    /// mix_l, mix_r)`. Lus par le sender `stream-levels` → VU MASTER/MIX
+    /// stéréo réels côté browser (pan + faders visibles).
+    pub fn master_mix_rms(&self) -> (f32, f32, f32, f32) {
+        (self.master_rms_l, self.master_rms_r, self.mix_rms_l, self.mix_rms_r)
     }
 
     /// DIM factor (= ducking des instruments quand le user veut entendre
@@ -559,6 +595,12 @@ impl AudioMixer {
             self.record_send(RecordCmd::PushMix(output.to_vec()));
         }
 
+        // Point 3 — RMS L/R du MIX (instruments post-fader, pré-dim/master) pour
+        // le VU MIX REC stéréo. Mesuré ICI (parité browser `instrumentMixBus`).
+        let (mix_l, mix_r) = stereo_rms(output);
+        self.mix_rms_l = mix_l;
+        self.mix_rms_r = mix_r;
+
         // DIM factor — atténue les instruments quand l'user veut entendre le
         // talkback clairement. Skip si == 1.0 (cas par défaut majoritaire).
         if (self.dim_factor - 1.0).abs() > f32::EPSILON {
@@ -595,6 +637,12 @@ impl AudioMixer {
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
+
+        // Point 3 — RMS L/R du MASTER (sortie finale = ce que l'utilisateur
+        // entend, post dim/master/clamp) pour le VU MASTER stéréo.
+        let (master_l, master_r) = stereo_rms(output);
+        self.master_rms_l = master_l;
+        self.master_rms_r = master_r;
 
         // Report drift drains (rate-limité à puissances de 2). Coût formatage
         // négligeable hors événement (1 if + un getter atomic-free par stream).
@@ -781,6 +829,30 @@ mod tests {
         let (lr_, rr) = lr(&m);
         assert!(lr_.abs() < 1e-4, "full right : rms_l ≈ 0, got {lr_}");
         assert!((rr - 1.0).abs() < 1e-4, "full right : rms_r ≈ 1, got {rr}");
+    }
+
+    /// Point 3 (Lot 2) — le VU MASTER/MIX doit refléter le pan du mix réel :
+    /// un stream centré → master L ≈ R ; pané à fond à gauche → master R ≈ 0.
+    #[test]
+    fn master_rms_reflete_le_mix_pane() {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1");
+        let ones = vec![1.0f32; 48_000];
+        let mut out = vec![0.0f32; 512];
+        // Centre.
+        m.push_samples("p1", &ones);
+        m.mix_into(&mut out);
+        let (ml, mr, xl, xr) = m.master_mix_rms();
+        assert!((ml - mr).abs() < 1e-3, "centre : master L ≈ R ({ml} vs {mr})");
+        assert!((xl - xr).abs() < 1e-3, "centre : mix L ≈ R");
+        // Full left : R muet côté master ET mix.
+        m.set_pan("p1", -1.0);
+        m.push_samples("p1", &ones);
+        m.mix_into(&mut out);
+        let (ml2, mr2, xl2, xr2) = m.master_mix_rms();
+        assert!(ml2 > 0.1, "full left : master L présent, got {ml2}");
+        assert!(mr2 < 1e-3, "full left : master R ≈ 0, got {mr2}");
+        assert!(xl2 > 0.1 && xr2 < 1e-3, "full left : mix L présent / R muet");
     }
 
     /// Helper : pousse un signal constant 1.0 dans un stream et mixe un bloc,
