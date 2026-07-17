@@ -26,6 +26,19 @@ pub const BACKING_ID: &str = "backing";
 /// on prend le minimum stable.
 const SELF_MONITOR_TARGET_MS: usize = 5;
 
+/// Loi de balance stéréo LINÉAIRE (0 dB au centre), source unique partagée par
+/// `mix_into` (le rendu audio) et `stream_rms` (les niveaux VU post-pan). Sans
+/// ce partage, le VU pourrait diverger de ce que l'utilisateur entend.
+///   `gain_l = min(1, 1−pan)`, `gain_r = min(1, 1+pan)`.
+/// Centre (`pan ≈ 0`) → `(1.0, 1.0)` ; extrêmes → `(1.0, 0.0)` / `(0.0, 1.0)`.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    if pan.abs() < f32::EPSILON {
+        (1.0, 1.0)
+    } else {
+        ((1.0 - pan).min(1.0), (1.0 + pan).min(1.0))
+    }
+}
+
 /// Mixes N remote audio streams into a single stereo output.
 /// Each stream has its own jitter buffer and volume control.
 pub struct AudioMixer {
@@ -517,9 +530,9 @@ impl AudioMixer {
                     *out += sample * vol;
                 }
             } else {
-                let p = stream.pan;
-                let gain_l = vol * (1.0 - p).min(1.0);
-                let gain_r = vol * (1.0 + p).min(1.0);
+                let (gl, gr) = pan_gains(stream.pan);
+                let gain_l = vol * gl;
+                let gain_r = vol * gr;
                 let mut i = 0;
                 while i + 1 < self.temp_buf.len() && i + 1 < output.len() {
                     output[i]   += self.temp_buf[i]   * gain_l;
@@ -594,7 +607,12 @@ impl AudioMixer {
     /// stéréo (2 barres indépendantes) côté browser.
     pub fn stream_rms(&self) -> Vec<(String, f32, f32, f32)> {
         self.streams.iter().map(|(id, stream)| {
-            (id.clone(), stream.rms, stream.rms_l, stream.rms_r)
+            // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
+            // aux RMS L/R (stockés pré-pan) → le VU reflète le placement stéréo
+            // exactement comme le rendu (self + peers). Un flux mono a
+            // `rms_l = rms_r = rms` en amont ; le pan crée alors l'asymétrie.
+            let (gl, gr) = pan_gains(stream.pan);
+            (id.clone(), stream.rms, stream.rms_l * gl, stream.rms_r * gr)
         }).collect()
     }
 
@@ -734,6 +752,35 @@ mod tests {
         assert!(rms_r.abs() < 1e-4, "rms_r ≈ 0 (canal droit silencieux)");
         // rms global = sqrt(moyenne sur tous) = sqrt(0.5) ≈ 0.707.
         assert!((rms - 0.5f32.sqrt()).abs() < 1e-3, "rms global = sqrt(0.5)");
+    }
+
+    /// Point 3 (Lot 2) — le VU doit refléter le pan : un flux MONO (L=R en amont,
+    /// comme l'instrument self) doit ressortir asymétrique dans `stream_rms` une
+    /// fois pané (le rendu `mix_into` et le VU partagent `pan_gains`).
+    #[test]
+    fn vu_rms_reflete_le_pan_mono() {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1");
+        // Source mono dupliquée : L = R = 1.0 (200 samples = 100 frames stéréo).
+        let s = vec![1.0f32; 200];
+        m.push_samples("p1", &s);
+        let lr = |m: &AudioMixer| {
+            let (_, _, l, r) = m.stream_rms().into_iter().find(|(id, ..)| id == "p1").unwrap();
+            (l, r)
+        };
+        // Centre : L = R.
+        let (l0, r0) = lr(&m);
+        assert!((l0 - r0).abs() < 1e-4, "centre : rms_l = rms_r");
+        // Full left : rms_r muet.
+        m.set_pan("p1", -1.0);
+        let (ll, rl) = lr(&m);
+        assert!((ll - 1.0).abs() < 1e-4, "full left : rms_l ≈ 1, got {ll}");
+        assert!(rl.abs() < 1e-4, "full left : rms_r ≈ 0, got {rl}");
+        // Full right : symétrique.
+        m.set_pan("p1", 1.0);
+        let (lr_, rr) = lr(&m);
+        assert!(lr_.abs() < 1e-4, "full right : rms_l ≈ 0, got {lr_}");
+        assert!((rr - 1.0).abs() < 1e-4, "full right : rms_r ≈ 1, got {rr}");
     }
 
     /// Helper : pousse un signal constant 1.0 dans un stream et mixe un bloc,
