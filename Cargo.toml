@@ -6,6 +6,3 @@ members = [
   "jamodio-au-host",
   "jamodio-vst3-host",
 ]
-# au-host-poc/ et vst3-host-poc/ restent hors workspace (bacs à sable, supprimés
-# une fois les crates in-workspace stables).
-exclude = ["au-host-poc", "vst3-host-poc"]
