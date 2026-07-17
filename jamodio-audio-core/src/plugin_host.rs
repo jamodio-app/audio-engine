@@ -41,8 +41,9 @@ pub enum PluginRef {
 }
 
 /// Métadonnées d'un plugin tel que présenté au browser.
-/// `incompatible: true` = latence intrinsèque trop haute (>64 samples) pour live.
-/// L'UI affiche ces plugins en grisé avec tooltip explicatif (cf. mémoire vision).
+/// `incompatible: true` = latence intrinsèque au-delà du budget live
+/// (cf. [`latency_exceeds_live_budget`]) → l'UI l'affiche grisé, non chargeable,
+/// avec un tooltip explicatif (cf. mémoire vision).
 /// `has_input_bus = false` (= synthé MIDI pur) signale au browser qu'il faut
 /// auto-switcher la source d'entrée en MIDI à l'activation (S2).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,8 +91,28 @@ pub struct MidiEvent {
     pub data: [u8; 3],
 }
 
-/// Limite latence intrinsèque acceptable pour Jamodio (bloc CPAL cible = 64 samples).
-pub const MAX_PLUGIN_LATENCY_SAMPLES: u32 = 64;
+/// Budget de latence intrinsèque (PDC) qu'un plugin INSERT peut ajouter tout en
+/// restant chargeable en live. **Sans rapport avec la taille de buffer** : c'est
+/// un retard fixe interne au plugin (typiquement son suréchantillonnage) qui
+/// s'AJOUTE au chemin note→oreille et note→réseau, quel que soit le bloc audio.
+/// Le stage plugin traite déjà par sous-blocs de 128 samples (`PLUGIN_BLOCK`,
+/// cf. `pipeline.rs`) et n'applique AUCUNE compensation de délai → la latence
+/// intrinsèque est purement additive, bornée ici par pur choix de budget live.
+///
+/// 128 samples = 2,67 ms @ 48 kHz : couvre les amp-sims faible latence (p. ex.
+/// Neural DSP ≈ 84 samples) et rejette le lookahead lourd / linéaire-phase.
+///
+/// Évolution possible (non implémentée) : troquer le blocage dur contre un
+/// avertissement doux laissant l'utilisateur juge — techniquement sûr, l'absence
+/// de PDC dans le pipeline garantissant qu'une latence > 128 ne casse rien.
+pub const MAX_PLUGIN_LATENCY_SAMPLES: u32 = 128;
+
+/// Règle unique de compatibilité live, partagée par les hôtes AU et VST3.
+/// `true` ⇒ latence intrinsèque au-delà de [`MAX_PLUGIN_LATENCY_SAMPLES`] :
+/// le plugin est marqué `incompatible` et présenté non chargeable par l'UI.
+pub const fn latency_exceeds_live_budget(latency_samples: u32) -> bool {
+    latency_samples > MAX_PLUGIN_LATENCY_SAMPLES
+}
 
 /// Erreurs PluginHost. Volontairement minimaliste — pas de hiérarchie complexe.
 use thiserror::Error;
@@ -218,5 +239,15 @@ mod serde_tests {
         assert!(!json.contains("has_editor"), "snake_case leaked: {json}");
         assert!(!json.contains("has_input_bus"), "snake_case leaked: {json}");
         assert!(!json.contains("is_instrument"), "snake_case leaked: {json}");
+    }
+
+    #[test]
+    fn latency_budget_boundary() {
+        // Limite incluse = compatible ; strictement au-delà = rejeté.
+        assert!(!latency_exceeds_live_budget(0));
+        assert!(!latency_exceeds_live_budget(84)); // Neural DSP Darkglass : désormais OK
+        assert!(!latency_exceeds_live_budget(MAX_PLUGIN_LATENCY_SAMPLES));
+        assert!(latency_exceeds_live_budget(MAX_PLUGIN_LATENCY_SAMPLES + 1));
+        assert!(latency_exceeds_live_budget(256));
     }
 }

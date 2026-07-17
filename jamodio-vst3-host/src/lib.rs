@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use jamodio_audio_core::plugin_host::{
-    MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo, PluginRef,
-    MAX_PLUGIN_LATENCY_SAMPLES,
+    latency_exceeds_live_budget, MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo,
+    PluginRef,
 };
 
 use crate::editor::EditorWindow;
@@ -204,7 +204,7 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
             },
             latency_samples: latency,
             has_editor,
-            incompatible: latency > MAX_PLUGIN_LATENCY_SAMPLES,
+            incompatible: latency_exceeds_live_budget(latency),
             has_input_bus,
             is_instrument,
         });

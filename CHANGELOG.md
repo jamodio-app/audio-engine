@@ -7,8 +7,21 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 ## [Unreleased]
 
 > Pré-releases `0.5.7-x` : itérations du **Lot 2** (talkback canal indépendant
-> via l'agent + VU-mètres fidèles au mix). Publiées en pre-release GitHub
-> (jamais « latest » — l'updater des testeurs ne les prend pas).
+> via l'agent + VU-mètres fidèles au mix) et correctifs ponctuels. Publiées en
+> pre-release GitHub (jamais « latest » — l'updater des testeurs ne les prend pas).
+
+## [0.5.7-7] — 2026-07-17
+
+### Corrigé
+- **Plugins INSERT — budget de latence intrinsèque relevé 64 → 128 samples.**
+  Un plugin dont la latence intrinsèque (PDC) tenait dans (64, 128] samples était
+  marqué incompatible, donc non chargeable — c'est le cas des amp-sims Neural DSP
+  (Darkglass Ultimate ≈ 84 samples), rejetés à tort. Cette latence est un retard
+  fixe interne au plugin (suréchantillonnage), **sans rapport avec la taille de
+  buffer** : le pipeline traite déjà par sous-blocs de 128 samples et n'applique
+  aucune compensation de délai → relever à 128 (2,67 ms @ 48 kHz) est purement
+  additif et sûr. La règle de compatibilité (`latency_exceeds_live_budget`) est
+  désormais centralisée et partagée par les hôtes AU et VST3.
 
 ## [0.5.7-6] — 2026-07-17
 

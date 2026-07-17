@@ -12,8 +12,8 @@
 #![cfg(target_os = "macos")]
 
 use jamodio_audio_core::plugin_host::{
-    MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo, PluginRef,
-    MAX_PLUGIN_LATENCY_SAMPLES,
+    latency_exceeds_live_budget, MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo,
+    PluginRef,
 };
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -171,7 +171,7 @@ unsafe extern "C" fn scan_thunk(
         },
         latency_samples,
         has_editor: has_editor != 0,
-        incompatible: latency_samples > MAX_PLUGIN_LATENCY_SAMPLES,
+        incompatible: latency_exceeds_live_budget(latency_samples),
         has_input_bus: has_input_bus != 0,
         is_instrument,
     });
@@ -389,9 +389,9 @@ mod tests {
             .iter()
             .find(|p| p.name == "AUDynamicsProcessor")
             .expect("AUDynamicsProcessor not found");
-        // POC mesure : 256 samples → incompatible (>64).
+        // POC mesure : 256 samples → au-delà du budget live (128) → incompatible.
         assert!(dcmp.incompatible);
-        assert!(dcmp.latency_samples > MAX_PLUGIN_LATENCY_SAMPLES);
+        assert!(latency_exceeds_live_budget(dcmp.latency_samples));
     }
 
     #[test]
