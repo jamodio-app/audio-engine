@@ -10,6 +10,15 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 > via l'agent + VU-mètres fidèles au mix). Publiées en pre-release GitHub
 > (jamais « latest » — l'updater des testeurs ne les prend pas).
 
+## [0.5.7-6] — 2026-07-17
+
+### Nettoyage
+- Retrait du diagnostic temporaire `talkback-vu-diag` (getter `is_voice_capturing`
+  inclus) : il a rempli son rôle. La cause du VU talkback plat au switch device
+  navigateur→agent était **côté navigateur** (snapshot instrument incomplet →
+  redémarrage parasite de la capture qui tuait le tap voix) — corrigée dans la
+  web app, aucun changement agent requis pour ce bug.
+
 ## [0.5.7-5] — 2026-07-17
 
 ### Corrections
@@ -18,12 +27,6 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   peer ni instrument actif. Le gate d'émission n'intégrait que l'instrument
   (`input_rms`) et le MIDI → parler **seul** (sans jouer) laissait le VU
   talkback figé.
-
-### Diagnostic (temporaire)
-- Log `talkback-vu-diag` (1×/s) : `voice_capturing` / `voice_gain` / `voice_rms`
-  / `input_rms`, pour trancher le VU talkback plat au switch device
-  navigateur→agent (capture non redémarrée vs gain 0 vs tap muet). À retirer une
-  fois la cause identifiée.
 
 ## [0.5.7-4] — 2026-07-17
 
