@@ -552,6 +552,11 @@ pub struct PipelineState {
     /// par-sample par `voice_encode_stage_loop` (fondu anti-clic). Pilote
     /// l'auto-mute talkback dont la DÉCISION reste côté browser.
     pub voice_gain: Arc<std::sync::atomic::AtomicU32>,
+    /// RMS (bits f32) du producteur voix POST-gain, mesuré par
+    /// `voice_encode_stage_loop` et diffusé dans `stream-levels` (producteur
+    /// `voice`) → alimente le VU talkback côté browser en mode agent voix (sinon
+    /// plat : pas d'analyser navigateur). `0.0` hors voix active.
+    pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
     /// Nb de canaux physiques + sample rate natif de la capture courante,
     /// mémorisés au `start_capture`. Permettent de greffer la voix (validation
     /// du canal demandé + config resampler voix) SANS redémarrer la capture
@@ -956,6 +961,7 @@ impl PipelineState {
             voice_ctrl_tx: None,
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
@@ -1857,6 +1863,7 @@ impl PipelineState {
         //    marge que les ringbufs instrument (32 blocs).
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
+        let voice_rms = self.voice_rms.clone();
         let native_sr = self.capture_native_sr;
         let output_device_name = self
             .output_device_id
@@ -1872,6 +1879,7 @@ impl PipelineState {
                     ssrc,
                     payload_type,
                     voice_gain,
+                    voice_rms,
                     native_sr,
                     output_device_name,
                 );
@@ -3419,12 +3427,14 @@ fn encode_stage_loop(
 //
 // N'ALIMENTE PAS les histogrammes perfstats instrument : la voix est un flux
 // secondaire, on ne veut pas polluer la mesure de latence du chemin principal.
+#[allow(clippy::too_many_arguments)]
 fn voice_encode_stage_loop(
     in_rx: Receiver<Vec<f32>>,
     sender: Arc<RtpSender>,
     ssrc: u32,
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
+    voice_rms: Arc<std::sync::atomic::AtomicU32>,
     native_sr: u32,
     output_device_name: Option<String>,
 ) {
@@ -3524,11 +3534,15 @@ fn voice_encode_stage_loop(
         }
 
         // 2. Gain lissé par-sample → accumulation → frames Opus stéréo (L=R).
+        //    On mesure au passage le RMS POST-gain du bloc (VU talkback agent).
         let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
+        let mut sum_sq = 0.0f32;
         for &s in &mono48 {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
             cur_gain += (target - cur_gain) * coeff;
-            acc.push(s * cur_gain);
+            let g = s * cur_gain;
+            sum_sq += g * g;
+            acc.push(g);
             if acc.len() == frame_size {
                 for (i, &m) in acc.iter().enumerate() {
                     stereo_frame[i * 2] = m;
@@ -3559,7 +3573,15 @@ fn voice_encode_stage_loop(
                 acc.clear();
             }
         }
+        // RMS post-gain du bloc → VU talkback (mono). Bits f32, comme input_rms.
+        let n = mono48.len();
+        if n > 0 {
+            let rms = (sum_sq / n as f32).sqrt();
+            voice_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
+    // Voix arrêtée : VU talkback à zéro.
+    voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
 }
 

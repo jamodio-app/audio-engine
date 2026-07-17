@@ -584,6 +584,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 0.0
             };
             let midi_active = pl.midi_active.load(std::sync::atomic::Ordering::Relaxed);
+            // Bug 2 (Lot 2) — RMS du producteur voix (talkback via agent) → VU
+            // talkback côté browser (sinon plat, pas d'analyser navigateur en
+            // mode agent voix). `0.0` hors voix active.
+            let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
             drop(pl);
             // Push si on a soit des niveaux peers, soit un signal self (RMS > 0
             // ou MIDI actif). En idle complet, on saute le push.
@@ -614,6 +618,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     rms: mix_l.max(mix_r),
                     rms_l: Some(mix_l),
                     rms_r: Some(mix_r),
+                });
+                // Bug 2 — niveau du talkback agent (mono) pour le VU voix browser.
+                levels.push(StreamLevel {
+                    producer_id: "voice".into(),
+                    rms: voice_rms,
+                    rms_l: Some(voice_rms),
+                    rms_r: Some(voice_rms),
                 });
                 let msg = AgentMessage::StreamLevels {
                     levels,
