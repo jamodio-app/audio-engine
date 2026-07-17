@@ -1916,6 +1916,13 @@ impl PipelineState {
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
 
+    /// DIAG (temporaire) — vrai si la capture talkback agent est active (thread
+    /// voice_encode censé tourner). Sert au log de diagnostic du bug
+    /// « VU talkback plat au switch navigateur→agent ».
+    pub fn is_voice_capturing(&self) -> bool {
+        self.voice_active
+    }
+
     /// Talkback (Lot 2) — pose le gain CIBLE du producteur voix (auto-mute /
     /// toggle manuel). Lissé par-sample côté `voice_encode_stage` (anti-clic).
     /// Idempotent et sûr même sans voix active (l'atomique est simplement écrit).

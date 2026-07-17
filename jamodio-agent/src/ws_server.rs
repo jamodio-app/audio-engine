@@ -558,6 +558,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             return;
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut diag_tick: u32 = 0; // DIAG (temporaire) — throttle log talkback-vu-diag
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
@@ -588,10 +589,32 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
             let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
+            // DIAG (temporaire) — bug « VU talkback plat au switch navigateur→agent ».
+            // Loggue 1×/s l'état de la capture voix pour trancher : capture inactive
+            // (redémarrage raté), gain=0 (auto-mute), ou rms=0 malgré gain=1 (tap muet).
+            let voice_capturing = pl.is_voice_capturing();
+            let voice_gain = f32::from_bits(pl.voice_gain.load(std::sync::atomic::Ordering::Relaxed));
             drop(pl);
-            // Push si on a soit des niveaux peers, soit un signal self (RMS > 0
-            // ou MIDI actif). En idle complet, on saute le push.
-            let has_self_signal = input_rms > 0.0 || midi_active;
+            diag_tick = diag_tick.wrapping_add(1);
+            if diag_tick % 10 == 0 {
+                tracing::info!(
+                    target: "jamodio::pipeline",
+                    voice_capturing,
+                    voice_gain,
+                    voice_rms,
+                    input_rms,
+                    "talkback-vu-diag"
+                );
+            }
+            // Push si on a soit des niveaux peers, soit un signal LOCAL (instrument
+            // RMS > 0, MIDI actif, OU talkback voix RMS > 0). En idle complet, on
+            // saute le push.
+            // Le talkback (`voice_rms`) DOIT figurer ici : en mode agent voix, le VU
+            // talkback n'a pas d'analyser navigateur et dépend exclusivement de ce
+            // push. Sans lui, parler SEUL (pas de peer, instrument silencieux) ne
+            // déclenchait aucun StreamLevels → VU talkback figé (bug switch
+            // navigateur→agent testé en solo). Cf. `voice_rms` plus haut.
+            let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0;
             if !rms_data.is_empty() || has_self_signal {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()

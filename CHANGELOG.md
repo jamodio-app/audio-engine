@@ -6,6 +6,13 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+### Corrections
+- **VU talkback (mode agent voix)** : les niveaux `StreamLevels` sont désormais
+  poussés dès que le talkback produit du signal (`voice_rms > 0`), même sans
+  peer ni instrument actif. Le gate d'émission n'intégrait que l'instrument et
+  le MIDI → parler seul (sans jouer) laissait le VU talkback figé. (Diagnostic
+  temporaire `talkback-vu-diag` ajouté pour le bug de switch device.)
+
 ## [0.5.6] — 2026-07-15
 
 > **Première version BETA publique.** Consolide les itérations de pré-release
