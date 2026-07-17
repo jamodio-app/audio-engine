@@ -6,12 +6,63 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+> Pré-releases `0.5.7-x` : itérations du **Lot 2** (talkback canal indépendant
+> via l'agent + VU-mètres fidèles au mix). Publiées en pre-release GitHub
+> (jamais « latest » — l'updater des testeurs ne les prend pas).
+
+## [0.5.7-5] — 2026-07-17
+
 ### Corrections
 - **VU talkback (mode agent voix)** : les niveaux `StreamLevels` sont désormais
   poussés dès que le talkback produit du signal (`voice_rms > 0`), même sans
-  peer ni instrument actif. Le gate d'émission n'intégrait que l'instrument et
-  le MIDI → parler seul (sans jouer) laissait le VU talkback figé. (Diagnostic
-  temporaire `talkback-vu-diag` ajouté pour le bug de switch device.)
+  peer ni instrument actif. Le gate d'émission n'intégrait que l'instrument
+  (`input_rms`) et le MIDI → parler **seul** (sans jouer) laissait le VU
+  talkback figé.
+
+### Diagnostic (temporaire)
+- Log `talkback-vu-diag` (1×/s) : `voice_capturing` / `voice_gain` / `voice_rms`
+  / `input_rms`, pour trancher le VU talkback plat au switch device
+  navigateur→agent (capture non redémarrée vs gain 0 vs tap muet). À retirer une
+  fois la cause identifiée.
+
+## [0.5.7-4] — 2026-07-17
+
+### Ajouté
+- **VU talkback en mode agent** : le thread `voice_encode` mesure le RMS
+  **post-gain** du talkback et l'agent le diffuse comme niveau `voice` dans
+  `StreamLevels` → le navigateur peut afficher le VU de la tranche talkback (qui
+  n'a aucun analyser Web Audio en mode agent voix).
+
+## [0.5.7-3] — 2026-07-17
+
+### Ajouté
+- **VU MASTER / MIX REC en vrai stéréo** : le mixer mesure le RMS L/R du mix
+  **réel** (`mix_into` → `stereo_rms`) — `mix` = tap post-fader, `master` =
+  sortie finale post-clamp — exposés via `master_mix_rms()` et diffusés comme
+  niveaux `master` / `mix`. Le navigateur consomme ces L/R (fini le proxy mono
+  L=R). Le pan et les faders deviennent visibles sur ces VU.
+
+## [0.5.7-2] — 2026-07-17
+
+### Corrigé
+- **VU reflète le pan** : l'agent diffusait des RMS L/R **pré-pan** (L=R pour un
+  flux mono). `mixer.rs` `stream_rms()` applique désormais la loi de balance
+  post-pan via le helper partagé `pan_gains()` (source unique avec `mix_into`) →
+  couvre self + peers en un seul point.
+
+## [0.5.7-1] — 2026-07-16
+
+### Ajouté
+- **Talkback canal indépendant via l'agent (Lot 2)** : nouveau protocole
+  `StartVoiceCapture` / `StopVoiceCapture` / `SetVoiceGain`. Un **4ᵉ thread
+  `voice_encode`** dédié + un **tap voix lock-free** dans `capture_stage`
+  (helper pur `extract_channel_mono`) extrait un canal mono arbitraire du buffer
+  d'entrée (nécessaire sur Windows/ASIO exclusif où Chrome ne voit que les
+  canaux 1-2). Fondu de gain **par-sample** anti-clic (attack 15 ms / release
+  80 ms) pour l'auto-mute ; réutilise `MusicEncoder` (mono → L=R).
+- **Coût nul quand le talkback est inactif** et **instrument byte-identique**
+  (forward instrument AVANT le tap, `try_send` non bloquant → le thread voix ne
+  ralentit jamais la capture instrument).
 
 ## [0.5.6] — 2026-07-15
 
