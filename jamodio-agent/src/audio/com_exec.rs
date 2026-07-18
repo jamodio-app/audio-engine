@@ -29,49 +29,68 @@
 #[cfg(target_os = "windows")]
 mod imp {
     use std::sync::mpsc::{channel, Sender};
-    use std::sync::OnceLock;
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
 
     /// Travail à exécuter sur le thread STA : une closure auto-contenue qui
     /// renvoie son résultat via son propre canal capturé.
     type Job = Box<dyn FnOnce() + Send>;
 
-    static TX: OnceLock<Sender<Job>> = OnceLock::new();
-
-    /// Sender vers le thread STA, créé paresseusement au premier appel.
-    fn sender() -> &'static Sender<Job> {
-        TX.get_or_init(|| {
-            let (tx, rx) = channel::<Job>();
-            std::thread::Builder::new()
-                .name("audio-com-sta".into())
-                .spawn(move || {
-                    use windows_sys::Win32::System::Com::{
-                        CoInitializeEx, COINIT_APARTMENTTHREADED,
-                    };
-                    // STA initialisé une seule fois, pour toute la vie du process.
-                    // Pas de `CoUninitialize` : le thread ne se termine jamais
-                    // (il vit autant que le process), donc l'apartment reste
-                    // valide tant qu'un stream ASIO peut exister.
-                    // SAFETY : thread neuf et dédié → pas de COM préexistant,
-                    // l'init STA réussit (jamais de RPC_E_CHANGED_MODE).
-                    let _ = unsafe {
-                        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32)
-                    };
-                    while let Ok(job) = rx.recv() {
-                        // Défense en profondeur : un panic dans une closure driver
-                        // (ASIO tiers, unwrap interne cpal, Drop de stream/host) ne
-                        // doit JAMAIS tuer ce thread. S'il mourait, TOUTE opération
-                        // audio Windows ultérieure (énumération, open/close stream)
-                        // échouerait pour la vie du process. Même leçon que
-                        // main_thread.rs:169 côté VST3. Cf. review pré-BETA (C7).
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                    }
-                })
-                .expect("spawn audio-com-sta thread");
-            tx
-        })
+    /// Worker STA courant : son canal d'envoi + son handle (pour le `join` au
+    /// recyclage). Encapsulés ensemble pour rester cohérents.
+    struct Worker {
+        tx: Sender<Job>,
+        handle: JoinHandle<()>,
     }
 
-    /// Exécute `f` sur le thread STA et renvoie son résultat (bloquant).
+    /// Worker courant, REMPLAÇABLE (≠ `OnceLock`) pour autoriser le RECYCLAGE de
+    /// l'apartment COM (cf. `recycle`). Motif : certains drivers ASIO (Focusrite
+    /// USB) reviennent « callbacks vivants mais MUETS » (ni VU ni son) après une
+    /// réouverture À FROID dans le MÊME apartment COM — typiquement après une
+    /// interface restée idle plusieurs minutes puis relâchée par la grâce. Seul un
+    /// `CoUninitialize`/`CoInitialize` frais les débloque (ce qu'un redémarrage de
+    /// process faisait implicitement). `None` = pas encore de worker (créé au 1er
+    /// appel `run`).
+    static WORKER: Mutex<Option<Worker>> = Mutex::new(None);
+
+    /// Démarre un thread STA neuf (COM initialisé pour sa durée de vie) et renvoie
+    /// son `Worker`. Le thread termine — et rend l'apartment via `CoUninitialize`
+    /// — dès que son `Sender` est droppé (fin de process ou `recycle`).
+    fn spawn_worker() -> Worker {
+        let (tx, rx) = channel::<Job>();
+        let handle = std::thread::Builder::new()
+            .name("audio-com-sta".into())
+            .spawn(move || {
+                use windows_sys::Win32::System::Com::{
+                    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+                };
+                // SAFETY : thread neuf et dédié → pas de COM préexistant, l'init
+                // STA réussit (jamais de RPC_E_CHANGED_MODE).
+                let _ = unsafe {
+                    CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32)
+                };
+                while let Ok(job) = rx.recv() {
+                    // Défense en profondeur : un panic dans une closure driver
+                    // (ASIO tiers, unwrap interne cpal, Drop de stream/host) ne
+                    // doit JAMAIS tuer ce thread. S'il mourait, TOUTE opération
+                    // audio Windows ultérieure (énumération, open/close stream)
+                    // échouerait pour la vie du worker. Même leçon que
+                    // main_thread.rs:169 côté VST3. Cf. review pré-BETA (C7).
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+                // Sender droppé (recycle ou arrêt) : on rend l'apartment proprement
+                // (équilibre le `CoInitializeEx` ci-dessus) AVANT de terminer, pour
+                // que le prochain worker reparte d'un COM strictement neuf.
+                // SAFETY : appelé sur le thread qui a fait l'init, exactement une
+                // fois, sans objet COM survivant (contrat de `recycle`).
+                unsafe { CoUninitialize() };
+            })
+            .expect("spawn audio-com-sta thread");
+        Worker { tx, handle }
+    }
+
+    /// Exécute `f` sur le thread STA courant (créé paresseusement au 1er appel) et
+    /// renvoie son résultat (bloquant).
     ///
     /// Si `f` panique, le thread STA SURVIT (catch_unwind) et le panic est
     /// re-propagé au thread appelant — pour les handlers ws il est absorbé en
@@ -91,9 +110,21 @@ mod imp {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             let _ = rtx.send(result);
         });
-        sender()
-            .send(job)
-            .expect("audio-com-sta thread vivant");
+        // Envoi sous le lock (crée le worker au besoin) ; l'attente du résultat se
+        // fait HORS lock → un `recycle` concurrent (jamais en pratique : verrou
+        // pipeline tenu) ne peut pas interbloquer avec une job en vol.
+        {
+            let mut guard = WORKER.lock().expect("com-sta worker mutex empoisonné");
+            if guard.is_none() {
+                *guard = Some(spawn_worker());
+            }
+            guard
+                .as_ref()
+                .expect("worker présent")
+                .tx
+                .send(job)
+                .expect("audio-com-sta thread vivant");
+        }
         match rrx.recv() {
             Ok(Ok(val)) => val,
             // La closure a paniqué : thread STA préservé, on re-panique le caller.
@@ -101,6 +132,31 @@ mod imp {
             // Thread STA mort : ne devrait plus arriver (catch_unwind ci-dessus).
             Err(_) => panic!("audio-com-sta thread mort"),
         }
+    }
+
+    /// Recycle le thread STA : termine l'apartment COM courant (`CoUninitialize`
+    /// au drop du thread) et en recrée un neuf (`CoInitialize` frais). Sert à
+    /// débloquer un driver ASIO revenu « vivant mais muet » après une réouverture
+    /// à froid (cf. `WORKER`).
+    ///
+    /// # Contrat d'appel (IMPORTANT)
+    /// À n'appeler QUE lorsqu'AUCUN objet ASIO/COM n'est vivant (tous les streams
+    /// et hosts fermés) — sinon leur `Drop`, qui DOIT tourner sur l'apartment
+    /// créateur, s'exécuterait sur un thread mort. En pratique : uniquement juste
+    /// avant une réouverture À FROID, après `close_audio_driver()`.
+    pub fn recycle() {
+        let mut guard = WORKER.lock().expect("com-sta worker mutex empoisonné");
+        if let Some(w) = guard.take() {
+            // Drop du Sender → `rx.recv()` renvoie `Err` → le worker sort de sa
+            // boucle, exécute `CoUninitialize`, puis termine. On ATTEND sa fin
+            // (join) pour garantir que l'apartment est bien rendu avant d'en
+            // recréer un — sinon deux apartments coexisteraient brièvement.
+            drop(w.tx);
+            let _ = w.handle.join();
+        }
+        // Recrée immédiatement un worker neuf : les appels `run` suivants repartent
+        // d'un COM strictement propre.
+        *guard = Some(spawn_worker());
     }
 }
 
@@ -114,6 +170,14 @@ where
     imp::run(f)
 }
 
+/// Recycle l'apartment COM-STA (Windows) : `CoUninitialize`/`CoInitialize` frais.
+/// À n'appeler qu'AUCUN objet ASIO vivant (cf. `imp::recycle`). No-op ailleurs.
+#[cfg(target_os = "windows")]
+#[inline]
+pub fn recycle() {
+    imp::recycle()
+}
+
 /// macOS (et autres non-Windows) : pas de COM → exécution inline, aucun thread.
 /// Les bornes `Send`/`'static` ne sont volontairement PAS exigées ici, pour ne
 /// rien contraindre sur le chemin CoreAudio existant.
@@ -125,3 +189,8 @@ where
 {
     f()
 }
+
+/// macOS (et autres non-Windows) : pas de COM → rien à recycler. No-op.
+#[cfg(not(target_os = "windows"))]
+#[inline]
+pub fn recycle() {}

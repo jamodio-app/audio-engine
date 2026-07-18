@@ -487,6 +487,13 @@ pub struct PipelineState {
     /// `WarmAudio`). `Some` ⇔ streams ASIO ouverts (session active ou parkée).
     /// `None` hors ASIO/Windows et hors capture → comportement historique.
     warm: Option<WarmAudio>,
+    /// 0.5.7 — le prochain open À FROID doit recycler l'apartment COM (cf.
+    /// `com_exec::recycle`). Posé quand la GRÂCE relâche le driver ASIO (interface
+    /// idle plusieurs min) : sa réouverture à froid dans le même apartment revient
+    /// parfois « callbacks vivants mais MUETTE » (ni VU ni son SELF), que seul un
+    /// COM neuf débloque. Consommé au prochain cold-start. Jamais posé hors
+    /// ASIO/Windows (la grâce n'existe que là) ⇒ `recycle` = no-op ailleurs.
+    com_recycle_pending: bool,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
@@ -944,6 +951,7 @@ impl PipelineState {
             reset_signal: crate::audio::asio_reset::ResetSignal::new(),
             reset_guard: None,
             warm: None,
+            com_recycle_pending: false,
             encoder_stop: None,
             recv_stops: HashMap::new(),
             decode_thread: None,
@@ -1471,6 +1479,10 @@ impl PipelineState {
                 "grâce expirée — driver ASIO relâché (interface libérée pour un autre logiciel)"
             );
             self.close_audio_driver();
+            // La prochaine réouverture sera À FROID après une interface potentiellement
+            // idle plusieurs min → recycler l'apartment COM avant, pour éviter le
+            // driver « vivant mais muet » (cf. `com_recycle_pending`).
+            self.com_recycle_pending = true;
         }
         expired
     }
@@ -1522,6 +1534,23 @@ impl PipelineState {
         // fermeture COMPLÈTE de la session + du driver, puis ouverture.
         self.teardown_session();
         self.close_audio_driver();
+
+        // Cold reopen après une libération par la GRÂCE (interface idle plusieurs
+        // min) : recyclage de l'apartment COM AVANT la réouverture. Certains
+        // drivers ASIO (Focusrite USB) reviennent sinon « callbacks vivants mais
+        // MUETS » (ni VU ni son SELF) tant qu'on rouvre dans le même apartment ;
+        // un CoUninitialize/CoInitialize frais les débloque (ce que faisait un
+        // redémarrage de process). Gated GRÂCE uniquement : le driver est déjà
+        // fermé (streams droppés), donc aucun objet COM vivant → recycle sûr. Le
+        // changement de device rouvre déjà proprement (1 ré-init), inutile là.
+        if self.com_recycle_pending {
+            tracing::info!(
+                target: "jamodio::pipeline",
+                "réouverture à froid après grâce ASIO — recyclage de l'apartment COM (anti « vivant mais muet »)"
+            );
+            crate::audio::com_exec::recycle();
+        }
+        self.com_recycle_pending = false;
 
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(64);
         self.capture_sample_tx = Some(sample_tx.clone());
