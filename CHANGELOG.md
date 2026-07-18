@@ -4,11 +4,27 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
-## [Unreleased]
+## [0.5.7] — 2026-07-18
 
-> Pré-releases `0.5.7-x` : itérations du **Lot 2** (talkback canal indépendant
-> via l'agent + VU-mètres fidèles au mix) et correctifs ponctuels. Publiées en
-> pre-release GitHub (jamais « latest » — l'updater des testeurs ne les prend pas).
+Première release **publique** du **Lot 2** : talkback sur un canal indépendant
+via l'agent, VU-mètres fidèles au mix (stéréo réel, pan, talkback pair) et
+robustesse ASIO. Consolide les pré-releases `0.5.7-1` → `0.5.7-8` (détail par
+version ci-dessous).
+
+## [0.5.7-8] — 2026-07-18
+
+### Corrigé
+- **Réouverture ASIO à froid muette après une pause prolongée hors studio**
+  (Focusrite USB). Après expiration de la grâce (~30 s hors studio), le driver
+  est relâché (`ASIOExit`) ; au rejoin, la réouverture à froid revenait parfois
+  « callbacks vivants mais MUETTE » (ni VU ni son SELF de l'instrument),
+  débloquée uniquement par un redémarrage de l'agent. Cause : l'apartment
+  COM-STA, unique pour toute la vie du process (`CoInitialize` une seule fois),
+  conservait l'état wedgé du driver — ce qu'un redémarrage de process
+  réinitialisait implicitement. Correctif : recyclage de l'apartment COM
+  (`CoUninitialize`/`CoInitialize` frais) juste avant le cold-reopen consécutif
+  à une libération par la grâce. Ciblé à ce seul cas, sûr (aucun objet ASIO
+  vivant à cet instant), sans effet sur macOS/WASAPI (pas de COM).
 
 ## [0.5.7-7] — 2026-07-17
 
