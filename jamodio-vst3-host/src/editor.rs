@@ -50,11 +50,13 @@ use vst3::{
             IConnectionPoint, IConnectionPointTrait, IEditController, IEditControllerTrait,
             IEditController_iid, IHostApplication, ParamID, ParamValue,
         },
-        IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait, ViewRect,
+        IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewContentScaleSupport,
+        IPlugViewContentScaleSupportTrait, IPlugViewTrait, ViewRect,
     },
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    UI::HiDpi::GetDpiForSystem,
     UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW,
         IsIconic, RegisterClassExW, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
@@ -579,6 +581,37 @@ fn open_editor_on_main_thread(
             "plugin ne supporte pas la plateforme HWND (tresult={plat_ok})"
         ));
     }
+    // 7bis. Facteur d'échelle DPI (fix 0.5.8 — GUI VST3 rognée sur écran > 100 %).
+    // Sur un écran à 150 % (ex. 2560×1440 @1.5×), un plugin JUCE (Neural DSP…)
+    // rend son UI à l'échelle système et déborde d'une fenêtre créée à la taille
+    // « 100 % » → GUI rognée + fenêtre non redimensionnable (canResize=false).
+    // Le contrat VST3 veut que l'hôte informe la vue AVANT getSize via
+    // IPlugViewContentScaleSupport : la vue renvoie alors la taille physique
+    // correcte. GetDpiForSystem() = DPI du moniteur principal (process Tauri
+    // per-monitor-aware). Un plugin qui détecte ensuite un autre moniteur
+    // corrige via IPlugFrame::resizeView (déjà géré). Sans cette interface, on
+    // laisse la taille native (le plugin ne scale pas, donc pas de rognage).
+    let scale = (unsafe { GetDpiForSystem() } as f32) / 96.0;
+    if scale > 0.0 && (scale - 1.0).abs() > 0.01 {
+        match view.cast::<IPlugViewContentScaleSupport>() {
+            Some(css) => {
+                // setContentScaleFactor attend un ScaleFactor (= f32) : `scale`
+                // est déjà f32, pas de cast (éviterait clippy::unnecessary_cast).
+                let sc_ok = unsafe { css.setContentScaleFactor(scale) };
+                tracing::info!(
+                    target: "jamodio::vst3::editor",
+                    scale, tresult = sc_ok,
+                    "setContentScaleFactor (DPI) appliqué"
+                );
+            }
+            None => tracing::info!(
+                target: "jamodio::vst3::editor",
+                scale,
+                "plugin sans IPlugViewContentScaleSupport — taille native conservée"
+            ),
+        }
+    }
+
     let mut size = ViewRect { left: 0, top: 0, right: 800, bottom: 600 };
     let _ = unsafe { view.getSize(&mut size) };
     let width = (size.right - size.left).max(100);

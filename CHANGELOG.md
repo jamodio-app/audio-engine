@@ -4,6 +4,21 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8-1] — 2026-07-20 (pré-release)
+
+### Corrigé
+- **Fenêtre d'éditeur VST3 rognée sur écran à haute densité (DPI > 100 %).**
+  Sur un affichage Windows à 150 % (ex. 2560×1440 @1.5×), l'UI de certains
+  plugins (Neural DSP Archetype, Polyverse Wider…) débordait de la fenêtre et
+  n'était pas entièrement visible, sans possibilité de redimensionner (plugins
+  à taille fixe). Cause : l'hôte n'informait jamais la vue du plugin de son
+  facteur d'échelle DPI — le plugin rendait son UI à l'échelle système mais la
+  fenêtre était créée à la taille « 100 % ». Correctif : l'hôte appelle
+  désormais `IPlugViewContentScaleSupport::setContentScaleFactor` (DPI du
+  moniteur ÷ 96) avant `getSize`, la vue renvoie alors sa taille physique
+  correcte et la fenêtre l'épouse. Complète le correctif de redimensionnement
+  `resizeView` de la 0.5.6.
+
 ## [0.5.7] — 2026-07-18
 
 Première release **publique** du **Lot 2** : talkback sur un canal indépendant
