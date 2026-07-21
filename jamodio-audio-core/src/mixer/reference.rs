@@ -18,13 +18,14 @@
 //! Un re-ancrage périodique (`set_grid`) absorbe la lente dérive du quartz de
 //! sortie vs l'horloge serveur (= l'équivalent de la DLL d'Option A).
 //!
-//! ## Extensibilité (décision Ben)
+//! ## Banque de sons & subdivisions (métro Lot 1)
 //!
-//! La synthèse est conçue extensible dès le départ (choix du son, figures
-//! rythmiques croche/triolet/doubles via `Figure::offsets`) — mais B1 ne câble
-//! qu'UN preset (`MetroSound::Click`, figure noire) : priorité à la robustesse
-//! et à la justesse de la synchro. Réf. design : l'ancien `metro-engine.js`
-//! (SOUNDS / FIGURES / subdivisions), commit de suppression `4402711`.
+//! Synthèse additive DÉTERMINISTE, MIROIR EXACT de `web/app/js/lib/metro-sounds.js`
+//! (timbres) et `metro-config.js` (figures) : le clic est identique que la
+//! référence sorte du navigateur (Option A) ou de l'agent (Option B). Timbres :
+//! `click`/`blip`/`digital`/`cowbell`/`woodblock` ; figures : noire → 1/32,
+//! triolets/sextolets (`Figure::offsets`). Toute évolution d'un timbre/figure
+//! doit rester synchronisée des DEUX côtés.
 
 /// Sample rate de sortie de l'agent (Hz). Verrouillé à 48 kHz (cf. `playback.rs`).
 const SR: f64 = 48_000.0;
@@ -32,7 +33,6 @@ const SR: f64 = 48_000.0;
 /// Enveloppe du grain de clic : attaque linéaire très courte (anti-pop) puis
 /// décroissance exponentielle. Durée totale bornée (le grain est coupé au-delà).
 const ATTACK_S: f32 = 0.0005; // 0.5 ms
-const DECAY_TAU_S: f32 = 0.030; // 30 ms
 const DURATION_S: f32 = 0.120; // 120 ms (queue inaudible ensuite)
 const DURATION_FRAMES: u64 = (DURATION_S as f64 * SR) as u64;
 
@@ -65,13 +65,31 @@ enum Role {
 /// chiffrages supportés (max actuel 7 pulses).
 const MAX_BEATS_PER_BAR: usize = 16;
 
-/// Timbre du métronome. Extensible : une nouvelle variante + son mapping
-/// `params()` suffit. B1 ne produit que `Click`.
+// Tables de partiels [multiplicateur de fréquence, amplitude] — MIROIR EXACT de
+// `metro-sounds.js` SPECS.partials. Synthèse additive déterministe (aucun bruit
+// aléatoire → parité parfaite navigateur/agent).
+const P_CLICK: &[(f32, f32)] = &[(1.0, 1.0), (2.0, 0.5)];
+const P_BLIP: &[(f32, f32)] = &[(1.0, 1.0)];
+const P_DIGITAL: &[(f32, f32)] = &[(1.0, 1.0), (3.0, 0.5), (5.0, 0.3), (7.0, 0.18)];
+const P_COWBELL: &[(f32, f32)] = &[(1.0, 1.0), (1.4815, 0.8), (2.0, 0.3), (2.96, 0.22)];
+const P_WOODBLOCK: &[(f32, f32)] = &[(1.0, 1.0), (2.4, 0.35), (3.8, 0.12)];
+
+/// Timbre du métronome (banque synthétisée). MIROIR de `metro-sounds.js`
+/// METRO_SOUNDS. Extensible : une variante + ses lignes dans `params`/`partials`/
+/// `decay_tau` suffit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum MetroSound {
     /// Clic synthétique (2 partiels + décroissance rapide) — le défaut.
     #[default]
     Click,
+    /// Pip sinus pur.
+    Blip,
+    /// Bip carré/harmonique net.
+    Digital,
+    /// Cloche 808 (deux partiels enharmoniques métalliques).
+    Cowbell,
+    /// Knock résonnant court et aigu.
+    Woodblock,
 }
 
 impl MetroSound {
@@ -80,11 +98,16 @@ impl MetroSound {
     pub fn from_wire(s: &str) -> Self {
         match s {
             "click" => MetroSound::Click,
+            "blip" => MetroSound::Blip,
+            "digital" => MetroSound::Digital,
+            "cowbell" => MetroSound::Cowbell,
+            "woodblock" => MetroSound::Woodblock,
             _ => MetroSound::default(),
         }
     }
 
-    /// Fréquence (Hz) et amplitude (0..1) du grain selon le rôle.
+    /// Fréquence (Hz) et amplitude (0..1) du grain selon le rôle. Miroir des
+    /// tables `freq`/`amp` de metro-sounds.js.
     fn params(self, role: Role) -> (f32, f32) {
         match self {
             MetroSound::Click => match role {
@@ -93,6 +116,80 @@ impl MetroSound {
                 Role::Main => (1200.0, 0.55),
                 Role::Sub => (1200.0, 0.30),
             },
+            MetroSound::Blip => match role {
+                Role::Accent => (2000.0, 0.85),
+                Role::Medium => (1750.0, 0.68),
+                Role::Main => (1500.0, 0.50),
+                Role::Sub => (1500.0, 0.28),
+            },
+            MetroSound::Digital => match role {
+                Role::Accent => (1000.0, 0.80),
+                Role::Medium => (920.0, 0.64),
+                Role::Main => (840.0, 0.50),
+                Role::Sub => (840.0, 0.28),
+            },
+            MetroSound::Cowbell => match role {
+                Role::Accent => (560.0, 0.75),
+                Role::Medium => (545.0, 0.60),
+                Role::Main => (540.0, 0.46),
+                Role::Sub => (540.0, 0.26),
+            },
+            MetroSound::Woodblock => match role {
+                Role::Accent => (1700.0, 0.80),
+                Role::Medium => (1500.0, 0.64),
+                Role::Main => (1300.0, 0.50),
+                Role::Sub => (1300.0, 0.28),
+            },
+        }
+    }
+
+    /// Partiels du timbre (miroir metro-sounds.js SPECS.partials).
+    fn partials(self) -> &'static [(f32, f32)] {
+        match self {
+            MetroSound::Click => P_CLICK,
+            MetroSound::Blip => P_BLIP,
+            MetroSound::Digital => P_DIGITAL,
+            MetroSound::Cowbell => P_COWBELL,
+            MetroSound::Woodblock => P_WOODBLOCK,
+        }
+    }
+
+    /// Constante de décroissance de l'enveloppe (s) — miroir SPECS.tau.
+    fn decay_tau(self) -> f32 {
+        match self {
+            MetroSound::Click => 0.030,
+            MetroSound::Blip => 0.035,
+            MetroSound::Digital => 0.022,
+            MetroSound::Cowbell => 0.035,
+            MetroSound::Woodblock => 0.014,
+        }
+    }
+
+    /// Enveloppe d'amplitude (0..1) à `t` s de l'onset (attaque partagée +
+    /// décroissance exponentielle propre au timbre).
+    fn envelope(self, t: f32) -> f32 {
+        if t < 0.0 {
+            0.0
+        } else if t < ATTACK_S {
+            t / ATTACK_S
+        } else {
+            (-(t - ATTACK_S) / self.decay_tau()).exp()
+        }
+    }
+
+    /// Timbre normalisé (∈ [-1,1]) à `t` s : somme des partiels de `freq`.
+    fn tone(self, freq: f32, t: f32) -> f32 {
+        use std::f32::consts::TAU;
+        let mut s = 0.0;
+        let mut norm = 0.0;
+        for (mult, amp) in self.partials() {
+            s += amp * (TAU * freq * mult * t).sin();
+            norm += amp;
+        }
+        if norm > 0.0 {
+            s / norm
+        } else {
+            0.0
         }
     }
 }
@@ -161,6 +258,8 @@ struct Voice {
     start_frame: u64,
     freq: f32,
     amp: f32,
+    /// Timbre à synthétiser pour ce grain (figé à l'émission de l'onset).
+    sound: MetroSound,
 }
 
 /// État de grille du métronome, exprimé en **frames de sortie** (pas en temps) :
@@ -612,6 +711,7 @@ impl ReferenceSource {
                     start_frame: onset.round() as u64,
                     freq,
                     amp,
+                    sound,
                 });
                 self.metro.last_onset_key = Some(key);
             }
@@ -633,7 +733,7 @@ impl ReferenceSource {
                 if rel > DURATION_S {
                     break;
                 }
-                let s = v.amp * envelope(rel) * tone(v.freq, rel);
+                let s = v.amp * v.sound.envelope(rel) * v.sound.tone(v.freq, rel);
                 let idx = ((f - block_start) as usize) * 2;
                 output[idx] += s * gain_l;
                 output[idx + 1] += s * gain_r;
@@ -644,25 +744,6 @@ impl ReferenceSource {
         self.voices
             .retain(|v| v.start_frame + DURATION_FRAMES > block_end);
     }
-}
-
-/// Enveloppe d'amplitude du grain (0..1) à `t` secondes de l'onset.
-fn envelope(t: f32) -> f32 {
-    if t < 0.0 {
-        0.0
-    } else if t < ATTACK_S {
-        t / ATTACK_S
-    } else {
-        (-(t - ATTACK_S) / DECAY_TAU_S).exp()
-    }
-}
-
-/// Timbre du clic à `t` secondes : fondamentale + octave (partiel à 2f), amorti
-/// pour rester dans [-1, 1] avant enveloppe.
-fn tone(freq: f32, t: f32) -> f32 {
-    use std::f32::consts::TAU;
-    let phase = TAU * freq * t;
-    (phase.sin() + 0.5 * (2.0 * phase).sin()) / 1.5
 }
 
 #[cfg(test)]
@@ -840,6 +921,54 @@ mod tests {
         let (_, sub) = MetroSound::Click.params(Role::Sub);
         let (_, main) = MetroSound::Click.params(Role::Main);
         assert!(sub < main, "subdivision plus discrète que le temps");
+    }
+
+    // ─── Sous-lot ③ : banque de sons synthétisés ──────────────────────────
+    #[test]
+    fn sound_parsers() {
+        assert_eq!(MetroSound::from_wire("blip"), MetroSound::Blip);
+        assert_eq!(MetroSound::from_wire("digital"), MetroSound::Digital);
+        assert_eq!(MetroSound::from_wire("cowbell"), MetroSound::Cowbell);
+        assert_eq!(MetroSound::from_wire("woodblock"), MetroSound::Woodblock);
+        assert_eq!(MetroSound::from_wire("???"), MetroSound::Click, "inconnu → défaut");
+    }
+
+    #[test]
+    fn each_sound_synthesizes_audible_grain() {
+        for s in [
+            MetroSound::Click, MetroSound::Blip, MetroSound::Digital,
+            MetroSound::Cowbell, MetroSound::Woodblock,
+        ] {
+            let mut r = ReferenceSource::new();
+            r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, s, Figure::default(), 0.0, 0);
+            let mut out = block(64); // beat 0 @ frame 0 → sonne dans ce bloc
+            r.advance_and_generate(&mut out, 0.0);
+            assert!(rms(&out) > 0.0, "{s:?} audible");
+        }
+    }
+
+    #[test]
+    fn click_tone_unchanged_non_regression() {
+        // Le click garde sa formule historique (fondamentale + octave, /1.5).
+        use std::f32::consts::TAU;
+        let t = 0.002_f32;
+        let p = TAU * 1200.0 * t;
+        let expected = (p.sin() + 0.5 * (2.0 * p).sin()) / 1.5;
+        assert!((MetroSound::Click.tone(1200.0, t) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sounds_have_distinct_partials() {
+        // Garde-fou parité : au moins 4 timbres aux partiels distincts.
+        let sets: Vec<_> = [
+            MetroSound::Click, MetroSound::Blip, MetroSound::Digital,
+            MetroSound::Cowbell, MetroSound::Woodblock,
+        ]
+        .iter()
+        .map(|s| s.partials().len())
+        .collect();
+        let uniq: std::collections::HashSet<_> = sets.iter().collect();
+        assert!(uniq.len() >= 3, "timbres variés");
     }
 
     // ─── Backing (B4) ─────────────────────────────────────────────────────
