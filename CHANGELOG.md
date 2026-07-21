@@ -4,6 +4,23 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8-2] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Changer son entrée en cours de session coupait la réception de TOUS les
+  pairs.** En session à plusieurs, dès qu'un membre changeait son entrée
+  (device, canal, ou upgrade WebRTC→agent), son agent perdait l'instrument de
+  tous les autres (VU figé, aucun son) jusqu'à un rejoin complet — d'où un bug
+  asymétrique (un sens fonctionne, l'autre non) constaté entre Mac et PC.
+  Cause : tout `start-capture` passait par `teardown_session`, qui wipe aussi la
+  réception des pairs (`recv_stops` + thread de décodage), alors que celle-ci est
+  INDÉPENDANTE du chemin de capture. Régression latente du refactor keep-warm
+  ASIO (0.5.4-5). Correctif : le browser signale via `sessionContinues` qu'un
+  `start-capture` continue une session active (hot-swap) ; l'agent reconstruit
+  alors UNIQUEMENT le chemin capture/self et PRÉSERVE la réception des pairs. Le
+  wipe complet ne subsiste que pour un vrai leave/rejoin. Nécessite le web à jour
+  (envoi du flag).
+
 ## [0.5.8-1] — 2026-07-20 (pré-release)
 
 ### Corrigé

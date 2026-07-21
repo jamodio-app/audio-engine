@@ -1917,7 +1917,7 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters, session_continues } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc,
@@ -1925,6 +1925,7 @@ async fn handle_message(
                 ?input_device,
                 ?channel_index,
                 ?stereo_start,
+                session_continues,
                 "StartCapture"
             );
             // Validation de la destination (M-agent-2, review pré-BETA 2026-07-12).
@@ -1954,7 +1955,7 @@ async fn handle_message(
             // La liveness des callbacks ASIO (cold-start ET mort en cours de
             // session) est surveillée en continu par `audio_liveness_supervisor`,
             // qui recrée les streams au besoin (cf. la fonction).
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters).await {
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters, session_continues).await {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser

@@ -68,6 +68,15 @@ pub enum BrowserMessage {
         /// Le browser les a reçues dans `plain-transport-created`.
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
+        /// `true` quand ce `start-capture` CONTINUE une session active (hot-swap
+        /// d'entrée : device/canal, upgrade WebRTC→agent) — par opposition à un
+        /// join initial. Dans ce cas l'agent reconstruit UNIQUEMENT le chemin
+        /// capture/self et PRÉSERVE la réception des pairs (`recv_stops` + thread
+        /// de décodage + streams pairs du mixer), au lieu de tout wiper via
+        /// `teardown_session`. `default = false` = rétro-compatible (vieux browser
+        /// ⇒ wipe complet = comportement historique).
+        #[serde(rename = "sessionContinues", default)]
+        session_continues: bool,
     },
     /// Talkback via l'agent (Lot 2, v0.5.7) — ajoute un SECOND producteur
     /// Opus/RTP (la voix) qui extrait un canal mono du MÊME buffer ASIO que
