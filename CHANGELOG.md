@@ -4,6 +4,19 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Ajouté
+- **Métronome enrichi (source « référence » Option B).** La synthèse du clic
+  supporte désormais : le **chiffrage** via `pulseRatio` (croche en ×/8) +
+  `beatsPerBar` + `accentPattern` (fort/médium/normal par temps) ; les
+  **subdivisions** (figures `8`/`8t`/`16` en plus de `q`) ; une **banque de sons**
+  synthétisés déterministes (`click`/`blip`/`digital`/`cowbell`/`woodblock`),
+  miroir exact du navigateur (`web/app/js/lib/metro-sounds.js`). Champs wire
+  `reference-config` rétro-compatibles (`serde(default)`) ; le pattern d'accents
+  est stocké dans un tableau FIXE (zéro allocation sur le chemin audio). Le
+  navigateur reste maître de la grille — aucun changement du timing/sync.
+
 ## [0.5.8-3] — 2026-07-21 (pré-release)
 
 ### Corrigé
