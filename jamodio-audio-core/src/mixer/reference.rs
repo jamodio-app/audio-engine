@@ -105,7 +105,22 @@ pub struct Figure {
     pub offsets: &'static [f32],
 }
 
+// Tables d'offsets (fractions de PULSE) — MIROIR de `metro-config.js` FIGURES.
+// Toute évolution doit rester synchronisée des deux côtés (browser + agent).
 const FIGURE_QUARTER: Figure = Figure { offsets: &[0.0] };
+const FIGURE_EIGHTH: Figure = Figure { offsets: &[0.0, 1.0 / 2.0] };
+const FIGURE_EIGHTH_T: Figure = Figure { offsets: &[0.0, 1.0 / 3.0, 2.0 / 3.0] };
+const FIGURE_SIXTEENTH: Figure = Figure {
+    offsets: &[0.0, 1.0 / 4.0, 2.0 / 4.0, 3.0 / 4.0],
+};
+const FIGURE_SIXTEENTH_T: Figure = Figure {
+    offsets: &[0.0, 1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0, 4.0 / 6.0, 5.0 / 6.0],
+};
+const FIGURE_THIRTYSECOND: Figure = Figure {
+    offsets: &[
+        0.0, 1.0 / 8.0, 2.0 / 8.0, 3.0 / 8.0, 4.0 / 8.0, 5.0 / 8.0, 6.0 / 8.0, 7.0 / 8.0,
+    ],
+};
 
 impl Default for Figure {
     fn default() -> Self {
@@ -118,6 +133,11 @@ impl Figure {
     pub fn from_wire(s: &str) -> Self {
         match s {
             "q" | "quarter" => FIGURE_QUARTER,
+            "8" => FIGURE_EIGHTH,
+            "8t" => FIGURE_EIGHTH_T,
+            "16" => FIGURE_SIXTEENTH,
+            "16t" => FIGURE_SIXTEENTH_T,
+            "32" => FIGURE_THIRTYSECOND,
             _ => Figure::default(),
         }
     }
@@ -780,6 +800,46 @@ mod tests {
         let (_, am) = MetroSound::Click.params(Role::Medium);
         let (_, an) = MetroSound::Click.params(Role::Main);
         assert!(aa > am && am > an, "accent > médium > normal");
+    }
+
+    // ─── Sous-lot ② : subdivisions (figures) ──────────────────────────────
+    #[test]
+    fn figure_parsers() {
+        assert_eq!(Figure::from_wire("8").offsets.len(), 2);
+        assert_eq!(Figure::from_wire("8t").offsets.len(), 3);
+        assert_eq!(Figure::from_wire("16").offsets.len(), 4);
+        assert_eq!(Figure::from_wire("16t").offsets.len(), 6);
+        assert_eq!(Figure::from_wire("32").offsets.len(), 8);
+        assert_eq!(Figure::from_wire("inconnu").offsets.len(), 1, "défaut noire");
+    }
+
+    #[test]
+    fn eighth_figure_adds_subdivision_onset() {
+        // 120 bpm, ratio 1 → 24000 frames/beat. Croche → onsets à 0 ET 12000.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::from_wire("8"), 0.0, 0);
+        let mut out = block(24_000); // un temps entier
+        r.advance_and_generate(&mut out, 0.0);
+        // 2 onsets émis (si=0 puis si=1) → dernière clé = beat0*2 + 1 = 1.
+        assert_eq!(r.metro.last_onset_key, Some(1), "croche : 2 onsets sur le temps");
+    }
+
+    #[test]
+    fn quarter_figure_single_onset() {
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::from_wire("q"), 0.0, 0);
+        let mut out = block(24_000);
+        r.advance_and_generate(&mut out, 0.0);
+        assert_eq!(r.metro.last_onset_key, Some(0), "noire : 1 seul onset");
+    }
+
+    #[test]
+    fn subdivision_uses_sub_role() {
+        // La subdivision (si>0) doit être plus discrète que le temps → amplitude
+        // Sub < Main (garantit le grain « léger » attendu).
+        let (_, sub) = MetroSound::Click.params(Role::Sub);
+        let (_, main) = MetroSound::Click.params(Role::Main);
+        assert!(sub < main, "subdivision plus discrète que le temps");
     }
 
     // ─── Backing (B4) ─────────────────────────────────────────────────────
