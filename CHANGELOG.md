@@ -4,6 +4,100 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8] — 2026-07-21
+
+Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` (détail
+par version ci-dessous) : éditeur VST3 net en haute densité (Windows), réception
+des pairs préservée au changement d'entrée, **keepalive Ping/Pong WS** (fin des
+déconnexions intermittentes qui perdaient mute/ENTRÉE/volumes en onglet
+arrière-plan), **métronome enrichi** (chiffrage `pulseRatio`/`accentPattern`,
+subdivisions, banque de sons synthétisés) — plus le correctif ENTRÉE ci-dessous.
+
+### Corrigé
+- **Instrument muet au join après avoir quitté une session en ENTRÉE OFF.** Le
+  drapeau `input_cut` (toggle ENTRÉE) est porté par le pipeline UNIQUE et à vie
+  de l'agent et survivait d'une session studio à l'autre : ré-entrer après avoir
+  quitté ENTRÉE OFF laissait l'instrument coupé à la source (VU mort, pas de
+  self-monitor) alors que l'UI se réaffiche ENTRÉE ON — « réparé » seulement par
+  un toggle OFF→ON manuel. Une nouvelle session (`session_continues=false`)
+  repart désormais ENTRÉE ON ; un OFF volontaire reste préservé au hot-swap
+  d'entrée (`session_continues=true`). Le navigateur réconcilie en complément
+  l'état UI réel au `capture-started` (ceinture+bretelles).
+
+## [0.5.8-5] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Changement de paramètre métronome pas appliqué en temps réel (obligé de
+  faire PAUSE/PLAY).** En cours de lecture, passer à une grille plus LENTE
+  (chiffrage ×/8 → ×/4, ou baisse de BPM) faisait chuter l'indice de temps
+  recalculé SOUS `last_onset_key` (garde-fou anti-double-clic) → tous les onsets
+  étaient supprimés jusqu'au rattrapage → silence. `set_config` réinitialise
+  désormais ce garde-fou (le re-ancrage périodique DLL via `set_grid` le
+  conserve, il reste nécessaire au joint d'un re-ancrage).
+
+## [0.5.8-4] — 2026-07-21 (pré-release)
+
+### Ajouté
+- **Métronome enrichi (source « référence » Option B).** La synthèse du clic
+  supporte désormais : le **chiffrage** via `pulseRatio` (croche en ×/8) +
+  `beatsPerBar` + `accentPattern` (fort/médium/normal par temps) ; les
+  **subdivisions** (figures `8`/`8t`/`16` en plus de `q`) ; une **banque de sons**
+  synthétisés déterministes (`click`/`blip`/`digital`/`cowbell`/`woodblock`),
+  miroir exact du navigateur (`web/app/js/lib/metro-sounds.js`). Champs wire
+  `reference-config` rétro-compatibles (`serde(default)`) ; le pattern d'accents
+  est stocké dans un tableau FIXE (zéro allocation sur le chemin audio). Le
+  navigateur reste maître de la grille — aucun changement du timing/sync.
+
+## [0.5.8-3] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Déconnexions WS agent↔browser en boucle (~toutes les 16 s) → commandes
+  perdues par intermittence.** Symptômes : MUTE d'un pair sans effet « par
+  moments », ENTRÉE muette au cold-rejoin, comportements « étranges/aléatoires ».
+  Cause racine : le watchdog agent (5 s) s'appuyait sur le heartbeat applicatif
+  du browser (`get-stats` émis par un `setInterval`), que Chrome **throttle en
+  onglet arrière-plan** → trous > 5 s → l'agent tuait le client → reconnexion →
+  pendant la ~1 s de coupure, `agentConnected=false` côté browser et tout
+  `agentSend` (mute, set-volume, ENTRÉE…) partait à la poubelle silencieusement.
+  Correctif : **keepalive Ping/Pong WebSocket** — l'agent émet un `Ping` toutes
+  les 2 s ; le navigateur y répond par un `Pong` au niveau réseau (hors JS
+  throttlé), ce qui nourrit le watchdog même en arrière-plan. Le watchdog garde
+  son rôle : un socket réellement mort ne renvoie plus de Pong → coupure
+  légitime. Fixe durablement mute intermittent + ENTRÉE cold-rejoin + tout
+  `agentSend` perdu.
+
+## [0.5.8-2] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Changer son entrée en cours de session coupait la réception de TOUS les
+  pairs.** En session à plusieurs, dès qu'un membre changeait son entrée
+  (device, canal, ou upgrade WebRTC→agent), son agent perdait l'instrument de
+  tous les autres (VU figé, aucun son) jusqu'à un rejoin complet — d'où un bug
+  asymétrique (un sens fonctionne, l'autre non) constaté entre Mac et PC.
+  Cause : tout `start-capture` passait par `teardown_session`, qui wipe aussi la
+  réception des pairs (`recv_stops` + thread de décodage), alors que celle-ci est
+  INDÉPENDANTE du chemin de capture. Régression latente du refactor keep-warm
+  ASIO (0.5.4-5). Correctif : le browser signale via `sessionContinues` qu'un
+  `start-capture` continue une session active (hot-swap) ; l'agent reconstruit
+  alors UNIQUEMENT le chemin capture/self et PRÉSERVE la réception des pairs. Le
+  wipe complet ne subsiste que pour un vrai leave/rejoin. Nécessite le web à jour
+  (envoi du flag).
+
+## [0.5.8-1] — 2026-07-20 (pré-release)
+
+### Corrigé
+- **Fenêtre d'éditeur VST3 rognée sur écran à haute densité (DPI > 100 %).**
+  Sur un affichage Windows à 150 % (ex. 2560×1440 @1.5×), l'UI de certains
+  plugins (Neural DSP Archetype, Polyverse Wider…) débordait de la fenêtre et
+  n'était pas entièrement visible, sans possibilité de redimensionner (plugins
+  à taille fixe). Cause : l'hôte n'informait jamais la vue du plugin de son
+  facteur d'échelle DPI — le plugin rendait son UI à l'échelle système mais la
+  fenêtre était créée à la taille « 100 % ». Correctif : l'hôte appelle
+  désormais `IPlugViewContentScaleSupport::setContentScaleFactor` (DPI du
+  moniteur ÷ 96) avant `getSize`, la vue renvoie alors sa taille physique
+  correcte et la fenêtre l'épouse. Complète le correctif de redimensionnement
+  `resizeView` de la 0.5.6.
+
 ## [0.5.7] — 2026-07-18
 
 Première release **publique** du **Lot 2** : talkback sur un canal indépendant

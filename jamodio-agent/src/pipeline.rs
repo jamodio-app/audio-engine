@@ -1364,7 +1364,12 @@ impl PipelineState {
     /// (sortie de studio sur ASIO) et avant un rejoin qui réutilise le driver
     /// chaud. NE touche NI au driver (`capture_stream`/`playback_stream`), NI au
     /// `reset_guard`, NI à `warm`, NI à `capture_sample_tx`.
-    fn teardown_session(&mut self) {
+    /// Démonte la session de capture/self. `preserve_peers = true` (hot-swap
+    /// d'entrée en session) GARDE la réception des pairs (`recv_stops` + thread de
+    /// décodage RT + streams pairs du mixer) — indépendante du chemin capture, il
+    /// n'y a aucune raison de la wiper quand l'utilisateur change juste son
+    /// entrée. `false` (vrai leave/park/stop) = wipe complet historique.
+    fn teardown_session(&mut self, preserve_peers: bool) {
         // 0.5.4-7 — plus d'encodeur consommateur : le callback du driver chaud
         // doit JETER ses samples (anti faux « agent saturé / drops/s » pendant le
         // park). Doit précéder l'arrêt de l'encodeur.
@@ -1382,15 +1387,21 @@ impl PipelineState {
         self.voice_active = false;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
         self.mixer.lock().remove_local_stream();
-        // Coupe les réceptions pair + le thread de décodage RT partagé.
-        let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
-        for id in ids {
-            self.remove_stream(&id);
-        }
-        if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
-            let _ = tx.send(DecodeMsg::Shutdown);
-            drop(tx);
-            let _ = join.join();
+        // Hot-swap d'entrée (session_continues) : la réception des pairs est
+        // INDÉPENDANTE du chemin capture (sockets UDP + décodage séparés) → on la
+        // garde intacte, sinon le pair qui change son entrée perd tous les autres
+        // instruments jusqu'au rejoin (bug asymétrique Mac/PC du 21/07).
+        if !preserve_peers {
+            // Coupe les réceptions pair + le thread de décodage RT partagé.
+            let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
+            for id in ids {
+                self.remove_stream(&id);
+            }
+            if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
+                let _ = tx.send(DecodeMsg::Shutdown);
+                drop(tx);
+                let _ = join.join();
+            }
         }
     }
 
@@ -1428,7 +1439,7 @@ impl PipelineState {
             tracing::warn!(target: "jamodio::pipeline", "park during recording — files discarded");
             let _ = self.stop_recording();
         }
-        self.teardown_session();
+        self.teardown_session(false);
         if let Some(w) = self.warm.as_mut() {
             w.parked_since = Some(std::time::Instant::now());
         }
@@ -1494,7 +1505,7 @@ impl PipelineState {
     /// Encapsule tout le teardown de la session/driver précédent·e. Renvoie les
     /// caractéristiques du device (pour l'encodeur + `CaptureStartedInfo`) et le
     /// `Receiver` capture.
-    fn prepare_audio_for_session(&mut self) -> Result<AcquiredAudio, CaptureStartError> {
+    fn prepare_audio_for_session(&mut self, preserve_peers: bool) -> Result<AcquiredAudio, CaptureStartError> {
         let input_id = self.input_device_id.clone();
         let output_id = self.output_device_id.clone();
 
@@ -1508,7 +1519,7 @@ impl PipelineState {
         if reuse {
             // Rejoin sur driver chaud : on démonte SEULEMENT la session, on GARDE
             // les streams + le canal. Zéro ASIOExit/ASIOInit = zéro churn.
-            self.teardown_session();
+            self.teardown_session(preserve_peers);
             let w = self.warm.as_mut().expect("reuse ⇒ warm présent");
             w.parked_since = None; // session active → annule la fermeture de grâce
             // Draine les buffers périmés accumulés pendant le park (le stream a
@@ -1532,7 +1543,10 @@ impl PipelineState {
 
         // Pas de réutilisation (à froid, device changé, ou hors ASIO) :
         // fermeture COMPLÈTE de la session + du driver, puis ouverture.
-        self.teardown_session();
+        // `preserve_peers` (hot-swap device) garde quand même la réception des
+        // pairs : elle est indépendante du driver capture (sockets UDP + thread
+        // de décodage séparés). Seul le chemin self/capture est reconstruit.
+        self.teardown_session(preserve_peers);
         self.close_audio_driver();
 
         // Cold reopen après une libération par la GRÂCE (interface idle plusieurs
@@ -1651,6 +1665,7 @@ impl PipelineState {
         channel_index: Option<u8>,
         stereo_start: Option<u8>,
         sfu_srtp: SrtpParameters,
+        session_continues: bool,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
         // 1. ACQUISITION AUDIO — réutilise le driver ASIO gardé CHAUD (rejoin sans
         //    ré-init = anti-churn Focusrite), ou ouvre à froid. Encapsule TOUT le
@@ -1659,6 +1674,9 @@ impl PipelineState {
         //    relâche tout ; le socket UDP n'est alloué qu'après). ASIO mono-client
         //    respecté (le chaud N'EST réutilisé que pour le MÊME device, sinon
         //    fermé d'abord). Cf. `prepare_audio_for_session`.
+        //    `session_continues` (hot-swap d'entrée) ⇒ on PRÉSERVE la réception
+        //    des pairs pendant la reconstruction du chemin capture (le teardown
+        //    ne wipe alors QUE le self, pas les `recv_stops`/décodage/streams pairs).
         let AcquiredAudio {
             sample_rx,
             channels_in,
@@ -1666,7 +1684,7 @@ impl PipelineState {
             input_buf,
             in_name,
             resolved_input_id,
-        } = self.prepare_audio_for_session()?;
+        } = self.prepare_audio_for_session(session_continues)?;
 
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
         // greffer un producteur voix plus tard (validation canal + resampler)
@@ -1674,6 +1692,18 @@ impl PipelineState {
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
         self.voice_active = false;
+        // ENTRÉE (input_cut) — le pipeline est UNIQUE et à vie (construit 1× au
+        // boot). Sans reset, `input_cut` SURVIT d'une session studio à l'autre :
+        // quitter en ENTRÉE OFF laissait l'instrument coupé à la source au join
+        // suivant (VU mort, pas de self-monitor) alors que l'UI se réaffiche ON
+        // → « réparé » seulement par un toggle OFF→ON manuel. Une nouvelle
+        // session (session_continues=false) repart donc ENTRÉE ON. Au hot-swap
+        // d'entrée (session_continues=true) on PRÉSERVE un OFF volontaire de
+        // l'utilisateur. Le web réconcilie aussi l'état UI au capture-started
+        // (ceinture+bretelles) ; ce reset est le filet racine côté agent.
+        if !session_continues {
+            self.set_input_cut(false);
+        }
         // Canal de commande du tap voix (capacité 4 : Add/Remove sont rares,
         // pilotés par les toggles UI). Poll é par `capture_stage_loop`.
         let (voice_ctrl_tx, voice_ctrl_rx) = bounded::<VoiceControl>(4);
@@ -2256,7 +2286,7 @@ impl PipelineState {
             tracing::warn!(target: "jamodio::pipeline", "stop_all during recording — files discarded");
             let _ = self.stop_recording();
         }
-        self.teardown_session();
+        self.teardown_session(false);
         self.close_audio_driver();
         self.state = AgentState::Idle;
         if was_active {

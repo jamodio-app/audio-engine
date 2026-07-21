@@ -1135,12 +1135,42 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     });
 
-    // Spawn task to forward outgoing messages to WebSocket
+    // Spawn task to forward outgoing messages to WebSocket.
+    //
+    // Keepalive Ping/Pong (0.5.8-3) : on émet un Ping WS toutes les 2 s. Le
+    // navigateur y répond automatiquement par un Pong AU NIVEAU RÉSEAU (couche
+    // WebSocket du navigateur, hors event-loop JS) — donc même un onglet en
+    // arrière-plan, dont Chrome throttle les timers `setInterval`, continue de
+    // nourrir le watchdog agent via la frame Pong entrante (le receive loop
+    // réarme son timeout sur TOUTE frame reçue, cf. `ws_rx.next()`).
+    //
+    // Sans ce Ping, le seul heartbeat était applicatif (get-stats émis par un
+    // `setInterval` browser) : throttlé en arrière-plan → trous > 5 s → le
+    // watchdog post-promotion (5 s) tuait le client toutes les ~16 s →
+    // reconnexions en boucle → fenêtres `agentConnected=false` → commandes
+    // `agentSend` perdues (mute d'un pair, ENTRÉE, set-volume/pan…). Le Ping/Pong
+    // est le keepalive canonique et robuste, indépendant du JS throttlé. Le
+    // watchdog garde son rôle d'origine : un socket RÉELLEMENT mort (onglet tué,
+    // half-open) ne renvoie plus de Pong → coupure légitime.
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_tx.send(Message::Text(json)).await.is_err() {
-                    break;
+        let mut ping = tokio::time::interval(std::time::Duration::from_secs(2));
+        // Si la tâche est occupée (rafale de perfstats), on ne rattrape pas les
+        // ticks manqués en burst : un Ping en retard suffit au keepalive.
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break }; // canal fermé → teardown
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if ws_tx.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = ping.tick() => {
+                    if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -1917,7 +1947,7 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters, session_continues } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc,
@@ -1925,6 +1955,7 @@ async fn handle_message(
                 ?input_device,
                 ?channel_index,
                 ?stereo_start,
+                session_continues,
                 "StartCapture"
             );
             // Validation de la destination (M-agent-2, review pré-BETA 2026-07-12).
@@ -1954,7 +1985,7 @@ async fn handle_message(
             // La liveness des callbacks ASIO (cold-start ET mort en cours de
             // session) est surveillée en continu par `audio_liveness_supervisor`,
             // qui recrée les streams au besoin (cf. la fonction).
-            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters).await {
+            match pl.start_capture(ssrc, sfu_ip.clone(), sfu_port, 111, channel_index, stereo_start, srtp_parameters, session_continues).await {
                 Ok((local_port, agent_srtp, info)) => {
                     // Deux messages : LocalPort (chaîne SRTP avec le SFU) +
                     // CaptureStarted (confirmation explicite côté browser
@@ -2311,6 +2342,9 @@ async fn handle_message(
             volume,
             pan,
             bpm,
+            pulse_ratio,
+            beats_per_bar,
+            accent_pattern,
             beats_per_accent,
             sound,
             figure,
@@ -2326,6 +2360,9 @@ async fn handle_message(
                 volume,
                 pan,
                 bpm,
+                pulse_ratio,
+                beats_per_bar,
+                &accent_pattern,
                 beats_per_accent,
                 MetroSound::from_wire(&sound),
                 Figure::from_wire(&figure),
@@ -2334,7 +2371,7 @@ async fn handle_message(
             );
             tracing::debug!(
                 target: "jamodio::ws",
-                enabled, bpm, beats_per_accent,
+                enabled, bpm, pulse_ratio, beats_per_bar, beats_per_accent,
                 anchor_beat_frame, anchor_beat_index,
                 "ReferenceConfig"
             );
