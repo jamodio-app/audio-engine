@@ -4,6 +4,17 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8-5] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Changement de paramètre métronome pas appliqué en temps réel (obligé de
+  faire PAUSE/PLAY).** En cours de lecture, passer à une grille plus LENTE
+  (chiffrage ×/8 → ×/4, ou baisse de BPM) faisait chuter l'indice de temps
+  recalculé SOUS `last_onset_key` (garde-fou anti-double-clic) → tous les onsets
+  étaient supprimés jusqu'au rattrapage → silence. `set_config` réinitialise
+  désormais ce garde-fou (le re-ancrage périodique DLL via `set_grid` le
+  conserve, il reste nécessaire au joint d'un re-ancrage).
+
 ## [0.5.8-4] — 2026-07-21 (pré-release)
 
 ### Ajouté

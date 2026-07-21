@@ -568,6 +568,14 @@ impl ReferenceSource {
         self.metro.sound = sound;
         self.metro.figure = figure;
         self.set_grid(anchor_beat_frame, anchor_beat_index);
+        // Changement de config EN COURS de lecture (bpm/chiffrage/rythme/son) : la
+        // grille bouge (nouvelle ancre). On RÉINITIALISE le garde-fou anti-double-
+        // clic — sinon, si la nouvelle grille est plus LENTE (l'indice de temps
+        // recalculé passe SOUS `last_onset_key`), tous les onsets seraient
+        // supprimés jusqu'au rattrapage → silence tant qu'on ne fait pas STOP/PLAY.
+        // NB : le re-ancrage périodique (DLL) passe par `set_grid` et NE réinitialise
+        // PAS ce garde-fou (il reste nécessaire au « joint » d'un re-ancrage).
+        self.metro.last_onset_key = None;
     }
 
     /// Re-ancrage périodique de la grille (message `reference-grid`) = la DLL :
@@ -881,6 +889,29 @@ mod tests {
         let (_, am) = MetroSound::Click.params(Role::Medium);
         let (_, an) = MetroSound::Click.params(Role::Main);
         assert!(aa > am && am > an, "accent > médium > normal");
+    }
+
+    #[test]
+    fn config_change_to_slower_grid_does_not_suppress_onsets() {
+        // Régression « changement pas en temps réel » : passer à une grille PLUS
+        // LENTE fait chuter l'indice de temps SOUS last_onset_key → sans reset,
+        // tous les onsets seraient supprimés jusqu'au rattrapage (silence).
+        let mut r = ReferenceSource::new();
+        // Grille rapide (croches, fpb=12000) : joue les beats 0..3 → last_onset_key grimpe.
+        r.set_config(true, 1.0, 0.0, 120.0, 0.5, 6, &[2, 0, 0, 1, 0, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        for _ in 0..4 {
+            r.advance_and_generate(&mut block(12_000), 0.0);
+        }
+        assert!(r.metro.last_onset_key.unwrap_or(0) >= 3, "plusieurs onsets émis sur la grille rapide");
+        // Changement → grille PLUS LENTE (noire, fpb=24000), indice d'ancrage BAS,
+        // ancrée au frame courant pour jouer tout de suite.
+        let now_frame = r.frames_rendered as f64;
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::default(), now_frame, 1);
+        assert_eq!(r.metro.last_onset_key, None, "garde-fou réinitialisé au changement de config");
+        // Le beat d'ancrage (index 1 @ now_frame) doit sonner immédiatement.
+        let mut out = block(64);
+        r.advance_and_generate(&mut out, 0.0);
+        assert!(rms(&out) > 0.0, "onset joue tout de suite après le changement (pas de suppression → plus de PAUSE/PLAY)");
     }
 
     // ─── Sous-lot ② : subdivisions (figures) ──────────────────────────────
