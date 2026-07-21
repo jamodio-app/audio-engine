@@ -50,13 +50,20 @@ const BACKING_SNAP_FRAMES: f64 = 2400.0;
 /// Rôle rythmique d'un onset — pilote timbre/niveau du grain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
-    /// 1er temps de la mesure (accent).
+    /// 1er temps de la mesure (accent fort).
     Accent,
+    /// Accent secondaire (tête de groupe d'une métrique composée/irrégulière).
+    Medium,
     /// Temps principal (non accentué).
     Main,
     /// Subdivision (croche/double/triolet) — plus discret. Futur (figures).
     Sub,
 }
+
+/// Longueur max d'un pattern d'accents (borne le tableau fixe embarqué dans
+/// `Metro` → aucune allocation sur le chemin audio). 16 couvre largement les
+/// chiffrages supportés (max actuel 7 pulses).
+const MAX_BEATS_PER_BAR: usize = 16;
 
 /// Timbre du métronome. Extensible : une nouvelle variante + son mapping
 /// `params()` suffit. B1 ne produit que `Click`.
@@ -82,6 +89,7 @@ impl MetroSound {
         match self {
             MetroSound::Click => match role {
                 Role::Accent => (1800.0, 0.90),
+                Role::Medium => (1500.0, 0.72),
                 Role::Main => (1200.0, 0.55),
                 Role::Sub => (1200.0, 0.30),
             },
@@ -142,6 +150,13 @@ struct Voice {
 struct Metro {
     frames_per_beat: f64,
     beats_per_accent: u32,
+    /// Nombre de pulses/mesure (modulo pour l'accent). 0 = utiliser le fallback
+    /// `beats_per_accent` (accent sur le 1er temps uniquement).
+    beats_per_bar: u32,
+    /// Pattern d'accents par pulse (0 normal / 1 médium / 2 fort). Seuls les
+    /// `beats_per_bar` premiers éléments sont significatifs. Tableau FIXE →
+    /// aucune allocation sur le chemin audio.
+    accent_pattern: [u8; MAX_BEATS_PER_BAR],
     anchor_beat_frame: f64,
     anchor_beat_index: u64,
     sound: MetroSound,
@@ -157,11 +172,31 @@ impl Metro {
         Self {
             frames_per_beat: 0.0,
             beats_per_accent: 4,
+            beats_per_bar: 0,
+            accent_pattern: [0; MAX_BEATS_PER_BAR],
             anchor_beat_frame: 0.0,
             anchor_beat_index: 0,
             sound: MetroSound::default(),
             figure: Figure::default(),
             last_onset_key: None,
+        }
+    }
+
+    /// Rôle du temps (pulse) d'indice global `ju`. Utilise le `accent_pattern`
+    /// fourni par le browser si disponible ; sinon retombe sur `beats_per_accent`
+    /// (rétro-compat : accent sur les multiples, comme avant l'accent-pattern).
+    fn beat_role(&self, ju: u64) -> Role {
+        if self.beats_per_bar > 0 {
+            let n = (self.beats_per_bar as usize).min(MAX_BEATS_PER_BAR);
+            match self.accent_pattern[(ju % n as u64) as usize] {
+                2 => Role::Accent,
+                1 => Role::Medium,
+                _ => Role::Main,
+            }
+        } else if ju.is_multiple_of(self.beats_per_accent.max(1) as u64) {
+            Role::Accent
+        } else {
+            Role::Main
         }
     }
 }
@@ -377,6 +412,12 @@ impl ReferenceSource {
         volume: f32,
         pan: f32,
         bpm: f32,
+        // Durée d'une pulse / noire : 1.0 noire, 0.5 croche, 1.5 noire pointée.
+        pulse_ratio: f64,
+        // Nb de pulses/mesure + pattern d'accents (0/1/2). `accent_pattern` vide
+        // → fallback `beats_per_accent`.
+        beats_per_bar: u32,
+        accent_pattern: &[u8],
         beats_per_accent: u32,
         sound: MetroSound,
         figure: Figure,
@@ -386,12 +427,25 @@ impl ReferenceSource {
         self.enabled = enabled;
         self.set_volume(volume);
         self.set_pan(pan);
+        // La PULSE (le temps cliqué) = noire × pulse_ratio. En 4/4 (ratio 1.0) →
+        // `SR*60/bpm`, identique à l'historique. Ratio non fini/≤0 → défaut 1.0.
+        let ratio = if pulse_ratio.is_finite() && pulse_ratio > 0.0 { pulse_ratio } else { 1.0 };
         self.metro.frames_per_beat = if bpm.is_finite() && bpm > 0.0 {
-            SR * 60.0 / bpm as f64
+            SR * 60.0 / bpm as f64 * ratio
         } else {
             0.0
         };
         self.metro.beats_per_accent = beats_per_accent.max(1);
+        // Copie le pattern dans le tableau fixe (tronqué à MAX_BEATS_PER_BAR).
+        // Longueur cohérente pattern/beats_per_bar sinon on ignore le pattern.
+        self.metro.accent_pattern = [0; MAX_BEATS_PER_BAR];
+        let bpb = beats_per_bar as usize;
+        if bpb > 0 && bpb <= MAX_BEATS_PER_BAR && accent_pattern.len() >= bpb {
+            self.metro.accent_pattern[..bpb].copy_from_slice(&accent_pattern[..bpb]);
+            self.metro.beats_per_bar = beats_per_bar;
+        } else {
+            self.metro.beats_per_bar = 0; // fallback beats_per_accent
+        }
         self.metro.sound = sound;
         self.metro.figure = figure;
         self.set_grid(anchor_beat_frame, anchor_beat_index);
@@ -504,7 +558,6 @@ impl ReferenceSource {
         let aidx = self.metro.anchor_beat_index as f64;
         let offsets = self.metro.figure.offsets;
         let n_off = offsets.len().max(1) as u64;
-        let bpa = self.metro.beats_per_accent.max(1) as u64;
         let sound = self.metro.sound;
 
         // Indices de beat susceptibles d'avoir un onset dans le bloc. On élargit
@@ -530,11 +583,7 @@ impl ReferenceSource {
                     }
                 }
                 let role = if si == 0 {
-                    if ju.is_multiple_of(bpa) {
-                        Role::Accent
-                    } else {
-                        Role::Main
-                    }
+                    self.metro.beat_role(ju)
                 } else {
                     Role::Sub
                 };
@@ -629,7 +678,7 @@ mod tests {
     fn beat_emerges_at_the_scheduled_frame() {
         // 120 bpm ⇒ 24000 frames/beat. Beat 0 ancré au frame 100.
         let mut r = ReferenceSource::new();
-        r.set_config(true, 1.0, 0.0, 120.0, 4, MetroSound::Click, Figure::default(), 100.0, 0);
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[], 4, MetroSound::Click, Figure::default(), 100.0, 0);
         // Rends par blocs de 64 frames jusqu'à couvrir le frame 100.
         let mut fired_block = None;
         for b in 0..4 {
@@ -648,7 +697,7 @@ mod tests {
         // Une grille, on rend le beat 0, puis un re-ancrage qui ne doit PAS
         // re-jouer le beat 0.
         let mut r = ReferenceSource::new();
-        r.set_config(true, 1.0, 0.0, 120.0, 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[], 4, MetroSound::Click, Figure::default(), 0.0, 0);
         // Beat 0 est à frame 0 → sonne au 1er bloc.
         let mut out = block(64);
         r.advance_and_generate(&mut out, 0.0);
@@ -674,7 +723,7 @@ mod tests {
     #[test]
     fn stop_clears_voices() {
         let mut r = ReferenceSource::new();
-        r.set_config(true, 1.0, 0.0, 120.0, 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[], 4, MetroSound::Click, Figure::default(), 0.0, 0);
         r.advance_and_generate(&mut block(64), 0.0);
         assert!(!r.voices.is_empty());
         r.stop();
@@ -688,6 +737,49 @@ mod tests {
         assert_eq!(MetroSound::from_wire("inconnu"), MetroSound::Click);
         assert_eq!(Figure::from_wire("q").offsets, FIGURE_QUARTER.offsets);
         assert_eq!(Figure::from_wire("bizarre").offsets, FIGURE_QUARTER.offsets);
+    }
+
+    // ─── Sous-lot ① : pulse_ratio + accent_pattern ────────────────────────
+    #[test]
+    fn pulse_ratio_scales_beat_spacing() {
+        // 120 bpm, ratio 1.0 (noire) → 24000 frames/beat ; ratio 0.5 (croche) → 12000.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        assert_eq!(r.metro.frames_per_beat, 24_000.0);
+        r.set_config(true, 1.0, 0.0, 120.0, 0.5, 5, &[2, 0, 0, 1, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        assert_eq!(r.metro.frames_per_beat, 12_000.0, "croche = moitié de la noire");
+    }
+
+    #[test]
+    fn accent_pattern_drives_role_5_8() {
+        // 5/8 (3+2) : fort sur 0, médium sur 3, normal ailleurs. Modulo 5 sur l'index.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 0.5, 5, &[2, 0, 0, 1, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        assert_eq!(r.metro.beat_role(0), Role::Accent);
+        assert_eq!(r.metro.beat_role(3), Role::Medium);
+        assert_eq!(r.metro.beat_role(1), Role::Main);
+        assert_eq!(r.metro.beat_role(5), Role::Accent, "mesure suivante : 5 mod 5 = 0");
+        assert_eq!(r.metro.beat_role(8), Role::Medium, "8 mod 5 = 3");
+    }
+
+    #[test]
+    fn empty_accent_pattern_falls_back_to_beats_per_accent() {
+        // Pattern vide (agent piloté par un browser ancien) → accent sur les
+        // multiples de beats_per_accent, comportement historique.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 0, &[], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        assert_eq!(r.metro.beats_per_bar, 0, "pas de pattern → fallback");
+        assert_eq!(r.metro.beat_role(0), Role::Accent);
+        assert_eq!(r.metro.beat_role(4), Role::Accent);
+        assert_eq!(r.metro.beat_role(1), Role::Main);
+    }
+
+    #[test]
+    fn medium_between_accent_and_main() {
+        let (_, aa) = MetroSound::Click.params(Role::Accent);
+        let (_, am) = MetroSound::Click.params(Role::Medium);
+        let (_, an) = MetroSound::Click.params(Role::Main);
+        assert!(aa > am && am > an, "accent > médium > normal");
     }
 
     // ─── Backing (B4) ─────────────────────────────────────────────────────
@@ -797,7 +889,7 @@ mod tests {
         let mut r = ReferenceSource::new();
         load_ramp(&mut r, 48_000);
         r.backing_play(0.5, 0.0); // audible immédiatement (rampe ≈0.5 en milieu)
-        r.set_config(true, 1.0, 0.0, 120.0, 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[], 4, MetroSound::Click, Figure::default(), 0.0, 0);
         let mut out = block(64);
         r.advance_and_generate(&mut out, 0.0);
         assert!(rms(&out) > 0.0, "métro + backing produisent du son");
@@ -806,7 +898,7 @@ mod tests {
     #[test]
     fn pan_hard_left_silences_right() {
         let mut r = ReferenceSource::new();
-        r.set_config(true, 1.0, -1.0, 120.0, 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        r.set_config(true, 1.0, -1.0, 120.0, 1.0, 4, &[], 4, MetroSound::Click, Figure::default(), 0.0, 0);
         let mut out = block(64);
         r.advance_and_generate(&mut out, 0.0);
         let l: f32 = out.iter().step_by(2).map(|s| s.abs()).sum();

@@ -22,6 +22,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 // ─── Browser → Agent ───────────────────────────────────
 
+/// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
+/// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
+fn default_pulse_ratio() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BrowserMessage {
@@ -298,6 +304,18 @@ pub enum BrowserMessage {
         volume: f32,
         pan: f32,
         bpm: f32,
+        /// Durée d'une pulse / noire (1.0 = noire, 0.5 = croche, 1.5 = noire
+        /// pointée). Absent (agent pré-0.5.8 / browser ancien) → 1.0 (4/4).
+        #[serde(rename = "pulseRatio", default = "default_pulse_ratio")]
+        pulse_ratio: f64,
+        /// Nombre de pulses par mesure (modulo pour l'accent). 0 = non fourni →
+        /// on retombe sur `beats_per_accent`.
+        #[serde(rename = "beatsPerBar", default)]
+        beats_per_bar: u32,
+        /// Pattern d'accents par pulse (0 normal / 1 médium / 2 fort). Vide →
+        /// fallback `beats_per_accent` (accent sur le 1 uniquement).
+        #[serde(rename = "accentPattern", default)]
+        accent_pattern: Vec<u8>,
         #[serde(rename = "beatsPerAccent")]
         beats_per_accent: u32,
         sound: String,

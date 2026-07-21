@@ -2342,6 +2342,9 @@ async fn handle_message(
             volume,
             pan,
             bpm,
+            pulse_ratio,
+            beats_per_bar,
+            accent_pattern,
             beats_per_accent,
             sound,
             figure,
@@ -2357,6 +2360,9 @@ async fn handle_message(
                 volume,
                 pan,
                 bpm,
+                pulse_ratio,
+                beats_per_bar,
+                &accent_pattern,
                 beats_per_accent,
                 MetroSound::from_wire(&sound),
                 Figure::from_wire(&figure),
@@ -2365,7 +2371,7 @@ async fn handle_message(
             );
             tracing::debug!(
                 target: "jamodio::ws",
-                enabled, bpm, beats_per_accent,
+                enabled, bpm, pulse_ratio, beats_per_bar, beats_per_accent,
                 anchor_beat_frame, anchor_beat_index,
                 "ReferenceConfig"
             );
