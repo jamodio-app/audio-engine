@@ -4,6 +4,26 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8] — 2026-07-21
+
+Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` (détail
+par version ci-dessous) : éditeur VST3 net en haute densité (Windows), réception
+des pairs préservée au changement d'entrée, **keepalive Ping/Pong WS** (fin des
+déconnexions intermittentes qui perdaient mute/ENTRÉE/volumes en onglet
+arrière-plan), **métronome enrichi** (chiffrage `pulseRatio`/`accentPattern`,
+subdivisions, banque de sons synthétisés) — plus le correctif ENTRÉE ci-dessous.
+
+### Corrigé
+- **Instrument muet au join après avoir quitté une session en ENTRÉE OFF.** Le
+  drapeau `input_cut` (toggle ENTRÉE) est porté par le pipeline UNIQUE et à vie
+  de l'agent et survivait d'une session studio à l'autre : ré-entrer après avoir
+  quitté ENTRÉE OFF laissait l'instrument coupé à la source (VU mort, pas de
+  self-monitor) alors que l'UI se réaffiche ENTRÉE ON — « réparé » seulement par
+  un toggle OFF→ON manuel. Une nouvelle session (`session_continues=false`)
+  repart désormais ENTRÉE ON ; un OFF volontaire reste préservé au hot-swap
+  d'entrée (`session_continues=true`). Le navigateur réconcilie en complément
+  l'état UI réel au `capture-started` (ceinture+bretelles).
+
 ## [0.5.8-5] — 2026-07-21 (pré-release)
 
 ### Corrigé

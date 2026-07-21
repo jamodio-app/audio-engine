@@ -1692,6 +1692,18 @@ impl PipelineState {
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
         self.voice_active = false;
+        // ENTRÉE (input_cut) — le pipeline est UNIQUE et à vie (construit 1× au
+        // boot). Sans reset, `input_cut` SURVIT d'une session studio à l'autre :
+        // quitter en ENTRÉE OFF laissait l'instrument coupé à la source au join
+        // suivant (VU mort, pas de self-monitor) alors que l'UI se réaffiche ON
+        // → « réparé » seulement par un toggle OFF→ON manuel. Une nouvelle
+        // session (session_continues=false) repart donc ENTRÉE ON. Au hot-swap
+        // d'entrée (session_continues=true) on PRÉSERVE un OFF volontaire de
+        // l'utilisateur. Le web réconcilie aussi l'état UI au capture-started
+        // (ceinture+bretelles) ; ce reset est le filet racine côté agent.
+        if !session_continues {
+            self.set_input_cut(false);
+        }
         // Canal de commande du tap voix (capacité 4 : Add/Remove sont rares,
         // pilotés par les toggles UI). Poll é par `capture_stage_loop`.
         let (voice_ctrl_tx, voice_ctrl_rx) = bounded::<VoiceControl>(4);
