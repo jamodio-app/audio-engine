@@ -4,7 +4,7 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
-## [Non publié]
+## [0.5.8-4] — 2026-07-21 (pré-release)
 
 ### Ajouté
 - **Métronome enrichi (source « référence » Option B).** La synthèse du clic
