@@ -1135,12 +1135,42 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     });
 
-    // Spawn task to forward outgoing messages to WebSocket
+    // Spawn task to forward outgoing messages to WebSocket.
+    //
+    // Keepalive Ping/Pong (0.5.8-3) : on émet un Ping WS toutes les 2 s. Le
+    // navigateur y répond automatiquement par un Pong AU NIVEAU RÉSEAU (couche
+    // WebSocket du navigateur, hors event-loop JS) — donc même un onglet en
+    // arrière-plan, dont Chrome throttle les timers `setInterval`, continue de
+    // nourrir le watchdog agent via la frame Pong entrante (le receive loop
+    // réarme son timeout sur TOUTE frame reçue, cf. `ws_rx.next()`).
+    //
+    // Sans ce Ping, le seul heartbeat était applicatif (get-stats émis par un
+    // `setInterval` browser) : throttlé en arrière-plan → trous > 5 s → le
+    // watchdog post-promotion (5 s) tuait le client toutes les ~16 s →
+    // reconnexions en boucle → fenêtres `agentConnected=false` → commandes
+    // `agentSend` perdues (mute d'un pair, ENTRÉE, set-volume/pan…). Le Ping/Pong
+    // est le keepalive canonique et robuste, indépendant du JS throttlé. Le
+    // watchdog garde son rôle d'origine : un socket RÉELLEMENT mort (onglet tué,
+    // half-open) ne renvoie plus de Pong → coupure légitime.
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_tx.send(Message::Text(json)).await.is_err() {
-                    break;
+        let mut ping = tokio::time::interval(std::time::Duration::from_secs(2));
+        // Si la tâche est occupée (rafale de perfstats), on ne rattrape pas les
+        // ticks manqués en burst : un Ping en retard suffit au keepalive.
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break }; // canal fermé → teardown
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if ws_tx.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ = ping.tick() => {
+                    if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
                 }
             }
         }

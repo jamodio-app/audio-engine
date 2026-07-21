@@ -4,6 +4,24 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.8-3] — 2026-07-21 (pré-release)
+
+### Corrigé
+- **Déconnexions WS agent↔browser en boucle (~toutes les 16 s) → commandes
+  perdues par intermittence.** Symptômes : MUTE d'un pair sans effet « par
+  moments », ENTRÉE muette au cold-rejoin, comportements « étranges/aléatoires ».
+  Cause racine : le watchdog agent (5 s) s'appuyait sur le heartbeat applicatif
+  du browser (`get-stats` émis par un `setInterval`), que Chrome **throttle en
+  onglet arrière-plan** → trous > 5 s → l'agent tuait le client → reconnexion →
+  pendant la ~1 s de coupure, `agentConnected=false` côté browser et tout
+  `agentSend` (mute, set-volume, ENTRÉE…) partait à la poubelle silencieusement.
+  Correctif : **keepalive Ping/Pong WebSocket** — l'agent émet un `Ping` toutes
+  les 2 s ; le navigateur y répond par un `Pong` au niveau réseau (hors JS
+  throttlé), ce qui nourrit le watchdog même en arrière-plan. Le watchdog garde
+  son rôle : un socket réellement mort ne renvoie plus de Pong → coupure
+  légitime. Fixe durablement mute intermittent + ENTRÉE cold-rejoin + tout
+  `agentSend` perdu.
+
 ## [0.5.8-2] — 2026-07-21 (pré-release)
 
 ### Corrigé
