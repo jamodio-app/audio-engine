@@ -40,14 +40,48 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Wrapper to make cpal::Stream Send — we only hold it alive (RAII), never use across threads.
-struct SendStream(#[allow(dead_code)] cpal::Stream);
+struct SendStream(cpal::Stream);
 // SAFETY: on ne fait que le garder en vie (RAII) et le dropper. Sur Windows,
 // l'OUVERTURE et la FERMETURE du stream ASIO se font sur le thread COM-STA
 // dédié (cf. `com_exec` + `close_stream_on_com`) — l'apartment STA qui a créé
 // le driver est donc aussi celui qui le détruit. On ne fait que transférer le
-// handle entre ce thread et la task tokio qui le stocke (jamais d'appel de
-// méthode hors-thread ; le callback temps réel tourne sur le thread du driver).
+// handle entre ce thread et la task tokio qui le stocke. Seule méthode appelée :
+// `pause()` dans `Drop` (cf. ci-dessous), qui s'exécute donc elle aussi sur le
+// thread COM-STA créateur (tous les drops passent par `close_stream_on_com` ou
+// par les closures `com_exec::run` d'`open_duplex_on_com`). Le callback temps
+// réel tourne sur le thread du driver.
 unsafe impl Send for SendStream {}
+
+/// FUITE CoreAudio — bug « perte de la tranche du pair au changement d'entrée »
+/// (rapport 21/07). Sur macOS, DROPPER un `cpal::Stream` d'ENTRÉE n'arrête PAS
+/// son AudioUnit : le callback fantôme continue à ~750 cb/s indéfiniment.
+/// Chaque hot-swap d'entrée en session (`swapAgentMusicDevice` → StartCapture)
+/// empilait donc +1 flux de capture (750→1500→…→7500 cb/s mesurés en prod sur
+/// 10 switches) jusqu'à saturer `pipeline.lock` → « callbacks audio figés »,
+/// overflow des jitter buffers, WS starvation (watchdog navigateur → « agent
+/// lost »), et streams pairs tués en ghost. `pause()` (→ AudioOutputUnitStop)
+/// AVANT la destruction coupe le callback net — prouvé par
+/// `capture::tests::{ghost_capture_callbacks_stop_after_drop,
+/// pause_stops_capture_callbacks}` (tests device réel, `--ignored`).
+///
+/// Placé dans `Drop` (et non dans `close_stream_on_com`) pour couvrir TOUS les
+/// chemins de destruction par construction : hot-swap, stop_all, reset driver,
+/// chemins d'erreur d'`open_duplex_on_com` (sortie déjà démarrée puis play()
+/// d'entrée en échec), futurs call-sites. Best-effort : sans effet néfaste sur
+/// un stream jamais démarré / déjà arrêté ; WASAPI supporte pause() ; l'ASIO
+/// single-owner ne passe pas par `SendStream` (cf. `AsioDuplexHost`).
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        use cpal::traits::StreamTrait as _;
+        if let Err(e) = self.0.pause() {
+            tracing::debug!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "pause() au drop du stream a échoué (déjà arrêté ?) — best-effort"
+            );
+        }
+    }
+}
 
 /// Résultat de l'ouverture du stream d'entrée (résolution + build) effectuée
 /// atomiquement sur le thread COM-STA — le `cpal::Device`/`cpal::Stream` !Send
@@ -4458,5 +4492,74 @@ mod midi_dispatch_tests {
         dispatch_subblock_midi(&events, 128, 256, &mut out);
         assert_eq!(out.len(), 1, "frame_offset == sub_start est inclus");
         assert_eq!(out[0].frame_offset, 0);
+    }
+}
+
+// ─── Régression : teardown des flux de capture (fuite hot-swap, bug 21/07) ───
+#[cfg(test)]
+mod teardown_tests {
+    use super::{close_stream_on_com, SendStream};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// RÉGRESSION de la fuite de flux de capture au hot-swap d'entrée (rapport
+    /// 21/07 : +750 cb/s par switch → saturation `pipeline.lock` → « callbacks
+    /// audio figés » → perte des tranches pairs). Exerce le chemin de teardown
+    /// RÉEL — `SendStream` (pause() au Drop) via `close_stream_on_com` — et
+    /// vérifie que PLUS AUCUN callback n'arrive ensuite. Si ce test échoue, la
+    /// fuite est de retour (ex. retrait du `impl Drop for SendStream`).
+    ///
+    /// Ouvre le device d'entrée réel → `#[ignore]` (CI sans device/permission).
+    /// Manuel (Mac) :
+    ///   `cargo test -p jamodio-agent --bins -- --ignored --nocapture teardown_stops`
+    #[test]
+    #[ignore = "ouvre le device d'entrée réel — manuel: cargo test -- --ignored teardown_stops"]
+    fn teardown_stops_capture_callbacks() {
+        use cpal::traits::StreamTrait;
+
+        let Some(id) = crate::audio::device::default_input_id() else {
+            eprintln!("SKIP: aucun device d'entrée par défaut");
+            return;
+        };
+        let Some(device) = crate::audio::device::get_input_device(&id) else {
+            eprintln!("SKIP: device d'entrée '{id}' introuvable");
+            return;
+        };
+
+        let (tx, _rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let (stream, _ch, _sr, _buf) = crate::audio::capture::build_capture_stream(
+            &device,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            callbacks.clone(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .expect("build_capture_stream");
+        stream.play().expect("play");
+
+        std::thread::sleep(Duration::from_millis(250));
+        let running = callbacks.load(Ordering::Relaxed);
+        if running == 0 {
+            eprintln!("INCONCLUSIF: 0 callback (permission micro macOS refusée ?)");
+            return;
+        }
+
+        // LE CHEMIN RÉEL du hot-swap (`close_audio_driver`) : wrap SendStream
+        // → close_stream_on_com → pause() au Drop, sur le thread com_exec.
+        close_stream_on_com(Some(SendStream(stream)));
+
+        std::thread::sleep(Duration::from_millis(80)); // callbacks en vol
+        let settled = callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(400));
+        let leaked = callbacks.load(Ordering::Relaxed) - settled;
+        assert_eq!(
+            leaked, 0,
+            "RÉGRESSION : {leaked} callbacks de capture APRÈS close_stream_on_com \
+             (400 ms) — la fuite du hot-swap est de retour (run={running})"
+        );
+        eprintln!("OK: teardown réel → 0 callback fantôme (run={running})");
     }
 }

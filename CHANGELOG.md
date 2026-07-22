@@ -4,6 +4,24 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.9-1] — 2026-07-22 (pré-release)
+
+### Corrigé
+- **Perte de la tranche des autres musiciens au changement d'entrée (macOS),
+  puis « recherche de l'Audio Engine » en boucle** (rapport bug 21/07). À chaque
+  changement de canal/device en session, l'ancien flux de capture CoreAudio
+  continuait de tourner après sa destruction (quirk cpal : dropper le stream
+  d'ENTRÉE n'arrête pas son AudioUnit) → +750 callbacks/s fantômes PAR
+  changement, mesurés jusqu'à 10 flux concurrents en prod. L'accumulation
+  saturait le lock pipeline → « callbacks audio figés — reset du driver »,
+  overflow des jitter buffers, agent muet sur sa WS (`pipeline.lock() timeout`)
+  → watchdog navigateur (« agent lost »), streams pairs tués en ghost (« no
+  packet for 8s ») et boucle de reconnexion jusqu'à relance manuelle. Fix :
+  `pause()` explicite (AudioOutputUnitStop) avant CHAQUE destruction de stream
+  cpal (`Drop for SendStream`) — couvre hot-swap, stop, reset driver et chemins
+  d'erreur par construction. Plus aucun callback fantôme. Régression couverte
+  par 3 tests device réel (`cargo test --bins -- --ignored capture_callbacks`).
+
 ## [0.5.8] — 2026-07-21
 
 Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` (détail
