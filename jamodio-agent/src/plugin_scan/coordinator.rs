@@ -286,8 +286,6 @@ mod job {
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
     use std::os::windows::io::AsRawHandle;
     use std::sync::OnceLock;
 
@@ -316,9 +314,8 @@ mod job {
                     CloseHandle(job);
                     return 0usize;
                 }
-                // Assigner l'agent lui-même au job serait fatal (il se tuerait
-                // en fermant le job) — on n'assigne QUE les workers.
-                let _ = GetCurrentProcess;
+                // NB : on n'assigne QUE les workers au job — jamais l'agent
+                // lui-même, qui se tuerait en fermant le job.
                 job as usize
             }
         }) as HANDLE
