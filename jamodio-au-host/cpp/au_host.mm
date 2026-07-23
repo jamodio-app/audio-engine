@@ -40,6 +40,13 @@ typedef void (*au_scan_cb)(void *ctx,
                            int has_editor,
                            int has_input_bus);  // S2 : 1 si bus audio in, 0 sinon
 
+// 0.5.9-2 — énumération seule du registre (scan out-of-process, cf. bas de
+// fichier) : identité du composant, aucune métadonnée nécessitant du code plugin.
+typedef void (*jmo_au_enum_cb)(void *ctx,
+                               uint32_t au_type,
+                               uint32_t au_subtype,
+                               uint32_t au_manuf);
+
 struct AuHostOpaque; // handle opaque pour Rust
 
 } // extern "C"
@@ -1107,6 +1114,73 @@ void au_host_scan(void *p, au_scan_cb cb, void *ctx) {
     if (!p || !cb) return;
     JmoAuHost *h = (__bridge JmoAuHost *)p;
     [h scanAndCallback:cb context:ctx];
+}
+
+// ---------- Scan out-of-process (0.5.9-2, PLAN-PLUGIN-SCAN-OOP) ----------
+//
+// Découpage du scan en deux primitives, réparties entre les deux process :
+// - `jmo_au_enumerate` : lecture SEULE du registre AudioComponent — aucune
+//   instanciation, aucun code plugin exécuté → sûr dans le process agent
+//   (coordinateur).
+// - `jmo_au_probe`     : instanciation réelle d'UN composant (latence, bus) —
+//   à n'appeler QUE depuis le process worker jetable. Contrairement à la
+//   mitigation v0.2.25 de scanAndCallback (Apple natives seulement), on probe
+//   ICI TOUS les fabricants : un crash du constructeur tiers tue le worker,
+//   pas l'agent, et on retrouve la vraie latence / le vrai has_input_bus.
+
+void jmo_au_enumerate(jmo_au_enum_cb cb, void *ctx) {
+    if (!cb) return;
+    // Mêmes types que scanAndCallback (S1.9) : effets + instruments +
+    // music-effects — le filtrage fin reste au load.
+    static const uint32_t kTypes[] = {
+        kAudioUnitType_Effect,
+        kAudioUnitType_MusicDevice,
+        kAudioUnitType_MusicEffect,
+    };
+    for (uint32_t type : kTypes) {
+        AudioComponentDescription desc = {0, 0, 0, 0, 0};
+        desc.componentType = type;
+        AudioComponent comp = nullptr;
+        while ((comp = AudioComponentFindNext(comp, &desc)) != nullptr) {
+            AudioComponentDescription d;
+            if (AudioComponentGetDescription(comp, &d) != noErr) continue;
+            cb(ctx, d.componentType, d.componentSubType, d.componentManufacturer);
+        }
+    }
+}
+
+int jmo_au_probe(uint32_t au_type, uint32_t au_subtype, uint32_t au_manuf,
+                 char *name_buf, size_t name_size,
+                 uint32_t *latency_samples, int *has_input_bus) {
+    if (!name_buf || name_size == 0 || !latency_samples || !has_input_bus) return 0;
+    name_buf[0] = '\0';
+    *latency_samples = 0;
+    *has_input_bus = 1; // défaut sûr, cohérent avec scanAndCallback
+
+    AudioComponentDescription desc = {0, 0, 0, 0, 0};
+    desc.componentType = au_type;
+    desc.componentSubType = au_subtype;
+    desc.componentManufacturer = au_manuf;
+    AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
+    if (!comp) return 0; // désinstallé entre l'énumération et la probe
+
+    CFStringRef cf_name = nullptr;
+    if (AudioComponentCopyName(comp, &cf_name) != noErr || !cf_name) return 0;
+    CFStringGetCString(cf_name, name_buf, name_size, kCFStringEncodingUTF8);
+    CFRelease(cf_name);
+
+    // Instanciation réelle — c'est ICI qu'un plugin défectueux crashe (le
+    // worker). Échec PROPRE (err) = défauts sûrs, le composant reste listé.
+    NSError *err = nil;
+    AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:desc
+                                                                   options:0
+                                                                     error:&err];
+    if (probe && !err) {
+        *latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
+        *has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
+        probe = nil; // ARC release
+    }
+    return 1;
 }
 
 uint32_t au_host_load(void *p,

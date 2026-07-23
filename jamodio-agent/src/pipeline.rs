@@ -824,14 +824,24 @@ pub enum InputSource {
     Midi(String), // device id format `"{idx}:{name}"` (cf. midi::list_devices)
 }
 
+/// Résultat d'un scan terminé : plugins sains + items blocklistés (crash/hang
+/// au scan out-of-process, 0.5.9-2). La blocklist est exposée au browser pour
+/// que l'utilisateur sache pourquoi un plugin n'apparaît pas.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Default)]
+pub struct ScanResult {
+    pub plugins: Vec<PluginInfo>,
+    pub blocked: Vec<crate::plugin_scan::session::BlockedItem>,
+}
+
 /// État du scan plugin en background. Stocké dans `PipelineState`.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub enum PluginScanCache {
     /// Scan en cours — le browser doit repoller dans quelques secondes.
     Scanning,
-    /// Scan terminé, liste prête.
-    Ready(Vec<PluginInfo>),
+    /// Scan terminé, liste prête (+ blocklist).
+    Ready(ScanResult),
     /// Scan échoué (rarissime).
     #[allow(dead_code)]
     Failed(String),
@@ -910,8 +920,8 @@ impl PluginControl {
         // AVANT unload pour ne pas décharger le plugin courant sur un refus.
         {
             let scan = self.plugin_scan_cache.lock();
-            let known = matches!(&*scan, PluginScanCache::Ready(items)
-                if items.iter().any(|p| p.plugin_ref == *plugin_ref));
+            let known = matches!(&*scan, PluginScanCache::Ready(r)
+                if r.plugins.iter().any(|p| p.plugin_ref == *plugin_ref));
             if !known {
                 return Err(
                     "plugin inconnu (absent du scan) — chargement refusé".to_string(),
@@ -933,8 +943,8 @@ impl PluginControl {
         // toute façon déjà le name dans sa liste.
         let (name, has_editor) = {
             let scan = self.plugin_scan_cache.lock();
-            if let PluginScanCache::Ready(items) = &*scan {
-                items
+            if let PluginScanCache::Ready(r) = &*scan {
+                r.plugins
                     .iter()
                     .find(|p| p.plugin_ref == *plugin_ref)
                     .map(|p| (p.name.clone(), p.has_editor))
@@ -1134,28 +1144,34 @@ impl PipelineState {
     }
 
     /// Lance le scan plugin en background. Appelé une fois après `new()` par
-    /// `main.rs`. Le thread tourne typiquement 100ms à 15s puis stocke le
-    /// résultat dans le cache. Méthode no-op sur les OS sans host plugin.
+    /// `main.rs`. Depuis 0.5.9-2 le scan est OUT-OF-PROCESS
+    /// (PLAN-PLUGIN-SCAN-OOP) : un plugin qui crashe à l'instanciation tue un
+    /// worker jetable, pas l'agent → il est blocklisté et le scan continue.
+    /// Le `plugin_host` n'est plus touché ici (il ne sert qu'au load réel).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn spawn_plugin_scan(&self) {
-        let host = self.plugin_host.clone();
         let cache = self.plugin_scan_cache.clone();
         let kind = if cfg!(target_os = "macos") { "AU" } else { "VST3" };
         std::thread::Builder::new()
             .name("plugin-scan".into())
             .spawn(move || {
                 let t0 = std::time::Instant::now();
-                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting in background");
-                let plugins = host.lock().scan();
+                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting (out-of-process)");
+                let scan = crate::plugin_scan::run_full_scan();
                 let elapsed_ms = t0.elapsed().as_millis();
                 tracing::info!(
                     target: "jamodio::plugin",
                     kind,
-                    count = plugins.len(),
+                    count = scan.plugins.len(),
+                    blocked = scan.blocked.len(),
+                    scanned = scan.scanned,
                     elapsed_ms,
                     "plugin scan finished"
                 );
-                *cache.lock() = PluginScanCache::Ready(plugins);
+                *cache.lock() = PluginScanCache::Ready(ScanResult {
+                    plugins: scan.plugins,
+                    blocked: scan.blocked,
+                });
             })
             .expect("spawn plugin-scan thread");
     }
@@ -1165,13 +1181,16 @@ impl PipelineState {
     }
 
     /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
-    /// Chacun renvoie un Result avec message d'erreur lisible pour wire.
+    /// Retourne (plugins sains, blocklist, scanning). `scanning=true` ⇒ scan
+    /// encore en cours (le browser repolle).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn list_instrument_plugins(&self) -> (Vec<PluginInfo>, bool) {
+    pub fn list_instrument_plugins(
+        &self,
+    ) -> (Vec<PluginInfo>, Vec<crate::plugin_scan::session::BlockedItem>, bool) {
         match &*self.plugin_scan_cache.lock() {
-            PluginScanCache::Scanning => (Vec::new(), true),
-            PluginScanCache::Ready(items) => (items.clone(), false),
-            PluginScanCache::Failed(_) => (Vec::new(), false),
+            PluginScanCache::Scanning => (Vec::new(), Vec::new(), true),
+            PluginScanCache::Ready(r) => (r.plugins.clone(), r.blocked.clone(), false),
+            PluginScanCache::Failed(_) => (Vec::new(), Vec::new(), false),
         }
     }
 
@@ -4067,7 +4086,7 @@ mod plugin_control_tests {
     /// comme le ferait un vrai scan. La garde elle-même est couverte par
     /// `load_refused_when_absent_from_scan`.
     fn make_control() -> PluginControl {
-        let scanned = [eq_ref(), bogus_ref()]
+        let plugins = [eq_ref(), bogus_ref()]
             .into_iter()
             .map(|plugin_ref| PluginInfo {
                 name: "test".into(),
@@ -4087,7 +4106,10 @@ mod plugin_control_tests {
             // remet à false (= fresh start).
             instrument_plugin_bypass: Arc::new(AtomicBool::new(true)),
             plugin_auto_bypass_active: Arc::new(AtomicBool::new(true)),
-            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Ready(scanned))),
+            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Ready(ScanResult {
+                plugins,
+                blocked: Vec::new(),
+            }))),
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),
         }

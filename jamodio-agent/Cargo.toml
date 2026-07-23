@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.9-1"
+version = "0.5.9-2"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -70,6 +70,10 @@ jamodio-vst3-host = { path = "../jamodio-vst3-host" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # 0.5.9-2 — Job Object KILL_ON_JOB_CLOSE : lie le worker de scan
+    # out-of-process à l'agent → l'OS tue le worker si l'agent meurt, même
+    # sur kill -9. Cf. plugin_scan/coordinator.rs::job.
+    "Win32_System_JobObjects",
     # Énumération ASIO : `asio-sys` charge les drivers via CoCreateInstance sans
     # initialiser COM lui-même → l'énumération doit tourner sur un thread STA.
     # Cf. device.rs::enumerate_with_com.

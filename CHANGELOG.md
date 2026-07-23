@@ -4,6 +4,42 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.9-2] — 2026-07-23 (pré-release)
+
+### Changé
+- **Scan des plugins désormais hors-process** — refonte architecturale
+  (standard DAW : auval, Cubase, JUCE). Jusqu'ici l'agent instanciait chaque
+  plugin tiers DANS son propre process pendant le scan de démarrage : un seul
+  plugin qui plante à l'instanciation faisait tomber l'agent entier — sans
+  panic Rust rattrapable (crash natif). Symptôme terrain (rapport 23/07,
+  Windows) : agent qui « cherche l'Audio Engine » en boucle, `agent lost` à
+  répétition, sessions impossibles — **Groove Agent SE** (Steinberg) tuait
+  l'agent 8 fois sur 13 au scan. Désormais le scan tourne dans un **worker
+  jetable** (le même binaire, `--plugin-scan-worker`) : si un plugin le fait
+  crasher ou le fige, seul le worker meurt, le plugin fautif est **exclu**
+  (blocklisté) et le scan reprend au suivant. L'agent ne tombe plus jamais au
+  scan.
+
+### Ajouté
+- **Cache de scan persisté** (`plugin-scan-cache-v1.json`) : en régime établi
+  le démarrage ne rescanne plus rien (publication de la liste en quelques ms
+  au lieu de 20-27 s à chaque boot). Un plugin n'est re-scanné que s'il est
+  nouveau ou mis à jour (empreinte mtime+taille).
+- **Blocklist auto-réversible** : un plugin exclu retente automatiquement sa
+  chance dès qu'il est mis à jour. Les plugins exclus sont signalés dans la
+  fenêtre FX (« N plugins exclus — instables au scan », icône + texte,
+  daltonien-safe) pour que l'absence soit comprise sans support.
+- Isolation dure du worker (Job Object `KILL_ON_JOB_CLOSE` sur Windows) : il
+  ne peut jamais survivre à l'agent.
+
+### Notes techniques
+- Worker ↔ agent : protocole NDJSON (begin/plugin/end), le coupable d'un crash
+  = l'item en cours au moment de la mort du worker. Watchdog 30 s/plugin
+  (plugin figé → tué → blocklisté). Wire `PluginList` : champ `blocked`
+  (rétro-compatible, ignoré par les navigateurs antérieurs).
+- Garde anti-RCE au `load()` préservée (le browser ne peut charger qu'un
+  plugin issu du scan).
+
 ## [0.5.9-1] — 2026-07-22 (pré-release)
 
 ### Corrigé

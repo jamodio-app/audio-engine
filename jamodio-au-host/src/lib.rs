@@ -66,7 +66,20 @@ extern "C" {
     fn au_host_latency_samples(p: *mut c_void, handle_id: u32) -> u32;
     fn au_host_open_editor(p: *mut c_void, handle_id: u32) -> c_int;
     fn au_host_close_editor(p: *mut c_void, handle_id: u32) -> c_int;
+    // 0.5.9-2 — scan out-of-process (cf. section « Scan out-of-process »).
+    fn jmo_au_enumerate(cb: AuEnumCb, ctx: *mut c_void);
+    fn jmo_au_probe(
+        au_type: u32,
+        au_subtype: u32,
+        au_manuf: u32,
+        name_buf: *mut c_char,
+        name_size: usize,
+        latency_samples: *mut u32,
+        has_input_bus: *mut c_int,
+    ) -> c_int;
 }
+
+type AuEnumCb = unsafe extern "C" fn(ctx: *mut c_void, au_type: u32, au_subtype: u32, au_manuf: u32);
 
 // ---------- Helpers fourcc ----------
 
@@ -149,10 +162,34 @@ unsafe extern "C" fn scan_thunk(
         Ok(s) => s.to_string(),
         Err(_) => return,
     };
+    ctx.out.push(build_plugin_info(
+        au_type,
+        au_subtype,
+        au_manuf,
+        &raw,
+        latency_samples,
+        has_editor != 0,
+        has_input_bus != 0,
+    ));
+}
+
+/// Construit un `PluginInfo` depuis les attributs bruts d'un composant AU.
+/// Source unique de vérité pour le nommage et la classification — partagée
+/// entre le scan legacy in-process (`scan_thunk`) et la probe worker
+/// (`scan_component`, 0.5.9-2).
+fn build_plugin_info(
+    au_type: u32,
+    au_subtype: u32,
+    au_manuf: u32,
+    raw_name: &str,
+    latency_samples: u32,
+    has_editor: bool,
+    has_input_bus: bool,
+) -> PluginInfo {
     // Convention Apple : `AudioComponentCopyName` retourne "Vendor: PluginName".
-    let (manufacturer, plugin_name) = match raw.split_once(": ") {
+    let (manufacturer, plugin_name) = match raw_name.split_once(": ") {
         Some((m, n)) => (m.to_string(), n.to_string()),
-        None => (String::new(), raw),
+        None => (String::new(), raw_name.to_string()),
     };
 
     let au_type_fcc = u32_to_fourcc(au_type);
@@ -161,7 +198,7 @@ unsafe extern "C" fn scan_thunk(
     // (`format==='au' && auType==='aumu'`) — désormais autoritaire côté agent.
     let is_instrument = au_type_fcc == "aumu";
 
-    ctx.out.push(PluginInfo {
+    PluginInfo {
         name: plugin_name,
         manufacturer,
         plugin_ref: PluginRef::Au {
@@ -170,11 +207,88 @@ unsafe extern "C" fn scan_thunk(
             manufacturer: u32_to_fourcc(au_manuf),
         },
         latency_samples,
-        has_editor: has_editor != 0,
+        has_editor,
         incompatible: latency_exceeds_live_budget(latency_samples),
-        has_input_bus: has_input_bus != 0,
+        has_input_bus,
         is_instrument,
-    });
+    }
+}
+
+// ---------- Scan out-of-process (0.5.9-2, PLAN-PLUGIN-SCAN-OOP) ----------
+
+/// Identité d'un composant AU (4-CC), telle que produite par l'énumération
+/// du registre. C'est l'« item » macOS du protocole worker (encodé
+/// `au:{type}/{subtype}/{manufacturer}` côté agent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuComponentId {
+    pub au_type: String,
+    pub subtype: String,
+    pub manufacturer: String,
+}
+
+/// Énumère le registre AudioComponent — lecture de données SEULE, aucun code
+/// plugin exécuté : sûr dans le process agent (coordinateur). Mêmes types de
+/// composants que le scan legacy (effets + instruments + music-effects).
+pub fn enumerate_components() -> Vec<AuComponentId> {
+    unsafe extern "C" fn thunk(ctx: *mut c_void, au_type: u32, au_subtype: u32, au_manuf: u32) {
+        let out = &mut *(ctx as *mut Vec<AuComponentId>);
+        out.push(AuComponentId {
+            au_type: u32_to_fourcc(au_type),
+            subtype: u32_to_fourcc(au_subtype),
+            manufacturer: u32_to_fourcc(au_manuf),
+        });
+    }
+    let mut out: Vec<AuComponentId> = Vec::new();
+    unsafe { jmo_au_enumerate(thunk, &mut out as *mut Vec<AuComponentId> as *mut c_void) };
+    out
+}
+
+/// Probe RÉELLE d'un composant (instanciation `AUAudioUnit`) — à n'appeler
+/// QUE depuis le process worker jetable : un crash du constructeur d'un
+/// plugin tiers tue le process appelant. Contrairement à la mitigation
+/// v0.2.25 du scan legacy (Apple natives seulement), TOUS les fabricants
+/// sont probés → vraie latence, vrai `has_input_bus`.
+///
+/// `None` = composant introuvable (désinstallé entre énumération et probe)
+/// ou nom illisible — l'item est simplement absent de la liste finale.
+pub fn scan_component(au_type: &str, subtype: &str, manufacturer: &str) -> Option<PluginInfo> {
+    let t = fourcc_to_u32(au_type)?;
+    let st = fourcc_to_u32(subtype)?;
+    let mf = fourcc_to_u32(manufacturer)?;
+
+    let mut name_buf = [0u8; 256];
+    let mut latency_samples: u32 = 0;
+    let mut has_input_bus: c_int = 1;
+    let found = unsafe {
+        jmo_au_probe(
+            t,
+            st,
+            mf,
+            name_buf.as_mut_ptr() as *mut c_char,
+            name_buf.len(),
+            &mut latency_samples,
+            &mut has_input_bus,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    let raw_name = CStr::from_bytes_until_nul(&name_buf).ok()?.to_str().ok()?;
+    if raw_name.is_empty() {
+        return None;
+    }
+
+    // `has_editor = true` pour tous : même règle que le scan legacy (AU v2
+    // affichables via AUGenericView, cf. commentaire dans au_host.mm).
+    Some(build_plugin_info(
+        t,
+        st,
+        mf,
+        raw_name,
+        latency_samples,
+        true,
+        has_input_bus != 0,
+    ))
 }
 
 // ---------- Trait impl ----------
@@ -379,6 +493,35 @@ mod tests {
             names.contains(&"AUNBandEQ"),
             "AUNBandEQ missing from scan"
         );
+    }
+
+    /// 0.5.9-2 — l'énumération seule (coordinateur) voit les mêmes composants
+    /// que le scan legacy, et la probe worker retrouve les vraies métadonnées.
+    #[test]
+    fn enumerate_then_probe_matches_legacy_scan() {
+        let ids = enumerate_components();
+        assert!(!ids.is_empty(), "enumerate should list AudioComponents");
+        let mrev = ids
+            .iter()
+            .find(|c| c.au_type == "aufx" && c.subtype == "mrev" && c.manufacturer == "appl")
+            .expect("AUMatrixReverb absent de l'énumération");
+
+        let info = scan_component(&mrev.au_type, &mrev.subtype, &mrev.manufacturer)
+            .expect("probe AUMatrixReverb");
+        assert_eq!(info.name, "AUMatrixReverb");
+        assert_eq!(info.manufacturer, "Apple");
+        assert!(info.has_input_bus);
+        assert!(!info.is_instrument);
+        assert!(!info.incompatible);
+    }
+
+    /// La probe d'un composant désinstallé/inconnu retourne None (pas de
+    /// panic, pas d'entrée fantôme dans la liste).
+    #[test]
+    fn probe_unknown_component_returns_none() {
+        assert_eq!(scan_component("xxxx", "yyyy", "zzzz"), None);
+        // 4-CC invalide (longueur ≠ 4) → None aussi.
+        assert_eq!(scan_component("au", "mrev", "appl"), None);
     }
 
     #[test]

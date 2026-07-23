@@ -605,9 +605,14 @@ pub enum AgentMessage {
     /// Sprint INSERT (S1) — réponse à `ListPlugins`. Snapshot du cache.
     /// `scanning = true` ⇒ le scan tourne encore (peut être vide). Le browser
     /// peut repoll quelques secondes plus tard pour avoir la liste finale.
+    /// `blocked` (0.5.9-2) = plugins exclus car ils ont crashé/figé le worker
+    /// de scan out-of-process → l'UI explique pourquoi ils n'apparaissent pas.
+    /// `#[serde(default)]` : rétro-compat browser pré-0.5.9-2 (champ ignoré).
     PluginList {
         items: Vec<PluginInfo>,
         scanning: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked: Vec<BlockedPlugin>,
     },
     /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin` ET push
     /// automatique au connect WS si un plugin est déjà chargé (sync state
@@ -950,6 +955,76 @@ pub enum AgentState {
     Idle,
     Capturing,
     Error,
+}
+
+/// Plugin exclu du scan (0.5.9-2) — il a crashé (`crash`) ou figé (`timeout`)
+/// le worker de scan out-of-process. Exposé au browser pour expliquer son
+/// absence de la liste (anti-ticket support).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedPlugin {
+    /// Nom lisible dérivé de l'item (basename `.vst3` sans extension pour
+    /// VST3, identité 4-CC pour AU) — l'instanciation ayant échoué, on n'a
+    /// pas le nom « propre » du plugin, seulement son fichier.
+    pub name: String,
+    /// Item brut : path `.vst3` (Windows) ou `au:type/subtype/manuf` (macOS).
+    pub item: String,
+    /// `"crash"` ou `"timeout"`.
+    pub reason: String,
+}
+
+impl BlockedPlugin {
+    /// Construit l'entrée wire depuis l'item de scan et sa raison. Dérive un
+    /// nom d'affichage best-effort à partir de l'item.
+    pub fn from_item(item: &str, reason: &str) -> Self {
+        let name = display_name_for_item(item);
+        Self {
+            name,
+            item: item.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+}
+
+/// Nom d'affichage pour un item blocklisté : basename sans `.vst3` (Windows)
+/// ou l'item AU tel quel. Purement cosmétique (UI).
+fn display_name_for_item(item: &str) -> String {
+    if item.starts_with("au:") {
+        return item.to_string();
+    }
+    let base = item
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(item);
+    base.strip_suffix(".vst3").unwrap_or(base).to_string()
+}
+
+#[cfg(test)]
+mod blocked_plugin_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_from_vst3_path() {
+        let b = BlockedPlugin::from_item(
+            "C:\\Program Files\\Common Files\\VST3\\Steinberg\\Groove Agent SE.vst3",
+            "crash",
+        );
+        assert_eq!(b.name, "Groove Agent SE");
+        assert_eq!(b.reason, "crash");
+    }
+
+    #[test]
+    fn display_name_from_au_item_is_verbatim() {
+        let b = BlockedPlugin::from_item("au:aumu/ksmp/-Ni-", "timeout");
+        assert_eq!(b.name, "au:aumu/ksmp/-Ni-");
+    }
+
+    #[test]
+    fn blocked_plugin_serializes_camel_case() {
+        let json = serde_json::to_string(&BlockedPlugin::from_item("/x/Foo.vst3", "crash")).unwrap();
+        assert!(json.contains(r#""name":"Foo""#), "{json}");
+        assert!(json.contains(r#""reason":"crash""#), "{json}");
+    }
 }
 
 #[cfg(test)]

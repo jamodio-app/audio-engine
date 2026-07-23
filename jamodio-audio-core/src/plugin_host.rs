@@ -46,7 +46,7 @@ pub enum PluginRef {
 /// avec un tooltip explicatif (cf. mémoire vision).
 /// `has_input_bus = false` (= synthé MIDI pur) signale au browser qu'il faut
 /// auto-switcher la source d'entrée en MIDI à l'activation (S2).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginInfo {
     pub name: String,
