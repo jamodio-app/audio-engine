@@ -4061,7 +4061,25 @@ mod plugin_control_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Contrôle avec cache de scan ENSEMENCÉ : la garde anti-RCE de `load()`
+    /// (audit pré-beta) refuse tout ref absent du scan — les tests qui
+    /// exercent le chemin de load réel doivent donc déclarer leurs refs ici,
+    /// comme le ferait un vrai scan. La garde elle-même est couverte par
+    /// `load_refused_when_absent_from_scan`.
     fn make_control() -> PluginControl {
+        let scanned = [eq_ref(), bogus_ref()]
+            .into_iter()
+            .map(|plugin_ref| PluginInfo {
+                name: "test".into(),
+                manufacturer: "test".into(),
+                plugin_ref,
+                latency_samples: 0,
+                has_editor: false,
+                incompatible: false,
+                has_input_bus: true,
+                is_instrument: false,
+            })
+            .collect();
         PluginControl {
             plugin_host: Arc::new(Mutex::new(PluginHostImpl::new())),
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
@@ -4069,7 +4087,7 @@ mod plugin_control_tests {
             // remet à false (= fresh start).
             instrument_plugin_bypass: Arc::new(AtomicBool::new(true)),
             plugin_auto_bypass_active: Arc::new(AtomicBool::new(true)),
-            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
+            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Ready(scanned))),
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),
         }
@@ -4082,6 +4100,28 @@ mod plugin_control_tests {
             subtype: "nbeq".into(),
             manufacturer: "appl".into(),
         }
+    }
+
+    /// AU inexistant — présent dans le cache de scan des tests (cf.
+    /// `make_control`) pour que `failed_load_leaves_handle_none` teste le
+    /// VRAI chemin d'échec du load natif, pas la garde anti-RCE.
+    fn bogus_ref() -> PluginRef {
+        PluginRef::Au {
+            au_type: "aufx".into(),
+            subtype: "zzzz".into(),
+            manufacturer: "zzzz".into(),
+        }
+    }
+
+    /// Garde anti-RCE (audit pré-beta) : un ref absent du cache de scan est
+    /// refusé AVANT tout appel natif — y compris pendant `Scanning`.
+    #[test]
+    fn load_refused_when_absent_from_scan() {
+        let ctrl = make_control();
+        *ctrl.plugin_scan_cache.lock() = PluginScanCache::Scanning;
+        let err = ctrl.load(&eq_ref()).expect_err("refus attendu pendant Scanning");
+        assert!(err.contains("absent du scan"), "message inattendu : {err}");
+        assert!(ctrl.instrument_plugin_handle.lock().is_none());
     }
 
     #[test]
@@ -4193,12 +4233,9 @@ mod plugin_control_tests {
         // Plugin inexistant → Err. Invariant de sûreté : le handle reste None
         // (jamais de wet sur une instance fantôme) → le thread audio reste dry.
         let ctrl = make_control();
-        let bogus = PluginRef::Au {
-            au_type: "aufx".into(),
-            subtype: "zzzz".into(),
-            manufacturer: "zzzz".into(),
-        };
-        assert!(ctrl.load(&bogus).is_err(), "load d'un AU inexistant doit échouer");
+        // `bogus_ref` est DANS le cache de scan (cf. make_control) → on passe
+        // la garde et on teste bien l'échec du load natif lui-même.
+        assert!(ctrl.load(&bogus_ref()).is_err(), "load d'un AU inexistant doit échouer");
         assert!(
             ctrl.instrument_plugin_handle.lock().is_none(),
             "handle reste None après échec de load (pas de wet fantôme)"
