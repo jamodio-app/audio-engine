@@ -343,11 +343,13 @@ mod tests {
     /// d'un process pour ne pas condamner à tort un item lent à démarrer.
     const TEST_TIMEOUT: Duration = Duration::from_millis(800);
 
-    /// Chemin du binaire mock-worker (bin dédié `mock_scan_worker`, cf.
-    /// src/bin/mock_scan_worker.rs). `CARGO_BIN_EXE_*` n'est PAS défini pour
-    /// les tests unitaires d'un crate bin (seulement pour tests/), donc on le
-    /// résout depuis l'exécutable de test : `target/<profil>/deps/test-bin`
-    /// → le sibling `target/<profil>/mock_scan_worker`.
+    /// Chemin du binaire mock-worker. C'est un EXAMPLE (examples/
+    /// mock_scan_worker.rs), pas un bin : `cargo build --release` (donc
+    /// `tauri build`) ne le compile pas → il ne peut jamais être bundlé dans
+    /// l'app livrée, tout en restant construit par `cargo test`. `CARGO_BIN_EXE_*`
+    /// ne couvre pas les examples, on résout donc le chemin depuis l'exécutable
+    /// de test : `target/<profil>/deps/test-bin` → `target/<profil>/examples/
+    /// mock_scan_worker`.
     fn mock_worker_path() -> std::path::PathBuf {
         let test_exe = std::env::current_exe().expect("current_exe");
         let profile_dir = test_exe
@@ -355,7 +357,7 @@ mod tests {
             .and_then(|deps| deps.parent()) // deps/ → <profil>/
             .expect("target/<profil>");
         let name = if cfg!(windows) { "mock_scan_worker.exe" } else { "mock_scan_worker" };
-        profile_dir.join(name)
+        profile_dir.join("examples").join(name)
     }
 
     fn mock_cmd(scenario: &'static str) -> impl Fn() -> Command {

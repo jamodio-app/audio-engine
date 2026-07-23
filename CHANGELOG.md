@@ -4,6 +4,15 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.9-3] — 2026-07-23 (pré-release)
+
+### Corrigé
+- **Binaire de test `mock_scan_worker` livré par erreur** dans l'app 0.5.9-2
+  (visible dans `Program Files` / le bundle `.app`). Il s'agissait d'un outil
+  de test placé à tort dans `src/bin/` (donc compilé et bundlé en release).
+  Déplacé en `examples/` : `tauri build` ne le compile plus → il ne peut plus
+  être livré, tout en restant disponible pour la suite de tests.
+
 ## [0.5.9-2] — 2026-07-23 (pré-release)
 
 ### Changé
