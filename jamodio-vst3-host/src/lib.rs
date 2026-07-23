@@ -234,22 +234,6 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
 // ---------- Trait impl ----------
 
 impl PluginHost for Vst3Host {
-    fn scan(&self) -> Vec<PluginInfo> {
-        // Sur vst3-main : le PREMIER chargement d'un module JUCE lie son
-        // MessageManager au thread courant — ce doit être vst3-main (= le
-        // thread qui pompe), sinon l'éditeur deadlock plus tard (cf.
-        // main_thread.rs).
-        main_thread::run(|| {
-            let mut out = Vec::new();
-            for dir in discovery::system_paths() {
-                for path in discovery::scan_directory(&dir) {
-                    scan_plugin_file(&path, &mut out);
-                }
-            }
-            out
-        })
-    }
-
     fn load(
         &mut self,
         plugin_ref: &PluginRef,
@@ -442,12 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_returns_a_vec() {
-        // Sur une machine sans plugins, scan() peut retourner vide — ce n'est
-        // pas une erreur. Sur la VM avec ValhallaFutureVerb installé, vide
-        // = bug. Le test n'asserte pas la non-vacuité pour rester portable.
-        let h = Vst3Host::new();
-        let _plugins = h.scan();
+    fn scan_file_missing_path_is_empty() {
+        // La primitive de scan par fichier (worker out-of-process) sur un
+        // chemin inexistant ne panique pas et retourne vide (load failed).
+        let out = scan_file(std::path::Path::new(r"C:\does\not\exist.vst3"));
+        assert!(out.is_empty());
     }
 
     #[test]

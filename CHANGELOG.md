@@ -4,6 +4,24 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.9-4] — 2026-07-23 (pré-release)
+
+### Corrigé
+- **macOS : icône parasite qui rebondissait dans le Dock au démarrage.** Le
+  worker de scan (process jetable qui partage le binaire de l'agent) se
+  déclare désormais process d'arrière-plan (`NSApplicationActivationPolicy
+  Prohibited`) → plus aucun rebond dans le Dock. Purement cosmétique, aucun
+  impact fonctionnel (Windows était déjà invisible via `CREATE_NO_WINDOW`).
+
+### Interne
+- **Suppression du scan de plugins in-process (code mort).** Depuis le passage
+  au scan hors-process (0.5.9-2), l'ancien chemin n'avait plus aucun appelant :
+  retrait de `PluginHost::scan` (trait) et de ses implémentations AU/VST3, du
+  callback C `au_host_scan`/`scanAndCallback`, de la mitigation « Apple natives
+  seulement » (obsolète : le worker isolé probe tous les fabricants), et de la
+  variante `PluginScanCache::Failed` (jamais construite). Tests de couverture
+  repointés sur les primitives out-of-process. Aucun changement de comportement.
+
 ## [0.5.9-3] — 2026-07-23 (pré-release)
 
 ### Corrigé

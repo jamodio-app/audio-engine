@@ -23,6 +23,13 @@ use super::protocol::WorkerEvent;
 
 /// Point d'entrée du worker. Ne retourne jamais.
 pub fn run() -> ! {
+    // macOS : le worker partage le binaire (donc l'Info.plist « app Regular »)
+    // de l'agent → sans ça son icône rebondit dans le Dock le temps du scan.
+    // On le déclare process d'arrière-plan AVANT tout usage AppKit/AVFoundation.
+    // (Windows : le worker est déjà invisible via CREATE_NO_WINDOW au spawn.)
+    #[cfg(target_os = "macos")]
+    jamodio_au_host::suppress_dock_for_helper();
+
     init_stderr_tracing();
     tracing::info!(
         target: "jamodio::scan-worker",

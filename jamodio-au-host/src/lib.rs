@@ -25,21 +25,9 @@ pub mod workgroup;
 
 // ---------- FFI ----------
 
-type AuScanCb = unsafe extern "C" fn(
-    ctx: *mut c_void,
-    au_type: u32,
-    au_subtype: u32,
-    au_manuf: u32,
-    name: *const c_char,
-    latency_samples: u32,
-    has_editor: c_int,
-    has_input_bus: c_int,
-);
-
 extern "C" {
     fn au_host_create() -> *mut c_void;
     fn au_host_destroy(p: *mut c_void);
-    fn au_host_scan(p: *mut c_void, cb: AuScanCb, ctx: *mut c_void);
     fn au_host_load(
         p: *mut c_void,
         au_type: u32,
@@ -68,6 +56,8 @@ extern "C" {
     fn au_host_close_editor(p: *mut c_void, handle_id: u32) -> c_int;
     // 0.5.9-2 — scan out-of-process (cf. section « Scan out-of-process »).
     fn jmo_au_enumerate(cb: AuEnumCb, ctx: *mut c_void);
+    // 0.5.9-4 — masque le process worker de scan (Dock/focus). Cf. suppress_dock.
+    fn jmo_suppress_dock();
     fn jmo_au_probe(
         au_type: u32,
         au_subtype: u32,
@@ -138,45 +128,11 @@ impl Drop for AuHost {
     }
 }
 
-// ---------- Scan callback ----------
-//
-// Le callback C reçoit les attributs d'un AU à la fois. On les pousse
-// dans un Vec<PluginInfo> dont le pointer est passé via `ctx`.
-
-struct ScanCtx {
-    out: Vec<PluginInfo>,
-}
-
-unsafe extern "C" fn scan_thunk(
-    ctx: *mut c_void,
-    au_type: u32,
-    au_subtype: u32,
-    au_manuf: u32,
-    name: *const c_char,
-    latency_samples: u32,
-    has_editor: c_int,
-    has_input_bus: c_int,
-) {
-    let ctx = &mut *(ctx as *mut ScanCtx);
-    let raw = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return,
-    };
-    ctx.out.push(build_plugin_info(
-        au_type,
-        au_subtype,
-        au_manuf,
-        &raw,
-        latency_samples,
-        has_editor != 0,
-        has_input_bus != 0,
-    ));
-}
+// ---------- Construction PluginInfo ----------
 
 /// Construit un `PluginInfo` depuis les attributs bruts d'un composant AU.
-/// Source unique de vérité pour le nommage et la classification — partagée
-/// entre le scan legacy in-process (`scan_thunk`) et la probe worker
-/// (`scan_component`, 0.5.9-2).
+/// Source unique de vérité pour le nommage et la classification, utilisée par
+/// la probe worker (`scan_component`, scan out-of-process 0.5.9-2).
 fn build_plugin_info(
     au_type: u32,
     au_subtype: u32,
@@ -245,9 +201,9 @@ pub fn enumerate_components() -> Vec<AuComponentId> {
 
 /// Probe RÉELLE d'un composant (instanciation `AUAudioUnit`) — à n'appeler
 /// QUE depuis le process worker jetable : un crash du constructeur d'un
-/// plugin tiers tue le process appelant. Contrairement à la mitigation
-/// v0.2.25 du scan legacy (Apple natives seulement), TOUS les fabricants
-/// sont probés → vraie latence, vrai `has_input_bus`.
+/// plugin tiers tue le process appelant. TOUS les fabricants sont probés
+/// (l'isolation process rend inutile toute mitigation « Apple natives
+/// seulement ») → vraie latence, vrai `has_input_bus`.
 ///
 /// `None` = composant introuvable (désinstallé entre énumération et probe)
 /// ou nom illisible — l'item est simplement absent de la liste finale.
@@ -278,8 +234,8 @@ pub fn scan_component(au_type: &str, subtype: &str, manufacturer: &str) -> Optio
         return None;
     }
 
-    // `has_editor = true` pour tous : même règle que le scan legacy (AU v2
-    // affichables via AUGenericView, cf. commentaire dans au_host.mm).
+    // `has_editor = true` pour tous : les AU v2 sont affichables via
+    // AUGenericView (cf. commentaire dans au_host.mm).
     Some(build_plugin_info(
         t,
         st,
@@ -291,21 +247,17 @@ pub fn scan_component(au_type: &str, subtype: &str, manufacturer: &str) -> Optio
     ))
 }
 
+/// Masque le process courant du Dock et de l'activation (macOS) — à appeler
+/// tôt dans le worker de scan out-of-process. Le worker partage le binaire de
+/// l'app (donc son Info.plist « app Regular ») ; sans ça il rebondirait dans
+/// le Dock le temps du scan. `NSApplicationActivationPolicyProhibited`.
+pub fn suppress_dock_for_helper() {
+    unsafe { jmo_suppress_dock() };
+}
+
 // ---------- Trait impl ----------
 
 impl PluginHost for AuHost {
-    fn scan(&self) -> Vec<PluginInfo> {
-        let mut ctx = ScanCtx { out: Vec::new() };
-        unsafe {
-            au_host_scan(
-                self.ptr,
-                scan_thunk,
-                &mut ctx as *mut ScanCtx as *mut c_void,
-            );
-        }
-        ctx.out
-    }
-
     fn load(
         &mut self,
         plugin_ref: &PluginRef,
@@ -475,44 +427,28 @@ mod tests {
         // Drop appelle au_host_destroy.
     }
 
+    /// Le scan out-of-process = énumération du registre puis probe par
+    /// composant. On vérifie que les AU Apple natifs (présents sur toute
+    /// machine macOS) sont énumérés puis correctement probés.
     #[test]
-    fn scan_finds_apple_natives() {
-        let h = AuHost::new();
-        let plugins = h.scan();
-        assert!(
-            !plugins.is_empty(),
-            "Scan should at least find Apple native AUs on macOS"
-        );
-        let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
-        assert!(
-            names.contains(&"AUMatrixReverb"),
-            "AUMatrixReverb missing from scan: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"AUNBandEQ"),
-            "AUNBandEQ missing from scan"
-        );
-    }
-
-    /// 0.5.9-2 — l'énumération seule (coordinateur) voit les mêmes composants
-    /// que le scan legacy, et la probe worker retrouve les vraies métadonnées.
-    #[test]
-    fn enumerate_then_probe_matches_legacy_scan() {
+    fn enumerate_and_probe_finds_apple_natives() {
         let ids = enumerate_components();
         assert!(!ids.is_empty(), "enumerate should list AudioComponents");
-        let mrev = ids
-            .iter()
-            .find(|c| c.au_type == "aufx" && c.subtype == "mrev" && c.manufacturer == "appl")
-            .expect("AUMatrixReverb absent de l'énumération");
 
-        let info = scan_component(&mrev.au_type, &mrev.subtype, &mrev.manufacturer)
-            .expect("probe AUMatrixReverb");
-        assert_eq!(info.name, "AUMatrixReverb");
-        assert_eq!(info.manufacturer, "Apple");
-        assert!(info.has_input_bus);
-        assert!(!info.is_instrument);
-        assert!(!info.incompatible);
+        for (st, name) in [("mrev", "AUMatrixReverb"), ("nbeq", "AUNBandEQ")] {
+            assert!(
+                ids.iter()
+                    .any(|c| c.au_type == "aufx" && c.subtype == st && c.manufacturer == "appl"),
+                "{name} absent de l'énumération"
+            );
+            let info = scan_component("aufx", st, "appl")
+                .unwrap_or_else(|| panic!("probe {name} a échoué"));
+            assert_eq!(info.name, name);
+            assert_eq!(info.manufacturer, "Apple");
+            assert!(info.has_input_bus);
+            assert!(!info.is_instrument);
+            assert!(!info.incompatible);
+        }
     }
 
     /// La probe d'un composant désinstallé/inconnu retourne None (pas de
@@ -526,12 +462,9 @@ mod tests {
 
     #[test]
     fn scan_flags_apple_dynamics_incompatible() {
-        let h = AuHost::new();
-        let plugins = h.scan();
-        let dcmp = plugins
-            .iter()
-            .find(|p| p.name == "AUDynamicsProcessor")
-            .expect("AUDynamicsProcessor not found");
+        let dcmp = scan_component("aufx", "dcmp", "appl")
+            .expect("probe AUDynamicsProcessor a échoué");
+        assert_eq!(dcmp.name, "AUDynamicsProcessor");
         // POC mesure : 256 samples → au-delà du budget live (128) → incompatible.
         assert!(dcmp.incompatible);
         assert!(latency_exceeds_live_budget(dcmp.latency_samples));

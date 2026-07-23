@@ -840,11 +840,10 @@ pub struct ScanResult {
 pub enum PluginScanCache {
     /// Scan en cours — le browser doit repoller dans quelques secondes.
     Scanning,
-    /// Scan terminé, liste prête (+ blocklist).
+    /// Scan terminé, liste prête (+ blocklist). Le scan out-of-process
+    /// n'échoue jamais globalement : un plugin fautif est blocklisté, pas
+    /// propagé en erreur → pas de variante `Failed`.
     Ready(ScanResult),
-    /// Scan échoué (rarissime).
-    #[allow(dead_code)]
-    Failed(String),
 }
 
 /// Snapshot complet du plugin chargé sur l'instrument self (S1.5). Utilisé
@@ -1190,7 +1189,6 @@ impl PipelineState {
         match &*self.plugin_scan_cache.lock() {
             PluginScanCache::Scanning => (Vec::new(), Vec::new(), true),
             PluginScanCache::Ready(r) => (r.plugins.clone(), r.blocked.clone(), false),
-            PluginScanCache::Failed(_) => (Vec::new(), Vec::new(), false),
         }
     }
 
