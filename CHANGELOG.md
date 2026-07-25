@@ -48,28 +48,82 @@ standard DAW) et correctif capture macOS. Consolide les pré-releases
 ## [0.5.8] — 2026-07-21
 
 Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` :
-éditeur VST3 net en haute densité (Windows), réception
-des pairs préservée au changement d'entrée, **keepalive Ping/Pong WS** (fin des
-déconnexions intermittentes qui perdaient mute/ENTRÉE/volumes en onglet
-arrière-plan), **métronome enrichi** (chiffrage `pulseRatio`/`accentPattern`,
-subdivisions, banque de sons synthétisés) — plus le correctif ENTRÉE ci-dessous.
+éditeur VST3 net en haute densité (Windows), réception des pairs préservée au
+changement d'entrée, **keepalive Ping/Pong WS** (fin des déconnexions
+intermittentes qui perdaient mute/ENTRÉE/volumes en onglet arrière-plan),
+**métronome enrichi** — plus le correctif ENTRÉE.
+
+### Ajouté
+- **Métronome enrichi (source « référence » Option B).** La synthèse du clic
+  supporte le **chiffrage** (`pulseRatio` pour la croche en ×/8 + `beatsPerBar`
+  + `accentPattern` fort/médium/normal par temps), les **subdivisions**
+  (`8`/`8t`/`16` en plus de `q`) et une **banque de sons** synthétisés
+  déterministes (`click`/`blip`/`digital`/`cowbell`/`woodblock`), miroir exact
+  du navigateur. Le navigateur reste maître de la grille (timing/sync inchangés).
 
 ### Corrigé
+- **Fenêtre d'éditeur VST3 rognée sur écran à haute densité (DPI > 100 %)**
+  (Neural DSP Archetype, Polyverse Wider…). L'hôte appelle désormais
+  `IPlugViewContentScaleSupport::setContentScaleFactor` avant `getSize` → la vue
+  renvoie sa taille physique correcte et la fenêtre l'épouse.
+- **Changer son entrée en cours de session coupait la réception de TOUS les
+  pairs** (VU figé, aucun son, jusqu'à un rejoin complet — bug asymétrique
+  Mac↔PC). Le navigateur signale via `sessionContinues` qu'un `start-capture`
+  continue une session active (hot-swap) : l'agent ne reconstruit alors que le
+  chemin capture/self et **préserve la réception des pairs**.
+- **Déconnexions WS agent↔browser en boucle (~16 s) → commandes perdues**
+  (mute/ENTRÉE/volumes par intermittence). Cause : le watchdog s'appuyait sur un
+  heartbeat JS **throttlé par Chrome en onglet arrière-plan**. Correctif :
+  **keepalive Ping/Pong WebSocket** (au niveau réseau, hors JS throttlé) — un
+  socket réellement mort ne renvoie plus de Pong → coupure légitime préservée.
+- **Changement de paramètre métronome pas appliqué en temps réel** (obligeait à
+  PAUSE/PLAY) : passer à une grille plus lente supprimait tous les onsets
+  jusqu'au rattrapage → silence. `set_config` réinitialise désormais le garde-fou
+  anti-double-clic.
 - **Instrument muet au join après avoir quitté une session en ENTRÉE OFF.** Le
-  drapeau `input_cut` (toggle ENTRÉE) est porté par le pipeline UNIQUE et à vie
-  de l'agent et survivait d'une session studio à l'autre : ré-entrer après avoir
-  quitté ENTRÉE OFF laissait l'instrument coupé à la source (VU mort, pas de
-  self-monitor) alors que l'UI se réaffiche ENTRÉE ON — « réparé » seulement par
-  un toggle OFF→ON manuel. Une nouvelle session (`session_continues=false`)
-  repart désormais ENTRÉE ON ; un OFF volontaire reste préservé au hot-swap
-  d'entrée (`session_continues=true`). Le navigateur réconcilie en complément
-  l'état UI réel au `capture-started` (ceinture+bretelles).
+  drapeau `input_cut` (toggle ENTRÉE), porté par le pipeline unique et à vie de
+  l'agent, survivait d'une session à l'autre → instrument coupé à la source alors
+  que l'UI se réaffiche ENTRÉE ON. Une nouvelle session
+  (`session_continues=false`) repart désormais ENTRÉE ON ; un OFF volontaire
+  reste préservé au hot-swap (`session_continues=true`).
 
 ## [0.5.7] — 2026-07-18
 
 Première release **publique** du **Lot 2** : talkback sur un canal indépendant
 via l'agent, VU-mètres fidèles au mix (stéréo réel, pan, talkback pair) et
 robustesse ASIO. Consolide les pré-releases `0.5.7-1` → `0.5.7-8`.
+
+### Ajouté
+- **Talkback sur un canal indépendant via l'agent (Lot 2)** : protocole
+  `StartVoiceCapture`/`StopVoiceCapture`/`SetVoiceGain`, **4ᵉ thread
+  `voice_encode`** + **tap voix lock-free** extrayant un canal mono arbitraire du
+  buffer d'entrée (nécessaire sur Windows/ASIO exclusif où Chrome ne voit que les
+  canaux 1-2). Fondu de gain par-sample anti-clic. **Coût nul quand inactif**,
+  instrument byte-identique.
+- **VU MASTER / MIX REC en vrai stéréo** : RMS L/R du mix **réel** (fini le proxy
+  mono L=R) → le pan et les faders deviennent visibles sur ces VU.
+- **VU talkback en mode agent** : le thread `voice_encode` mesure le RMS
+  **post-gain** du talkback, diffusé comme niveau `voice` dans `StreamLevels`.
+
+### Corrigé
+- **VU ne reflétait pas le pan** : les RMS L/R sont désormais calculés **post-pan**
+  (loi de balance partagée avec `mix_into`) — couvre self + peers en un point.
+- **VU talkback figé quand on parle seul** (sans jouer) : les niveaux sont poussés
+  dès que `voice_rms > 0`, même sans peer ni instrument actif.
+- **Plugins INSERT — budget de latence intrinsèque relevé 64 → 128 samples.** Les
+  amp-sims Neural DSP (Darkglass ≈ 84 samples) étaient rejetés à tort ; 128
+  (2,67 ms @ 48 kHz) est purement additif et sûr. Règle de compatibilité
+  centralisée et partagée par les hôtes AU et VST3.
+- **Réouverture ASIO à froid muette après une pause prolongée hors studio**
+  (Focusrite USB). Après relâche du driver par la grâce, la réouverture revenait
+  parfois « callbacks vivants mais muette ». Correctif : recyclage de l'apartment
+  COM-STA (`CoUninitialize`/`CoInitialize` frais) avant ce cold-reopen — ciblé,
+  sûr, sans effet sur macOS/WASAPI.
+
+### Nettoyage
+- Retrait du diagnostic temporaire `talkback-vu-diag` : la cause du VU talkback
+  plat au switch device navigateur→agent était **côté navigateur** (snapshot
+  instrument incomplet), corrigée dans la web app.
 
 ## [0.5.6] — 2026-07-15
 
