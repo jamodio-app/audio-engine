@@ -40,14 +40,48 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Wrapper to make cpal::Stream Send — we only hold it alive (RAII), never use across threads.
-struct SendStream(#[allow(dead_code)] cpal::Stream);
+struct SendStream(cpal::Stream);
 // SAFETY: on ne fait que le garder en vie (RAII) et le dropper. Sur Windows,
 // l'OUVERTURE et la FERMETURE du stream ASIO se font sur le thread COM-STA
 // dédié (cf. `com_exec` + `close_stream_on_com`) — l'apartment STA qui a créé
 // le driver est donc aussi celui qui le détruit. On ne fait que transférer le
-// handle entre ce thread et la task tokio qui le stocke (jamais d'appel de
-// méthode hors-thread ; le callback temps réel tourne sur le thread du driver).
+// handle entre ce thread et la task tokio qui le stocke. Seule méthode appelée :
+// `pause()` dans `Drop` (cf. ci-dessous), qui s'exécute donc elle aussi sur le
+// thread COM-STA créateur (tous les drops passent par `close_stream_on_com` ou
+// par les closures `com_exec::run` d'`open_duplex_on_com`). Le callback temps
+// réel tourne sur le thread du driver.
 unsafe impl Send for SendStream {}
+
+/// FUITE CoreAudio — bug « perte de la tranche du pair au changement d'entrée »
+/// (rapport 21/07). Sur macOS, DROPPER un `cpal::Stream` d'ENTRÉE n'arrête PAS
+/// son AudioUnit : le callback fantôme continue à ~750 cb/s indéfiniment.
+/// Chaque hot-swap d'entrée en session (`swapAgentMusicDevice` → StartCapture)
+/// empilait donc +1 flux de capture (750→1500→…→7500 cb/s mesurés en prod sur
+/// 10 switches) jusqu'à saturer `pipeline.lock` → « callbacks audio figés »,
+/// overflow des jitter buffers, WS starvation (watchdog navigateur → « agent
+/// lost »), et streams pairs tués en ghost. `pause()` (→ AudioOutputUnitStop)
+/// AVANT la destruction coupe le callback net — prouvé par
+/// `capture::tests::{ghost_capture_callbacks_stop_after_drop,
+/// pause_stops_capture_callbacks}` (tests device réel, `--ignored`).
+///
+/// Placé dans `Drop` (et non dans `close_stream_on_com`) pour couvrir TOUS les
+/// chemins de destruction par construction : hot-swap, stop_all, reset driver,
+/// chemins d'erreur d'`open_duplex_on_com` (sortie déjà démarrée puis play()
+/// d'entrée en échec), futurs call-sites. Best-effort : sans effet néfaste sur
+/// un stream jamais démarré / déjà arrêté ; WASAPI supporte pause() ; l'ASIO
+/// single-owner ne passe pas par `SendStream` (cf. `AsioDuplexHost`).
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        use cpal::traits::StreamTrait as _;
+        if let Err(e) = self.0.pause() {
+            tracing::debug!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "pause() au drop du stream a échoué (déjà arrêté ?) — best-effort"
+            );
+        }
+    }
+}
 
 /// Résultat de l'ouverture du stream d'entrée (résolution + build) effectuée
 /// atomiquement sur le thread COM-STA — le `cpal::Device`/`cpal::Stream` !Send
@@ -790,17 +824,26 @@ pub enum InputSource {
     Midi(String), // device id format `"{idx}:{name}"` (cf. midi::list_devices)
 }
 
+/// Résultat d'un scan terminé : plugins sains + items blocklistés (crash/hang
+/// au scan out-of-process, 0.5.9-2). La blocklist est exposée au browser pour
+/// que l'utilisateur sache pourquoi un plugin n'apparaît pas.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Default)]
+pub struct ScanResult {
+    pub plugins: Vec<PluginInfo>,
+    pub blocked: Vec<crate::plugin_scan::session::BlockedItem>,
+}
+
 /// État du scan plugin en background. Stocké dans `PipelineState`.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub enum PluginScanCache {
     /// Scan en cours — le browser doit repoller dans quelques secondes.
     Scanning,
-    /// Scan terminé, liste prête.
-    Ready(Vec<PluginInfo>),
-    /// Scan échoué (rarissime).
-    #[allow(dead_code)]
-    Failed(String),
+    /// Scan terminé, liste prête (+ blocklist). Le scan out-of-process
+    /// n'échoue jamais globalement : un plugin fautif est blocklisté, pas
+    /// propagé en erreur → pas de variante `Failed`.
+    Ready(ScanResult),
 }
 
 /// Snapshot complet du plugin chargé sur l'instrument self (S1.5). Utilisé
@@ -876,8 +919,8 @@ impl PluginControl {
         // AVANT unload pour ne pas décharger le plugin courant sur un refus.
         {
             let scan = self.plugin_scan_cache.lock();
-            let known = matches!(&*scan, PluginScanCache::Ready(items)
-                if items.iter().any(|p| p.plugin_ref == *plugin_ref));
+            let known = matches!(&*scan, PluginScanCache::Ready(r)
+                if r.plugins.iter().any(|p| p.plugin_ref == *plugin_ref));
             if !known {
                 return Err(
                     "plugin inconnu (absent du scan) — chargement refusé".to_string(),
@@ -899,8 +942,8 @@ impl PluginControl {
         // toute façon déjà le name dans sa liste.
         let (name, has_editor) = {
             let scan = self.plugin_scan_cache.lock();
-            if let PluginScanCache::Ready(items) = &*scan {
-                items
+            if let PluginScanCache::Ready(r) = &*scan {
+                r.plugins
                     .iter()
                     .find(|p| p.plugin_ref == *plugin_ref)
                     .map(|p| (p.name.clone(), p.has_editor))
@@ -1100,28 +1143,34 @@ impl PipelineState {
     }
 
     /// Lance le scan plugin en background. Appelé une fois après `new()` par
-    /// `main.rs`. Le thread tourne typiquement 100ms à 15s puis stocke le
-    /// résultat dans le cache. Méthode no-op sur les OS sans host plugin.
+    /// `main.rs`. Depuis 0.5.9-2 le scan est OUT-OF-PROCESS
+    /// (PLAN-PLUGIN-SCAN-OOP) : un plugin qui crashe à l'instanciation tue un
+    /// worker jetable, pas l'agent → il est blocklisté et le scan continue.
+    /// Le `plugin_host` n'est plus touché ici (il ne sert qu'au load réel).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn spawn_plugin_scan(&self) {
-        let host = self.plugin_host.clone();
         let cache = self.plugin_scan_cache.clone();
         let kind = if cfg!(target_os = "macos") { "AU" } else { "VST3" };
         std::thread::Builder::new()
             .name("plugin-scan".into())
             .spawn(move || {
                 let t0 = std::time::Instant::now();
-                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting in background");
-                let plugins = host.lock().scan();
+                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting (out-of-process)");
+                let scan = crate::plugin_scan::run_full_scan();
                 let elapsed_ms = t0.elapsed().as_millis();
                 tracing::info!(
                     target: "jamodio::plugin",
                     kind,
-                    count = plugins.len(),
+                    count = scan.plugins.len(),
+                    blocked = scan.blocked.len(),
+                    scanned = scan.scanned,
                     elapsed_ms,
                     "plugin scan finished"
                 );
-                *cache.lock() = PluginScanCache::Ready(plugins);
+                *cache.lock() = PluginScanCache::Ready(ScanResult {
+                    plugins: scan.plugins,
+                    blocked: scan.blocked,
+                });
             })
             .expect("spawn plugin-scan thread");
     }
@@ -1131,13 +1180,15 @@ impl PipelineState {
     }
 
     /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
-    /// Chacun renvoie un Result avec message d'erreur lisible pour wire.
+    /// Retourne (plugins sains, blocklist, scanning). `scanning=true` ⇒ scan
+    /// encore en cours (le browser repolle).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn list_instrument_plugins(&self) -> (Vec<PluginInfo>, bool) {
+    pub fn list_instrument_plugins(
+        &self,
+    ) -> (Vec<PluginInfo>, Vec<crate::plugin_scan::session::BlockedItem>, bool) {
         match &*self.plugin_scan_cache.lock() {
-            PluginScanCache::Scanning => (Vec::new(), true),
-            PluginScanCache::Ready(items) => (items.clone(), false),
-            PluginScanCache::Failed(_) => (Vec::new(), false),
+            PluginScanCache::Scanning => (Vec::new(), Vec::new(), true),
+            PluginScanCache::Ready(r) => (r.plugins.clone(), r.blocked.clone(), false),
         }
     }
 
@@ -4027,7 +4078,25 @@ mod plugin_control_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Contrôle avec cache de scan ENSEMENCÉ : la garde anti-RCE de `load()`
+    /// (audit pré-beta) refuse tout ref absent du scan — les tests qui
+    /// exercent le chemin de load réel doivent donc déclarer leurs refs ici,
+    /// comme le ferait un vrai scan. La garde elle-même est couverte par
+    /// `load_refused_when_absent_from_scan`.
     fn make_control() -> PluginControl {
+        let plugins = [eq_ref(), bogus_ref()]
+            .into_iter()
+            .map(|plugin_ref| PluginInfo {
+                name: "test".into(),
+                manufacturer: "test".into(),
+                plugin_ref,
+                latency_samples: 0,
+                has_editor: false,
+                incompatible: false,
+                has_input_bus: true,
+                is_instrument: false,
+            })
+            .collect();
         PluginControl {
             plugin_host: Arc::new(Mutex::new(PluginHostImpl::new())),
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
@@ -4035,7 +4104,10 @@ mod plugin_control_tests {
             // remet à false (= fresh start).
             instrument_plugin_bypass: Arc::new(AtomicBool::new(true)),
             plugin_auto_bypass_active: Arc::new(AtomicBool::new(true)),
-            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
+            plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Ready(ScanResult {
+                plugins,
+                blocked: Vec::new(),
+            }))),
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),
         }
@@ -4048,6 +4120,28 @@ mod plugin_control_tests {
             subtype: "nbeq".into(),
             manufacturer: "appl".into(),
         }
+    }
+
+    /// AU inexistant — présent dans le cache de scan des tests (cf.
+    /// `make_control`) pour que `failed_load_leaves_handle_none` teste le
+    /// VRAI chemin d'échec du load natif, pas la garde anti-RCE.
+    fn bogus_ref() -> PluginRef {
+        PluginRef::Au {
+            au_type: "aufx".into(),
+            subtype: "zzzz".into(),
+            manufacturer: "zzzz".into(),
+        }
+    }
+
+    /// Garde anti-RCE (audit pré-beta) : un ref absent du cache de scan est
+    /// refusé AVANT tout appel natif — y compris pendant `Scanning`.
+    #[test]
+    fn load_refused_when_absent_from_scan() {
+        let ctrl = make_control();
+        *ctrl.plugin_scan_cache.lock() = PluginScanCache::Scanning;
+        let err = ctrl.load(&eq_ref()).expect_err("refus attendu pendant Scanning");
+        assert!(err.contains("absent du scan"), "message inattendu : {err}");
+        assert!(ctrl.instrument_plugin_handle.lock().is_none());
     }
 
     #[test]
@@ -4159,12 +4253,9 @@ mod plugin_control_tests {
         // Plugin inexistant → Err. Invariant de sûreté : le handle reste None
         // (jamais de wet sur une instance fantôme) → le thread audio reste dry.
         let ctrl = make_control();
-        let bogus = PluginRef::Au {
-            au_type: "aufx".into(),
-            subtype: "zzzz".into(),
-            manufacturer: "zzzz".into(),
-        };
-        assert!(ctrl.load(&bogus).is_err(), "load d'un AU inexistant doit échouer");
+        // `bogus_ref` est DANS le cache de scan (cf. make_control) → on passe
+        // la garde et on teste bien l'échec du load natif lui-même.
+        assert!(ctrl.load(&bogus_ref()).is_err(), "load d'un AU inexistant doit échouer");
         assert!(
             ctrl.instrument_plugin_handle.lock().is_none(),
             "handle reste None après échec de load (pas de wet fantôme)"
@@ -4458,5 +4549,74 @@ mod midi_dispatch_tests {
         dispatch_subblock_midi(&events, 128, 256, &mut out);
         assert_eq!(out.len(), 1, "frame_offset == sub_start est inclus");
         assert_eq!(out[0].frame_offset, 0);
+    }
+}
+
+// ─── Régression : teardown des flux de capture (fuite hot-swap, bug 21/07) ───
+#[cfg(test)]
+mod teardown_tests {
+    use super::{close_stream_on_com, SendStream};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// RÉGRESSION de la fuite de flux de capture au hot-swap d'entrée (rapport
+    /// 21/07 : +750 cb/s par switch → saturation `pipeline.lock` → « callbacks
+    /// audio figés » → perte des tranches pairs). Exerce le chemin de teardown
+    /// RÉEL — `SendStream` (pause() au Drop) via `close_stream_on_com` — et
+    /// vérifie que PLUS AUCUN callback n'arrive ensuite. Si ce test échoue, la
+    /// fuite est de retour (ex. retrait du `impl Drop for SendStream`).
+    ///
+    /// Ouvre le device d'entrée réel → `#[ignore]` (CI sans device/permission).
+    /// Manuel (Mac) :
+    ///   `cargo test -p jamodio-agent --bins -- --ignored --nocapture teardown_stops`
+    #[test]
+    #[ignore = "ouvre le device d'entrée réel — manuel: cargo test -- --ignored teardown_stops"]
+    fn teardown_stops_capture_callbacks() {
+        use cpal::traits::StreamTrait;
+
+        let Some(id) = crate::audio::device::default_input_id() else {
+            eprintln!("SKIP: aucun device d'entrée par défaut");
+            return;
+        };
+        let Some(device) = crate::audio::device::get_input_device(&id) else {
+            eprintln!("SKIP: device d'entrée '{id}' introuvable");
+            return;
+        };
+
+        let (tx, _rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let (stream, _ch, _sr, _buf) = crate::audio::capture::build_capture_stream(
+            &device,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            callbacks.clone(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .expect("build_capture_stream");
+        stream.play().expect("play");
+
+        std::thread::sleep(Duration::from_millis(250));
+        let running = callbacks.load(Ordering::Relaxed);
+        if running == 0 {
+            eprintln!("INCONCLUSIF: 0 callback (permission micro macOS refusée ?)");
+            return;
+        }
+
+        // LE CHEMIN RÉEL du hot-swap (`close_audio_driver`) : wrap SendStream
+        // → close_stream_on_com → pause() au Drop, sur le thread com_exec.
+        close_stream_on_com(Some(SendStream(stream)));
+
+        std::thread::sleep(Duration::from_millis(80)); // callbacks en vol
+        let settled = callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(400));
+        let leaked = callbacks.load(Ordering::Relaxed) - settled;
+        assert_eq!(
+            leaked, 0,
+            "RÉGRESSION : {leaked} callbacks de capture APRÈS close_stream_on_com \
+             (400 ms) — la fuite du hot-swap est de retour (run={running})"
+        );
+        eprintln!("OK: teardown réel → 0 callback fantôme (run={running})");
     }
 }

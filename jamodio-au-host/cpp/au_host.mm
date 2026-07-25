@@ -31,14 +31,12 @@
 
 extern "C" {
 
-typedef void (*au_scan_cb)(void *ctx,
-                           uint32_t au_type,
-                           uint32_t au_subtype,
-                           uint32_t au_manuf,
-                           const char *name,
-                           uint32_t latency_samples,
-                           int has_editor,
-                           int has_input_bus);  // S2 : 1 si bus audio in, 0 sinon
+// 0.5.9-2 — énumération seule du registre (scan out-of-process, cf. bas de
+// fichier) : identité du composant, aucune métadonnée nécessitant du code plugin.
+typedef void (*jmo_au_enum_cb)(void *ctx,
+                               uint32_t au_type,
+                               uint32_t au_subtype,
+                               uint32_t au_manuf);
 
 struct AuHostOpaque; // handle opaque pour Rust
 
@@ -282,85 +280,6 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     return self;
 }
 
-- (void)scanAndCallback:(au_scan_cb)cb context:(void *)ctx {
-    // S1.9 — Scan multi-types : effets (`aufx`) + instruments (`aumu`) +
-    // music-effects (`aumf`). On laisse le load filtrer plus finement selon
-    // la présence d'un bus audio in (cf. loadType:). Raison : certains
-    // plugins listés en `aumu` ont quand même un bus audio in (cas
-    // AmpliTube 5 chez IK Multimedia) → exclure tout `aumu` cachait
-    // AmpliTube de la liste alors qu'il marchait avant. Les vrais
-    // synthés MIDI purs (AUMIDISynth, AUSampler) restent chargeables
-    // au MVP mais produiront silence sans MIDI → MIDI routing arrive en S2.
-    static const uint32_t kTypes[] = {
-        kAudioUnitType_Effect,
-        kAudioUnitType_MusicDevice,
-        kAudioUnitType_MusicEffect,
-    };
-    for (uint32_t type : kTypes) {
-        AudioComponentDescription desc = {0, 0, 0, 0, 0};
-        desc.componentType = type;
-        AudioComponent comp = nullptr;
-        while ((comp = AudioComponentFindNext(comp, &desc)) != nullptr) {
-            AudioComponentDescription d;
-            if (AudioComponentGetDescription(comp, &d) != noErr) continue;
-
-            CFStringRef cf_name = nullptr;
-            if (AudioComponentCopyName(comp, &cf_name) != noErr || !cf_name) continue;
-            char name_buf[256] = {0};
-            CFStringGetCString(cf_name, name_buf, sizeof(name_buf), kCFStringEncodingUTF8);
-            CFRelease(cf_name);
-
-            // Latence rapportée AVANT instantiation : on doit instancier brièvement.
-            //
-            // v0.2.25 — Crash isolation au scan.
-            // Depuis qu'on a ajouté disable-library-validation + allow-jit en
-            // v0.2.24, les plugins 3rd party se chargent IN-PROCESS dans notre
-            // agent. Si un de leurs constructeurs/destructeurs C++ crashe ou
-            // throw une exception dans un destructeur (cas FIN-NEO d'UJAM,
-            // std::thread::~thread() qui throw → std::terminate), notre agent
-            // crashe au démarrage pendant ce scan.
-            //
-            // Mitigation : on ne probe que les Apple natives (manufacturer
-            // == 'appl' = 0x6170706c) pour récupérer latence/has_input_bus.
-            // Pour les 3rd party, valeurs par défaut sûres :
-            //   - latency_samples = 0   (= ne pas filtrer comme incompatible)
-            //   - has_input_bus = 1     (= traiter comme effet par défaut ;
-            //     l'auto-switch MIDI se fera au load réel si le plugin se
-            //     révèle être un instrument pur)
-            // Le user paye le prix au LOAD réel d'un plugin défectueux (qui
-            // peut crasher l'agent), mais le SCAN reste fiable et l'agent
-            // boot toujours.
-            const uint32_t kAppleManuf = 0x6170706c; // 'appl' big-endian
-            uint32_t latency_samples = 0;
-            int has_input_bus = 1;
-            if (d.componentManufacturer == kAppleManuf) {
-                NSError *err = nil;
-                AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:d
-                                                                                options:0
-                                                                                  error:&err];
-                if (probe && !err) {
-                    latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
-                    // S2 — has_input_bus permet au browser de savoir s'il faut
-                    // auto-switcher en source MIDI (= pur instrument) au load.
-                    has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
-                    probe = nil; // ARC release
-                }
-            }
-            // else : 3rd party plugin → on ne probe pas, défauts sûrs.
-            // `providesUserInterface` retourne YES uniquement pour les AU v3
-            // qui exposent un custom view controller. Les AU v2 (= la totalité
-            // des AU Apple natifs, AmpliTube legacy, etc.) retournent NO mais
-            // sont parfaitement affichables via AUGenericView. Comme on utilise
-            // AUGenericView en fallback dans openEditor:, on annonce un editor
-            // pour TOUS les AU. Quand on switchera vers requestViewController
-            // pour les AU v3 modernes (S2), on raffinera.
-            int has_editor = 1;
-
-            cb(ctx, d.componentType, d.componentSubType, d.componentManufacturer,
-               name_buf, latency_samples, has_editor, has_input_bus);
-        }
-    }
-}
 
 - (uint32_t)loadType:(uint32_t)au_type
              subtype:(uint32_t)au_subtype
@@ -1103,10 +1022,82 @@ void au_host_destroy(void *p) {
     (void)(__bridge_transfer JmoAuHost *)p; // ARC release et dealloc
 }
 
-void au_host_scan(void *p, au_scan_cb cb, void *ctx) {
-    if (!p || !cb) return;
-    JmoAuHost *h = (__bridge JmoAuHost *)p;
-    [h scanAndCallback:cb context:ctx];
+// ---------- Scan out-of-process (0.5.9-2, PLAN-PLUGIN-SCAN-OOP) ----------
+//
+// Découpage du scan en deux primitives, réparties entre les deux process :
+// - `jmo_au_enumerate` : lecture SEULE du registre AudioComponent — aucune
+//   instanciation, aucun code plugin exécuté → sûr dans le process agent
+//   (coordinateur).
+// - `jmo_au_probe`     : instanciation réelle d'UN composant (latence, bus) —
+//   à n'appeler QUE depuis le process worker jetable. On probe ICI TOUS les
+//   fabricants (l'isolation process rend inutile toute mitigation « Apple
+//   natives seulement ») : un crash du constructeur tiers tue le worker, pas
+//   l'agent, et on retrouve la vraie latence / le vrai has_input_bus.
+
+void jmo_au_enumerate(jmo_au_enum_cb cb, void *ctx) {
+    if (!cb) return;
+    // Effets (`aufx`) + instruments (`aumu`) + music-effects (`aumf`) — le
+    // filtrage fin (bus d'entrée) reste au load.
+    static const uint32_t kTypes[] = {
+        kAudioUnitType_Effect,
+        kAudioUnitType_MusicDevice,
+        kAudioUnitType_MusicEffect,
+    };
+    for (uint32_t type : kTypes) {
+        AudioComponentDescription desc = {0, 0, 0, 0, 0};
+        desc.componentType = type;
+        AudioComponent comp = nullptr;
+        while ((comp = AudioComponentFindNext(comp, &desc)) != nullptr) {
+            AudioComponentDescription d;
+            if (AudioComponentGetDescription(comp, &d) != noErr) continue;
+            cb(ctx, d.componentType, d.componentSubType, d.componentManufacturer);
+        }
+    }
+}
+
+int jmo_au_probe(uint32_t au_type, uint32_t au_subtype, uint32_t au_manuf,
+                 char *name_buf, size_t name_size,
+                 uint32_t *latency_samples, int *has_input_bus) {
+    if (!name_buf || name_size == 0 || !latency_samples || !has_input_bus) return 0;
+    name_buf[0] = '\0';
+    *latency_samples = 0;
+    *has_input_bus = 1; // défaut sûr si la probe échoue proprement
+
+    AudioComponentDescription desc = {0, 0, 0, 0, 0};
+    desc.componentType = au_type;
+    desc.componentSubType = au_subtype;
+    desc.componentManufacturer = au_manuf;
+    AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
+    if (!comp) return 0; // désinstallé entre l'énumération et la probe
+
+    CFStringRef cf_name = nullptr;
+    if (AudioComponentCopyName(comp, &cf_name) != noErr || !cf_name) return 0;
+    CFStringGetCString(cf_name, name_buf, name_size, kCFStringEncodingUTF8);
+    CFRelease(cf_name);
+
+    // Instanciation réelle — c'est ICI qu'un plugin défectueux crashe (le
+    // worker). Échec PROPRE (err) = défauts sûrs, le composant reste listé.
+    NSError *err = nil;
+    AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:desc
+                                                                   options:0
+                                                                     error:&err];
+    if (probe && !err) {
+        *latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
+        *has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
+        probe = nil; // ARC release
+    }
+    return 1;
+}
+
+// 0.5.9-4 — masque le process courant du Dock et de l'activation. Appelé tôt
+// par le worker de scan out-of-process : il partage le binaire (et l'Info.plist
+// « app Regular ») de l'agent, donc sans ça son icône rebondit dans le Dock le
+// temps du scan. `Prohibited` = ni Dock, ni menu, ni focus volé.
+void jmo_suppress_dock(void) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    }
 }
 
 uint32_t au_host_load(void *p,

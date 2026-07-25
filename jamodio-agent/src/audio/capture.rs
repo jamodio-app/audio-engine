@@ -441,4 +441,142 @@ mod tests {
         assert_eq!(result, Err("structural"));
         assert_eq!(calls.get(), 1, "no retry when is_retryable returns false");
     }
+
+    /// REPRO fuite de flux de capture au hot-swap d'entrée (rapport bug 21/07,
+    /// `pierremasse`). Symptôme mesuré : `capture_cb_per_sec` grimpe de +750 à
+    /// CHAQUE changement de canal/device en session (750→1500→…→7500) alors que
+    /// la sortie reste à 750 → 10 callbacks de capture concurrents → saturation
+    /// `pipeline.lock` → `callbacks audio figés — reset du driver` → perte de la
+    /// tranche du pair + boucle de reconnexion.
+    ///
+    /// Ce test DOCUMENTE la racine (mesurée le 22/07 : 301 callbacks pendant les
+    /// 400 ms suivant le drop) : sur macOS/CoreAudio, dropper un `cpal::Stream`
+    /// d'ENTRÉE n'arrête PAS son AudioUnit — le callback fantôme continue à
+    /// ~750/s. C'est CE quirk qui impose le `pause()` explicite du
+    /// `impl Drop for SendStream` (pipeline.rs). L'assertion est donc INVERSÉE
+    /// (on s'attend à la fuite) : si ce test se met à échouer, c'est que cpal a
+    /// corrigé son drop en amont → le pause() devient redondant (le garder par
+    /// sûreté, il est sans effet néfaste).
+    ///
+    /// Ouvre le VRAI device d'entrée par défaut → `#[ignore]` pour ne jamais
+    /// tourner en CI (pas de device / pas de permission micro). Lancer sur le
+    /// Mac :  `cargo test -p jamodio-agent --bins -- --ignored --nocapture ghost_capture`
+    #[test]
+    #[ignore = "ouvre le device d'entrée réel — manuel: cargo test -- --ignored ghost_capture"]
+    fn ghost_capture_callbacks_stop_after_drop() {
+        use cpal::traits::StreamTrait;
+
+        let Some(id) = crate::audio::device::default_input_id() else {
+            eprintln!("SKIP: aucun device d'entrée par défaut");
+            return;
+        };
+        let Some(device) = crate::audio::device::get_input_device(&id) else {
+            eprintln!("SKIP: device d'entrée '{id}' introuvable");
+            return;
+        };
+
+        // Consommateur volontairement gardé (le `_rx` ne doit pas être droppé,
+        // sinon les callbacks passent en branche `Disconnected` — on veut mesurer
+        // le compteur `capture_callbacks`, incrémenté INCONDITIONNELLEMENT en tête
+        // de `forward_samples`, donc indépendant du consommateur).
+        let (tx, _rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let drops = Arc::new(AtomicU64::new(0));
+        let frames = Arc::new(AtomicU32::new(0));
+        let feeding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let (stream, _ch, _sr, _buf) =
+            build_capture_stream(&device, tx, drops, callbacks.clone(), frames, feeding)
+                .expect("build_capture_stream");
+        stream.play().expect("play");
+
+        std::thread::sleep(Duration::from_millis(250));
+        let running = callbacks.load(Ordering::Relaxed);
+        if running == 0 {
+            // Pas de callbacks du tout → probablement pas d'accès micro (TCC) :
+            // on ne peut RIEN conclure, on ne fait donc PAS échouer le test.
+            eprintln!(
+                "INCONCLUSIF: 0 callback pendant que le stream tourne \
+                 (permission micro macOS refusée ?) — repro impossible ici"
+            );
+            return;
+        }
+
+        // Drop du stream = ce que fait `close_stream_on_com` au hot-swap.
+        drop(stream);
+        // Laisse retomber les callbacks EN VOL (déjà entrés dans le driver).
+        std::thread::sleep(Duration::from_millis(80));
+        let settled = callbacks.load(Ordering::Relaxed);
+        // Fenêtre d'observation post-drop : un flux SAIN n'émet plus rien ici.
+        std::thread::sleep(Duration::from_millis(400));
+        let after = callbacks.load(Ordering::Relaxed);
+
+        let leaked = after - settled;
+        assert!(
+            leaked > 0,
+            "Le drop CPAL arrête désormais les callbacks d'entrée (0 fantôme en \
+             400 ms, run={running}) : le quirk CoreAudio semble corrigé en amont. \
+             Le pause() de `Drop for SendStream` (pipeline.rs) devient redondant — \
+             le GARDER par sûreté, mais ce test documentaire peut être retiré."
+        );
+        eprintln!(
+            "QUIRK CONFIRMÉ: {leaked} callbacks fantômes en 400 ms après drop brut \
+             (run={running}) — d'où le pause() au Drop de SendStream"
+        );
+    }
+
+    /// VALIDATION DU CORRECTIF (Phase 2) : un `pause()` explicite AVANT le drop
+    /// arrête-t-il réellement les callbacks CoreAudio ? Si oui, le fix est de
+    /// `pause()` chaque flux de capture avant de le dropper (dans
+    /// `pipeline::close_stream_on_com` / `close_audio_driver`), ce qui supprime
+    /// le flux fantôme à la source. Contre-épreuve du test de repro ci-dessus.
+    ///
+    /// Manuel (Mac) :  `cargo test -p jamodio-agent --bins -- --ignored --nocapture pause_stops_capture`
+    #[test]
+    #[ignore = "ouvre le device d'entrée réel — manuel: cargo test -- --ignored pause_stops_capture"]
+    fn pause_stops_capture_callbacks() {
+        use cpal::traits::StreamTrait;
+
+        let Some(id) = crate::audio::device::default_input_id() else {
+            eprintln!("SKIP: aucun device d'entrée par défaut");
+            return;
+        };
+        let Some(device) = crate::audio::device::get_input_device(&id) else {
+            eprintln!("SKIP: device d'entrée '{id}' introuvable");
+            return;
+        };
+
+        let (tx, _rx) = crossbeam_channel::bounded::<Vec<f32>>(64);
+        let callbacks = Arc::new(AtomicU64::new(0));
+        let drops = Arc::new(AtomicU64::new(0));
+        let frames = Arc::new(AtomicU32::new(0));
+        let feeding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let (stream, _ch, _sr, _buf) =
+            build_capture_stream(&device, tx, drops, callbacks.clone(), frames, feeding)
+                .expect("build_capture_stream");
+        stream.play().expect("play");
+        std::thread::sleep(Duration::from_millis(250));
+        let running = callbacks.load(Ordering::Relaxed);
+        if running == 0 {
+            eprintln!("INCONCLUSIF: 0 callback (permission micro macOS refusée ?)");
+            return;
+        }
+
+        // LE CORRECTIF CANDIDAT : stop explicite avant le drop.
+        stream.pause().expect("pause");
+        std::thread::sleep(Duration::from_millis(80)); // callbacks en vol
+        let settled = callbacks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(400));
+        let after = callbacks.load(Ordering::Relaxed);
+        drop(stream);
+
+        let leaked = after - settled;
+        assert_eq!(
+            leaked, 0,
+            "pause() n'arrête PAS les callbacks ({leaked} en 400 ms) → le fix ne \
+             peut pas se limiter à pause()+drop, investiguer plus loin. (run={running})"
+        );
+        eprintln!("OK: pause() arrête les callbacks (run={running}, post-pause=0) → fix validé");
+    }
 }

@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "windows")]
 
-mod discovery;
+pub mod discovery;
 mod editor;
 mod conn_proxy;
 mod events;
@@ -119,11 +119,29 @@ impl Drop for Vst3Host {
 
 // ---------- Scan ----------
 
+/// Scan d'UN fichier `.vst3` — API du worker out-of-process (0.5.9-2,
+/// PLAN-PLUGIN-SCAN-OOP). Instancie réellement chaque classe du module pour
+/// lire latence/bus/éditeur — à n'appeler QUE depuis le process worker
+/// jetable : un crash natif du plugin tue le process appelant.
+///
+/// Exécute sur vst3-main (contrainte single-main-thread VST3 + binding du
+/// MessageManager JUCE, cf. main_thread.rs) — thread spawné lazily dans le
+/// process courant.
+pub fn scan_file(path: &Path) -> Vec<PluginInfo> {
+    let path = path.to_path_buf();
+    main_thread::run(move || {
+        let mut out = Vec::new();
+        scan_plugin_file(&path, &mut out);
+        out
+    })
+}
+
 /// Scan d'un seul plugin : load → factory info → énumère classes → instancie
 /// chaque Audio Module Class pour lire latence/has_input_bus/has_editor.
 ///
-/// Best-effort : si le plugin crash au load OU au setup, on log et on passe au
-/// suivant. La crash isolation par sub-process viendra en S3.
+/// Best-effort sur les échecs PROPRES (load/createInstance/setup en erreur) :
+/// log et passe au suivant. Les crashs NATIFS ne sont pas rattrapables
+/// in-process — c'est le rôle du worker jetable (cf. `scan_file`).
 fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
     let module = match LoadedModule::load(path) {
         Ok(m) => m,
@@ -216,22 +234,6 @@ fn scan_plugin_file(path: &Path, out: &mut Vec<PluginInfo>) {
 // ---------- Trait impl ----------
 
 impl PluginHost for Vst3Host {
-    fn scan(&self) -> Vec<PluginInfo> {
-        // Sur vst3-main : le PREMIER chargement d'un module JUCE lie son
-        // MessageManager au thread courant — ce doit être vst3-main (= le
-        // thread qui pompe), sinon l'éditeur deadlock plus tard (cf.
-        // main_thread.rs).
-        main_thread::run(|| {
-            let mut out = Vec::new();
-            for dir in discovery::system_paths() {
-                for path in discovery::scan_directory(&dir) {
-                    scan_plugin_file(&path, &mut out);
-                }
-            }
-            out
-        })
-    }
-
     fn load(
         &mut self,
         plugin_ref: &PluginRef,
@@ -424,12 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_returns_a_vec() {
-        // Sur une machine sans plugins, scan() peut retourner vide — ce n'est
-        // pas une erreur. Sur la VM avec ValhallaFutureVerb installé, vide
-        // = bug. Le test n'asserte pas la non-vacuité pour rester portable.
-        let h = Vst3Host::new();
-        let _plugins = h.scan();
+    fn scan_file_missing_path_is_empty() {
+        // La primitive de scan par fichier (worker out-of-process) sur un
+        // chemin inexistant ne panique pas et retourne vide (load failed).
+        let out = scan_file(std::path::Path::new(r"C:\does\not\exist.vst3"));
+        assert!(out.is_empty());
     }
 
     #[test]

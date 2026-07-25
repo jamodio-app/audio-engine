@@ -46,7 +46,7 @@ pub enum PluginRef {
 /// avec un tooltip explicatif (cf. mémoire vision).
 /// `has_input_bus = false` (= synthé MIDI pur) signale au browser qu'il faut
 /// auto-switcher la source d'entrée en MIDI à l'activation (S2).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginInfo {
     pub name: String,
@@ -130,13 +130,14 @@ pub enum PluginError {
 }
 
 /// Hôte plugin audio. Une instance vit pendant toute la durée du studio agent.
-/// Les méthodes `scan`/`load`/`unload`/`open_editor` sont appelées depuis le main thread.
+/// Les méthodes `load`/`unload`/`open_editor` sont appelées depuis le main thread.
 /// `process_stereo` est appelé depuis le thread audio RT (CPAL callback) — ne doit
 /// jamais bloquer ni allouer.
+///
+/// Le SCAN ne passe plus par ce trait : depuis 0.5.9-2 il est out-of-process
+/// (cf. `jamodio-agent::plugin_scan`), via les primitives par-item de chaque
+/// hôte (`scan_file` VST3, `enumerate_components`/`scan_component` AU).
 pub trait PluginHost: Send {
-    /// Liste tous les plugins installés du format supporté.
-    fn scan(&self) -> Vec<PluginInfo>;
-
     /// Charge un plugin et retourne son handle. Format audio fixé : 48k stéréo f32.
     /// max_frames = bloc CPAL maximum garanti (typiquement 64).
     fn load(&mut self, plugin_ref: &PluginRef, max_frames: u32) -> Result<PluginHandle, PluginError>;

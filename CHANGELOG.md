@@ -4,10 +4,51 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.9] — 2026-07-23
+
+Release **publique**. Refonte du **scan des plugins** (désormais hors-process,
+standard DAW) et correctif capture macOS. Consolide les pré-releases
+`0.5.9-1` → `0.5.9-4`.
+
+### Changé
+- **Scan des plugins hors-process.** L'agent instanciait chaque plugin tiers
+  dans son propre process au démarrage : un seul plugin qui plante à
+  l'instanciation (crash natif, ex. Groove Agent SE) faisait tomber l'agent
+  entier, sans possibilité de le rattraper. Le scan tourne désormais dans un
+  **worker jetable** : un plugin qui le fait crasher ou figer ne tue que le
+  worker, le plugin fautif est **exclu** (blocklisté) et le scan reprend au
+  suivant. L'agent ne tombe plus jamais au scan.
+
+### Ajouté
+- **Cache de scan persisté** : le scan complet n'a lieu qu'une fois (seuls les
+  plugins nouveaux ou mis à jour sont re-scannés) → démarrages suivants quasi
+  instantanés (quelques ms au lieu de 15–25 s).
+- **Blocklist auto-réversible** : un plugin exclu retente automatiquement sa
+  chance dès qu'il est mis à jour ; les plugins exclus sont signalés au
+  navigateur (fenêtre FX) pour expliquer leur absence.
+- Isolation dure du worker : Job Object `KILL_ON_JOB_CLOSE` sur Windows — il ne
+  peut jamais survivre à l'agent.
+
+### Corrigé
+- **Perte de la tranche des autres musiciens au changement d'entrée (macOS),
+  puis « recherche de l'Audio Engine » en boucle.** À chaque changement de
+  canal/device en session, l'ancien flux de capture CoreAudio continuait de
+  tourner après sa destruction (quirk cpal : dropper le stream d'entrée n'arrête
+  pas son AudioUnit) → callbacks fantômes qui saturaient le lock pipeline →
+  agent muet, watchdog « agent lost », streams pairs tués et boucle de
+  reconnexion. Correctif : `pause()` explicite avant chaque destruction de
+  stream cpal (`Drop for SendStream`) — couvre hot-swap, stop, reset driver et
+  chemins d'erreur. Couvert par 3 tests device réel.
+
+### Interne
+- Suppression du scan de plugins in-process, devenu inutile (code mort) ;
+  couverture de tests repointée sur les primitives hors-process. Aucun
+  changement de comportement.
+
 ## [0.5.8] — 2026-07-21
 
-Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` (détail
-par version ci-dessous) : éditeur VST3 net en haute densité (Windows), réception
+Release **publique** consolidant les pré-releases `0.5.8-1` → `0.5.8-5` :
+éditeur VST3 net en haute densité (Windows), réception
 des pairs préservée au changement d'entrée, **keepalive Ping/Pong WS** (fin des
 déconnexions intermittentes qui perdaient mute/ENTRÉE/volumes en onglet
 arrière-plan), **métronome enrichi** (chiffrage `pulseRatio`/`accentPattern`,
@@ -24,171 +65,11 @@ subdivisions, banque de sons synthétisés) — plus le correctif ENTRÉE ci-des
   d'entrée (`session_continues=true`). Le navigateur réconcilie en complément
   l'état UI réel au `capture-started` (ceinture+bretelles).
 
-## [0.5.8-5] — 2026-07-21 (pré-release)
-
-### Corrigé
-- **Changement de paramètre métronome pas appliqué en temps réel (obligé de
-  faire PAUSE/PLAY).** En cours de lecture, passer à une grille plus LENTE
-  (chiffrage ×/8 → ×/4, ou baisse de BPM) faisait chuter l'indice de temps
-  recalculé SOUS `last_onset_key` (garde-fou anti-double-clic) → tous les onsets
-  étaient supprimés jusqu'au rattrapage → silence. `set_config` réinitialise
-  désormais ce garde-fou (le re-ancrage périodique DLL via `set_grid` le
-  conserve, il reste nécessaire au joint d'un re-ancrage).
-
-## [0.5.8-4] — 2026-07-21 (pré-release)
-
-### Ajouté
-- **Métronome enrichi (source « référence » Option B).** La synthèse du clic
-  supporte désormais : le **chiffrage** via `pulseRatio` (croche en ×/8) +
-  `beatsPerBar` + `accentPattern` (fort/médium/normal par temps) ; les
-  **subdivisions** (figures `8`/`8t`/`16` en plus de `q`) ; une **banque de sons**
-  synthétisés déterministes (`click`/`blip`/`digital`/`cowbell`/`woodblock`),
-  miroir exact du navigateur (`web/app/js/lib/metro-sounds.js`). Champs wire
-  `reference-config` rétro-compatibles (`serde(default)`) ; le pattern d'accents
-  est stocké dans un tableau FIXE (zéro allocation sur le chemin audio). Le
-  navigateur reste maître de la grille — aucun changement du timing/sync.
-
-## [0.5.8-3] — 2026-07-21 (pré-release)
-
-### Corrigé
-- **Déconnexions WS agent↔browser en boucle (~toutes les 16 s) → commandes
-  perdues par intermittence.** Symptômes : MUTE d'un pair sans effet « par
-  moments », ENTRÉE muette au cold-rejoin, comportements « étranges/aléatoires ».
-  Cause racine : le watchdog agent (5 s) s'appuyait sur le heartbeat applicatif
-  du browser (`get-stats` émis par un `setInterval`), que Chrome **throttle en
-  onglet arrière-plan** → trous > 5 s → l'agent tuait le client → reconnexion →
-  pendant la ~1 s de coupure, `agentConnected=false` côté browser et tout
-  `agentSend` (mute, set-volume, ENTRÉE…) partait à la poubelle silencieusement.
-  Correctif : **keepalive Ping/Pong WebSocket** — l'agent émet un `Ping` toutes
-  les 2 s ; le navigateur y répond par un `Pong` au niveau réseau (hors JS
-  throttlé), ce qui nourrit le watchdog même en arrière-plan. Le watchdog garde
-  son rôle : un socket réellement mort ne renvoie plus de Pong → coupure
-  légitime. Fixe durablement mute intermittent + ENTRÉE cold-rejoin + tout
-  `agentSend` perdu.
-
-## [0.5.8-2] — 2026-07-21 (pré-release)
-
-### Corrigé
-- **Changer son entrée en cours de session coupait la réception de TOUS les
-  pairs.** En session à plusieurs, dès qu'un membre changeait son entrée
-  (device, canal, ou upgrade WebRTC→agent), son agent perdait l'instrument de
-  tous les autres (VU figé, aucun son) jusqu'à un rejoin complet — d'où un bug
-  asymétrique (un sens fonctionne, l'autre non) constaté entre Mac et PC.
-  Cause : tout `start-capture` passait par `teardown_session`, qui wipe aussi la
-  réception des pairs (`recv_stops` + thread de décodage), alors que celle-ci est
-  INDÉPENDANTE du chemin de capture. Régression latente du refactor keep-warm
-  ASIO (0.5.4-5). Correctif : le browser signale via `sessionContinues` qu'un
-  `start-capture` continue une session active (hot-swap) ; l'agent reconstruit
-  alors UNIQUEMENT le chemin capture/self et PRÉSERVE la réception des pairs. Le
-  wipe complet ne subsiste que pour un vrai leave/rejoin. Nécessite le web à jour
-  (envoi du flag).
-
-## [0.5.8-1] — 2026-07-20 (pré-release)
-
-### Corrigé
-- **Fenêtre d'éditeur VST3 rognée sur écran à haute densité (DPI > 100 %).**
-  Sur un affichage Windows à 150 % (ex. 2560×1440 @1.5×), l'UI de certains
-  plugins (Neural DSP Archetype, Polyverse Wider…) débordait de la fenêtre et
-  n'était pas entièrement visible, sans possibilité de redimensionner (plugins
-  à taille fixe). Cause : l'hôte n'informait jamais la vue du plugin de son
-  facteur d'échelle DPI — le plugin rendait son UI à l'échelle système mais la
-  fenêtre était créée à la taille « 100 % ». Correctif : l'hôte appelle
-  désormais `IPlugViewContentScaleSupport::setContentScaleFactor` (DPI du
-  moniteur ÷ 96) avant `getSize`, la vue renvoie alors sa taille physique
-  correcte et la fenêtre l'épouse. Complète le correctif de redimensionnement
-  `resizeView` de la 0.5.6.
-
 ## [0.5.7] — 2026-07-18
 
 Première release **publique** du **Lot 2** : talkback sur un canal indépendant
 via l'agent, VU-mètres fidèles au mix (stéréo réel, pan, talkback pair) et
-robustesse ASIO. Consolide les pré-releases `0.5.7-1` → `0.5.7-8` (détail par
-version ci-dessous).
-
-## [0.5.7-8] — 2026-07-18
-
-### Corrigé
-- **Réouverture ASIO à froid muette après une pause prolongée hors studio**
-  (Focusrite USB). Après expiration de la grâce (~30 s hors studio), le driver
-  est relâché (`ASIOExit`) ; au rejoin, la réouverture à froid revenait parfois
-  « callbacks vivants mais MUETTE » (ni VU ni son SELF de l'instrument),
-  débloquée uniquement par un redémarrage de l'agent. Cause : l'apartment
-  COM-STA, unique pour toute la vie du process (`CoInitialize` une seule fois),
-  conservait l'état wedgé du driver — ce qu'un redémarrage de process
-  réinitialisait implicitement. Correctif : recyclage de l'apartment COM
-  (`CoUninitialize`/`CoInitialize` frais) juste avant le cold-reopen consécutif
-  à une libération par la grâce. Ciblé à ce seul cas, sûr (aucun objet ASIO
-  vivant à cet instant), sans effet sur macOS/WASAPI (pas de COM).
-
-## [0.5.7-7] — 2026-07-17
-
-### Corrigé
-- **Plugins INSERT — budget de latence intrinsèque relevé 64 → 128 samples.**
-  Un plugin dont la latence intrinsèque (PDC) tenait dans (64, 128] samples était
-  marqué incompatible, donc non chargeable — c'est le cas des amp-sims Neural DSP
-  (Darkglass Ultimate ≈ 84 samples), rejetés à tort. Cette latence est un retard
-  fixe interne au plugin (suréchantillonnage), **sans rapport avec la taille de
-  buffer** : le pipeline traite déjà par sous-blocs de 128 samples et n'applique
-  aucune compensation de délai → relever à 128 (2,67 ms @ 48 kHz) est purement
-  additif et sûr. La règle de compatibilité (`latency_exceeds_live_budget`) est
-  désormais centralisée et partagée par les hôtes AU et VST3.
-
-## [0.5.7-6] — 2026-07-17
-
-### Nettoyage
-- Retrait du diagnostic temporaire `talkback-vu-diag` (getter `is_voice_capturing`
-  inclus) : il a rempli son rôle. La cause du VU talkback plat au switch device
-  navigateur→agent était **côté navigateur** (snapshot instrument incomplet →
-  redémarrage parasite de la capture qui tuait le tap voix) — corrigée dans la
-  web app, aucun changement agent requis pour ce bug.
-
-## [0.5.7-5] — 2026-07-17
-
-### Corrections
-- **VU talkback (mode agent voix)** : les niveaux `StreamLevels` sont désormais
-  poussés dès que le talkback produit du signal (`voice_rms > 0`), même sans
-  peer ni instrument actif. Le gate d'émission n'intégrait que l'instrument
-  (`input_rms`) et le MIDI → parler **seul** (sans jouer) laissait le VU
-  talkback figé.
-
-## [0.5.7-4] — 2026-07-17
-
-### Ajouté
-- **VU talkback en mode agent** : le thread `voice_encode` mesure le RMS
-  **post-gain** du talkback et l'agent le diffuse comme niveau `voice` dans
-  `StreamLevels` → le navigateur peut afficher le VU de la tranche talkback (qui
-  n'a aucun analyser Web Audio en mode agent voix).
-
-## [0.5.7-3] — 2026-07-17
-
-### Ajouté
-- **VU MASTER / MIX REC en vrai stéréo** : le mixer mesure le RMS L/R du mix
-  **réel** (`mix_into` → `stereo_rms`) — `mix` = tap post-fader, `master` =
-  sortie finale post-clamp — exposés via `master_mix_rms()` et diffusés comme
-  niveaux `master` / `mix`. Le navigateur consomme ces L/R (fini le proxy mono
-  L=R). Le pan et les faders deviennent visibles sur ces VU.
-
-## [0.5.7-2] — 2026-07-17
-
-### Corrigé
-- **VU reflète le pan** : l'agent diffusait des RMS L/R **pré-pan** (L=R pour un
-  flux mono). `mixer.rs` `stream_rms()` applique désormais la loi de balance
-  post-pan via le helper partagé `pan_gains()` (source unique avec `mix_into`) →
-  couvre self + peers en un seul point.
-
-## [0.5.7-1] — 2026-07-16
-
-### Ajouté
-- **Talkback canal indépendant via l'agent (Lot 2)** : nouveau protocole
-  `StartVoiceCapture` / `StopVoiceCapture` / `SetVoiceGain`. Un **4ᵉ thread
-  `voice_encode`** dédié + un **tap voix lock-free** dans `capture_stage`
-  (helper pur `extract_channel_mono`) extrait un canal mono arbitraire du buffer
-  d'entrée (nécessaire sur Windows/ASIO exclusif où Chrome ne voit que les
-  canaux 1-2). Fondu de gain **par-sample** anti-clic (attack 15 ms / release
-  80 ms) pour l'auto-mute ; réutilise `MusicEncoder` (mono → L=R).
-- **Coût nul quand le talkback est inactif** et **instrument byte-identique**
-  (forward instrument AVANT le tap, `try_send` non bloquant → le thread voix ne
-  ralentit jamais la capture instrument).
+robustesse ASIO. Consolide les pré-releases `0.5.7-1` → `0.5.7-8`.
 
 ## [0.5.6] — 2026-07-15
 

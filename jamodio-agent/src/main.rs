@@ -7,6 +7,7 @@
 mod audio;
 mod logging;
 mod pipeline;
+mod plugin_scan;
 #[cfg(target_os = "windows")]
 mod tray_promote;
 mod ws_server;
@@ -156,6 +157,15 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
 }
 
 fn main() {
+    // Mode worker de scan plugins (0.5.9-2, PLAN-PLUGIN-SCAN-OOP) : process
+    // enfant JETABLE spawné par le coordinateur pour instancier les plugins
+    // hors du process agent. Court-circuit AVANT tout le reste — pas de
+    // logging fichier, pas de lock single-instance, pas de Tauri, pas de
+    // port 9876, pas de tray. Ne retourne jamais.
+    if std::env::args().any(|a| a == "--plugin-scan-worker") {
+        plugin_scan::worker::run();
+    }
+
     // Relance « attendue » (bouton « Redémarrer l'agent » → ws_server::
     // spawn_awaited_relaunch). On a été spawné DÉTACHÉ par l'ancien process
     // pendant qu'il s'éteignait. On attend qu'il soit mort — donc que le verrou

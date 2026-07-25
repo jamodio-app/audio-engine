@@ -2489,14 +2489,27 @@ async fn handle_message(
                 // message → l'UI restait figée). Le browser reçoit un signal
                 // explicite « toujours en cours » et repolle.
                 let Some(pl) = lock_pipeline_wait(pipeline).await else {
-                    return vec![AgentMessage::PluginList { items: vec![], scanning: true }];
+                    return vec![AgentMessage::PluginList {
+                        items: vec![],
+                        scanning: true,
+                        blocked: vec![],
+                    }];
                 };
-                let (items, scanning) = pl.list_instrument_plugins();
-                vec![AgentMessage::PluginList { items, scanning }]
+                let (items, blocked_items, scanning) = pl.list_instrument_plugins();
+                let blocked = blocked_items
+                    .iter()
+                    .map(|b| {
+                        jamodio_audio_core::protocol::BlockedPlugin::from_item(
+                            &b.item,
+                            b.reason.as_wire(),
+                        )
+                    })
+                    .collect();
+                vec![AgentMessage::PluginList { items, scanning, blocked }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
             }
         }
 
