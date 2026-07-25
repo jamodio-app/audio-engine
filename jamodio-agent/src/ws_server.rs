@@ -2018,18 +2018,9 @@ async fn handle_message(
                         detail: None,
                     }]
                 }
-                Err(crate::pipeline::CaptureStartError::OutputDeviceNotFound { requested }) => {
-                    tracing::warn!(
-                        target: "jamodio::ws",
-                        ?requested,
-                        "StartCapture rejected: output device not found"
-                    );
-                    vec![AgentMessage::CaptureError {
-                        reason: "output-device-not-found".into(),
-                        requested_device: requested,
-                        detail: None,
-                    }]
-                }
+                // NB (Lot A 0.5.10) : plus de cas `OutputDeviceNotFound` — la sortie
+                // est non-fatale (repli défaut système + `outputFallback` dans
+                // `CaptureStarted`). Une sortie introuvable ne rejette plus la capture.
                 Err(crate::pipeline::CaptureStartError::Other(msg)) => {
                     // ASIO est mono-client : l'échec d'ouverture n°1 est un
                     // driver déjà tenu par une autre app (DAW). On le dit

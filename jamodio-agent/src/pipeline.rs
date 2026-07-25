@@ -527,7 +527,10 @@ pub enum CaptureStartError {
     /// Le device demandé (ou le default si aucun id) n'a pas été trouvé.
     /// Le `requested` est l'id transmis par le browser (None si aucun).
     InputDeviceNotFound { requested: Option<String> },
-    OutputDeviceNotFound { requested: Option<String> },
+    // NB (Lot A 0.5.10) : plus de `OutputDeviceNotFound`. La résolution de sortie
+    // est désormais NON-FATALE (repli sur la sortie par défaut système + signal
+    // `outputFallback` dans `CaptureStarted`) → une sortie introuvable ne peut
+    // plus faire échouer un StartCapture. Cf. `open_duplex_on_com`.
     /// Erreur technique : SFU, UDP, encoder, etc.
     Other(String),
 }
@@ -537,9 +540,6 @@ impl std::fmt::Display for CaptureStartError {
         match self {
             Self::InputDeviceNotFound { requested } => {
                 write!(f, "input device introuvable : {:?}", requested)
-            }
-            Self::OutputDeviceNotFound { requested } => {
-                write!(f, "output device introuvable : {:?}", requested)
             }
             Self::Other(s) => write!(f, "{}", s),
         }
@@ -2275,9 +2275,7 @@ impl PipelineState {
                         "recréation sortie échouée — playback désactivé (capture rétablie)"
                     ),
                     OutputOpen::NotFound => {
-                        return Err(CaptureStartError::OutputDeviceNotFound {
-                            requested: self.output_device_id.clone(),
-                        })
+                        unreachable!("open_duplex_on_com ne produit jamais NotFound (repli non-fatal sur défaut système, Lot A 0.5.10)")
                     }
                     OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
                 }
