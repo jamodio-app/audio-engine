@@ -383,6 +383,18 @@ pub fn default_output_device() -> Option<(cpal::Device, String)> {
     Some((dev, name))
 }
 
+/// Nom du device de sortie par DÉFAUT OS — lecture **COM-safe** (via `com_exec`,
+/// contrat STA Windows). Utilisé par le superviseur qui fait suivre le « Défaut
+/// système » au défaut OS en live (Lot A2) : il tourne hors du thread com_exec,
+/// donc doit passer par lui pour interroger CoreAudio/WASAPI sans planter. `None`
+/// si aucun défaut. N'est appelé QUE hors ASIO (cf. `output_follows_os_default`).
+pub fn default_output_name() -> Option<String> {
+    super::com_exec::run(|| {
+        let host = super::host::active();
+        host.default_output_device().and_then(|d| d.name().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

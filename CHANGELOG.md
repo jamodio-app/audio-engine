@@ -4,6 +4,22 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-3] — 2026-07-25 (pré-release)
+
+Chantier **sortie audio mode agent** (« Défaut système » suit l'OS en live).
+
+### Corrigé
+- **L'instrument (self-monitor) ne suivait pas le changement de sortie par
+  défaut de l'OS en session.** En « Défaut système », le stream de sortie de
+  l'agent était ouvert une fois au démarrage et jamais réouvert : si l'on
+  changeait la sortie OS pendant une session, backing/métronome (via navigateur)
+  suivaient mais l'instrument (via l'agent) restait collé à l'ancienne sortie.
+  Un superviseur sonde désormais le défaut de sortie OS (~1 s, **hors thread
+  audio → zéro latence**) et, quand « Défaut système » est actif (CoreAudio/
+  WASAPI, jamais ASIO), réouvre le playback sur le nouveau défaut. Une sortie
+  **explicitement** choisie n'est jamais écrasée. Invariant testé
+  (`should_follow_os_default`).
+
 ## [0.5.10-2] — 2026-07-25 (pré-release)
 
 Chantier **sortie audio mode agent** (Lot B — énumération tolérante macOS).

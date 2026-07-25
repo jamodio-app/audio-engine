@@ -1610,6 +1610,10 @@ async fn audio_liveness_supervisor(
     // (parké, hors studio). Couvre les leave/rejoin rapides (anti-churn Focusrite)
     // puis libère l'interface pour un autre logiciel (DAW). Cf. `park`.
     const PARK_GRACE: Duration = Duration::from_secs(30);
+    // Lot A2 (0.5.10-3) — intervalle de sondage du défaut de sortie OS pour le
+    // suivi live du « Défaut système ». Événement rare et manuel → 1 s suffit
+    // largement, et c'est hors du thread audio (zéro latence).
+    const DEFAULT_OUT_POLL: Duration = Duration::from_secs(1);
 
     // Canal de signalisation kAsioResetRequest (stable pour la vie du pipeline).
     let reset_signal = { pipeline.lock().await.reset_signal() };
@@ -1635,6 +1639,11 @@ async fn audio_liveness_supervisor(
     let mut last_reset_seen = reset_signal.request_count();
     let mut degraded = false;
     let mut last_repair: Option<Instant> = None;
+    // Lot A2 — suivi live du défaut de sortie OS (« Défaut système »). `None` =
+    // pas de base établie (hors suivi, ou session pas encore observée). Le poll
+    // est étranglé à `DEFAULT_OUT_POLL` (le tick liveness est à 250 ms).
+    let mut last_default_out: Option<String> = None;
+    let mut last_default_check = Instant::now();
 
     loop {
         // Réveil : tick périodique (filet de liveness) OU demande de reset
@@ -1682,7 +1691,42 @@ async fn audio_liveness_supervisor(
             // prochain start rouvrira déjà à la cible courante. On la purge pour
             // éviter un rebuild parasite au démarrage suivant.
             crate::audio::buffer_policy::take_rebuild_request();
+            last_default_out = None; // hors session : oublie la base de suivi OS
             continue;
+        }
+
+        // Lot A2 (0.5.10-3) — SUIVI LIVE DU DÉFAUT DE SORTIE OS. Quand la sélection
+        // est « Défaut système » (host CoreAudio/WASAPI, pas ASIO) et que
+        // l'utilisateur change la sortie par défaut de l'OS EN SESSION, on réouvre
+        // le playback dessus → l'instrument suit l'OS (comme backing/métro via le
+        // navigateur). Sondage étranglé à 1 s, hors thread audio → zéro latence.
+        // La réouverture réutilise `restart_playback` (chemin éprouvé, gap couvert
+        // par le ring décodeur). Une sortie EXPLICITEMENT choisie n'est jamais
+        // suivie (gate dans `output_follows_os_default`).
+        if last_default_check.elapsed() >= DEFAULT_OUT_POLL {
+            last_default_check = Instant::now();
+            let follows = { pipeline.lock().await.output_follows_os_default() };
+            if follows {
+                // Lecture COM-safe du défaut OS courant (sans tenir le lock pipeline).
+                if let Some(cur) = crate::audio::device::default_output_name() {
+                    match last_default_out.as_deref() {
+                        // Base établie ET le défaut a changé → réouvre le playback.
+                        Some(prev) if prev != cur => {
+                            tracing::info!(
+                                target: "jamodio::ws",
+                                from = %prev,
+                                to = %cur,
+                                "défaut de sortie OS changé (Défaut système) → réouverture du playback"
+                            );
+                            pipeline.lock().await.follow_os_default_output();
+                        }
+                        _ => {} // inchangé
+                    }
+                    last_default_out = Some(cur); // (re)pose la base courante
+                }
+            } else {
+                last_default_out = None; // sortie explicite / ASIO / inactif → pas de suivi
+            }
         }
 
         // 0.5.4-17 — backoff de buffer demandé par le flush `perfstats` (64 → 128

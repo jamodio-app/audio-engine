@@ -464,6 +464,22 @@ fn output_fallback_from(output_id: Option<&str>, requested_found: bool) -> Optio
     }
 }
 
+/// Lot A2 (0.5.10-3) — le playback doit-il SUIVRE le défaut de sortie OS en
+/// live ? PUR. Vrai UNIQUEMENT si : sélection « Défaut système » (`output_id`
+/// None — une sélection explicite de device n'est JAMAIS écrasée par un
+/// changement OS), host **non-ASIO** (CoreAudio/WASAPI ; en ASIO la sortie = la
+/// même interface que l'entrée, pas de notion de défaut OS), playback ouvert, et
+/// session en capture. Le superviseur (`audio_liveness_supervisor`) réouvre le
+/// playback sur le nouveau défaut quand ceci est vrai et que le défaut OS change.
+fn should_follow_os_default(
+    output_id: Option<&str>,
+    is_asio: bool,
+    playback_active: bool,
+    capturing: bool,
+) -> bool {
+    output_id.is_none() && !is_asio && playback_active && capturing
+}
+
 #[cfg(test)]
 mod output_fallback_tests {
     use super::output_fallback_from;
@@ -494,6 +510,32 @@ mod output_fallback_tests {
         // quel que soit `requested_found` (non pertinent quand aucune sortie précise).
         assert_eq!(output_fallback_from(None, false), None);
         assert_eq!(output_fallback_from(None, true), None);
+    }
+}
+
+#[cfg(test)]
+mod follow_os_default_tests {
+    use super::should_follow_os_default;
+
+    // Invariant Lot A2 : « Défaut système » (None) + non-ASIO + playback + capture.
+    #[test]
+    fn follows_only_when_system_default_non_asio_active() {
+        assert!(should_follow_os_default(None, false, true, true), "cas nominal : suit l'OS");
+    }
+    #[test]
+    fn explicit_device_never_followed() {
+        // Une sortie explicitement choisie n'est jamais écrasée par un changement OS.
+        assert!(!should_follow_os_default(Some("3:Casque"), false, true, true));
+    }
+    #[test]
+    fn asio_never_followed() {
+        // ASIO : sortie = interface d'entrée, pas de défaut OS à suivre.
+        assert!(!should_follow_os_default(None, true, true, true));
+    }
+    #[test]
+    fn inactive_playback_or_idle_not_followed() {
+        assert!(!should_follow_os_default(None, false, false, true), "pas de playback");
+        assert!(!should_follow_os_default(None, false, true, false), "hors capture");
     }
 }
 
@@ -1459,6 +1501,37 @@ impl PipelineState {
             // duplex de start_capture).
             OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
         }
+    }
+
+    /// Lot A2 (0.5.10-3) — le playback suit-il le défaut de sortie OS ? (« Défaut
+    /// système » sélectionné, host non-ASIO, playback ouvert, session en capture).
+    /// Interrogé périodiquement par `audio_liveness_supervisor` : quand vrai ET
+    /// que le défaut OS change, il appelle `follow_os_default_output`.
+    pub fn output_follows_os_default(&self) -> bool {
+        should_follow_os_default(
+            self.output_device_id.as_deref(),
+            Self::host_is_asio(),
+            self.playback_stream.is_some(),
+            matches!(self.state, AgentState::Capturing),
+        )
+    }
+
+    /// Lot A2 — réouvre le playback sur le défaut de sortie OS COURANT. Appelé par
+    /// le superviseur quand « Défaut système » est actif et que le défaut OS a
+    /// changé. `output_device_id` reste `None` → `restart_playback` rouvre le
+    /// nouveau défaut (résolution `default_output_device()`). Mixer conservé, gap
+    /// couvert par le ring buffer décodeur (comme un changement de device manuel).
+    /// Hors thread audio → zéro latence ajoutée à la pipeline.
+    pub fn follow_os_default_output(&mut self) {
+        // Garde anti-race : l'état a pu changer entre le sondage du superviseur
+        // (lock relâché pendant la lecture COM du défaut OS) et cet appel — fin de
+        // session, ou sélection explicite d'une sortie. On ne réouvre QUE si le
+        // suivi est TOUJOURS pertinent → jamais de playback orphelin sur un
+        // pipeline idle, jamais d'écrasement d'un device explicitement choisi.
+        if !self.output_follows_os_default() {
+            return;
+        }
+        self.restart_playback();
     }
 
     /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
