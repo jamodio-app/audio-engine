@@ -70,8 +70,66 @@ fn main() {
         Err(e) => println!("host.output_devices() a échoué : {e}"),
     }
 
+    // 3) Test décisif : tente d'OUVRIR chaque device en forçant 48k/2ch (SANS
+    //    jouer de son — build seul, pas de play()). Si un device dont
+    //    `supported_output_configs` échoue s'ouvre quand même → on POURRAIT le
+    //    proposer (ex. port jack inactif « Écouteurs externes »). Sinon → non
+    //    ouvrable, exclusion CPAL justifiée.
+    println!("\n── test d'ouverture forcée 48k/2ch (build sans play) ──");
+    if let Ok(devs) = host.devices() {
+        let config = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(48_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        for (i, d) in devs.enumerate() {
+            let name = d.name().unwrap_or_else(|_| "<sans nom>".into());
+            let res = d.build_output_stream(
+                &config,
+                move |data: &mut [f32], _| data.fill(0.0), // silence
+                move |err| eprintln!("stream err: {err}"),
+                None,
+            );
+            match res {
+                Ok(_stream) => println!("[{i}] {name} → OUVRABLE (48k/2ch) ✅"),
+                Err(e) => println!("[{i}] {name} → non ouvrable : {e}"),
+            }
+        }
+    }
+
+    // 4) Réplique de la NOUVELLE énumération tolérante macOS (list_outputs) :
+    //    host.devices() + inclut si config queryable OU build-probe ok.
+    println!("\n── NOUVELLE liste tolérante (= list_outputs macOS après fix) ──");
+    let default = host
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_default();
+    if let Ok(devs) = host.devices() {
+        let probe_cfg = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(48_000),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        for (idx, d) in devs.enumerate() {
+            let Ok(name) = d.name() else { continue };
+            let (keep, how) = if d.default_output_config().is_ok() {
+                (true, "config")
+            } else if d
+                .build_output_stream(&probe_cfg, |x: &mut [f32], _| x.fill(0.0), |_| {}, None)
+                .is_ok()
+            {
+                (true, "probe")
+            } else {
+                (false, "-")
+            };
+            if keep {
+                let def = if name == default { " (défaut)" } else { "" };
+                println!("  {idx}:{name}{def}  [{how}]");
+            }
+        }
+    }
     println!(
         "\n=> Compare : un device présent en (1) mais ABSENT de (2) est écarté par \
-         le pré-filtre CPAL (récupérable). Absent des DEUX = caché par macOS."
+         le pré-filtre CPAL. La liste (4) le RÉCUPÈRE si build-probe ok."
     );
 }

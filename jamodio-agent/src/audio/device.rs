@@ -149,9 +149,20 @@ fn list_outputs_inner() -> Vec<AudioDevice> {
 
     let host = super::host::active();
     let default = host.default_output_device().and_then(|d| d.name().ok());
+    let list = enumerate_outputs(&host, default.as_deref());
+    *OUTPUT_CACHE.lock().unwrap() = Some(list.clone());
+    list
+}
 
+/// Énumération des sorties — **Windows (WASAPI/ASIO)** : strictement inchangée,
+/// `host.output_devices()` (le pré-filtre CPAL). On NE probe PAS sur Windows :
+/// ouvrir un driver ASIO mono-client pour tester l'ouvrabilité le rechargerait
+/// (cause racine du gel Focusrite). L'index de l'id = position dans
+/// `host.output_devices()` (cohérent avec `get_output_device` non-macOS).
+#[cfg(not(target_os = "macos"))]
+fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevice> {
     let Ok(devices) = host.output_devices() else { return vec![] };
-    let list: Vec<AudioDevice> = devices
+    devices
         .enumerate()
         .filter_map(|(idx, d)| {
             let name = d.name().ok()?;
@@ -161,14 +172,89 @@ fn list_outputs_inner() -> Vec<AudioDevice> {
             Some(AudioDevice {
                 id: make_id(idx, &name),
                 name: name.clone(),
-                is_default: Some(&name) == default.as_ref(),
+                is_default: Some(name.as_str()) == default,
                 channels,
                 native_sample_rate,
             })
         })
+        .collect()
+}
+
+/// Énumération des sorties — **macOS (CoreAudio)** : TOLÉRANTE. CPAL
+/// `output_devices()` sous-liste : son pré-filtre écarte toute sortie dont
+/// `supported_output_configs()` échoue (« Invalid property value ») — ce qui
+/// arrive à des sorties RÉELLES et OUVRABLES (port jack intégré inactif
+/// « Écouteurs externes », HP sous un agrégat, etc. — prouvé 2026-07-25). On
+/// énumère donc `host.devices()` et on inclut un device s'il est réellement
+/// ouvrable en sortie : soit sa config est queryable (rapide), soit un
+/// build-probe 48 kHz/2ch réussit (SANS `play()` → aucun son). L'index de l'id
+/// = position dans `host.devices()` (cohérent avec `get_output_device` macOS).
+/// Résultat mis en cache par l'appelant → le probe ne tourne qu'au rebuild.
+#[cfg(target_os = "macos")]
+fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevice> {
+    let Ok(devices) = host.devices() else { return vec![] };
+    let mut recovered = 0usize;
+    let list: Vec<AudioDevice> = devices
+        .enumerate()
+        .filter_map(|(idx, d)| {
+            let name = d.name().ok()?;
+            // Chemin rapide : config de sortie queryable → vraie sortie, vrais canaux/SR.
+            if let Ok(cfg) = d.default_output_config() {
+                return Some(AudioDevice {
+                    id: make_id(idx, &name),
+                    name: name.clone(),
+                    is_default: Some(name.as_str()) == default,
+                    channels: cfg.channels(),
+                    native_sample_rate: cfg.sample_rate().0,
+                });
+            }
+            // Chemin lent : config non queryable (port inactif/agrégat). Le device
+            // est-il quand même OUVRABLE en sortie ? Build-probe 48k/2ch sans play.
+            // Les entrées (micros) échouent ici → exclues. Canaux/SR assumés au
+            // standard agent (48k/2ch) faute de query — la lecture force 48k de toute façon.
+            if probe_output_openable(&d) {
+                recovered += 1;
+                return Some(AudioDevice {
+                    id: make_id(idx, &name),
+                    name: name.clone(),
+                    is_default: Some(name.as_str()) == default,
+                    channels: 2,
+                    native_sample_rate: 48_000,
+                });
+            }
+            None // ni queryable ni ouvrable → pas une sortie utilisable
+        })
         .collect();
-    *OUTPUT_CACHE.lock().unwrap() = Some(list.clone());
+    if recovered > 0 {
+        tracing::info!(
+            target: "jamodio::devices",
+            recovered,
+            total = list.len(),
+            "énumération sortie tolérante : {recovered} sortie(s) récupérée(s) par build-probe (config CoreAudio non queryable mais ouvrable)"
+        );
+    }
     list
+}
+
+/// macOS — teste si un device est ouvrable en SORTIE en forçant 48 kHz/2ch
+/// (build du stream SANS `play()` → aucun son émis, drop immédiat). Discrimine
+/// les vraies sorties (ouvrent) des entrées/devices morts (échouent). Ne tourne
+/// que pour les devices dont la config n'est pas queryable (chemin lent).
+#[cfg(target_os = "macos")]
+fn probe_output_openable(device: &cpal::Device) -> bool {
+    let config = cpal::StreamConfig {
+        channels: 2,
+        sample_rate: cpal::SampleRate(48_000),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    device
+        .build_output_stream(
+            &config,
+            |data: &mut [f32], _| data.fill(0.0), // silence — jamais play()é
+            |_err| {},
+            None,
+        )
+        .is_ok()
 }
 
 /// Return the default input device id (au format `"{idx}:{name}"`).
@@ -261,6 +347,14 @@ pub fn get_input_device(id: &str) -> Option<cpal::Device> {
 pub fn get_output_device(id: &str) -> Option<cpal::Device> {
     let (idx, expected_name) = parse_id(id)?;
     let host = super::host::active();
+    // L'index de l'id doit indexer la MÊME énumération que `enumerate_outputs` :
+    // macOS = `host.devices()` (tolérant, inclut les sorties ouvrables non
+    // queryables) ; Windows = `host.output_devices()` (inchangé). Sinon l'index
+    // glisse et la résolution stricte par nom rejette (→ repli non-fatal côté
+    // pipeline). La vérification de nom ci-dessous reste le garde strict.
+    #[cfg(target_os = "macos")]
+    let devices: Vec<cpal::Device> = host.devices().ok()?.collect();
+    #[cfg(not(target_os = "macos"))]
     let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
     let dev = devices.into_iter().nth(idx)?;
     let actual_name = dev.name().ok()?;

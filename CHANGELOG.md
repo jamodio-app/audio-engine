@@ -4,6 +4,22 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-2] — 2026-07-25 (pré-release)
+
+Chantier **sortie audio mode agent** (Lot B — énumération tolérante macOS).
+
+### Corrigé
+- **Sorties réelles manquantes dans le sélecteur (macOS).** L'énumération CPAL
+  `output_devices()` pré-filtre les sorties sur `supported_output_configs()`, qui
+  **échoue** pour des sorties pourtant OUVRABLES : port jack intégré inactif
+  (« Écouteurs externes »), HP intégrés quand un device virtuel enregistreur
+  possède la route, etc. → elles disparaissaient de la liste. L'agent énumère
+  désormais `host.devices()` et inclut toute sortie **réellement ouvrable**
+  (config queryable, ou build-probe 48 kHz/2ch réussi **sans jouer de son**).
+  Récupère les écouteurs/HP absents à tort. **macOS uniquement** — sur Windows,
+  l'énumération reste inchangée (probe interdit : ouvrir un driver ASIO
+  mono-client le rechargerait). Résultat mis en cache (probe au rebuild seul).
+
 ## [0.5.10-1] — 2026-07-25 (pré-release)
 
 Chantier **sortie audio mode agent** (Lot A — picker de sortie CoreAudio).
