@@ -38,7 +38,10 @@ fn run_worker(items: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Compte les events par type dans les lignes NDJSON.
+/// Compte les events par type dans les lignes NDJSON. Utilisé uniquement par
+/// les tests macOS (probe AU réelle) → gaté pour ne pas être du code mort sur
+/// Windows (où `-D warnings` en CI transformerait le warning en erreur).
+#[cfg(target_os = "macos")]
 fn count_events(lines: &[String]) -> (usize, usize, usize) {
     let (mut b, mut p, mut e) = (0, 0, 0);
     for l in lines {
