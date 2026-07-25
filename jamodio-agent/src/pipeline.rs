@@ -97,7 +97,16 @@ struct BuiltInput {
 
 /// Résultat de l'ouverture d'un stream de sortie sur le thread COM-STA.
 enum OutputOpen {
-    Opened { stream: SendStream, buffer: Option<u32>, name: String },
+    Opened {
+        stream: SendStream,
+        buffer: Option<u32>,
+        name: String,
+        /// Lot A (0.5.10) — `Some(id)` si une sortie précise avait été demandée
+        /// mais était introuvable, et qu'on a ouvert la sortie par défaut
+        /// système À LA PLACE (repli non-fatal). `None` = sortie demandée
+        /// ouverte, ou aucune sortie précise (défaut demandé explicitement).
+        fallback_from: Option<String>,
+    },
     NotFound,
     BuildFailed(String),
     /// 0.5.3-4 — un stream de playback tournait déjà (re-StartCapture « à chaud »)
@@ -209,6 +218,12 @@ struct AcquiredAudio {
     input_buf: Option<u32>,
     in_name: String,
     resolved_input_id: String,
+    /// Lot A (0.5.10) — nom de la sortie effectivement ouverte (vide si playback
+    /// désactivé / réutilisation ASIO sans info sortie séparée).
+    output_name: String,
+    /// Lot A (0.5.10) — `true` si la sortie demandée était introuvable et qu'on
+    /// a ouvert la sortie par défaut système à la place (repli non-fatal).
+    output_fallback: bool,
 }
 
 /// Résout le device de sortie + ouvre le stream playback **sur le thread
@@ -237,7 +252,7 @@ fn open_output_on_com(
         // de cold-start full-duplex à éviter, donc build+play immédiat suffit.
         match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks, output_frames) {
             Ok((stream, buffer)) => match stream.play() {
-                Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name },
+                Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name, fallback_from: None },
                 Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
             },
             Err(e) => OutputOpen::BuildFailed(format!("{}", e)),
@@ -351,16 +366,33 @@ fn open_duplex_on_com(
 
         // --- SORTIE : résolution + build (SANS play) + play, si nécessaire ---
         let output = if build_output {
-            let dev = match output_id.as_deref() {
-                Some(id) => crate::audio::device::get_output_device(id),
-                None => crate::audio::device::default_output_device().map(|(d, _)| d),
+            // Lot A (0.5.10) — résolution NON-FATALE. Une sortie précise demandée
+            // (via select-devices) qui ne résout plus (index CPAL glissé / device
+            // retiré) ne doit JAMAIS bloquer l'entrée en session : on retombe sur
+            // la sortie par défaut système + on remonte `fallback_from` jusqu'au
+            // browser (picker → « Défaut système » + toast). Repli VISIBLE, jamais
+            // silencieux (charte). Si même la sortie par défaut est absente
+            // (Mac sans aucune sortie), on dégrade en BuildFailed = playback
+            // désactivé, capture active (parité avec l'échec de build existant).
+            let requested_dev = output_id
+                .as_deref()
+                .and_then(crate::audio::device::get_output_device);
+            let fallback_from = output_fallback_from(output_id.as_deref(), requested_dev.is_some());
+            if let Some(req) = &fallback_from {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested = %req,
+                    "sortie demandée introuvable au start — repli sur la sortie par défaut système (non-fatal)"
+                );
+            }
+            let dev = match requested_dev {
+                Some(d) => Some(d), // sortie demandée trouvée
+                None => crate::audio::device::default_output_device().map(|(d, _)| d), // défaut (demandé ou repli)
             };
             match dev {
-                None => {
-                    // Sortie introuvable = fatal. `in_stream` (non démarré) est
-                    // droppé ici, sur le thread COM-STA. Erreur claire.
-                    return Err(CaptureStartError::OutputDeviceNotFound { requested: output_id });
-                }
+                None => OutputOpen::BuildFailed(
+                    "aucune sortie disponible (ni demandée ni défaut système)".to_string(),
+                ),
                 Some(d) => {
                     let out_name = d.name().unwrap_or_default();
                     match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames) {
@@ -370,6 +402,7 @@ fn open_duplex_on_com(
                                 stream: SendStream(out_stream),
                                 buffer,
                                 name: out_name,
+                                fallback_from,
                             },
                             Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
                         },
@@ -415,6 +448,53 @@ fn open_duplex_on_com(
             reset_guard,
         })
     })
+}
+
+/// Lot A (0.5.10) — décision de REPLI de sortie (PURE, testable). Encode
+/// l'invariant du lot : une sortie PRÉCISE demandée (`Some(id)`) mais absente
+/// (`requested_found == false`) ⇒ on retombera sur la sortie par défaut système
+/// et on le SIGNALE (`Some(id)`). Tout autre cas (sortie demandée trouvée, ou
+/// défaut demandé explicitement `None`) ⇒ pas de repli (`None`). Ne bloque
+/// jamais : le seul chemin d'échec possible en aval est « aucune sortie du tout »
+/// (dégradé en playback désactivé, capture active). Cf. `open_duplex_on_com`.
+fn output_fallback_from(output_id: Option<&str>, requested_found: bool) -> Option<String> {
+    match output_id {
+        Some(id) if !requested_found => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod output_fallback_tests {
+    use super::output_fallback_from;
+
+    // Invariant Lot A (0.5.10) : une sortie invalide ne bloque JAMAIS le start —
+    // elle est signalée comme repli (fallback_from = Some), jamais fatale.
+    #[test]
+    fn requested_missing_marks_fallback() {
+        assert_eq!(
+            output_fallback_from(Some("3:Casque débranché"), false),
+            Some("3:Casque débranché".to_string()),
+            "sortie demandée absente → repli signalé (jamais fatal)"
+        );
+    }
+
+    #[test]
+    fn requested_found_no_fallback() {
+        assert_eq!(
+            output_fallback_from(Some("0:Haut-parleurs MacBook Pro"), true),
+            None,
+            "sortie demandée trouvée → aucun repli"
+        );
+    }
+
+    #[test]
+    fn default_requested_no_fallback() {
+        // `None` = « Défaut système » demandé explicitement → jamais un repli,
+        // quel que soit `requested_found` (non pertinent quand aucune sortie précise).
+        assert_eq!(output_fallback_from(None, false), None);
+        assert_eq!(output_fallback_from(None, true), None);
+    }
 }
 
 /// Ferme (drop) un `cpal::Stream` **sur le thread COM-STA** (Windows) / inline
@@ -476,6 +556,13 @@ pub struct CaptureStartedInfo {
     /// est actif → ~29 ms de latence cachée. Le browser surface un badge
     /// rouge UI sur la base de cette valeur.
     pub native_sample_rate: u32,
+    /// Lot A (0.5.10) — nom de la sortie effectivement ouverte (vide si playback
+    /// désactivé). Informatif côté UI.
+    pub output_name: String,
+    /// Lot A (0.5.10) — `true` si la sortie demandée était introuvable → repli
+    /// sur la sortie par défaut système (le browser remet le picker sur
+    /// « Défaut système » + toast). Repli VISIBLE (charte : jamais silencieux).
+    pub output_fallback: bool,
 }
 
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
@@ -1347,7 +1434,7 @@ impl PipelineState {
             self.perfstats.output_callbacks.clone(),
             self.perfstats.output_frames.clone(),
         ) {
-            OutputOpen::Opened { stream, buffer, name } => {
+            OutputOpen::Opened { stream, buffer, name, .. } => {
                 self.playback_stream = Some(stream);
                 self.output_buffer_samples = buffer;
                 tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
@@ -1589,6 +1676,10 @@ impl PipelineState {
                 input_buf: w.input_buf,
                 in_name: w.in_name.clone(),
                 resolved_input_id: w.resolved_input_id.clone(),
+                // ASIO chaud réutilisé : sortie = même interface que l'entrée,
+                // déjà ouverte au 1er start → jamais de repli à signaler ici.
+                output_name: w.in_name.clone(),
+                output_fallback: false,
             });
         }
 
@@ -1635,28 +1726,36 @@ impl PipelineState {
             self.perfstats.capture_feeding.clone(),
             self.reset_signal.clone(),
         )?;
-        let (channels_in, native_sr, input_buf, in_name, resolved_input_id) = match built {
+        let (channels_in, native_sr, input_buf, in_name, resolved_input_id, output_name, output_fallback) = match built {
             BuiltDuplex::Cpal { input, output, reset_guard } => {
                 self.reset_guard = Some(reset_guard);
                 tracing::info!(target: "jamodio::pipeline", device = %input.name, "input device opened");
                 self.input_buffer_samples = input.input_buf;
-                let meta = (input.channels, input.native_sr, input.input_buf, input.name, input.resolved_id);
+                let in_meta = (input.channels, input.native_sr, input.input_buf, input.name, input.resolved_id);
                 self.capture_stream = Some(input.stream);
-                match output {
-                    OutputOpen::Opened { stream, buffer, name } => {
-                        tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                let (out_name, out_fallback) = match output {
+                    OutputOpen::Opened { stream, buffer, name, fallback_from } => {
+                        if let Some(req) = &fallback_from {
+                            tracing::warn!(target: "jamodio::pipeline", requested = %req, device = %name, "output device opened en REPLI sur la sortie par défaut (sortie demandée introuvable)");
+                        } else {
+                            tracing::info!(target: "jamodio::pipeline", device = %name, "output device opened");
+                        }
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
+                        (name, fallback_from.is_some())
                     }
-                    OutputOpen::BuildFailed(e) => tracing::warn!(
-                        target: "jamodio::pipeline",
-                        error = %e,
-                        "ouverture du stream de sortie échouée — playback désactivé (capture active)"
-                    ),
+                    OutputOpen::BuildFailed(e) => {
+                        tracing::warn!(
+                            target: "jamodio::pipeline",
+                            error = %e,
+                            "ouverture du stream de sortie échouée — playback désactivé (capture active)"
+                        );
+                        (String::new(), false)
+                    }
                     OutputOpen::Skipped => unreachable!("build_output=true ⇒ jamais Skipped"),
-                    OutputOpen::NotFound => unreachable!("OutputDeviceNotFound déjà renvoyé par la closure"),
-                }
-                meta
+                    OutputOpen::NotFound => unreachable!("open_duplex_on_com ne produit plus NotFound (repli non-fatal)"),
+                };
+                (in_meta.0, in_meta.1, in_meta.2, in_meta.3, in_meta.4, out_name, out_fallback)
             }
             #[cfg(target_os = "windows")]
             BuiltDuplex::Asio(a) => {
@@ -1666,8 +1765,9 @@ impl PipelineState {
                 tracing::info!(target: "jamodio::pipeline", device = %a.name, "AsioDuplexHost — entrée + sortie ouvertes (single-owner)");
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
+                let out_name = a.name.clone(); // ASIO mono-device : sortie = même interface que l'entrée
                 self.asio_host = Some(a.host);
-                (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id)
+                (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id, out_name, false)
             }
         };
 
@@ -1694,6 +1794,8 @@ impl PipelineState {
             input_buf,
             in_name,
             resolved_input_id,
+            output_name,
+            output_fallback,
         })
     }
 
@@ -1735,6 +1837,8 @@ impl PipelineState {
             input_buf,
             in_name,
             resolved_input_id,
+            output_name,
+            output_fallback,
         } = self.prepare_audio_for_session(session_continues)?;
 
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
@@ -1913,6 +2017,8 @@ impl PipelineState {
             device_name: in_name,
             channels: channels_in,
             native_sample_rate: native_sr,
+            output_name,
+            output_fallback,
         };
         Ok((local_port, agent_srtp, info))
     }
@@ -2152,7 +2258,7 @@ impl PipelineState {
                 self.input_buffer_samples = input.input_buf;
                 self.capture_stream = Some(input.stream);
                 match output {
-                    OutputOpen::Opened { stream, buffer, name } => {
+                    OutputOpen::Opened { stream, buffer, name, .. } => {
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
                         tracing::info!(

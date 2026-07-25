@@ -4,6 +4,26 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-1] — 2026-07-25 (pré-release)
+
+Chantier **sortie audio mode agent** (Lot A — picker de sortie CoreAudio).
+
+### Corrigé
+- **Une préférence de sortie périmée ne bloque plus l'entrée en session.**
+  Avant, si la sortie sélectionnée (ex. un casque USB) n'était plus résolvable
+  au démarrage de la capture (index CoreAudio glissé, device retiré, sortie par
+  défaut système changée), l'agent **rejetait tout le StartCapture** → session
+  impossible. Désormais la résolution de sortie est **non-fatale** : l'agent
+  retombe sur la **sortie par défaut système** et le signale au navigateur
+  (nouveau `outputFallback` dans `CaptureStarted`) → le sélecteur revient sur
+  « Défaut système » + toast. Repli **visible**, jamais silencieux. L'entrée
+  (instrument) suivait déjà cette philosophie ; la sortie s'aligne.
+
+### Ajouté
+- `CaptureStarted` porte `outputName` + `outputFallback` (sortie effectivement
+  ouverte + drapeau de repli). Invariant testé : une sortie invalide ne bloque
+  jamais StartCapture (`output_fallback_from`).
+
 ## [0.5.9] — 2026-07-23
 
 Release **publique**. Refonte du **scan des plugins** (désormais hors-process,

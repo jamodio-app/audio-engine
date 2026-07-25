@@ -2001,6 +2001,8 @@ async fn handle_message(
                             device_name: info.device_name,
                             channels: info.channels,
                             native_sample_rate: info.native_sample_rate,
+                            output_name: info.output_name,
+                            output_fallback: info.output_fallback,
                         },
                     ]
                 }

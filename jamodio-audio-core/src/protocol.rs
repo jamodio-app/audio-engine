@@ -533,6 +533,19 @@ pub enum AgentMessage {
         /// par défaut en 44 100 Hz sur Realtek onboard).
         #[serde(rename = "nativeSampleRate")]
         native_sample_rate: u32,
+        /// Lot A sortie (0.5.10) — nom de la sortie EFFECTIVEMENT ouverte
+        /// (vide si le playback est désactivé). Purement informatif côté UI.
+        #[serde(rename = "outputName", default)]
+        output_name: String,
+        /// Lot A sortie (0.5.10) — `true` si une sortie PRÉCISE avait été
+        /// demandée (via `select-devices`) mais qu'elle était introuvable au
+        /// moment du start (index CPAL glissé / device retiré) → l'agent est
+        /// retombé sur la sortie par défaut système AU LIEU d'échouer. Le
+        /// browser doit alors remettre le picker sur « Défaut système » +
+        /// afficher un toast (repli VISIBLE, jamais silencieux — charte). Wire
+        /// back-compat : absent = ancien agent = pas de repli signalé.
+        #[serde(rename = "outputFallback", default)]
+        output_fallback: bool,
     },
     /// Erreur explicite quand la capture ne peut pas démarrer parce que le
     /// device demandé n'est pas trouvé. Plus de silent fallback to default :
