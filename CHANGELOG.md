@@ -4,6 +4,25 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-4] — 2026-07-25 (pré-release)
+
+Chantier **sortie audio mode agent** (Lot C — voix des pairs via l'agent).
+
+### Ajouté
+- **La voix (talkback) des pairs peut sortir par l'agent** (donc sur le device
+  d'écoute choisi), au lieu de rester sur la sortie système via le navigateur.
+  `AddStream` gagne un `mediaTag` (`instrument` par défaut / `voice`). Les flux
+  `voice` sont mixés dans un **étage dédié** : sommés APRÈS le tap RECORD et
+  APRÈS le DIM (comme la référence métronome) → **jamais enregistrés, jamais
+  duckés** (parité exacte avec le `voiceBus` du navigateur). Tranche unique avec
+  gain/pan de bus (`set-peer-voice-gain` / `set-peer-voice-pan`) ; niveau agrégé
+  remonté (`peer-voice`) pour le VU voix. Décodage mono inchangé (sûr).
+- **Latence : aucune sur la pipeline instrument/self-monitor** (étage voix
+  distinct) ; la voix suit le budget jitter des flux réseau (~7–13 ms),
+  imperceptible pour la parole.
+- Invariants testés : une voix n'entre jamais dans le RECORD (mix + stems) et
+  n'est jamais duckée par le DIM.
+
 ## [0.5.10-3] — 2026-07-25 (pré-release)
 
 Chantier **sortie audio mode agent** (« Défaut système » suit l'OS en live).

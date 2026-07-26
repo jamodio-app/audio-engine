@@ -1,5 +1,6 @@
 use super::reference::{Figure, MetroSound, OutputAnchor, ReferenceSource};
 use super::ring_buffer::JitterBuffer;
+use crate::protocol::StreamKind;
 use crate::record::RecordCmd;
 use crate::sync::clock::mono_now_ms;
 use crossbeam_channel::Sender;
@@ -84,6 +85,19 @@ pub struct AudioMixer {
     master_rms_r: f32,
     mix_rms_l: f32,
     mix_rms_r: f32,
+    /// Lot C (0.5.10-4) — accumulateur de la VOIX des pairs (talkback entrant).
+    /// Les streams `StreamKind::Voice` sont sommés ici (passe 1), puis ajoutés à
+    /// `output` dans `mix_into` APRÈS le tap RECORD et le DIM (comme la référence)
+    /// → jamais enregistrée, jamais duckée (parité `voiceBus` navigateur).
+    /// Réutilisé bloc à bloc (comme `temp_buf`) → zéro alloc RT.
+    voice_buf: Vec<f32>,
+    /// Gain/pan du BUS voix (une seule tranche, parité `voiceGain`/`voicePanNode`
+    /// navigateur). Le mute est porté par le gain (le web envoie 0.0). Défaut 1.0/0.0.
+    voice_gain: f32,
+    voice_pan: f32,
+    /// RMS (mono) de la voix des pairs effectivement mixée (post gain de bus) —
+    /// remonté via `stream-levels` pour le VU voix navigateur en mode agent.
+    inbound_voice_rms: f32,
 }
 
 /// RMS par canal d'un buffer stéréo entrelacé (L,R,L,R…). `(0,0)` si vide.
@@ -102,6 +116,9 @@ fn stereo_rms(buf: &[f32]) -> (f32, f32) {
 
 struct StreamState {
     jitter: JitterBuffer,
+    /// Lot C — nature du flux : `Instrument` (sommé dans le mix enregistré/duckable)
+    /// ou `Voice` (talkback pair, sommé post-tap/post-DIM via `voice_buf`).
+    kind: StreamKind,
     volume: f32,
     /// Pan range [-1.0, 1.0]. -1 = full left, 0 = center, +1 = full right.
     /// Loi de BALANCE stéréo linéaire dans `mix_into` (0 dB au centre :
@@ -150,6 +167,10 @@ impl AudioMixer {
             master_rms_r: 0.0,
             mix_rms_l: 0.0,
             mix_rms_r: 0.0,
+            voice_buf: Vec::new(),
+            voice_gain: 1.0,
+            voice_pan: 0.0,
+            inbound_voice_rms: 0.0,
         }
     }
 
@@ -185,6 +206,24 @@ impl AudioMixer {
         self.master_gain = if gain.is_finite() { gain.clamp(0.0, 1.5) } else { 1.0 };
     }
 
+    /// Lot C — gain du BUS voix (talkback pairs). Tranche unique : le web envoie
+    /// le gain EFFECTIF (valeur du fader, ou 0.0 pour le mute « M »). Clamp
+    /// [0.0, 1.5] (parité faders ; NaN → 1.0).
+    pub fn set_peer_voice_gain(&mut self, gain: f32) {
+        self.voice_gain = if gain.is_finite() { gain.clamp(0.0, 1.5) } else { 1.0 };
+    }
+
+    /// Lot C — balance du BUS voix, [-1.0, 1.0] (parité `voicePanNode`). NaN → 0.0.
+    pub fn set_peer_voice_pan(&mut self, pan: f32) {
+        self.voice_pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    }
+
+    /// Lot C — RMS mono de la voix des pairs effectivement mixée (post gain de
+    /// bus), pour le VU voix navigateur en mode agent. `0.0` si aucune voix.
+    pub fn inbound_voice_rms(&self) -> f32 {
+        self.inbound_voice_rms
+    }
+
     /// Helper interne : try_send vers le record thread sans bloquer.
     /// Drop silencieux si le channel est plein (thread en retard) — le warn
     /// est émis côté thread record qui surveille sa queue length.
@@ -195,13 +234,16 @@ impl AudioMixer {
     }
 
     /// Add a new remote stream.
-    pub fn add_stream(&mut self, producer_id: &str) {
+    /// Ajoute un stream entrant. `kind` (Lot C) route son mixage : `Instrument`
+    /// = mix enregistré/duckable ; `Voice` = talkback pair, sommé post-tap/post-DIM.
+    pub fn add_stream(&mut self, producer_id: &str, kind: StreamKind) {
         let mut jitter = JitterBuffer::new();
         if let Some(ms) = self.default_target_ms {
             jitter.set_target_ms(ms);
         }
         self.streams.insert(producer_id.to_string(), StreamState {
             jitter,
+            kind,
             volume: 1.0,
             pan: 0.0,
             rms: 0.0,
@@ -237,6 +279,7 @@ impl AudioMixer {
         jitter.set_local_mode(true);
         self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
             jitter,
+            kind: StreamKind::Instrument, // self-monitor = instrument (enregistré/duckable)
             volume: 0.0,
             pan: 0.0,
             rms: 0.0,
@@ -449,8 +492,15 @@ impl AudioMixer {
     pub fn push_samples(&mut self, producer_id: &str, samples: &[f32]) {
         // REC-3 : tap stem-peer. Pre-fader (avant `vol *` dans mix_into),
         // post Opus decode. On filtre SELF_MONITOR_ID car push_self_samples
-        // émet déjà son propre PushSelf (sinon double tap pour self).
-        if self.record_tx.is_some() && producer_id != SELF_MONITOR_ID && !samples.is_empty() {
+        // émet déjà son propre PushSelf (sinon double tap pour self). Lot C : on
+        // filtre aussi les flux VOIX — le talkback des pairs n'est jamais
+        // enregistré (parité `voiceBus` navigateur, hors `instrumentMixBus`). Le
+        // lookup de `kind` est court-circuité hors enregistrement (record_tx None).
+        if self.record_tx.is_some()
+            && producer_id != SELF_MONITOR_ID
+            && !samples.is_empty()
+            && self.streams.get(producer_id).is_none_or(|s| s.kind != StreamKind::Voice)
+        {
             self.record_send(RecordCmd::PushPeer(producer_id.to_string(), samples.to_vec()));
         }
 
@@ -554,9 +604,28 @@ impl AudioMixer {
         if self.temp_buf.len() != output.len() {
             self.temp_buf.resize(output.len(), 0.0);
         }
+        // Lot C — accumulateur voix (talkback pairs), sommé plus bas post-tap/post-DIM.
+        if self.voice_buf.len() != output.len() {
+            self.voice_buf.resize(output.len(), 0.0);
+        }
+        self.voice_buf.fill(0.0);
+        let mut any_voice = false;
 
+        // PASSE 1 — chaque stream est pull UNE fois (le jitter buffer se consomme) :
+        //   - INSTRUMENT/self → sommé (fader+balance) dans `output` ;
+        //   - VOICE (talkback pair) → accumulé BRUT dans `voice_buf` (pas de
+        //     fader/pan par pair : tranche unique, cf. décision Lot C) — le
+        //     gain/pan de bus s'applique après le DIM.
         for stream in self.streams.values_mut() {
             stream.jitter.pull(&mut self.temp_buf);
+
+            if stream.kind == StreamKind::Voice {
+                any_voice = true;
+                for (v, &sample) in self.voice_buf.iter_mut().zip(self.temp_buf.iter()) {
+                    *v += sample;
+                }
+                continue;
+            }
 
             let vol = stream.volume;
             // Balance stéréo — loi LINÉAIRE 0 dB au centre. Les streams sont
@@ -616,6 +685,34 @@ impl AudioMixer {
             }
         }
 
+        // Lot C — VOIX des pairs (talkback). Sommée ICI, exactement comme la
+        // référence : APRÈS le tap RECORD (⇒ jamais enregistrée) et APRÈS le DIM
+        // (⇒ jamais duckée : le talkback reste clair pendant que les instruments
+        // baissent), AVANT le master. Gain/pan de BUS unique (parité voiceGain/
+        // voicePanNode navigateur ; le mute = gain 0 envoyé par le web). Le VU
+        // voix lit `inbound_voice_rms` (mono, post-gain).
+        if any_voice && self.voice_gain > f32::EPSILON {
+            let (gl, gr) = pan_gains(self.voice_pan);
+            let gain_l = self.voice_gain * gl;
+            let gain_r = self.voice_gain * gr;
+            let mut i = 0;
+            while i + 1 < self.voice_buf.len() && i + 1 < output.len() {
+                output[i]     += self.voice_buf[i]     * gain_l;
+                output[i + 1] += self.voice_buf[i + 1] * gain_r;
+                i += 2;
+            }
+            // RMS mono post-gain (avant pan) pour le VU voix navigateur.
+            let frames = self.voice_buf.len() / 2;
+            if frames > 0 {
+                let sum_sq: f32 = self.voice_buf.iter().map(|s| s * s).sum();
+                self.inbound_voice_rms = (sum_sq / self.voice_buf.len() as f32).sqrt() * self.voice_gain;
+            } else {
+                self.inbound_voice_rms = 0.0;
+            }
+        } else {
+            self.inbound_voice_rms = 0.0;
+        }
+
         // Référence (métronome via l'agent — Option B). Ajoutée ICI, à un point
         // DÉDIÉ hors de la boucle streams :
         //   - APRÈS le tap record push_mix ⇒ EXCLUE du MIX enregistré (parité
@@ -658,16 +755,20 @@ impl AudioMixer {
     /// RMS level per stream (for VU meters sent to browser).
     /// Retourne `(producer_id, rms_global, rms_l, rms_r)` par stream. Le global
     /// reste utilisé pour les VU peers (1 valeur) ; L/R alimentent le VU self
-    /// stéréo (2 barres indépendantes) côté browser.
+    /// stéréo (2 barres indépendantes) côté browser. Lot C : les flux VOIX sont
+    /// EXCLUS (les VU pairs = instruments+self seuls) — la voix est un agrégat
+    /// unique remonté par `inbound_voice_rms()` (tranche voix navigateur).
     pub fn stream_rms(&self) -> Vec<(String, f32, f32, f32)> {
-        self.streams.iter().map(|(id, stream)| {
-            // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
-            // aux RMS L/R (stockés pré-pan) → le VU reflète le placement stéréo
-            // exactement comme le rendu (self + peers). Un flux mono a
-            // `rms_l = rms_r = rms` en amont ; le pan crée alors l'asymétrie.
-            let (gl, gr) = pan_gains(stream.pan);
-            (id.clone(), stream.rms, stream.rms_l * gl, stream.rms_r * gr)
-        }).collect()
+        self.streams.iter()
+            .filter(|(_, stream)| stream.kind != StreamKind::Voice)
+            .map(|(id, stream)| {
+                // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
+                // aux RMS L/R (stockés pré-pan) → le VU reflète le placement stéréo
+                // exactement comme le rendu (self + peers). Un flux mono a
+                // `rms_l = rms_r = rms` en amont ; le pan crée alors l'asymétrie.
+                let (gl, gr) = pan_gains(stream.pan);
+                (id.clone(), stream.rms, stream.rms_l * gl, stream.rms_r * gr)
+            }).collect()
     }
 
     /// Sprint S6 — purge la fenêtre glissante de drift drains et retourne
@@ -796,7 +897,7 @@ mod tests {
     #[test]
     fn rms_par_canal_l_r_independants() {
         let mut m = AudioMixer::new();
-        m.add_stream("p1");
+        m.add_stream("p1", StreamKind::Instrument);
         // Entrelacé stéréo : L = 1.0 partout, R = 0.0 partout.
         let mut s = Vec::new();
         for _ in 0..100 { s.push(1.0); s.push(0.0); }
@@ -814,7 +915,7 @@ mod tests {
     #[test]
     fn vu_rms_reflete_le_pan_mono() {
         let mut m = AudioMixer::new();
-        m.add_stream("p1");
+        m.add_stream("p1", StreamKind::Instrument);
         // Source mono dupliquée : L = R = 1.0 (200 samples = 100 frames stéréo).
         let s = vec![1.0f32; 200];
         m.push_samples("p1", &s);
@@ -842,7 +943,7 @@ mod tests {
     #[test]
     fn master_rms_reflete_le_mix_pane() {
         let mut m = AudioMixer::new();
-        m.add_stream("p1");
+        m.add_stream("p1", StreamKind::Instrument);
         let ones = vec![1.0f32; 48_000];
         let mut out = vec![0.0f32; 512];
         // Centre.
@@ -865,7 +966,7 @@ mod tests {
     /// retourne (gain_L_effectif, gain_R_effectif) mesurés sur la sortie.
     fn measure_gains(pan: f32) -> (f32, f32) {
         let mut m = AudioMixer::new();
-        m.add_stream("p1");
+        m.add_stream("p1", StreamKind::Instrument);
         m.set_pan("p1", pan);
         // Remplit le jitter buffer au-delà de sa target pour que pull()
         // rende le signal (et pas du silence de prime).
@@ -909,7 +1010,7 @@ mod tests {
     fn set_target_ms_all_excludes_self_monitor() {
         let mut m = AudioMixer::new();
         m.add_local_stream();
-        m.add_stream("peer");
+        m.add_stream("peer", StreamKind::Instrument);
         m.set_target_ms_all(40);
         let (self_target, _) = m.self_monitor_stats();
         assert_eq!(self_target, SELF_MONITOR_TARGET_MS, "self-monitor préservé");
@@ -924,7 +1025,7 @@ mod tests {
     fn set_volume_rejects_nan() {
         let (l, _r) = {
             let mut m = AudioMixer::new();
-            m.add_stream("p1");
+            m.add_stream("p1", StreamKind::Instrument);
             m.set_volume("p1", f32::NAN);
             let ones = vec![1.0f32; 48_000];
             m.push_samples("p1", &ones);
@@ -933,5 +1034,60 @@ mod tests {
             (out[0], out[1])
         };
         assert!(l.is_finite() && l > 0.5, "volume NaN → fallback 1.0, got {l}");
+    }
+
+    // ─── Lot C — invariants voix des pairs (0.5.10-4) ─────────────────────────
+
+    /// INVARIANT : la voix des pairs n'est JAMAIS duckée par le DIM. Avec DIM=0
+    /// (instruments coupés), la voix reste pleinement audible en sortie (parité
+    /// `voiceBus` navigateur : talkback clair pendant que les instruments baissent).
+    #[test]
+    fn voice_is_never_ducked_by_dim() {
+        let mut m = AudioMixer::new();
+        m.add_stream("inst", StreamKind::Instrument);
+        m.add_stream("voice", StreamKind::Voice);
+        let ones = vec![1.0f32; 48_000];
+        m.push_samples("inst", &ones);
+        m.push_samples("voice", &ones);
+        m.set_dim(0.0); // duck TOTAL des instruments
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        let rms: f32 = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(rms > 0.5, "voix audible malgré DIM=0 (jamais duckée), rms={rms}");
+        assert!(m.inbound_voice_rms() > 0.5, "RMS voix remonté pour le VU, got {}", m.inbound_voice_rms());
+    }
+
+    /// INVARIANT : la voix des pairs n'entre JAMAIS dans le RECORD — ni dans le
+    /// stem par pair (`PushPeer`), ni dans le MIX (`PushMix`). Parité `voiceBus`
+    /// navigateur (talkback hors `instrumentMixBus`).
+    #[test]
+    fn voice_is_never_recorded() {
+        use crate::record::RecordCmd;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut m = AudioMixer::new();
+        m.set_record_tx(Some(tx));
+        m.add_stream("inst", StreamKind::Instrument);
+        m.add_stream("voice", StreamKind::Voice);
+        let ones = vec![1.0f32; 48_000];
+        m.push_samples("inst", &ones);   // → stem PushPeer("inst")
+        m.push_samples("voice", &ones);  // → PAS de stem (voix)
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);            // → PushMix = instruments SEULS
+        let mut peer_stems = Vec::new();
+        let mut mix_rms = 0.0f32;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                RecordCmd::PushPeer(id, _) => peer_stems.push(id),
+                RecordCmd::PushMix(buf) => {
+                    mix_rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+                }
+                _ => {}
+            }
+        }
+        assert!(peer_stems.iter().any(|id| id == "inst"), "stem instrument enregistré");
+        assert!(!peer_stems.iter().any(|id| id == "voice"), "stem voix JAMAIS enregistré");
+        // MIX enregistré = instrument seul (rms≈1). Si la voix avait fuité dans le
+        // tap (pré-voix), le mix vaudrait ~2 (deux sources à 1.0).
+        assert!((mix_rms - 1.0).abs() < 0.2, "MIX enregistré = instruments seuls, voix exclue (rms={mix_rms})");
     }
 }

@@ -15,7 +15,7 @@ use jamodio_audio_core::perfstats::Histogram;
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::audio::midi::CapturedMidiEvent;
-use jamodio_audio_core::protocol::AgentState;
+use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 use jamodio_audio_core::sync::jitter::JitterEstimator;
@@ -2383,6 +2383,7 @@ impl PipelineState {
         sfu_ip: String,
         sfu_port: u16,
         sfu_srtp: SrtpParameters,
+        media_tag: StreamKind,
     ) -> Result<(u16, SrtpParameters), String> {
         // Remove existing if any
         self.remove_stream(&producer_id);
@@ -2447,7 +2448,7 @@ impl PipelineState {
         self.recv_epoch = self.recv_epoch.wrapping_add(1);
         let epoch = self.recv_epoch;
         tokio::spawn(async move {
-            recv_io_task(receiver, sfu_addr, pid, epoch, tx, pool_rx, stop_rx).await;
+            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, tx, pool_rx, stop_rx).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
@@ -3905,6 +3906,9 @@ enum DecodeMsg {
         epoch: u64,
         recv_instant: std::time::Instant,
         buf: Vec<u8>,
+        /// Lot C — nature du flux (constante pour le producteur) : détermine
+        /// l'étage de mix au 1er paquet (`mixer.add_stream(kind)`).
+        kind: StreamKind,
     },
     /// Pair terminé (stop ou idle-timeout) : envoyé en DERNIER par l'io task →
     /// le thread retire l'état + le stream mixer APRÈS le dernier paquet du pair
@@ -4011,7 +4015,7 @@ fn decode_rt_loop(
                     net_stats_by_producer.lock().remove(&*producer_id);
                 }
             }
-            DecodeMsg::Packet { producer_id, epoch, recv_instant, buf } => {
+            DecodeMsg::Packet { producer_id, epoch, recv_instant, buf, kind } => {
                 // (Re)création de l'état + du stream mixer selon la génération.
                 let needs_create = match states.get(&producer_id) {
                     Some(st) if st.epoch == epoch => false,
@@ -4032,7 +4036,7 @@ fn decode_rt_loop(
                 if needs_create {
                     match DecodeState::new(&producer_id, epoch) {
                         Some(st) => {
-                            mixer.lock().add_stream(&producer_id);
+                            mixer.lock().add_stream(&producer_id, kind);
                             states.insert(producer_id.clone(), st);
                         }
                         None => {
@@ -4156,6 +4160,7 @@ async fn recv_io_task(
     sfu_addr: SocketAddr,
     producer_id: Arc<str>,
     epoch: u64,
+    kind: StreamKind,
     tx: Sender<DecodeMsg>,
     pool_rx: Receiver<Vec<u8>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -4215,6 +4220,7 @@ async fn recv_io_task(
                                 epoch,
                                 recv_instant,
                                 buf: full,
+                                kind,
                             })
                             .is_err()
                         {

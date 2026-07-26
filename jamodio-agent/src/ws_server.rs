@@ -561,9 +561,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
-            let (rms_data, master_mix) = {
+            let (rms_data, master_mix, peer_voice_rms) = {
                 let m = pl.mixer.lock();
-                (m.stream_rms(), m.master_mix_rms())
+                (m.stream_rms(), m.master_mix_rms(), m.inbound_voice_rms())
             };
             // Sprint B talkback auto-mute : lit input_rms (instrument self post-plugin)
             // et midi_active (Note ON dans les ~200 dernières ms) pour piloter le
@@ -596,7 +596,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback n'a pas d'analyser navigateur et dépend exclusivement de ce
             // push. Sans lui, parler SEUL — pas de peer, instrument silencieux —
             // n'émettait aucun StreamLevels et le VU talkback restait figé.
-            let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0;
+            let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0 || peer_voice_rms > 0.0;
             if !rms_data.is_empty() || has_self_signal {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
@@ -630,6 +630,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     rms: voice_rms,
                     rms_l: Some(voice_rms),
                     rms_r: Some(voice_rms),
+                });
+                // Lot C — niveau agrégé de la voix des PAIRS reçue via l'agent
+                // (mono, une tranche) → VU voix navigateur en mode agent-routé.
+                levels.push(StreamLevel {
+                    producer_id: "peer-voice".into(),
+                    rms: peer_voice_rms,
+                    rms_l: Some(peer_voice_rms),
+                    rms_r: Some(peer_voice_rms),
                 });
                 let msg = AgentMessage::StreamLevels {
                     levels,
@@ -2144,11 +2152,12 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, .. } => {
+        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, media_tag, .. } => {
             tracing::info!(
                 target: "jamodio::ws",
                 producer = &producer_id[..8.min(producer_id.len())],
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
+                ?media_tag,
                 "AddStream"
             );
             // Setup critique du montage d'un flux entrant (join d'un peer) : on
@@ -2158,7 +2167,7 @@ async fn handle_message(
             let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
                 return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
             };
-            match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters).await {
+            match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters, media_tag).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id,
                     port: local_port,
@@ -2336,6 +2345,22 @@ async fn handle_message(
                 return vec![];
             };
             pl.mixer.lock().set_dim(factor);
+            vec![]
+        }
+
+        // Lot C — bus voix des pairs (talkback via l'agent). Tranche unique.
+        BrowserMessage::SetPeerVoiceGain { gain } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().set_peer_voice_gain(gain);
+            vec![]
+        }
+        BrowserMessage::SetPeerVoicePan { pan } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.mixer.lock().set_peer_voice_pan(pan);
             vec![]
         }
 

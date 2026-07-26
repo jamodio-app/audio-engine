@@ -28,6 +28,22 @@ fn default_pulse_ratio() -> f64 {
     1.0
 }
 
+/// Lot C (0.5.10-4) — nature d'un flux entrant (`AddStream`), pilote son étage de
+/// mix côté agent :
+///   - `Instrument` (défaut) : sommé dans le mix instruments → **enregistré**
+///     (tap RECORD) et **duckable** (DIM) ;
+///   - `Voice` : talkback d'un pair, sommé APRÈS le tap RECORD et le DIM → jamais
+///     enregistré, jamais ducké (parité `voiceBus` navigateur).
+///
+/// Rétrocompat wire : champ absent (vieux web) → `Instrument`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamKind {
+    #[default]
+    Instrument,
+    Voice,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BrowserMessage {
@@ -135,6 +151,10 @@ pub enum BrowserMessage {
         /// Clés SRTP du SFU pour ce flux (reçues dans `plain-consumer-created`).
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
+        /// Lot C (0.5.10-4) — nature du flux (instrument par défaut / voix). Pilote
+        /// son étage de mix (cf. `StreamKind`). Absent = vieux web = instrument.
+        #[serde(rename = "mediaTag", default)]
+        media_tag: StreamKind,
     },
     RemoveStream {
         #[serde(rename = "producerId")]
@@ -204,6 +224,16 @@ pub enum BrowserMessage {
     /// peer entendrait, indépendant de mon écoute locale dim/master).
     SetDim {
         factor: f32,
+    },
+    /// Lot C (0.5.10-4) — gain du BUS voix (talkback des pairs reçu via l'agent).
+    /// Tranche unique : le web envoie le gain EFFECTIF (valeur du fader, ou `0.0`
+    /// pour le mute « M »). Distinct de `set-voice-gain` (capture/envoi).
+    SetPeerVoiceGain {
+        gain: f32,
+    },
+    /// Lot C (0.5.10-4) — balance du BUS voix des pairs, [-1.0, 1.0].
+    SetPeerVoicePan {
+        pan: f32,
     },
     /// Sprint INSERT (S1) — liste les plugins natifs installés sur la machine.
     /// L'agent répond avec `PluginList` qui contient le snapshot du cache de
