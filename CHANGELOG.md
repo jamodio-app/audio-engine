@@ -4,6 +4,18 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-5] — 2026-07-26 (pré-release)
+
+### Corrigé
+- **Talkback des pairs coupé après ~8 s de silence (régression Lot C).** Le flux
+  voix entrant utilise le chemin de réception de l'agent, dont l'idle-timeout de
+  8 s terminait les flux « fantômes ». Or le talkback est légitimement silencieux
+  quand personne ne parle (piste d'envoi désactivée au mute → aucun paquet) :
+  le flux voix était alors tué à tort et le talkback perdu jusqu'à un rejoin.
+  L'idle-timeout est désormais **désactivé pour les flux voix** (le nettoyage
+  passe par le `remove-stream` explicite du navigateur) ; les instruments (audio
+  continu) gardent le timeout de 8 s.
+
 ## [0.5.10-4] — 2026-07-25 (pré-release)
 
 Chantier **sortie audio mode agent** (Lot C — voix des pairs via l'agent).

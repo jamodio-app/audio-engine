@@ -4173,11 +4173,21 @@ async fn recv_io_task(
     punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut punch_remaining: u32 = 30;
 
-    // Idle-timeout : un pair vivant envoie ~400 pkt/s (Opus CBR + DTX OFF →
-    // paquets continus MÊME en silence, cf. encoder.rs). 8 s sans paquet = flux
-    // mort (reconnexion non signalée par le browser) → auto-terminaison pour
-    // nettoyer le producteur fantôme.
-    let idle_timeout = std::time::Duration::from_secs(8);
+    // Idle-timeout : un flux INSTRUMENT vivant envoie ~400 pkt/s en continu (Opus
+    // CBR + DTX OFF, MÊME en silence, cf. encoder.rs) → 8 s sans paquet = flux mort
+    // (reconnexion non signalée par le browser) → auto-terminaison du fantôme.
+    //
+    // VOIX (Lot C) : le talkback est LÉGITIMEMENT silencieux quand personne ne
+    // parle — la piste d'envoi est DÉSACTIVÉE au mute/auto-mute → AUCUN paquet,
+    // pour une durée potentiellement longue (tout un morceau). On DÉSACTIVE donc
+    // l'idle-timeout pour la voix : sinon un silence > 8 s la terminait à tort et
+    // le talkback était perdu jusqu'à un rejoin (régression Lot C observée
+    // 2026-07-26). Le nettoyage d'un flux voix mort passe par le `remove-stream`
+    // explicite du browser (consumer-closed), fiable.
+    let idle_timeout: Option<std::time::Duration> = match kind {
+        StreamKind::Instrument => Some(std::time::Duration::from_secs(8)),
+        StreamKind::Voice => None,
+    };
     let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(2));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_packet = std::time::Instant::now();
@@ -4194,9 +4204,12 @@ async fn recv_io_task(
                 punch_remaining -= 1;
             }
             _ = idle_check.tick() => {
-                if got_first && last_packet.elapsed() >= idle_timeout {
-                    tracing::warn!(target: "jamodio::recv", producer = short, "no packet for 8s — terminating (ghost/orphan stream)");
-                    break;
+                // Voix : `idle_timeout == None` → jamais terminée sur silence.
+                if let Some(timeout) = idle_timeout {
+                    if got_first && last_packet.elapsed() >= timeout {
+                        tracing::warn!(target: "jamodio::recv", producer = short, "no packet for 8s — terminating (ghost/orphan stream)");
+                        break;
+                    }
                 }
             }
             result = receiver.recv(&mut buf) => {
