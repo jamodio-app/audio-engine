@@ -2344,6 +2344,9 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
+            // DIM = ducking des instruments pour entendre le talkback. Loggé (action
+            // utilisateur rare) → diagnostic « le DIM réagit-il en mode agent ? ».
+            tracing::info!(target: "jamodio::ws", factor, "SetDim (ducking instruments)");
             pl.mixer.lock().set_dim(factor);
             vec![]
         }

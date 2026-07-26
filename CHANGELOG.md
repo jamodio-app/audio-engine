@@ -4,6 +4,12 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-6] — 2026-07-26 (pré-release)
+
+### Diagnostic
+- Log INFO à la réception de `SetDim` (ducking des instruments) — action
+  utilisateur rare, permet de vérifier que le DIM est bien reçu en mode agent.
+
 ## [0.5.10-5] — 2026-07-26 (pré-release)
 
 ### Corrigé
