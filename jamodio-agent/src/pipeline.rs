@@ -285,8 +285,14 @@ fn open_duplex_on_com(
     input_frames: Arc<std::sync::atomic::AtomicU32>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
     capture_feeding: Arc<std::sync::atomic::AtomicBool>,
+    // Lot B — paire de canaux de sortie ASIO (partagée, swap live). Ignorée hors ASIO.
+    output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
+    // `output_pair_start` n'est consommé que par le chemin ASIO (Windows) ; hors
+    // Windows, on le marque utilisé pour éviter un warning (aucun effet).
+    #[cfg(not(target_os = "windows"))]
+    let _ = &output_pair_start;
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
 
@@ -318,6 +324,7 @@ fn open_duplex_on_com(
                 mixer,
                 output_callbacks,
                 output_frames,
+                output_pair_start,
                 &reset_signal,
             )
             .map_err(CaptureStartError::Other)?;
@@ -674,6 +681,11 @@ pub struct PipelineState {
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
     input_device_id: Option<String>,
     output_device_id: Option<String>,
+    /// Lot B — index de départ (0-based) de la paire de canaux de SORTIE ASIO,
+    /// persisté ici (défaut 0 = canaux 1-2) et partagé (Arc) avec le callback du
+    /// host ASIO. Changer sa valeur (`set_output_pair`) = swap LIVE de la paire,
+    /// sans réouverture driver. Ignoré hors ASIO (le callback cpal ne le lit pas).
+    output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
     /// State
     pub state: AgentState,
     /// Buffer CPAL côté CAPTURE, en samples (mono), set au start_capture.
@@ -1130,6 +1142,7 @@ impl PipelineState {
             recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
+            output_pair_start: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             state: AgentState::Idle,
             input_buffer_samples: None,
             output_buffer_samples: None,
@@ -1445,6 +1458,18 @@ impl PipelineState {
     /// n'a jamais sélectionné).
     pub fn set_input_device(&mut self, input: Option<String>) {
         self.input_device_id = input;
+    }
+
+    /// Lot B — change la PAIRE de canaux de sortie ASIO (index de départ 0-based ;
+    /// 0 = canaux 1-2, 2 = 3-4…). Swap LIVE par simple store atomique : le callback
+    /// du host ASIO lit la nouvelle valeur au bloc suivant, SANS réouverture driver
+    /// (aucun churn ASIOExit/ASIOInit, compatible keep-warm). Le clamp final aux
+    /// bornes réelles de l'interface est fait dans le callback (`clamp_output_pair`).
+    /// Inerte hors ASIO (CoreAudio/WASAPI : ce compteur n'est jamais lu). Persiste
+    /// à travers les ré-ouvertures (même Arc re-passé à `AsioDuplexHost::open`).
+    pub fn set_output_pair(&self, start: usize) {
+        self.output_pair_start
+            .store(start, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn select_devices(&mut self, input: Option<String>, output: Option<String>) {
@@ -1797,6 +1822,7 @@ impl PipelineState {
             self.perfstats.input_frames.clone(),
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
+            self.output_pair_start.clone(),
             self.reset_signal.clone(),
         )?;
         let (channels_in, native_sr, input_buf, in_name, resolved_input_id, output_name, output_fallback) = match built {
@@ -2320,6 +2346,7 @@ impl PipelineState {
             self.perfstats.input_frames.clone(),
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
+            self.output_pair_start.clone(),
             self.reset_signal.clone(),
         )?;
 

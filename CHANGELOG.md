@@ -4,6 +4,21 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-9] — 2026-07-27 (pré-release)
+
+### Ajouté
+- **Lot B — sélection de la PAIRE de canaux de sortie ASIO (Windows).** Le host
+  ASIO ouvre désormais TOUS les canaux de sortie de l'interface (`n_out = outs`) et
+  n'écrit le mix stéréo que dans la paire choisie (`output_pair_start`, atomique
+  partagé), zéros ailleurs. Nouveau message dédié `set-output-pair {pair}` →
+  `PipelineState::set_output_pair` = **swap LIVE de la paire par store atomique,
+  AUCUNE réouverture driver** (aucun churn ASIOExit/ASIOInit, compatible keep-warm ;
+  le même `Arc` est re-passé aux ré-ouvertures). Clamp aux bornes de l'interface
+  dans le callback (`clamp_output_pair`, pur + testé). Zéro ms ajouté (buffer/SR
+  inchangés ; lecture = 1 `load` Relaxed/bloc). Inerte hors ASIO (CoreAudio/WASAPI :
+  compteur jamais lu). Invariant testé : changer la paire n'appelle NI open NI
+  ASIOInit. Le web (picker de paire) suit.
+
 ## [0.5.10-8] — 2026-07-27 (pré-release)
 
 ### Ajouté

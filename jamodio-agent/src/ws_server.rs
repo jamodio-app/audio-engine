@@ -1999,6 +1999,18 @@ async fn handle_message(
             vec![make_status(AgentState::Idle)]
         }
 
+        BrowserMessage::SetOutputPair { pair } => {
+            // Lot B — swap LIVE de la paire de canaux de sortie ASIO (store atomique,
+            // aucune réouverture driver). Non critique : si le lock est occupé on
+            // laisse tomber (le web re-enverra au prochain changement). Inerte hors ASIO.
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            pl.set_output_pair(pair as usize);
+            tracing::debug!(target: "jamodio::ws", pair, "SetOutputPair");
+            vec![]
+        }
+
         BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters, session_continues } => {
             tracing::info!(
                 target: "jamodio::ws",

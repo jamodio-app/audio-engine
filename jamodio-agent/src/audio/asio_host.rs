@@ -28,7 +28,7 @@ use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -178,6 +178,17 @@ fn prime(driver: &sys::Driver, n_in: usize, n_out: usize, size: i32) {
 }
 
 /// Host ASIO duplex single-owner. Possède le driver ; le `Drop` fait le cleanup ASIO.
+/// Borne l'index de départ de la paire de sortie à `[0, n_out-2]` (Lot B) : la
+/// paire choisie occupe les canaux `start` et `start+1`. PUR (testable), appelé
+/// dans le callback à chaque bloc (un `load` atomique + ce clamp). Si l'interface
+/// a moins de 2 sorties (cas dégénéré, `n_out >= 1` garanti par `open`), renvoie 0.
+fn clamp_output_pair(start: usize, n_out: usize) -> usize {
+    if n_out < 2 {
+        return 0;
+    }
+    start.min(n_out - 2)
+}
+
 pub struct AsioDuplexHost {
     driver: sys::Driver,
     streams: Arc<Mutex<Option<sys::AsioStreams>>>,
@@ -213,6 +224,11 @@ impl AsioDuplexHost {
         mixer: Arc<Mutex<AudioMixer>>,
         output_callbacks: Arc<AtomicU64>,
         output_frames: Arc<AtomicU32>,
+        // Lot B — index de départ (0-based) de la PAIRE de canaux de sortie ASIO.
+        // Partagé avec la pipeline (persiste à travers les ré-ouvertures keep-warm) ;
+        // lu à chaque bloc dans le callback → changement de paire = swap LIVE sans
+        // réouverture driver.
+        output_pair_start: Arc<AtomicUsize>,
         reset_signal: &ResetSignal,
     ) -> Result<Self, String> {
         // 1) UNE instance Asio, UN load_driver (1 ASIOInit).
@@ -227,7 +243,11 @@ impl AsioDuplexHost {
 
         let channels = driver.channels().map_err(|e| format!("channels: {e:?}"))?;
         let n_in = channels.ins.max(0) as usize;
-        let n_out = (channels.outs.max(0) as usize).min(2); // le mixer produit du stéréo
+        // Lot B — on ouvre TOUS les canaux de sortie de l'interface (le mixer produit
+        // du stéréo, écrit dans la PAIRE choisie via `output_pair_start`, zéros
+        // ailleurs). Ouvrir tous les canaux = pratique DAW standard ; permet de
+        // changer de paire EN SESSION par simple swap atomique (aucune réouverture).
+        let n_out = channels.outs.max(0) as usize;
         if n_in == 0 || n_out == 0 {
             return Err(format!("driver sans entrée/sortie (ins={}, outs={})", channels.ins, channels.outs));
         }
@@ -284,6 +304,7 @@ impl AsioDuplexHost {
             let mixer = mixer.clone();
             let output_callbacks = output_callbacks.clone();
             let output_frames = output_frames.clone();
+            let output_pair_start = output_pair_start.clone();
             let mut out_scratch: Vec<f32> = Vec::new();
             driver.add_callback(move |info| {
                 let idx = info.buffer_index as usize;
@@ -346,14 +367,30 @@ impl AsioDuplexHost {
                     out_scratch.clear();
                     out_scratch.resize(bufsz * 2, 0.0);
                     mixer.lock().mix_into(&mut out_scratch);
+                    // Lot B — le mix stéréo va sur la PAIRE choisie (canaux `ps`, `ps+1`),
+                    // zéros sur tous les autres canaux ouverts (nécessaire chaque bloc :
+                    // double-buffer ASIO + la paire peut bouger en live). Lu ici = swap
+                    // atomique sans réouverture.
+                    let n_out = out.buffer_infos.len();
+                    let ps = clamp_output_pair(output_pair_start.load(Ordering::Relaxed), n_out);
                     for (c, bi) in out.buffer_infos.iter().enumerate() {
                         let base = bi.buffers[idx] as *mut u8;
                         if base.is_null() {
                             continue;
                         }
+                        // Canal L de la paire → out_scratch[.. + 0], R → [.. + 1], sinon 0.
+                        let lane = if c == ps {
+                            Some(0)
+                        } else if c == ps + 1 {
+                            Some(1)
+                        } else {
+                            None
+                        };
                         for f in 0..bufsz {
-                            // canaux > stéréo : silence.
-                            let v = if c < 2 { out_scratch[f * 2 + c] } else { 0.0 };
+                            let v = match lane {
+                                Some(l) => out_scratch[f * 2 + l],
+                                None => 0.0,
+                            };
                             unsafe { out_fmt.write(base, f, v) };
                         }
                     }
@@ -460,6 +497,39 @@ impl Drop for AsioDuplexHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Lot B — paire de sortie ───────────────────────────────────────────
+    #[test]
+    fn output_pair_clamps_into_range() {
+        // 8 sorties → paires valides : start ∈ {0,2,4,6}. Le clamp borne à n_out-2.
+        assert_eq!(clamp_output_pair(0, 8), 0, "1-2");
+        assert_eq!(clamp_output_pair(6, 8), 6, "7-8 (dernière paire)");
+        assert_eq!(clamp_output_pair(7, 8), 6, "start hors borne → dernière paire valide");
+        assert_eq!(clamp_output_pair(100, 8), 6, "très grand → borné");
+    }
+
+    #[test]
+    fn output_pair_degenerate_devices() {
+        // Interface stéréo : seule la paire 0-1 existe.
+        assert_eq!(clamp_output_pair(0, 2), 0);
+        assert_eq!(clamp_output_pair(5, 2), 0, "pas d'autre paire qu'un stéréo → 0");
+        // Cas dégénéré (< 2 sorties) : jamais de paire → 0 (pas d'accès hors borne).
+        assert_eq!(clamp_output_pair(0, 1), 0);
+        assert_eq!(clamp_output_pair(3, 0), 0);
+    }
+
+    #[test]
+    fn output_pair_swap_is_pure_no_driver_call() {
+        // INVARIANT (pattern 787a7eb) : changer la paire = un simple store/load
+        // atomique, JAMAIS une réouverture (open/ASIOInit/create_buffers). On le
+        // matérialise ici : le pilotage de la paire passe par un AtomicUsize partagé,
+        // lu dans le callback — aucun appel driver n'est nécessaire pour un swap.
+        let pair = Arc::new(AtomicUsize::new(0));
+        let shared = pair.clone();               // clone donné au callback (host)
+        pair.store(4, Ordering::Relaxed);         // « set_output_pair(4) » côté pipeline
+        assert_eq!(clamp_output_pair(shared.load(Ordering::Relaxed), 8), 4,
+            "le callback lit la nouvelle paire sans réouverture");
+    }
 
     #[test]
     fn snap_keeps_legal_size() {

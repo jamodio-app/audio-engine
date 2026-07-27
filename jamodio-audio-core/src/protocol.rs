@@ -67,6 +67,14 @@ pub enum BrowserMessage {
         #[serde(rename = "outputId")]
         output_id: Option<String>,
     },
+    /// Lot B — choisit la PAIRE de canaux de SORTIE ASIO (index de départ 0-based :
+    /// 0 = canaux 1-2, 2 = 3-4…). Message DÉDIÉ (hors `select-devices`, dont le
+    /// contrat inputId/outputId reste figé ; en ASIO l'output_id est ignoré, la
+    /// sortie = même interface que l'entrée). Swap LIVE côté agent (aucune
+    /// réouverture driver). Inerte hors ASIO.
+    SetOutputPair {
+        pair: u8,
+    },
     StartCapture {
         ssrc: u32,
         #[serde(rename = "sfuIp")]
@@ -1268,6 +1276,16 @@ mod tests {
             ).unwrap(),
             BrowserMessage::ReferencePreviewSync { .. }
         ));
+    }
+
+    #[test]
+    fn set_output_pair_parses_from_wire() {
+        match serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"set-output-pair","pair":2}"#,
+        ).unwrap() {
+            BrowserMessage::SetOutputPair { pair } => assert_eq!(pair, 2),
+            _ => panic!("attendu SetOutputPair"),
+        }
     }
 
     #[test]
