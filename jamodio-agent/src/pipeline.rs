@@ -287,7 +287,9 @@ fn open_duplex_on_com(
     input_frames: Arc<std::sync::atomic::AtomicU32>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
     capture_feeding: Arc<std::sync::atomic::AtomicBool>,
-    // Lot B — paire de canaux de sortie ASIO (partagée, swap live). Ignorée hors ASIO.
+    // Lot B (ASIO) + extension CoreAudio — paire de canaux de sortie sur device
+    // multicanal (partagée, swap live). Lue par le callback playback (branche Cpal)
+    // ET par le callback ASIO. Inerte sur un device ≤ 2 sorties.
     output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
@@ -679,10 +681,12 @@ pub struct PipelineState {
     /// l'id reçu — on n'accepte aucune autre forme (cf. `device::get_input_device`).
     input_device_id: Option<String>,
     output_device_id: Option<String>,
-    /// Lot B — index de départ (0-based) de la paire de canaux de SORTIE ASIO,
-    /// persisté ici (défaut 0 = canaux 1-2) et partagé (Arc) avec le callback du
-    /// host ASIO. Changer sa valeur (`set_output_pair`) = swap LIVE de la paire,
-    /// sans réouverture driver. Ignoré hors ASIO (le callback cpal ne le lit pas).
+    /// Lot B (ASIO) + extension CoreAudio — index de départ (0-based) de la paire
+    /// de canaux de SORTIE sur un device multicanal, persisté ici (défaut 0 =
+    /// canaux 1-2) et partagé (Arc) avec les callbacks de sortie. Changer sa valeur
+    /// (`set_output_pair`) = swap LIVE de la paire, sans réouverture driver. Lu par
+    /// le callback playback (cpal, branche CoreAudio/WASAPI) ET par le callback du
+    /// host ASIO. Inerte sur un device ≤ 2 sorties.
     output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
     /// State
     pub state: AgentState,
@@ -1458,13 +1462,14 @@ impl PipelineState {
         self.input_device_id = input;
     }
 
-    /// Lot B — change la PAIRE de canaux de sortie ASIO (index de départ 0-based ;
-    /// 0 = canaux 1-2, 2 = 3-4…). Swap LIVE par simple store atomique : le callback
-    /// du host ASIO lit la nouvelle valeur au bloc suivant, SANS réouverture driver
-    /// (aucun churn ASIOExit/ASIOInit, compatible keep-warm). Le clamp final aux
-    /// bornes réelles de l'interface est fait dans le callback (`clamp_output_pair`).
-    /// Inerte hors ASIO (CoreAudio/WASAPI : ce compteur n'est jamais lu). Persiste
-    /// à travers les ré-ouvertures (même Arc re-passé à `AsioDuplexHost::open`).
+    /// Lot B (ASIO) + extension CoreAudio — change la PAIRE de canaux de sortie sur
+    /// un device multicanal (index de départ 0-based ; 0 = canaux 1-2, 2 = 3-4…).
+    /// Swap LIVE par simple store atomique : les callbacks de sortie (playback cpal
+    /// CoreAudio/WASAPI ET host ASIO) lisent la nouvelle valeur au bloc suivant,
+    /// SANS réouverture driver (aucun churn ASIOExit/ASIOInit, compatible keep-warm).
+    /// Le clamp final aux bornes réelles de l'interface est fait dans le callback
+    /// (`clamp_output_pair`). Inerte sur un device ≤ 2 sorties. Persiste à travers
+    /// les ré-ouvertures (même Arc re-passé à `AsioDuplexHost::open`).
     pub fn set_output_pair(&self, start: usize) {
         self.output_pair_start
             .store(start, std::sync::atomic::Ordering::Relaxed);

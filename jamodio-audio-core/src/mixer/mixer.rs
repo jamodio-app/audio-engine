@@ -728,7 +728,7 @@ impl AudioMixer {
         // (⇒ jamais duckée : le talkback reste clair pendant que les instruments
         // baissent), AVANT le master. Gain/pan de BUS unique (parité voiceGain/
         // voicePanNode navigateur ; le mute = gain 0 envoyé par le web). Le VU
-        // voix lit `inbound_voice_rms` (mono, post-gain).
+        // voix lit `inbound_voice_rms` (RMS scalaire agrégé L+R, post-gain de bus).
         if any_voice && self.voice_gain > f32::EPSILON {
             let (gl, gr) = pan_gains(self.voice_pan);
             let gain_l = self.voice_gain * gl;
@@ -739,7 +739,8 @@ impl AudioMixer {
                 output[i + 1] += self.voice_buf[i + 1] * gain_r;
                 i += 2;
             }
-            // RMS mono post-gain (avant pan) pour le VU voix navigateur.
+            // RMS scalaire agrégé sur L+R, post-gain de bus (avant pan), pour le VU
+            // voix navigateur.
             let frames = self.voice_buf.len() / 2;
             if frames > 0 {
                 let sum_sq: f32 = self.voice_buf.iter().map(|s| s * s).sum();

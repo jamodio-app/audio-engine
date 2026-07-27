@@ -67,11 +67,13 @@ pub enum BrowserMessage {
         #[serde(rename = "outputId")]
         output_id: Option<String>,
     },
-    /// Lot B — choisit la PAIRE de canaux de SORTIE ASIO (index de départ 0-based :
-    /// 0 = canaux 1-2, 2 = 3-4…). Message DÉDIÉ (hors `select-devices`, dont le
-    /// contrat inputId/outputId reste figé ; en ASIO l'output_id est ignoré, la
-    /// sortie = même interface que l'entrée). Swap LIVE côté agent (aucune
-    /// réouverture driver). Inerte hors ASIO.
+    /// Lot B (ASIO) + extension 0.5.10-10 (CoreAudio) — choisit la PAIRE de canaux
+    /// de SORTIE sur un device multicanal (index de départ 0-based : 0 = canaux
+    /// 1-2, 2 = 3-4…). Message DÉDIÉ (hors `select-devices`, dont le contrat
+    /// inputId/outputId reste figé ; en ASIO l'output_id est ignoré, la sortie =
+    /// même interface que l'entrée). Swap LIVE côté agent (store atomique, aucune
+    /// réouverture driver) — appliqué par le callback playback sur ASIO ET
+    /// CoreAudio. Inerte sur un device ≤ 2 sorties (une seule paire possible).
     SetOutputPair {
         pair: u8,
     },

@@ -24,6 +24,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::audio::asio_reset::ResetSignal;
+use crate::audio::output_pair::clamp_output_pair;
 use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
@@ -178,8 +179,6 @@ fn prime(driver: &sys::Driver, n_in: usize, n_out: usize, size: i32) {
 }
 
 /// Host ASIO duplex single-owner. Possède le driver ; le `Drop` fait le cleanup ASIO.
-use super::output_pair::clamp_output_pair;
-
 pub struct AsioDuplexHost {
     driver: sys::Driver,
     streams: Arc<Mutex<Option<sys::AsioStreams>>>,

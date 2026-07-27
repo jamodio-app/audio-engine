@@ -2000,9 +2000,10 @@ async fn handle_message(
         }
 
         BrowserMessage::SetOutputPair { pair } => {
-            // Lot B — swap LIVE de la paire de canaux de sortie ASIO (store atomique,
-            // aucune réouverture driver). Non critique : si le lock est occupé on
-            // laisse tomber (le web re-enverra au prochain changement). Inerte hors ASIO.
+            // Lot B (ASIO) + extension CoreAudio — swap LIVE de la paire de canaux de
+            // sortie sur device multicanal (store atomique, aucune réouverture driver).
+            // Non critique : si le lock est occupé on laisse tomber (le web re-enverra
+            // au prochain changement). Inerte sur un device ≤ 2 sorties.
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
@@ -2356,9 +2357,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            // DIM = ducking des instruments pour entendre le talkback. Loggé (action
-            // utilisateur rare) → diagnostic « le DIM réagit-il en mode agent ? ».
-            tracing::info!(target: "jamodio::ws", factor, "SetDim (ducking instruments)");
+            // DIM = ducking des instruments pour laisser passer le talkback.
             pl.mixer.lock().set_dim(factor);
             vec![]
         }
