@@ -22,6 +22,10 @@ pub const REFERENCE_ID: &str = "reference";
 /// via `SetVolume`/`SetPan` avec ce producer_id (tranche backing de la mixette).
 pub const BACKING_ID: &str = "backing";
 
+/// Id réservé de la sous-source preview (Lot D — aperçu Library en studio).
+/// Volume/pan pilotés par le browser via `SetVolume`/`SetPan` avec ce producer_id.
+pub const PREVIEW_ID: &str = "preview";
+
 /// Cible jitter buffer du self-monitor (ms). 5 = MIN_TARGET_MS du ring buffer ;
 /// le signal vient du même process que la capture, donc pas de gigue réseau,
 /// on prend le minimum stable.
@@ -350,6 +354,10 @@ impl AudioMixer {
             self.reference.set_backing_volume(volume);
             return;
         }
+        if producer_id == PREVIEW_ID {
+            self.reference.set_preview_volume(volume);
+            return;
+        }
         // Garde NaN alignée sur set_pan/set_dim/set_master_gain :
         // NaN.clamp() = NaN → silence définitif du stream sinon.
         let v = if volume.is_finite() { volume.clamp(0.0, 1.5) } else { 1.0 };
@@ -375,6 +383,10 @@ impl AudioMixer {
         }
         if producer_id == BACKING_ID {
             self.reference.set_backing_pan(pan);
+            return;
+        }
+        if producer_id == PREVIEW_ID {
+            self.reference.set_preview_pan(pan);
             return;
         }
         let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
@@ -458,6 +470,32 @@ impl AudioMixer {
     }
     pub fn backing_sync(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
         self.reference.backing_sync(anchor_backing_frame, anchor_output_frame);
+    }
+
+    // ─── Preview (Lot D) — délégué à la source référence (buffer séparé) ───────
+    pub fn preview_begin(&mut self, total_frames: usize) {
+        self.reference.preview_begin(total_frames);
+    }
+    pub fn preview_push(&mut self, samples: &[f32]) {
+        self.reference.preview_push(samples);
+    }
+    pub fn preview_end(&mut self) {
+        self.reference.preview_end();
+    }
+    pub fn preview_unload(&mut self) {
+        self.reference.preview_unload();
+    }
+    pub fn preview_play(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.preview_play(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn preview_pause(&mut self) {
+        self.reference.preview_pause();
+    }
+    pub fn preview_seek(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.preview_seek(anchor_backing_frame, anchor_output_frame);
+    }
+    pub fn preview_sync(&mut self, anchor_backing_frame: f64, anchor_output_frame: f64) {
+        self.reference.preview_sync(anchor_backing_frame, anchor_output_frame);
     }
 
     /// Phase B — transmet la gigue réseau mesurée (RFC 3550, ms) au jitter
@@ -1089,5 +1127,62 @@ mod tests {
         // MIX enregistré = instrument seul (rms≈1). Si la voix avait fuité dans le
         // tap (pré-voix), le mix vaudrait ~2 (deux sources à 1.0).
         assert!((mix_rms - 1.0).abs() < 0.2, "MIX enregistré = instruments seuls, voix exclue (rms={mix_rms})");
+    }
+
+    // ─── Lot D — invariants aperçu Library (preview) ──────────────────────────
+
+    /// INVARIANT : l'aperçu Library n'est JAMAIS ducké par le DIM (mixé post-DIM,
+    /// comme le backing/la référence). DIM=0 (instruments coupés) → l'aperçu reste
+    /// pleinement audible.
+    #[test]
+    fn preview_is_never_ducked_by_dim() {
+        let mut m = AudioMixer::new();
+        m.add_stream("inst", StreamKind::Instrument);
+        m.push_samples("inst", &vec![1.0f32; 48_000]);
+        // Aperçu chargé + en lecture (constante 0.8, buffer > bloc).
+        m.preview_begin(2000);
+        m.preview_push(&vec![0.8f32; 4000]);
+        m.preview_end();
+        m.preview_play(0.0, 0.0);
+        m.set_dim(0.0); // duck TOTAL des instruments
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        // Instruments duckés à 0 → seul l'aperçu reste.
+        let rms: f32 = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
+        assert!(rms > 0.3, "aperçu audible malgré DIM=0 (jamais ducké), rms={rms}");
+    }
+
+    /// INVARIANT : l'aperçu Library n'entre JAMAIS dans le RECORD (mixé après le
+    /// tap, comme le backing). Le MIX enregistré = instruments seuls ; aucun stem
+    /// "preview".
+    #[test]
+    fn preview_is_never_recorded() {
+        use crate::record::RecordCmd;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut m = AudioMixer::new();
+        m.set_record_tx(Some(tx));
+        m.add_stream("inst", StreamKind::Instrument);
+        m.push_samples("inst", &vec![1.0f32; 48_000]);
+        m.preview_begin(2000);
+        m.preview_push(&vec![0.8f32; 4000]);
+        m.preview_end();
+        m.preview_play(0.0, 0.0);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out); // → PushMix = instruments SEULS
+        let mut peer_stems = Vec::new();
+        let mut mix_rms = 0.0f32;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                RecordCmd::PushPeer(id, _) => peer_stems.push(id),
+                RecordCmd::PushMix(buf) => {
+                    mix_rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+                }
+                _ => {}
+            }
+        }
+        assert!(!peer_stems.iter().any(|id| id == "preview"), "aperçu JAMAIS enregistré en stem");
+        // MIX = instrument seul (~1.0). Si l'aperçu (0.8) avait fuité dans le tap,
+        // le mix serait sensiblement > 1.0.
+        assert!((mix_rms - 1.0).abs() < 0.2, "MIX enregistré = instruments seuls, aperçu exclu (rms={mix_rms})");
     }
 }

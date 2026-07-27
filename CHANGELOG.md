@@ -4,6 +4,18 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-8] — 2026-07-27 (pré-release)
+
+### Ajouté
+- **Lot D — aperçus de fichiers Library via l'agent (en studio).** Nouveau slot
+  `preview` dans la source référence (2e instance de `Backing`, buffer séparé),
+  mixé au même point que le backing → **jamais enregistré, jamais ducké par le
+  DIM** ; charger un aperçu **n'évince pas** le backing chargé. Messages wire
+  `reference-preview-{begin,chunk,end,unload,play,pause,seek,sync}` (miroir des
+  messages backing). `PREVIEW_ID` routé pour volume/pan. Invariants testés
+  (record/DIM au niveau mixer, non-éviction du backing au niveau référence).
+  Zéro ms sur la pipeline (chemin backing : PCM lu dans le callback, RT-safe).
+
 ## [0.5.10-7] — 2026-07-27 (pré-release)
 
 ### Corrigé

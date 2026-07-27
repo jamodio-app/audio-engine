@@ -538,6 +538,13 @@ pub struct ReferenceSource {
     voices: Vec<Voice>,
     /// Sous-source backing (B4) — rejoue le PCM poussé par le browser, aligné.
     backing: Backing,
+    /// Sous-source PREVIEW (Lot D) — aperçu d'un fichier de la Library en studio.
+    /// Réutilise EXACTEMENT la machinerie `Backing` (décision Ben : 2e instance,
+    /// buffer séparé). Mixée au même point que le backing (post-tap RECORD,
+    /// post-DIM) donc jamais enregistrée ni duckée ; buffer distinct → charger un
+    /// aperçu N'ÉVINCE PAS le backing chargé (le web met le backing en pause le
+    /// temps de l'aperçu, puis le reprend).
+    preview: Backing,
 }
 
 impl Default for ReferenceSource {
@@ -559,6 +566,7 @@ impl ReferenceSource {
             // 1-2 beats ; large marge pour les futures subdivisions.
             voices: Vec::with_capacity(8),
             backing: Backing::new(),
+            preview: Backing::new(),
         }
     }
 
@@ -694,6 +702,46 @@ impl ReferenceSource {
         self.backing.set_pan(p);
     }
 
+    // ─── Preview (Lot D) — aperçu Library via l'agent ─────────────────────────
+    // Miroir EXACT des méthodes backing, sur l'instance `preview` (buffer séparé).
+    /// Démarre le chargement d'un aperçu (réserve `total_frames` frames).
+    pub fn preview_begin(&mut self, total_frames: usize) {
+        self.preview.begin(total_frames);
+    }
+    /// Ajoute un chunk de PCM stéréo entrelacé (déjà converti en f32 côté handler).
+    pub fn preview_push(&mut self, samples: &[f32]) {
+        self.preview.push_chunk(samples);
+    }
+    /// Fin de chargement → l'aperçu devient lisible.
+    pub fn preview_end(&mut self) {
+        self.preview.end();
+    }
+    /// Décharge l'aperçu (libère le PCM). N'affecte pas le backing.
+    pub fn preview_unload(&mut self) {
+        self.preview.unload();
+    }
+    /// Lance la lecture : le frame aperçu `abf` doit émerger au frame de sortie `aof`.
+    pub fn preview_play(&mut self, abf: f64, aof: f64) {
+        self.preview.play(abf, aof);
+    }
+    pub fn preview_pause(&mut self) {
+        self.preview.pause();
+    }
+    /// Repositionne (seek) : snap au prochain bloc.
+    pub fn preview_seek(&mut self, abf: f64, aof: f64) {
+        self.preview.seek(abf, aof);
+    }
+    /// Re-ancrage périodique (= DLL de l'aperçu) : ajuste la cible du servo.
+    pub fn preview_sync(&mut self, abf: f64, aof: f64) {
+        self.preview.sync(abf, aof);
+    }
+    pub fn set_preview_volume(&mut self, v: f32) {
+        self.preview.set_volume(v);
+    }
+    pub fn set_preview_pan(&mut self, p: f32) {
+        self.preview.set_pan(p);
+    }
+
     /// Avance le compteur de frames, rafraîchit l'ancre (avec `mono_ms` fourni
     /// par le mixer), et additionne la synthèse métro dans `output` (stéréo
     /// entrelacé). Appelé à CHAQUE `mix_into`, même désactivé, pour que l'ancre
@@ -713,6 +761,10 @@ impl ReferenceSource {
         }
         // Backing (B4) — mixé au même point (donc mêmes garanties record/DIM/master).
         self.backing.generate(output, block_start);
+        // Preview (Lot D) — aperçu Library, mixé juste après le backing → hérite des
+        // mêmes garanties (post-tap RECORD, post-DIM) ; buffer séparé (n'évince pas
+        // le backing). Le web met le backing en pause pendant l'aperçu.
+        self.preview.generate(output, block_start);
         self.frames_rendered = block_end;
     }
 
@@ -1157,6 +1209,46 @@ mod tests {
         let mut out = block(64);
         r.advance_and_generate(&mut out, 0.0);
         assert_eq!(rms(&out), 0.0, "unload → silencieux");
+    }
+
+    // ─── Preview (Lot D) ──────────────────────────────────────────────────
+    #[test]
+    fn preview_plays_independently() {
+        let mut r = ReferenceSource::new();
+        r.preview_begin(1000);
+        r.preview_push(&[0.5_f32; 2000]); // 1000 frames
+        r.preview_end();
+        r.preview_play(0.0, 0.0);
+        let mut out = block(512); // ≥ fondu de declic
+        r.advance_and_generate(&mut out, 0.0);
+        assert!(rms(&out) > 0.3, "aperçu audible une fois chargé + play");
+    }
+
+    /// INVARIANT : charger/décharger un aperçu n'affecte JAMAIS le backing
+    /// (2 buffers distincts, décision Ben). Le backing en lecture survit à toute
+    /// la vie de l'aperçu.
+    #[test]
+    fn preview_does_not_evict_backing() {
+        let mut r = ReferenceSource::new();
+        // Backing chargé + en lecture (constante 0.5).
+        r.backing_begin(1000);
+        r.backing_push(&[0.5_f32; 2000]);
+        r.backing_end();
+        r.backing_play(0.0, 0.0);
+        // Aperçu chargé APRÈS le backing (constante 0.3) → buffer séparé.
+        r.preview_begin(1000);
+        r.preview_push(&[0.3_f32; 2000]);
+        r.preview_end();
+        r.preview_play(0.0, 0.0);
+        // Les deux sonnent, sommés (le buffer backing n'a pas été écrasé).
+        let mut out = block(512);
+        r.advance_and_generate(&mut out, 0.0);
+        assert!(rms(&out) > 0.3, "backing + aperçu sonnent ensemble (buffers distincts)");
+        // Décharger l'aperçu ne coupe PAS le backing.
+        r.preview_unload();
+        let mut out2 = block(512);
+        r.advance_and_generate(&mut out2, 512.0);
+        assert!(rms(&out2) > 0.3, "backing survit au unload de l'aperçu");
     }
 
     #[test]
