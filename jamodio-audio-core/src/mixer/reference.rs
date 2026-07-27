@@ -47,6 +47,11 @@ const BACKING_SERVO_CLAMP: f64 = 0.01;
 /// 2400 frames = 50 ms @48k.
 const BACKING_SNAP_FRAMES: f64 = 2400.0;
 
+/// Pas d'enveloppe de declic par frame : fondu d'entrée/sortie en ~5,3 ms
+/// (256 frames @48k) → supprime le clic à la discontinuité play/stop sans
+/// altérer audiblement l'attaque/relâche. `1/256`.
+const BACKING_DECLICK_STEP: f32 = 1.0 / 256.0;
+
 /// Rôle rythmique d'un onset — pilote timbre/niveau du grain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
@@ -346,6 +351,14 @@ struct Backing {
     anchored: bool,
     /// Force un SNAP de la tête au prochain bloc (play / seek).
     snap_pending: bool,
+    /// Enveloppe de DECLIC (0.0..1.0) — fondu court appliqué au gain pour éviter
+    /// le clic à la discontinuité au play (0→1) et au stop/pause (1→0). Sans elle,
+    /// couper `playing` net faisait sauter la sortie de la forme d'onde à zéro
+    /// instantanément → claquement audible (constaté 2026-07-27).
+    env: f32,
+    /// true = fondu de SORTIE en cours (déclenché par `pause`) : on continue de
+    /// générer jusqu'à `env == 0`, PUIS on arrête réellement (`playing = false`).
+    stopping: bool,
 }
 
 impl Backing {
@@ -362,6 +375,8 @@ impl Backing {
             anchor_output_frame: 0.0,
             anchored: false,
             snap_pending: false,
+            env: 0.0,
+            stopping: false,
         }
     }
 
@@ -391,6 +406,9 @@ impl Backing {
         self.ready = false;
         self.playing = false;
         self.anchored = false;
+        // Teardown : coupe net (buffer libéré, plus rien à faire fondre).
+        self.env = 0.0;
+        self.stopping = false;
     }
     fn set_anchor(&mut self, abf: f64, aof: f64) {
         if abf.is_finite() && aof.is_finite() {
@@ -403,9 +421,15 @@ impl Backing {
         self.set_anchor(abf, aof);
         self.playing = true;
         self.snap_pending = true;
+        self.stopping = false; // (re)démarrage → l'enveloppe remonte (fondu d'entrée)
     }
     fn pause(&mut self) {
-        self.playing = false;
+        // Fondu de SORTIE au lieu d'une coupure nette : on garde `playing = true`
+        // et on laisse `generate` faire descendre l'enveloppe à 0 avant d'arrêter
+        // réellement (anti-clic). Idempotent si déjà en train de s'arrêter.
+        if self.playing {
+            self.stopping = true;
+        }
     }
     fn seek(&mut self, abf: f64, aof: f64) {
         self.set_anchor(abf, aof);
@@ -465,15 +489,32 @@ impl Backing {
         let gain_l = self.volume * (1.0 - self.pan).min(1.0);
         let gain_r = self.volume * (1.0 + self.pan).min(1.0);
         let frames = output.len() / 2;
+        // Cible d'enveloppe : 0 si on s'arrête (fondu de sortie), 1 sinon (fondu
+        // d'entrée / plein régime). Pas de fondu = ~5,3 ms (256 frames @48 kHz).
+        let env_target: f32 = if self.stopping { 0.0 } else { 1.0 };
         for i in 0..frames {
             if self.play_head >= pcm_frames - 1.0 {
-                self.playing = false; // fin de piste
+                self.playing = false; // fin de piste (le PCM se termine ~à zéro)
+                self.stopping = false;
+                self.env = 0.0;
                 break;
             }
+            // Rampe l'enveloppe vers sa cible (anti-clic au play/pause).
+            if self.env < env_target {
+                self.env = (self.env + BACKING_DECLICK_STEP).min(env_target);
+            } else if self.env > env_target {
+                self.env = (self.env - BACKING_DECLICK_STEP).max(env_target);
+            }
             let (l, r) = self.sample_at(self.play_head);
-            output[i * 2] += l * gain_l;
-            output[i * 2 + 1] += r * gain_r;
+            output[i * 2] += l * gain_l * self.env;
+            output[i * 2 + 1] += r * gain_r * self.env;
             self.play_head += self.rs_speed;
+            // Fondu de sortie terminé → arrêt RÉEL.
+            if self.stopping && self.env <= 0.0 {
+                self.playing = false;
+                self.stopping = false;
+                break;
+            }
         }
     }
 }
@@ -1026,27 +1067,41 @@ mod tests {
         r.backing_play(0.0, 0.0);
         r.advance_and_generate(&mut out, 0.0);
         assert_eq!(rms(&out), 0.0, "silencieux tant que non chargé (end)");
-        // end + play → audible.
+        // end + play → audible. Bloc ≥ 256 frames pour dépasser le fondu de
+        // declic (~256 frames) et atteindre le plein régime.
         r.backing_end();
-        r.backing_play(0.0, r.anchor().frame as f64); // ancre au frame de sortie courant
-        let mut out2 = block(64);
-        r.advance_and_generate(&mut out2, 1.0);
+        r.backing_push(&[0.5_f32; 1200]); // total 700 frames ≥ fondu
+        r.backing_play(0.0, 0.0);
+        let mut out2 = block(512);
+        r.advance_and_generate(&mut out2, 0.0);
         assert!(rms(&out2) > 0.3, "audible une fois chargé + play");
-        assert!((out2[0] - 0.5).abs() < 1e-3);
+        // Après le fondu d'entrée (frame ≥ 256), plein niveau 0.5.
+        assert!((out2[400 * 2] - 0.5).abs() < 1e-3, "plein niveau après le fondu, got {}", out2[400 * 2]);
+        // Fondu d'entrée : le TOUT PREMIER frame est fortement atténué (≠ 0.5).
+        assert!(out2[0].abs() < 0.1, "fondu d'entrée : 1er frame attténué, got {}", out2[0]);
     }
 
     #[test]
-    fn backing_pause_silences() {
+    fn backing_pause_declicks_then_silences() {
         let mut r = ReferenceSource::new();
         r.backing_begin(1000);
-        r.backing_push(&[0.5_f32; 2000]);
+        r.backing_push(&[0.5_f32; 2000]); // 1000 frames
         r.backing_end();
         r.backing_play(0.0, 0.0);
-        r.advance_and_generate(&mut block(64), 0.0);
+        r.advance_and_generate(&mut block(512), 0.0); // env → 1.0 (512 > 256)
         r.backing_pause();
-        let mut out = block(64);
-        r.advance_and_generate(&mut out, 64.0);
-        assert_eq!(rms(&out), 0.0, "pause coupe le backing");
+        // Bloc juste après pause : fondu de SORTIE (declic) → PAS coupé net, mais
+        // le début du bloc porte encore du signal (env descend de 1 vers 0).
+        let mut fade = block(512);
+        r.advance_and_generate(&mut fade, 512.0);
+        assert!(fade[0].abs() > 0.1, "pause : fondu de sortie (pas de coupure nette), got {}", fade[0]);
+        // ...et la FIN du bloc (après ~256 frames de fondu) est muette.
+        let tail: f32 = fade.iter().skip(400 * 2).map(|s| s.abs()).sum();
+        assert_eq!(tail, 0.0, "pause : silence une fois le fondu de sortie terminé");
+        // Bloc suivant : totalement muet (playing=false).
+        let mut out = block(512);
+        r.advance_and_generate(&mut out, 1024.0);
+        assert_eq!(rms(&out), 0.0, "pause : silence complet au bloc suivant");
     }
 
     #[test]
@@ -1067,10 +1122,11 @@ mod tests {
         let mut r = ReferenceSource::new();
         load_ramp(&mut r, 48_000); // valeur = frame/48000
         r.backing_play(0.0, 0.0);
-        r.advance_and_generate(&mut block(64), 0.0);
-        r.backing_seek(24_000.0, 64.0); // milieu, ancré au bloc suivant (frame 64)
-        let mut out = block(64);
-        r.advance_and_generate(&mut out, 64.0);
+        r.advance_and_generate(&mut block(512), 0.0); // env → 1.0 (dépasse le fondu)
+        r.backing_seek(24_000.0, 512.0); // milieu, ancré au bloc suivant (frame 512)
+        let mut out = block(512);
+        r.advance_and_generate(&mut out, 512.0);
+        // env déjà à 1.0 (pas de fondu au seek) → le 1er frame reflète la position.
         assert!((out[0] - 0.5).abs() < 0.01, "seek snappe à la position (got {})", out[0]);
     }
 

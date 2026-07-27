@@ -4,6 +4,14 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-7] — 2026-07-27 (pré-release)
+
+### Corrigé
+- **Claquement (clic) à l'arrêt du backing track.** L'arrêt/pause coupait la
+  lecture net (forme d'onde → 0 instantané) → discontinuité audible. Ajout d'un
+  **fondu de declic** (~5 ms) : fondu d'entrée au play, fondu de sortie au
+  pause/stop. Bénéficie aussi au futur slot preview (Lot D, réutilise `Backing`).
+
 ## [0.5.10-6] — 2026-07-26 (pré-release)
 
 ### Diagnostic
