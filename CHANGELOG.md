@@ -4,6 +4,24 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.5.10-10] — 2026-07-27 (pré-release)
+
+### Ajouté
+- **Extension paire de sortie à CoreAudio (cohérence Mac/PC).** Le chemin de
+  sortie cpal (`playback.rs`, CoreAudio + WASAPI) ouvre désormais le device avec
+  son **nombre réel de canaux** (`default_output_config().channels()`) au lieu de
+  2 en dur, et n'écrit le mix stéréo que dans la **paire choisie**
+  (`output_pair_start` partagé), zéros ailleurs — même mécanisme que l'ASIO
+  (Lot B). Sur un device stéréo (n_out=2) : comportement **identique** à
+  l'historique. Le message `set-output-pair` pilote maintenant **ASIO ET
+  CoreAudio** (swap live, aucune réouverture ; le callback lit l'atomique).
+
+### Nettoyage
+- `clamp_output_pair` extrait dans un module partagé `audio::output_pair`
+  (cross-platform, testé sur toutes plateformes) au lieu du module `asio_host`
+  Windows-only ; réutilisé par ASIO et CoreAudio. Clippy 100 % propre (fix doc
+  overindent dans l'exemple `enum_outputs`).
+
 ## [0.5.10-9] — 2026-07-27 (pré-release)
 
 ### Ajouté

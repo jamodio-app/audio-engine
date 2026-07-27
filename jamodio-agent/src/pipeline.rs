@@ -236,6 +236,8 @@ fn open_output_on_com(
     mixer: Arc<Mutex<AudioMixer>>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
+    // Lot B / CoreAudio — paire de canaux de sortie (partagée, swap live).
+    output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
 ) -> OutputOpen {
     crate::audio::com_exec::run(move || {
         use cpal::traits::{DeviceTrait, StreamTrait};
@@ -250,7 +252,7 @@ fn open_output_on_com(
         // Volet B : build (sans play) puis play, sur le thread COM-STA. Sur ce
         // chemin (add_stream / sortie seule, capture déjà chaude) il n'y a pas
         // de cold-start full-duplex à éviter, donc build+play immédiat suffit.
-        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks, output_frames) {
+        match crate::audio::playback::build_playback_stream(&device, mixer, output_callbacks, output_frames, output_pair_start) {
             Ok((stream, buffer)) => match stream.play() {
                 Ok(()) => OutputOpen::Opened { stream: SendStream(stream), buffer, name, fallback_from: None },
                 Err(e) => OutputOpen::BuildFailed(format!("play: {}", e)),
@@ -289,10 +291,6 @@ fn open_duplex_on_com(
     output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
-    // `output_pair_start` n'est consommé que par le chemin ASIO (Windows) ; hors
-    // Windows, on le marque utilisé pour éviter un warning (aucun effet).
-    #[cfg(not(target_os = "windows"))]
-    let _ = &output_pair_start;
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
 
@@ -402,7 +400,7 @@ fn open_duplex_on_com(
                 ),
                 Some(d) => {
                     let out_name = d.name().unwrap_or_default();
-                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames) {
+                    match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames, output_pair_start) {
                         // Démarre la SORTIE d'abord (buffers tous créés).
                         Ok((out_stream, buffer)) => match out_stream.play() {
                             Ok(()) => OutputOpen::Opened {
@@ -1500,6 +1498,7 @@ impl PipelineState {
             self.mixer.clone(),
             self.perfstats.output_callbacks.clone(),
             self.perfstats.output_frames.clone(),
+            self.output_pair_start.clone(),
         ) {
             OutputOpen::Opened { stream, buffer, name, .. } => {
                 self.playback_stream = Some(stream);
@@ -2488,6 +2487,7 @@ impl PipelineState {
                 self.mixer.clone(),
                 self.perfstats.output_callbacks.clone(),
                 self.perfstats.output_frames.clone(),
+                self.output_pair_start.clone(),
             ) {
                 OutputOpen::Opened { stream, buffer, .. } => {
                     self.playback_stream = Some(stream);

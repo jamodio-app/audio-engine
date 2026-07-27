@@ -11,6 +11,7 @@ pub mod com_exec;
 pub mod device;
 pub mod host;
 pub mod capture;
+pub mod output_pair;
 pub mod playback;
 pub mod midi;
 /// 0.5.4-18 — écoute des réveils de veille Windows → re-init ASIO (no-op ailleurs).

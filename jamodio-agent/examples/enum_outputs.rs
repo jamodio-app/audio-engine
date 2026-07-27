@@ -5,11 +5,11 @@
 //! But : quand un device virtuel « enregistreur » (ex. MJAudioRecorder) est la
 //! sortie PAR DÉFAUT macOS, les haut-parleurs intégrés disparaissent de la liste
 //! de l'agent. Ce diag tranche la cause :
-//!   - HP présents dans `devices()` mais ABSENTS de `output_devices()`
-//!       → c'est le pré-filtre CPAL (`supported_output_configs` échoue) →
-//!         RÉCUPÉRABLE par une énumération tolérante (Lot B agent).
+//!   - HP présents dans `devices()` mais ABSENTS de `output_devices()` →
+//!     c'est le pré-filtre CPAL (`supported_output_configs` échoue) →
+//!     RÉCUPÉRABLE par une énumération tolérante (Lot B agent).
 //!   - HP absents des DEUX → macOS/le pilote les cache réellement (agrégat qui
-//!         possède le device) → NON récupérable côté agent (rien à coder).
+//!     possède le device) → NON récupérable côté agent (rien à coder).
 //!
 //! Usage (à lancer AVEC MJAudioRecorder réglé en sortie par défaut macOS) :
 //!   cargo run -p jamodio-agent --example enum_outputs
