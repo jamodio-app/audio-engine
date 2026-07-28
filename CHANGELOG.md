@@ -4,147 +4,59 @@ Toutes les versions notables de **Jamodio Audio Engine**.
 Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
-## [0.5.10-10] — 2026-07-27 (pré-release)
+
+## [0.5.10] — 2026-07-28
+
+Chantier **sortie audio en mode agent** : en studio, tout l'audio IN **et OUT**
+passe par l'agent, avec choix du périphérique et des canaux de sortie. Zéro ms
+ajouté à la pipeline (garde-fou latence n°1 respecté). Durci par une revue de code
+max-effort (web + agent) avant release.
 
 ### Ajouté
-- **Extension paire de sortie à CoreAudio (cohérence Mac/PC).** Le chemin de
-  sortie cpal (`playback.rs`, CoreAudio + WASAPI) ouvre désormais le device avec
-  son **nombre réel de canaux** (`default_output_config().channels()`) au lieu de
-  2 en dur, et n'écrit le mix stéréo que dans la **paire choisie**
-  (`output_pair_start` partagé), zéros ailleurs — même mécanisme que l'ASIO
-  (Lot B). Sur un device stéréo (n_out=2) : comportement **identique** à
-  l'historique. Le message `set-output-pair` pilote maintenant **ASIO ET
-  CoreAudio** (swap live, aucune réouverture ; le callback lit l'atomique).
-
-### Nettoyage
-- `clamp_output_pair` extrait dans un module partagé `audio::output_pair`
-  (cross-platform, testé sur toutes plateformes) au lieu du module `asio_host`
-  Windows-only ; réutilisé par ASIO et CoreAudio. Clippy 100 % propre (fix doc
-  overindent dans l'exemple `enum_outputs`).
-
-## [0.5.10-9] — 2026-07-27 (pré-release)
-
-### Ajouté
-- **Lot B — sélection de la PAIRE de canaux de sortie ASIO (Windows).** Le host
-  ASIO ouvre désormais TOUS les canaux de sortie de l'interface (`n_out = outs`) et
-  n'écrit le mix stéréo que dans la paire choisie (`output_pair_start`, atomique
-  partagé), zéros ailleurs. Nouveau message dédié `set-output-pair {pair}` →
-  `PipelineState::set_output_pair` = **swap LIVE de la paire par store atomique,
-  AUCUNE réouverture driver** (aucun churn ASIOExit/ASIOInit, compatible keep-warm ;
-  le même `Arc` est re-passé aux ré-ouvertures). Clamp aux bornes de l'interface
-  dans le callback (`clamp_output_pair`, pur + testé). Zéro ms ajouté (buffer/SR
-  inchangés ; lecture = 1 `load` Relaxed/bloc). Inerte hors ASIO (CoreAudio/WASAPI :
-  compteur jamais lu). Invariant testé : changer la paire n'appelle NI open NI
-  ASIOInit. Le web (picker de paire) suit.
-
-## [0.5.10-8] — 2026-07-27 (pré-release)
-
-### Ajouté
-- **Lot D — aperçus de fichiers Library via l'agent (en studio).** Nouveau slot
-  `preview` dans la source référence (2e instance de `Backing`, buffer séparé),
-  mixé au même point que le backing → **jamais enregistré, jamais ducké par le
-  DIM** ; charger un aperçu **n'évince pas** le backing chargé. Messages wire
-  `reference-preview-{begin,chunk,end,unload,play,pause,seek,sync}` (miroir des
-  messages backing). `PREVIEW_ID` routé pour volume/pan. Invariants testés
-  (record/DIM au niveau mixer, non-éviction du backing au niveau référence).
-  Zéro ms sur la pipeline (chemin backing : PCM lu dans le callback, RT-safe).
-
-## [0.5.10-7] — 2026-07-27 (pré-release)
+- **Sélection de la sortie audio (mode agent).** Picker de périphérique de sortie
+  (CoreAudio) + sélection de la **paire de canaux de sortie** sur interface
+  multicanal — **ASIO (Windows) ET CoreAudio (Mac)**. L'agent ouvre tous les canaux
+  du device et n'écrit le mix stéréo que dans la paire choisie (`set-output-pair`,
+  store atomique) : **swap LIVE, aucune réouverture driver**, inerte sur un device
+  ≤ 2 sorties. Sortie stéréo standard = comportement **identique** à l'historique
+  (fast-path zéro-copie).
+- **Voix / talkback des pairs via l'agent (Lot C).** La voix des autres musiciens
+  peut sortir sur le device d'écoute choisi (plus seulement la sortie système). Étage
+  voix **dédié** : sommé après le tap RECORD et après le DIM → **jamais enregistré,
+  jamais ducké** (parité exacte avec le navigateur). Latence instrument/self-monitor
+  **intacte** (étage distinct) ; voix ≈ 7–13 ms, imperceptible pour la parole.
+- **Aperçus de fichiers Library via l'agent, en studio (Lot D).** Slot `preview`
+  dédié (2e instance de backing, buffer séparé) sortant sur le bon device ; jamais
+  enregistré ni ducké, n'évince pas le backing chargé.
+- **Énumération de sortie tolérante (macOS).** Récupère les sorties réellement
+  ouvrables que CPAL masquait (port jack intégré inactif, HP sous un enregistreur
+  virtuel…). Windows inchangé (probe interdit sur driver ASIO mono-client).
+- **« Défaut système » suit l'OS en live.** Changer la sortie par défaut de l'OS en
+  session réouvre le playback dessus (instrument aligné sur backing/métronome). Hors
+  thread audio → zéro latence. Une sortie explicitement choisie n'est jamais écrasée.
 
 ### Corrigé
-- **Claquement (clic) à l'arrêt du backing track.** L'arrêt/pause coupait la
-  lecture net (forme d'onde → 0 instantané) → discontinuité audible. Ajout d'un
-  **fondu de declic** (~5 ms) : fondu d'entrée au play, fondu de sortie au
-  pause/stop. Bénéficie aussi au futur slot preview (Lot D, réutilise `Backing`).
+- **Une préférence de sortie périmée ne bloque plus l'entrée en session.** La
+  résolution de sortie est **non-fatale** : repli **visible** sur la sortie par
+  défaut système + signal `outputFallback` (le sélecteur revient sur « Défaut
+  système » + toast), jamais silencieux.
+- **Talkback des pairs coupé après ~8 s de silence.** L'idle-timeout est désactivé
+  pour les flux voix (légitimement silencieux au mute) ; les instruments gardent le
+  timeout.
+- **Claquement (clic) à l'arrêt du backing track.** Fondu de declic ~5 ms au
+  play/pause/stop (profite aussi aux aperçus Library).
 
-## [0.5.10-6] — 2026-07-26 (pré-release)
-
-### Diagnostic
-- Log INFO à la réception de `SetDim` (ducking des instruments) — action
-  utilisateur rare, permet de vérifier que le DIM est bien reçu en mode agent.
-
-## [0.5.10-5] — 2026-07-26 (pré-release)
-
-### Corrigé
-- **Talkback des pairs coupé après ~8 s de silence (régression Lot C).** Le flux
-  voix entrant utilise le chemin de réception de l'agent, dont l'idle-timeout de
-  8 s terminait les flux « fantômes ». Or le talkback est légitimement silencieux
-  quand personne ne parle (piste d'envoi désactivée au mute → aucun paquet) :
-  le flux voix était alors tué à tort et le talkback perdu jusqu'à un rejoin.
-  L'idle-timeout est désormais **désactivé pour les flux voix** (le nettoyage
-  passe par le `remove-stream` explicite du navigateur) ; les instruments (audio
-  continu) gardent le timeout de 8 s.
-
-## [0.5.10-4] — 2026-07-25 (pré-release)
-
-Chantier **sortie audio mode agent** (Lot C — voix des pairs via l'agent).
-
-### Ajouté
-- **La voix (talkback) des pairs peut sortir par l'agent** (donc sur le device
-  d'écoute choisi), au lieu de rester sur la sortie système via le navigateur.
-  `AddStream` gagne un `mediaTag` (`instrument` par défaut / `voice`). Les flux
-  `voice` sont mixés dans un **étage dédié** : sommés APRÈS le tap RECORD et
-  APRÈS le DIM (comme la référence métronome) → **jamais enregistrés, jamais
-  duckés** (parité exacte avec le `voiceBus` du navigateur). Tranche unique avec
-  gain/pan de bus (`set-peer-voice-gain` / `set-peer-voice-pan`) ; niveau agrégé
-  remonté (`peer-voice`) pour le VU voix. Décodage mono inchangé (sûr).
-- **Latence : aucune sur la pipeline instrument/self-monitor** (étage voix
-  distinct) ; la voix suit le budget jitter des flux réseau (~7–13 ms),
-  imperceptible pour la parole.
-- Invariants testés : une voix n'entre jamais dans le RECORD (mix + stems) et
-  n'est jamais duckée par le DIM.
-
-## [0.5.10-3] — 2026-07-25 (pré-release)
-
-Chantier **sortie audio mode agent** (« Défaut système » suit l'OS en live).
-
-### Corrigé
-- **L'instrument (self-monitor) ne suivait pas le changement de sortie par
-  défaut de l'OS en session.** En « Défaut système », le stream de sortie de
-  l'agent était ouvert une fois au démarrage et jamais réouvert : si l'on
-  changeait la sortie OS pendant une session, backing/métronome (via navigateur)
-  suivaient mais l'instrument (via l'agent) restait collé à l'ancienne sortie.
-  Un superviseur sonde désormais le défaut de sortie OS (~1 s, **hors thread
-  audio → zéro latence**) et, quand « Défaut système » est actif (CoreAudio/
-  WASAPI, jamais ASIO), réouvre le playback sur le nouveau défaut. Une sortie
-  **explicitement** choisie n'est jamais écrasée. Invariant testé
-  (`should_follow_os_default`).
-
-## [0.5.10-2] — 2026-07-25 (pré-release)
-
-Chantier **sortie audio mode agent** (Lot B — énumération tolérante macOS).
-
-### Corrigé
-- **Sorties réelles manquantes dans le sélecteur (macOS).** L'énumération CPAL
-  `output_devices()` pré-filtre les sorties sur `supported_output_configs()`, qui
-  **échoue** pour des sorties pourtant OUVRABLES : port jack intégré inactif
-  (« Écouteurs externes »), HP intégrés quand un device virtuel enregistreur
-  possède la route, etc. → elles disparaissaient de la liste. L'agent énumère
-  désormais `host.devices()` et inclut toute sortie **réellement ouvrable**
-  (config queryable, ou build-probe 48 kHz/2ch réussi **sans jouer de son**).
-  Récupère les écouteurs/HP absents à tort. **macOS uniquement** — sur Windows,
-  l'énumération reste inchangée (probe interdit : ouvrir un driver ASIO
-  mono-client le rechargerait). Résultat mis en cache (probe au rebuild seul).
-
-## [0.5.10-1] — 2026-07-25 (pré-release)
-
-Chantier **sortie audio mode agent** (Lot A — picker de sortie CoreAudio).
-
-### Corrigé
-- **Une préférence de sortie périmée ne bloque plus l'entrée en session.**
-  Avant, si la sortie sélectionnée (ex. un casque USB) n'était plus résolvable
-  au démarrage de la capture (index CoreAudio glissé, device retiré, sortie par
-  défaut système changée), l'agent **rejetait tout le StartCapture** → session
-  impossible. Désormais la résolution de sortie est **non-fatale** : l'agent
-  retombe sur la **sortie par défaut système** et le signale au navigateur
-  (nouveau `outputFallback` dans `CaptureStarted`) → le sélecteur revient sur
-  « Défaut système » + toast. Repli **visible**, jamais silencieux. L'entrée
-  (instrument) suivait déjà cette philosophie ; la sortie s'aligne.
-
-### Ajouté
-- `CaptureStarted` porte `outputName` + `outputFallback` (sortie effectivement
-  ouverte + drapeau de repli). Invariant testé : une sortie invalide ne bloque
-  jamais StartCapture (`output_fallback_from`).
+### Robustesse (revue max-effort avant release)
+- **Sortie stéréo (self-monitor) : fast-path zéro-copie restauré** — plus d'étage
+  CPU ajouté sur le chemin audio le plus sensible.
+- **Superviseur de liveness** : ne reconstruit plus une capture SAINE quand la sortie
+  est absente par design (plus de churn de la capture).
+- **`set-output-pair`** appliqué de façon fiable (plus de perte silencieuse sous
+  contention de lock).
+- Défauts sûrs : le tap RECORD n'enregistre jamais un flux inconnu ; l'index de
+  paire est forcé pair ; l'enveloppe de declic est réinitialisée au (re)chargement.
+- Nettoyage ciblé (module partagé `audio::output_pair`, commentaires, code mort) ;
+  clippy 100 % propre sur **macOS ET Windows**.
 
 ## [0.5.9] — 2026-07-23
 
