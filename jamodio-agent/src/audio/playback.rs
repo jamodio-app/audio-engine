@@ -34,22 +34,23 @@ fn on_playback_err(err: cpal::StreamError) {
 /// `data` (`frames*n_out` entrelacé) : canal L de la paire → canal `ps`, R →
 /// `ps+1`, ZÉROS sur tous les autres canaux (device multicanal — Lot B/CoreAudio).
 /// `conv` convertit un échantillon f32 → type natif du device (f32/i32/i16).
-/// `n_out == 2` (device stéréo) → écriture directe des 2 canaux (cas historique).
+///
+/// On met TOUT le buffer à zéro (un `fill`) puis on n'écrit que les 2 lanes de la
+/// paire — moins de travail par frame que l'ancien branchement par canal, et
+/// memory-safe même si `ps` n'est pas clampé (les 2 écritures sont gardées `< n_out`).
 fn scatter_pair<T: Copy>(data: &mut [T], scratch: &[f32], n_out: usize, ps: usize, conv: impl Fn(f32) -> T) {
     if n_out == 0 {
         return;
     }
     let frames = data.len() / n_out;
+    data.fill(conv(0.0)); // silence sur tous les canaux, on n'écrira que la paire
     for f in 0..frames {
-        for c in 0..n_out {
-            let v = if c == ps {
-                scratch[f * 2]
-            } else if c == ps + 1 {
-                scratch[f * 2 + 1]
-            } else {
-                0.0
-            };
-            data[f * n_out + c] = conv(v);
+        let base = f * n_out;
+        if ps < n_out {
+            data[base + ps] = conv(scratch[f * 2]);
+        }
+        if ps + 1 < n_out {
+            data[base + ps + 1] = conv(scratch[f * 2 + 1]);
         }
     }
 }
@@ -143,11 +144,13 @@ pub fn build_playback_stream(
     // driver. Si la sortie ne pull pas (cold-start ASIO muet), ce compteur reste
     // figé → le watchdog (ws_server) le détecte et relance. Un `fetch_add(Relaxed)`
     // par callback = négligeable sur le hot-path RT.
-    // Le mix est TOUJOURS produit dans un scratch STÉRÉO (frames*2), puis « scatteré »
-    // dans la paire de canaux choisie du device (zéros ailleurs), quel que soit le
-    // format natif. Sur un device stéréo (n_out=2, ps=0) → écriture directe des 2
-    // canaux (identique à l'historique). Le scratch est capturé par le callback
-    // (pas d'alloc par bloc après warm-up).
+    // Sortie multicanal (n_out>2) : le mix est produit dans un scratch STÉRÉO
+    // (frames*2) puis « scatteré » dans la paire de canaux choisie (zéros ailleurs).
+    // Format ENTIER (ASIO Int32/Int16) : idem, avec conversion f32→natif.
+    // FAST-PATH device STÉRÉO f32 (n_out=2, cas dominant CoreAudio/WASAPI = le
+    // self-monitor/instrument) : le mix va DIRECTEMENT dans le buffer device, ZÉRO
+    // copie — comportement historique préservé (pas d'étage nouveau sur le chemin
+    // le plus sensible). Le scratch est capturé par le callback (pas d'alloc/bloc).
     let stream = match sample_format {
         SampleFormat::F32 => {
             let output_callbacks = output_callbacks.clone();
@@ -160,6 +163,12 @@ pub fn build_playback_stream(
                     output_callbacks.fetch_add(1, Ordering::Relaxed);
                     let frames = data.len() / n_out;
                     output_frames.store(frames as u32, Ordering::Relaxed);
+                    // Device stéréo : écriture directe zéro-copie (fast-path historique).
+                    if n_out == 2 {
+                        mixer.lock().mix_into(data);
+                        return;
+                    }
+                    // Device multicanal : scratch stéréo → paire choisie.
                     scratch.clear();
                     scratch.resize(frames * 2, 0.0);
                     mixer.lock().mix_into(&mut scratch);

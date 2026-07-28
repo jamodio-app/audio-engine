@@ -2251,6 +2251,16 @@ impl PipelineState {
         self.audio_streams_open()
     }
 
+    /// Vrai si une SORTIE audio est censée produire des callbacks : soit un stream
+    /// de playback cpal ouvert, soit l'hôte ASIO duplex (dont la sortie fait partie
+    /// du callback commun). Faux = playback intentionnellement absent (repli non-fatal
+    /// Lot A : aucune sortie dispo/demandée/défaut). Le superviseur de liveness s'en
+    /// sert pour NE PAS churner une capture SAINE quand la sortie est absente (le
+    /// compteur de callbacks de sortie ne peut alors pas avancer — ≠ flatline).
+    pub fn has_playback_stream(&self) -> bool {
+        self.playback_stream.is_some() || self.has_asio_host()
+    }
+
     /// 0.5.4-2 — clone du canal de signalisation `kAsioResetRequest`, pour que le
     /// superviseur de liveness sache (immédiatement) quand un driver ASIO demande
     /// un reset. No-op sémantique hors Windows (jamais signalé).

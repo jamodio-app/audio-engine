@@ -298,22 +298,21 @@ pub fn log_devices() {
             );
         }
     }
-    if let Ok(devices) = host.output_devices() {
-        for (idx, d) in devices.enumerate() {
-            let name = d.name().unwrap_or_else(|_| "<err>".into());
-            let cfg = d.default_output_config().ok();
-            let ch = cfg.as_ref().map(|c| c.channels()).unwrap_or(0);
-            let sr = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
-            tracing::info!(
-                target: "jamodio::devices",
-                kind = "output",
-                index = idx,
-                name = %name,
-                channels = ch,
-                sample_rate = sr,
-                is_default = name == def_out,
-            );
-        }
+    // Sortie : on logge l'ÉNUMÉRATION RÉELLE (`list_outputs`, celle qui produit les
+    // ids `{idx}:{name}` envoyés au web). Sur macOS elle passe par `host.devices()`
+    // (tolérante) → un `host.output_devices().enumerate()` donnerait un index NE
+    // correspondant PAS à l'id. On logge donc l'`id` complet, pas un index brut.
+    // (log_devices n'est appelé qu'au démarrage → le build-probe éventuel est hors session.)
+    for d in list_outputs() {
+        tracing::info!(
+            target: "jamodio::devices",
+            kind = "output",
+            id = %d.id,
+            name = %d.name,
+            channels = d.channels,
+            sample_rate = d.native_sample_rate,
+            is_default = d.is_default,
+        );
     }
 }
 

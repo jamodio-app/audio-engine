@@ -1673,11 +1673,12 @@ async fn audio_liveness_supervisor(
         }
 
         // Observation atomique (lock bref).
-        let (state_capturing, has_stream, cap, out) = {
+        let (state_capturing, has_stream, has_output, cap, out) = {
             let pl = pipeline.lock().await;
             (
                 matches!(pl.state, AgentState::Capturing),
                 pl.has_active_capture_stream(),
+                pl.has_playback_stream(),
                 pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
                 pl.perfstats.output_callbacks.load(Ordering::Relaxed),
             )
@@ -1819,8 +1820,14 @@ async fn audio_liveness_supervisor(
         let reqs = reset_signal.request_count();
         let reset_requested = reqs != last_reset_seen;
 
-        // Les DEUX compteurs avancent ET aucun reset en attente ⇒ session saine.
-        let advancing = cap > prev_cap && out > prev_out;
+        // Session saine = la capture avance ET (la sortie avance OU il n'y a PAS de
+        // sortie par design). Sans ce `|| !has_output`, une machine dont le playback
+        // est intentionnellement absent (repli non-fatal Lot A : aucune sortie
+        // valide) verrait `out` figé → flatline → repair reconstruit LES DEUX streams,
+        // dont la capture SAINE → churn (les pairs entendraient l'utilisateur
+        // glitcher). La récupération de la SORTIE est un chemin distinct (suivi du
+        // défaut OS / retry), pas le repair complet de la capture.
+        let advancing = cap > prev_cap && (out > prev_out || !has_output);
         prev_cap = cap;
         prev_out = out;
         if advancing && !reset_requested {
@@ -2002,9 +2009,13 @@ async fn handle_message(
         BrowserMessage::SetOutputPair { pair } => {
             // Lot B (ASIO) + extension CoreAudio — swap LIVE de la paire de canaux de
             // sortie sur device multicanal (store atomique, aucune réouverture driver).
-            // Non critique : si le lock est occupé on laisse tomber (le web re-enverra
-            // au prochain changement). Inerte sur un device ≤ 2 sorties.
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
+            // On ATTEND le lock (lock_pipeline_wait, pas try_lock) : contrairement aux
+            // faders re-poussés en continu, le choix de paire est un ONE-SHOT au SAVE,
+            // jamais réémis → le dropper sous contention laisserait l'utilisateur sur la
+            // mauvaise paire SANS feedback (charte « X ou erreur explicite »). L'op est
+            // triviale (un store atomique) et hors thread audio → l'attente est sûre.
+            // Inerte sur un device ≤ 2 sorties.
+            let Some(pl) = lock_pipeline_wait(pipeline).await else {
                 return vec![];
             };
             pl.set_output_pair(pair as usize);

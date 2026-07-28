@@ -534,10 +534,16 @@ impl AudioMixer {
         // filtre aussi les flux VOIX — le talkback des pairs n'est jamais
         // enregistré (parité `voiceBus` navigateur, hors `instrumentMixBus`). Le
         // lookup de `kind` est court-circuité hors enregistrement (record_tx None).
+        // Défaut SÛR (defense-in-depth) : un stream INCONNU (pas encore `add_stream`)
+        // n'est PAS enregistré → `is_some_and` (et non `is_none_or`). En pratique
+        // `add_stream(kind)` précède toujours `push_samples`, mais on ne veut pas que
+        // l'invariant « la voix n'est jamais enregistrée » dépende de cet ordre : si
+        // un futur chemin poussait des samples avant l'enregistrement du stream, un
+        // fragment de voix ne doit pas fuiter dans le stem.
         if self.record_tx.is_some()
             && producer_id != SELF_MONITOR_ID
             && !samples.is_empty()
-            && self.streams.get(producer_id).is_none_or(|s| s.kind != StreamKind::Voice)
+            && self.streams.get(producer_id).is_some_and(|s| s.kind != StreamKind::Voice)
         {
             self.record_send(RecordCmd::PushPeer(producer_id.to_string(), samples.to_vec()));
         }

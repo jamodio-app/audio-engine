@@ -17,7 +17,10 @@ pub fn clamp_output_pair(start: usize, n_out: usize) -> usize {
     if n_out < 2 {
         return 0;
     }
-    start.min(n_out - 2)
+    // Borne à [0, n_out-2] ET force un index de départ PAIR : les paires sont
+    // 0-1, 2-3, 4-5… ; un `start` impair donnerait une paire off-grille (ex. 4-5
+    // au lieu de 3-4/5-6). L'UI n'envoie que des index pairs → défense en profondeur.
+    (start.min(n_out - 2)) & !1
 }
 
 #[cfg(test)]
@@ -33,6 +36,11 @@ mod tests {
         assert_eq!(clamp_output_pair(6, 8), 6, "7-8 (dernière paire)");
         assert_eq!(clamp_output_pair(7, 8), 6, "start hors borne → dernière paire valide");
         assert_eq!(clamp_output_pair(100, 8), 6, "très grand → borné");
+        // Alignement pair (défense) : un start impair retombe sur la paire paire inf.
+        assert_eq!(clamp_output_pair(3, 8), 2, "start impair 3 → paire 3-4 (index 2)");
+        assert_eq!(clamp_output_pair(5, 8), 4, "start impair 5 → paire 5-6 (index 4)");
+        // n_out impair : dernière paire = 4-5 (index 4), le canal 6 reste seul.
+        assert_eq!(clamp_output_pair(9, 7), 4, "n_out=7 → dernière paire index 4");
     }
 
     #[test]

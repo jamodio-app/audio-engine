@@ -394,6 +394,11 @@ impl Backing {
         self.anchored = false;
         self.play_head = 0.0;
         self.rs_speed = 1.0;
+        // Reset défensif de l'enveloppe de declic : si un `begin` arrive alors qu'un
+        // fondu de sortie est en cours (stopping=true, env>0), le play suivant doit
+        // repartir d'un fondu d'entrée COMPLET (env=0), pas d'un état résiduel.
+        self.env = 0.0;
+        self.stopping = false;
     }
     fn push_chunk(&mut self, samples: &[f32]) {
         self.pcm.extend_from_slice(samples);
