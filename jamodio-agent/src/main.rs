@@ -184,6 +184,42 @@ fn main() {
     // bind à _log_guard au scope de main() (drop = fin du process = OK).
     let _log_guard = logging::init();
 
+    // Filet de diagnostic crash (0.5.11) : un panic Rust part par DÉFAUT sur
+    // stderr — jeté sur une app GUI Windows → invisible dans `agent.log` (donc
+    // absent du bug-report support). On installe un hook qui route le panic
+    // (message + localisation + backtrace) vers `tracing` → `agent.log` → bundle.
+    // On CHAÎNE le hook par défaut : on ne change pas la stratégie d'unwind.
+    //
+    // Portée : ceci capture les panics RUST uniquement. Les crashs NATIFS
+    // (corruption de tas / access-violation SEH, ex. driver ASIO) passent à côté
+    // et relèvent d'un `SetUnhandledExceptionFilter`/minidump — à ajouter en
+    // session Windows (cf. internal-docs/plans/PLAN-ASIO-OUTPUT-PAIR-2026-07.md,
+    // §« Capture de crash natif »).
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<inconnue>".to_string());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<payload non-string>".to_string());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            tracing::error!(
+                target: "jamodio::panic",
+                location = %location,
+                message = %message,
+                backtrace = %backtrace,
+                "PANIC Rust — thread en cours d'unwind"
+            );
+            default_hook(info);
+        }));
+    }
+
     tauri::Builder::default()
         // ─── Single-instance lock ─────────────────────────────
         // Si un 2e process est lancé (clic répété sur "Lancer", deep link

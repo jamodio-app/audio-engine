@@ -233,11 +233,33 @@ impl AsioDuplexHost {
 
         let channels = driver.channels().map_err(|e| format!("channels: {e:?}"))?;
         let n_in = channels.ins.max(0) as usize;
-        // Lot B — on ouvre TOUS les canaux de sortie de l'interface (le mixer produit
-        // du stéréo, écrit dans la PAIRE choisie via `output_pair_start`, zéros
-        // ailleurs). Ouvrir tous les canaux = pratique DAW standard ; permet de
-        // changer de paire EN SESSION par simple swap atomique (aucune réouverture).
-        let n_out = channels.outs.max(0) as usize;
+        // Lot B (0.5.11) — n'ouvrir QUE les canaux de sortie nécessaires à la paire
+        // COURANTE (lue à l'ouverture), pas TOUS les canaux.
+        //
+        // Pourquoi (RACINE d'un crash 0.5.10) : ouvrir les 32 sorties d'un WING
+        // (`ASIOCreateBuffers` sur 32 in + 32 out = 64 buffers, puis 32 écritures
+        // FFI par callback) déclenchait une CORRUPTION DE TAS côté asio-sys/driver
+        // sur les interfaces à beaucoup de canaux (`STATUS_HEAP_CORRUPTION` /
+        // access-violation Windows, cf. crash-loop grotchybrax 28/07). On revient au
+        // régime éprouvé 0.5.9 : `paire+2` sorties (ex. paire 1-2 → 2 ; 3-4 → 4).
+        //
+        // `clamp_output_pair` garantit un `start` PAIR borné à `[0, total-2]`, donc
+        // `+2 ∈ [2, total]`. Le callback écrit le mix sur `ps`/`ps+1` (toujours dans
+        // la fenêtre ouverte) et des zéros ailleurs.
+        //
+        // LIMITE CONNUE (à corriger en session Windows, cf. PLAN-ASIO-OUTPUT-PAIR) :
+        // si l'utilisateur choisit EN SESSION une paire PLUS HAUTE que la fenêtre
+        // ouverte, le callback la clampe à la dernière paire ouverte (mauvais
+        // routage, JAMAIS de crash) jusqu'à la prochaine réouverture. Le fix propre
+        // = réouverture sur croissance de paire (reset borné) — non fait ici car
+        // non testable hors machine Windows.
+        let total_out = channels.outs.max(0) as usize;
+        let n_out = if total_out < 2 {
+            total_out
+        } else {
+            (clamp_output_pair(output_pair_start.load(Ordering::Relaxed), total_out) + 2)
+                .min(total_out)
+        };
         if n_in == 0 || n_out == 0 {
             return Err(format!("driver sans entrée/sortie (ins={}, outs={})", channels.ins, channels.outs));
         }

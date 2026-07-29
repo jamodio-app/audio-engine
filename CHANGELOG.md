@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-1] — non publié (pré-release)
+
+Correctif d'un **crash sur interface à beaucoup de canaux** introduit en 0.5.10.
+
+### Corrigé
+- **Crash ASIO 32 canaux (corruption de tas / `STATUS_HEAP_CORRUPTION`).** En
+  0.5.10, l'agent ouvrait **tous** les canaux de sortie de l'interface pour le swap
+  de paire live ; sur un Behringer WING (32 in / 32 out) → `ASIOCreateBuffers` sur
+  64 buffers + 32 écritures FFI/callback → corruption de tas côté asio-sys/driver
+  (crash-loop « le moteur ne veut plus se lancer »). L'agent n'ouvre désormais que
+  **`paire+2`** canaux de sortie (régime éprouvé 0.5.9). Limite connue et cible
+  « niveau DAW » (ouverture de canaux précis) documentées dans
+  `internal-docs/plans/PLAN-ASIO-OUTPUT-PAIR-2026-07.md`.
+
+### Ajouté
+- **Hook panic Rust → `agent.log`.** Un panic Rust partait par défaut sur stderr
+  (jeté sur une app GUI Windows, invisible dans le bug-report). Il est désormais
+  routé vers le log fichier (message + localisation + backtrace), donc présent dans
+  le bundle support. (Les crashs natifs/SEH restent à couvrir — cf. plan ci-dessus.)
+
+
 ## [0.5.10] — 2026-07-28
 
 Chantier **sortie audio en mode agent** : en studio, tout l'audio IN **et OUT**
