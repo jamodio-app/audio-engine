@@ -399,6 +399,23 @@ fn open_duplex_on_com(
                 ),
                 Some(d) => {
                     let out_name = d.name().unwrap_or_default();
+                    // R2 SORTIE (Mac) — refuse une sortie hors 48 kHz : jamais de resample
+                    // CoreAudio implicite (latence cachée sur le self-monitor). Gaté sur
+                    // `native_sr == 48000` : si l'ENTRÉE est déjà hors 48, on laisse R2 entrée
+                    // remonter le vrai problème (bon message). Cas courant (in=out=même device
+                    // 44,1) → R2 entrée ; ce gate ne mord que sur une sortie DIFFÉRENTE en 44,1.
+                    if native_sr == 48_000 {
+                        if let Some(out_sr) = crate::audio::playback::output_native_sr(&d) {
+                            if out_sr != 48_000 {
+                                tracing::warn!(
+                                    target: "jamodio::pipeline",
+                                    output = %out_name, actual_sr = out_sr,
+                                    "StartCapture refusé — SORTIE hors 48 kHz natif (R2 sortie)"
+                                );
+                                return Err(CaptureStartError::OutputNotForty8kHz { actual_sr: out_sr });
+                            }
+                        }
+                    }
                     match crate::audio::playback::build_playback_stream(&d, mixer, output_callbacks, output_frames, output_pair_start) {
                         // Démarre la SORTIE d'abord (buffers tous créés).
                         Ok((out_stream, buffer)) => match out_stream.play() {
@@ -584,6 +601,12 @@ pub enum CaptureStartError {
     /// natif (`actual_sr` = rate réel négocié). REFUS : jamais de resampling caché
     /// (~29 ms = tout le budget latence). L'UI demande de régler l'interface en 48 kHz.
     NotForty8kHz { actual_sr: u32 },
+    /// R2 SORTIE (décision 48k/ASIO-only) — device de SORTIE hors 48 kHz natif
+    /// (`actual_sr` = rate réel). REFUS : jamais de resample CoreAudio implicite sur le
+    /// playback (latence cachée sur le self-monitor). Mac-only en pratique (sur Windows
+    /// la sortie = le device ASIO d'entrée, déjà gaté par R2). L'UI demande de régler
+    /// la SORTIE en 48 kHz.
+    OutputNotForty8kHz { actual_sr: u32 },
     // NB (Lot A 0.5.10) : plus de `OutputDeviceNotFound`. La résolution de sortie
     // est désormais NON-FATALE (repli sur la sortie par défaut système + signal
     // `outputFallback` dans `CaptureStarted`) → une sortie introuvable ne peut
@@ -602,6 +625,9 @@ impl std::fmt::Display for CaptureStartError {
             Self::NoAsio => write!(f, "host WASAPI : ASIO requis (installer un pilote ASIO)"),
             Self::NotForty8kHz { actual_sr } => {
                 write!(f, "device en {} Hz : 48 kHz natif requis", actual_sr)
+            }
+            Self::OutputNotForty8kHz { actual_sr } => {
+                write!(f, "sortie en {} Hz : 48 kHz natif requis", actual_sr)
             }
             Self::Other(s) => write!(f, "{}", s),
         }

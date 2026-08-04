@@ -2238,6 +2238,16 @@ async fn handle_message(
                         detail: Some(format!("{} Hz", actual_sr)),
                     }]
                 }
+                // R2 SORTIE — device de SORTIE hors 48 kHz natif (Mac). L'UI bloque et
+                // demande de régler la SORTIE en 48 kHz (jamais de resample caché).
+                Err(crate::pipeline::CaptureStartError::OutputNotForty8kHz { actual_sr }) => {
+                    tracing::warn!(target: "jamodio::ws", actual_sr, "StartCapture refusé : SORTIE hors 48 kHz natif (R2 sortie)");
+                    vec![AgentMessage::CaptureError {
+                        reason: "output-not-48khz".into(),
+                        requested_device: input_device,
+                        detail: Some(format!("{} Hz", actual_sr)),
+                    }]
+                }
                 // NB (Lot A 0.5.10) : plus de cas `OutputDeviceNotFound` — la sortie
                 // est non-fatale (repli défaut système + `outputFallback` dans
                 // `CaptureStarted`). Une sortie introuvable ne rejette plus la capture.

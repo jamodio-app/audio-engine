@@ -10,6 +10,13 @@ const TARGET_SR: u32 = 48000;
 // La taille de buffer cible n'est plus une constante figée : elle est pilotée
 // par `crate::audio::buffer_policy` (64 par défaut, 128 après backoff auto).
 
+/// R2 SORTIE (Mac/CoreAudio) — sample rate natif du device de sortie, `None` si non
+/// queryable. La pipeline REFUSE une sortie hors 48 kHz (jamais de resample CoreAudio
+/// implicite = latence cachée sur le self-monitor). Symétrique de R2 entrée.
+pub fn output_native_sr(device: &Device) -> Option<u32> {
+    device.default_output_config().ok().map(|c| c.sample_rate().0)
+}
+
 /// Vérifie si le device OUTPUT expose une `BufferSize::Range` qui contient
 /// `target_buf` pour le couple `(channels, sr)` demandé. Symétrique de
 /// `capture::device_supports_fixed_buffer`. Permet de choisir
