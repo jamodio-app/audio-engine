@@ -44,6 +44,10 @@ extern "C" {
 const PRIME_MS: u64 = 120;
 /// Délai max d'attente du 1ᵉʳ callback après `ASIOStart`.
 const START_TIMEOUT: Duration = Duration::from_secs(2);
+/// Lot B — settle entre deux essais de `set_sample_rate` (un driver qui vient de
+/// changer d'horloge — ASE_NoClock transitoire — a besoin de quelques dizaines de
+/// ms pour verrouiller la PLL avant d'accepter le nouveau rate).
+const RATE_SETTLE_MS: u64 = 60;
 
 /// Format d'échantillon natif ASIO géré par le host (variantes little-endian, seules
 /// rencontrées sur les interfaces Windows réelles).
@@ -227,9 +231,46 @@ impl AsioDuplexHost {
             .load_driver(driver_name)
             .map_err(|e| format!("load_driver({driver_name}): {e:?}"))?;
 
-        // 2) Sample rate (best-effort ; reconfigure le driver au SR cible 48 kHz).
-        let _ = driver.set_sample_rate(48_000.0);
-        let native_sr = driver.sample_rate().unwrap_or(48_000.0) as u32;
+        // 2) Sample rate — Lot B robustesse ASIO : `set_sample_rate(48k)` NON
+        //    SILENCIEUX. On capture le résultat ET on vérifie le rate EFFECTIF.
+        //    Séquence, alignée sur ce que fait un DAW :
+        //      a) 1er set + vérif ; si non honoré → settle bref + RE-SET (couvre le
+        //         ASE_NoClock transitoire, la PLL a besoin de verrouiller) ;
+        //      b) si TOUJOURS ≠ 48 k → on renvoie le rate RÉEL (native_sr le reflète)
+        //         + WARN explicite. `start_capture` (garde R2, décision 48k/ASIO-only)
+        //         REFUSERA alors la capture — JAMAIS de resampling caché. Un pilote
+        //         ASIO natif bascule le matériel en 48 ici même (transparent) ; seuls
+        //         les wrappers (ASIO4ALL) / le WASAPI partagé restent bloqués hors 48.
+        let target = 48_000.0_f64;
+        let set_res = driver.set_sample_rate(target);
+        let mut sr = driver.sample_rate().unwrap_or(0.0);
+        if set_res.is_err() || (sr - target).abs() > 1.0 {
+            tracing::warn!(
+                target: "jamodio::audio",
+                set_ok = set_res.is_ok(),
+                got_sr = sr,
+                "set_sample_rate(48k) non honoré au 1er essai — settle + nouvel essai"
+            );
+            std::thread::sleep(Duration::from_millis(RATE_SETTLE_MS));
+            let retry_res = driver.set_sample_rate(target);
+            sr = driver.sample_rate().unwrap_or(sr);
+            if retry_res.is_err() || (sr - target).abs() > 1.0 {
+                tracing::warn!(
+                    target: "jamodio::audio",
+                    retry_ok = retry_res.is_ok(),
+                    got_sr = sr,
+                    "driver REFUSE 48 kHz — la capture sera REFUSÉE (R2, jamais de resampling caché) ; l'UI demandera de régler l'interface en 48 kHz"
+                );
+            } else {
+                tracing::info!(target: "jamodio::audio", "set_sample_rate(48k) honoré au 2e essai (après settle)");
+            }
+        }
+        // native_sr = rate DÉCLARÉ par le driver. ⚠️ CERTAINS DRIVERS MENTENT :
+        // le Focusrite natif renvoie « OK » à set_sample_rate(48k) et rapporte
+        // sample_rate()=48000, mais continue de DÉLIVRER à 44,1. On corrige ce
+        // rate plus bas en MESURANT la cadence réelle des callbacks (seul signal
+        // fiable) après le start — cf. bloc « vérification du rate RÉEL ».
+        let mut native_sr = if sr > 0.0 { sr as u32 } else { target as u32 };
 
         let channels = driver.channels().map_err(|e| format!("channels: {e:?}"))?;
         let n_in = channels.ins.max(0) as usize;
@@ -437,6 +478,42 @@ impl AsioDuplexHost {
                 "AsioDuplexHost : aucun callback en {START_TIMEOUT:?} après ASIOStart — driver muet (le superviseur de liveness prendra le relais)"
             );
         } else {
+            // ── VÉRIFICATION DU RATE RÉEL (le driver peut MENTIR) ──────────────
+            // On MESURE la cadence des callbacks sur une brève fenêtre : le rate
+            // réel = cb_par_seconde × buffer_size. C'est le SEUL signal fiable —
+            // `sample_rate()` peut rapporter 48 000 alors que le matériel tourne à
+            // 44,1 (Focusrite natif : mensonge prouvé le 04/08, cb=689×64≈44 100).
+            // Si le mesuré diverge nettement (> 3 %) du déclaré, on RETIENT LE
+            // MESURÉ → la garde R2 (start_capture) refusera un vrai non-48. Coût :
+            // ~500 ms à l'ouverture (hors thread RT, une fois au join).
+            let c0 = capture_callbacks.load(Ordering::Relaxed);
+            let m0 = Instant::now();
+            std::thread::sleep(Duration::from_millis(500));
+            let dt = m0.elapsed().as_secs_f64();
+            let cb_delta = capture_callbacks.load(Ordering::Relaxed).saturating_sub(c0);
+            if cb_delta > 0 && dt > 0.0 && buffer_size > 0 {
+                let measured_sr = (cb_delta as f64 / dt) * buffer_size as f64;
+                let declared = native_sr as f64;
+                if (measured_sr - declared).abs() / declared > 0.03 {
+                    tracing::warn!(
+                        target: "jamodio::audio",
+                        declared_sr = native_sr,
+                        measured_sr = measured_sr as u32,
+                        cb_per_sec = (cb_delta as f64 / dt) as u32,
+                        buffer_size,
+                        "driver MENT sur son rate (déclaré ≠ mesuré) — on retient le rate RÉEL mesuré (la capture sera refusée si ≠ 48 kHz)"
+                    );
+                    native_sr = measured_sr.round() as u32;
+                    // Snap au rate standard le plus proche (le mesuré a ±~1 % de
+                    // bruit) : évite qu'un 44 096 mesuré passe pour « ni 44,1 ni 48 ».
+                    for std_sr in [44100u32, 48000, 88200, 96000, 176400, 192000, 32000, 22050, 11025] {
+                        if (native_sr as i64 - std_sr as i64).abs() <= 400 {
+                            native_sr = std_sr;
+                            break;
+                        }
+                    }
+                }
+            }
             tracing::info!(
                 target: "jamodio::audio",
                 first_callback_ms = t0.elapsed().as_millis() as u64,

@@ -32,9 +32,6 @@ pub type PluginHostImpl = AuHost;
 #[cfg(target_os = "windows")]
 pub type PluginHostImpl = Vst3Host;
 use parking_lot::Mutex;
-// Trait `Resampler` requis pour appeler output_frames_max() / process_into_buffer()
-// sur le `SincFixedIn<f32>` du resampler 44.1k → 48k Windows.
-use rubato::Resampler as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -576,6 +573,15 @@ pub enum CaptureStartError {
     /// Le device demandé (ou le default si aucun id) n'a pas été trouvé.
     /// Le `requested` est l'id transmis par le browser (None si aucun).
     InputDeviceNotFound { requested: Option<String> },
+    /// R1 (décision 48k/ASIO-only, 04/08) — host WASAPI sur Windows (aucun driver
+    /// ASIO) : la capture est REFUSÉE. Pas de fallback WASAPI (latence évitable).
+    /// L'UI demande d'installer un pilote ASIO (natif de l'interface ; ASIO4ALL à
+    /// défaut d'interface).
+    NoAsio,
+    /// R2 (décision 48k/ASIO-only) — le device n'a pas pu être ouvert en 48 kHz
+    /// natif (`actual_sr` = rate réel négocié). REFUS : jamais de resampling caché
+    /// (~29 ms = tout le budget latence). L'UI demande de régler l'interface en 48 kHz.
+    NotForty8kHz { actual_sr: u32 },
     // NB (Lot A 0.5.10) : plus de `OutputDeviceNotFound`. La résolution de sortie
     // est désormais NON-FATALE (repli sur la sortie par défaut système + signal
     // `outputFallback` dans `CaptureStarted`) → une sortie introuvable ne peut
@@ -589,6 +595,10 @@ impl std::fmt::Display for CaptureStartError {
         match self {
             Self::InputDeviceNotFound { requested } => {
                 write!(f, "input device introuvable : {:?}", requested)
+            }
+            Self::NoAsio => write!(f, "host WASAPI : ASIO requis (installer un pilote ASIO)"),
+            Self::NotForty8kHz { actual_sr } => {
+                write!(f, "device en {} Hz : 48 kHz natif requis", actual_sr)
             }
             Self::Other(s) => write!(f, "{}", s),
         }
@@ -644,6 +654,12 @@ pub struct PipelineState {
     /// détecte que les callbacks ASIO se sont arrêtés en cours de session
     /// (`rebuild_audio_streams`). `None` hors capture.
     capture_sample_tx: Option<Sender<Vec<f32>>>,
+    /// R4 (décision 48k/ASIO-only, 04/08) — `Some(actual_sr)` quand un reset a
+    /// rouvert le driver HORS 48 kHz : la capture doit être ARRÊTÉE (jamais de
+    /// resampling). Posé par `rebuild_audio_streams`, DRAINÉ par le superviseur de
+    /// liveness (`take_rate_drift_stop`) qui fait `stop_all` + remonte l'erreur au
+    /// browser, hors du verrou pipeline. `None` = pas de dérive.
+    rate_drift_stop: Option<u32>,
     /// 0.5.4-2 — canal de signalisation `kAsioResetRequest` (cf.
     /// `audio::asio_reset`). Partagé avec le superviseur de liveness, qui exécute
     /// le reset différé dès qu'un driver ASIO le demande. No-op hors Windows.
@@ -1134,6 +1150,7 @@ impl PipelineState {
             #[cfg(target_os = "windows")]
             asio_host: None,
             capture_sample_tx: None,
+            rate_drift_stop: None,
             reset_signal: crate::audio::asio_reset::ResetSignal::new(),
             reset_guard: None,
             warm: None,
@@ -1749,12 +1766,33 @@ impl PipelineState {
         let input_id = self.input_device_id.clone();
         let output_id = self.output_device_id.clone();
 
-        let reuse = Self::host_is_asio()
+        // Mêmes device + streams chauds ouverts = candidat au reuse à chaud.
+        let device_match = Self::host_is_asio()
             && self.audio_streams_open()
             && self
                 .warm
                 .as_ref()
                 .is_some_and(|w| w.input_id == input_id && w.output_id == output_id);
+
+        // Lot C robustesse ASIO — REVALIDATION DU RATE AU REUSE-WARM. Un rejoin
+        // reprend le driver chaud sans reset ni flatline ; si le format Windows a
+        // changé sous le driver (ASIO4ALL suit l'endpoint) il tourne désormais à un
+        // AUTRE rate que celui mémorisé → le reuse aveugle encoderait au mauvais
+        // rate (le chemin même qu'a emprunté le test 04/08, sans jamais déclencher
+        // Lot A). On probe le rate réel du driver (hors thread RT) : s'il diffère
+        // → on REFUSE le reuse et on tombe dans le cold reopen propre ci-dessous.
+        // La probe n'a lieu que sur un candidat Windows/ASIO (device_match) ; le
+        // bloc cfg garde la compilation macOS/WASAPI (méthode host-only absente).
+        let reuse = device_match && {
+            #[cfg(target_os = "windows")]
+            {
+                self.warm_driver_rate_still_valid()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                true
+            }
+        };
 
         if reuse {
             // Rejoin sur driver chaud : on démonte SEULEMENT la session, on GARDE
@@ -1923,6 +1961,16 @@ impl PipelineState {
         sfu_srtp: SrtpParameters,
         session_continues: bool,
     ) -> Result<(u16, SrtpParameters, CaptureStartedInfo), CaptureStartError> {
+        // R1 (décision 48k/ASIO-only, 04/08) — Windows : ASIO OBLIGATOIRE. Si le
+        // host résolu au boot est WASAPI (aucun driver ASIO), on REFUSE la capture
+        // au lieu d'ouvrir un chemin WASAPI à latence évitable. L'UI demande
+        // d'installer un pilote ASIO. macOS/CoreAudio : sans objet (pas d'ASIO).
+        #[cfg(target_os = "windows")]
+        if !Self::host_is_asio() {
+            tracing::warn!(target: "jamodio::pipeline", "StartCapture refusé — host WASAPI, ASIO requis (R1)");
+            return Err(CaptureStartError::NoAsio);
+        }
+
         // 1. ACQUISITION AUDIO — réutilise le driver ASIO gardé CHAUD (rejoin sans
         //    ré-init = anti-churn Focusrite), ou ouvre à froid. Encapsule TOUT le
         //    teardown de la session/driver précédent·e + ouvre/réutilise les
@@ -1944,9 +1992,27 @@ impl PipelineState {
             output_fallback,
         } = self.prepare_audio_for_session(session_continues)?;
 
+        // R2 (décision 48k/ASIO-only, 04/08) — 48 kHz NATIF OBLIGATOIRE. Le driver
+        // vient d'être ouvert/réutilisé ; s'il ne tourne pas EXACTEMENT à 48 kHz on
+        // REFUSE — jamais de resampler caché (~29 ms = tout le budget latence). On
+        // ferme le driver ouvert pour rien et on remonte le rate réel à l'UI (elle
+        // demande de régler l'interface en 48 kHz). Un pilote ASIO natif aura déjà
+        // basculé le matériel en 48 via `set_sample_rate` (cf. `asio_host::open`) →
+        // ce refus ne frappe que les wrappers/WASAPI partagé bloqués hors 48.
+        if native_sr != 48_000 {
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                actual_sr = native_sr,
+                "StartCapture refusé — device hors 48 kHz natif (R2), fermeture du driver"
+            );
+            self.close_audio_driver();
+            return Err(CaptureStartError::NotForty8kHz { actual_sr: native_sr });
+        }
+
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
-        // greffer un producteur voix plus tard (validation canal + resampler)
-        // sans redémarrer l'instrument. Fresh capture ⇒ pas de voix active.
+        // greffer un producteur voix plus tard (validation canal) sans redémarrer
+        // l'instrument. Fresh capture ⇒ pas de voix active. `native_sr` est
+        // invariablement 48 kHz ici (R2 ci-dessus).
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
         self.voice_active = false;
@@ -2002,8 +2068,7 @@ impl PipelineState {
         tracing::info!(
             target: "jamodio::pipeline",
             channels_in, native_sr, ?channel_index, ?stereo_start,
-            needs_resample = native_sr != 48000,
-            "input config"
+            "input config (48 kHz natif garanti — R2)"
         );
 
         // Sélection effective, validée contre channels_in. Mono prioritaire
@@ -2076,7 +2141,7 @@ impl PipelineState {
             .spawn(move || {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
-                    channels_in, native_sr, effective_sel, mixer_for_encoder, input_cut_for_encoder,
+                    channels_in, effective_sel, mixer_for_encoder, input_cut_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
@@ -2178,12 +2243,11 @@ impl PipelineState {
             .map_err(|e| format!("{}", e))?
             .port();
         let sender = Arc::new(sender);
-        // 5. Canal capture_stage → voice_encode (mono BRUT @ native_sr). Même
+        // 5. Canal capture_stage → voice_encode (mono BRUT @ 48 kHz — R2). Même
         //    marge que les ringbufs instrument (32 blocs).
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
-        let native_sr = self.capture_native_sr;
         let output_device_name = self
             .output_device_id
             .as_deref()
@@ -2199,7 +2263,6 @@ impl PipelineState {
                     payload_type,
                     voice_gain,
                     voice_rms,
-                    native_sr,
                     output_device_name,
                 );
             })
@@ -2399,12 +2462,28 @@ impl PipelineState {
                 self.reset_guard = None;
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
+                let new_sr = a.native_sr;
                 self.asio_host = Some(a.host);
                 tracing::info!(
                     target: "jamodio::pipeline",
                     device = %a.name,
+                    native_sr = new_sr,
                     "AsioDuplexHost recréé (reset single-owner)"
                 );
+
+                // R4 (décision 48k/ASIO-only) — REVALIDATION DU RATE AU RESET. Si
+                // le driver a rouvert à ≠48 kHz (endpoint changé sous nous), on ne
+                // resample PAS (interdit) : on ARME un hard-stop. Le superviseur
+                // draine `rate_drift_stop`, arrête la capture et remonte l'erreur au
+                // browser (« règle en 48 kHz »). Si 48 kHz → rebuild aveugle nominal.
+                if new_sr != 48_000 {
+                    tracing::warn!(
+                        target: "jamodio::pipeline",
+                        actual_sr = new_sr,
+                        "reset ASIO rouvert HORS 48 kHz — hard-stop de la capture (R4)"
+                    );
+                    self.rate_drift_stop = Some(new_sr);
+                }
             }
         }
         // P1 — repart propre : vide les jitter buffers du périmé accumulé pendant
@@ -2412,6 +2491,59 @@ impl PipelineState {
         // re-prime à la cible de démarrage. Évite de rejouer le retard accumulé.
         self.mixer.lock().reset_streams_for_recovery();
         Ok(())
+    }
+
+    /// R4 (décision 48k/ASIO-only) — DRAINE un hard-stop de rate en attente :
+    /// renvoie `Some(actual_sr)` (et remet à `None`) si un reset a rouvert le
+    /// driver HORS 48 kHz depuis le dernier appel. Le superviseur de liveness
+    /// l'appelle après chaque reconstruction et, si `Some`, arrête la capture
+    /// (`stop_all`) + remonte `CaptureError` au browser, HORS du verrou pipeline.
+    pub fn take_rate_drift_stop(&mut self) -> Option<u32> {
+        self.rate_drift_stop.take()
+    }
+
+    /// Rate natif que l'encodeur ASSUME actuellement pour la capture (`0` hors
+    /// capture ; invariablement 48 000 en capture — garde R2). Lu par le détecteur
+    /// de sécurité du superviseur, qui le confronte au rate RÉEL déduit du débit de
+    /// callbacks (`cb_per_sec × frames_livrés_par_callback`).
+    pub fn capture_native_sr(&self) -> u32 {
+        self.capture_native_sr
+    }
+
+    /// Robustesse ASIO (04/08) — vrai si le driver gardé CHAUD délivre TOUJOURS du
+    /// 48 kHz → réutilisation à chaud sûre. On NE FAIT PLUS CONFIANCE à
+    /// `driver.sample_rate()` (il MENT : Focusrite natif rapporte 48 mais délivre
+    /// 44,1). On MESURE la cadence RÉELLE des callbacks (déjà en marche même parké)
+    /// sur une brève fenêtre : `cb_par_sec × buffer_size`. Si ≠ 48 kHz (ou driver
+    /// muet, ou taille inconnue) → faux → l'appelant fait un COLD REOPEN (qui
+    /// re-vérifie), plutôt qu'un reuse aveugle qui entrerait au mauvais rate.
+    #[cfg(target_os = "windows")]
+    fn warm_driver_rate_still_valid(&mut self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let buf = self
+            .input_buffer_samples
+            .or_else(|| self.warm.as_ref().and_then(|w| w.input_buf))
+            .filter(|b| *b > 0);
+        let Some(buf) = buf else { return false }; // taille inconnue → prudence
+        let c0 = self.perfstats.capture_callbacks.load(Relaxed);
+        let t0 = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let dt = t0.elapsed().as_secs_f64();
+        let cb = self.perfstats.capture_callbacks.load(Relaxed).saturating_sub(c0);
+        if cb == 0 || dt <= 0.0 {
+            return false; // driver muet → cold reopen (le liveness gère aussi)
+        }
+        let measured_sr = (cb as f64 / dt) * buf as f64;
+        let ok = (measured_sr - 48_000.0).abs() / 48_000.0 <= 0.06;
+        if !ok {
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                measured_sr = measured_sr as u32,
+                buffer_size = buf,
+                "reuse-warm : rate RÉEL du driver chaud ≠ 48 kHz (mesuré) — cold reopen au lieu du reuse aveugle"
+            );
+        }
+        ok
     }
 
     /// Add a receive pipeline for one remote stream.
@@ -2774,7 +2906,6 @@ fn encoder_thread(
     payload_type: u8,
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
-    native_sr: u32,
     channel_sel: ChannelSel,
     mixer: Arc<Mutex<AudioMixer>>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
@@ -2811,7 +2942,6 @@ fn encoder_thread(
                 cap_to_proc_tx,
                 stop_cap,
                 channels_in,
-                native_sr,
                 channel_sel,
                 perfstats_cap,
                 out_name_cap,
@@ -2911,18 +3041,18 @@ fn encoder_thread(
 // ═══════════════════════════════════════════════════════════════════
 //
 // Responsabilités :
-//   - Lire les chunks PCM bruts depuis CPAL via `sample_rx`
+//   - Lire les chunks PCM bruts depuis CPAL/ASIO via `sample_rx`
 //   - Remapper le canal mono sélectionné en stéréo (= dupliquer ou
 //     extraire le bon canal selon `channel_index`)
-//   - Resampler si `native_sr != 48_000` (Rubato SincFixedIn) — pratique
-//     uniquement sur Windows WASAPI shared 44.1k. Sur Mac CoreAudio
-//     l'input est nativement 48k → bypass total (resampler = None).
 //   - Apposer un `Instant::now()` à chaque bloc émis pour mesure
 //     pipeline_latency end-to-end (lu par encode_stage).
 //
+// PAS DE RESAMPLER (décision 48k/ASIO-only, 04/08) : l'entrée est TOUJOURS
+// 48 kHz natif (garde R2 au `start_capture` — un device hors 48 est refusé, pas
+// resamplé). Le resampler Rubato ajoutait ~29 ms cachées = tout le budget
+// latence → supprimé. Le stage est donc un simple remap + forward.
+//
 // Coût observé en baseline : < 200 µs par bloc CPAL (= ~5% du budget 2.7 ms).
-// L'isoler en thread propre prépare le terrain pour mesurer
-// `capture_p99_ms` séparément en S4 si besoin.
 
 #[allow(clippy::too_many_arguments)]
 fn capture_stage_loop(
@@ -2930,7 +3060,6 @@ fn capture_stage_loop(
     out_tx: Sender<TimedBlock>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     channels_in: u16,
-    native_sr: u32,
     channel_sel: ChannelSel,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
@@ -2954,53 +3083,6 @@ fn capture_stage_loop(
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
 
-    // Resampler natif → 48 kHz (mic Windows onboard typique = 44.1 kHz, mac
-    // CoreAudio est généralement 48 kHz natif → bypass total). Rubato Sinc
-    // est sync, ~50-150 µs par bloc 128 samples sur M1. Latence introduite
-    // ≈ sinc_len / native_sr = 256 / 44100 ≈ 5.8 ms (acceptable, dominé par
-    // le buffer WASAPI shared 10 ms de toute façon sur ce path).
-    let mut resampler: Option<rubato::SincFixedIn<f32>> = if native_sr != 48000 {
-        let ratio = 48000.0 / native_sr as f64;
-        let params = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: rubato::SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-        match rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, 1024, CHANNELS) {
-            Ok(r) => {
-                tracing::info!(
-                    target: "jamodio::encoder",
-                    native_sr, target_sr = 48000u32, ratio,
-                    "resampler enabled (native_sr ≠ 48k)"
-                );
-                Some(r)
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "jamodio::encoder",
-                    error = %e,
-                    "rubato init failed — capture continuera SANS resampling (audio désynchronisé)"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Buffers de sortie Rubato réutilisés entre les itérations pour éviter
-    // d'allouer dans le hot path. Resize au besoin (output_frames_max).
-    let mut resample_out_l: Vec<f32> = Vec::with_capacity(2048);
-    let mut resample_out_r: Vec<f32> = Vec::with_capacity(2048);
-    // Accumulateur PRE-resample : Rubato impose un chunk_size FIXE en input
-    // (1024). Les buffers CPAL arrivent à des tailles variables (128 sur
-    // CoreAudio, ~480 sur WASAPI shared). On accumule jusqu'à atteindre
-    // 1024 par canal avant de resampler.
-    let mut pre_resample_l: Vec<f32> = Vec::with_capacity(2048);
-    let mut pre_resample_r: Vec<f32> = Vec::with_capacity(2048);
-    const RESAMPLE_CHUNK: usize = 1024;
-
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -3022,12 +3104,10 @@ fn capture_stage_loop(
             Ok(samples) => {
                 // Talkback (Lot 2) — TAP VOIX. Extrait le canal micro du buffer
                 // multicanal BRUT (donc AVANT le plugin/monitor/remap instrument)
-                // et l'envoie au `voice_encode_stage`. Placé ici pour s'exécuter
-                // à CHAQUE buffer CPAL (le `continue` d'accumulation resampler
-                // instrument plus bas ne doit pas sauter la voix). Coût STRICTEMENT
-                // NUL quand la voix est inactive (`voice_out = None` → un seul
-                // test). try_send non bloquant : le thread capture instrument
-                // n'est JAMAIS ralenti par un retard du thread voix.
+                // et l'envoie au `voice_encode_stage`. Coût STRICTEMENT NUL quand
+                // la voix est inactive (`voice_out = None` → un seul test).
+                // try_send non bloquant : le thread capture instrument n'est
+                // JAMAIS ralenti par un retard du thread voix.
                 if let Some((vch, vtx)) = voice_out.as_ref() {
                     let mono = extract_channel_mono(&samples, channels_in, *vch);
                     if !mono.is_empty() {
@@ -3050,55 +3130,8 @@ fn capture_stage_loop(
                 // s'arrête juste avant out_tx.send (= AVANT l'entrée en file
                 // dans le ringbuf du process_stage).
                 let t_stage_start = t_block_start;
-                let mut stereo = remap_to_stereo(&samples, channels_in, channel_sel);
-
-                // RESAMPLE (Windows 44.1 → 48k). Bypass total si natif = 48k.
-                if let Some(rs) = resampler.as_mut() {
-                    for chunk in stereo.chunks_exact(2) {
-                        pre_resample_l.push(chunk[0]);
-                        pre_resample_r.push(chunk[1]);
-                    }
-                    stereo.clear();
-                    let out_max = rs.output_frames_max();
-                    if resample_out_l.len() < out_max {
-                        resample_out_l.resize(out_max, 0.0);
-                    }
-                    if resample_out_r.len() < out_max {
-                        resample_out_r.resize(out_max, 0.0);
-                    }
-                    while pre_resample_l.len() >= RESAMPLE_CHUNK {
-                        let waves_in: [&[f32]; 2] = [
-                            &pre_resample_l[..RESAMPLE_CHUNK],
-                            &pre_resample_r[..RESAMPLE_CHUNK],
-                        ];
-                        let mut waves_out: [&mut [f32]; 2] = [
-                            &mut resample_out_l[..],
-                            &mut resample_out_r[..],
-                        ];
-                        match rs.process_into_buffer(&waves_in, &mut waves_out, None) {
-                            Ok((_in_used, out_frames)) => {
-                                for i in 0..out_frames {
-                                    stereo.push(resample_out_l[i]);
-                                    stereo.push(resample_out_r[i]);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    target: "jamodio::encoder",
-                                    error = %e,
-                                    "rubato process_into_buffer failed"
-                                );
-                            }
-                        }
-                        pre_resample_l.drain(..RESAMPLE_CHUNK);
-                        pre_resample_r.drain(..RESAMPLE_CHUNK);
-                    }
-                    // Pas encore assez de samples accumulés → on attend le
-                    // prochain buffer CPAL. Le bloc n'est pas émis ce tour-ci.
-                    if stereo.is_empty() {
-                        continue;
-                    }
-                }
+                // 48 kHz natif garanti (R2) → remap direct, aucun resampling.
+                let stereo = remap_to_stereo(&samples, channels_in, channel_sel);
 
                 // v0.4.8 — observe le temps de traitement PUR du capture_stage
                 // (= depuis sample_rx.recv jusqu'ici, avant entrée en file).
@@ -3741,10 +3774,9 @@ fn encode_stage_loop(
 //
 // 2e producteur Opus/RTP DÉDIÉ au canal talkback. Symétrique à
 // `encode_stage_loop` mais autonome (thread propre, socket/ssrc/SRTP dédiés) :
-//   - reçoit des blocs MONO @ native_sr tap és sur le buffer BRUT par
-//     `capture_stage_loop` (donc AVANT plugin/monitor/remap instrument) ;
-//   - resample → 48 kHz si besoin (mic 44.1k ; bypass total à 48k natif =
-//     cas ASIO exclusif où le talkback via agent a vraiment lieu) ;
+//   - reçoit des blocs MONO @ 48 kHz tap és sur le buffer BRUT par
+//     `capture_stage_loop` (donc AVANT plugin/monitor/remap instrument) — la
+//     capture est TOUJOURS 48 kHz natif (garde R2), donc aucun resampling ;
 //   - applique le gain talkback lissé PAR-SAMPLE (fondu anti-clic, asymétrique
 //     ouverture rapide / fermeture douce — même sensation que le ramp Web Audio
 //     de l'auto-mute browser, cf. talkback_threshold_tuning) ;
@@ -3765,7 +3797,6 @@ fn voice_encode_stage_loop(
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<std::sync::atomic::AtomicU32>,
-    native_sr: u32,
     output_device_name: Option<String>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3785,34 +3816,6 @@ fn voice_encode_stage_loop(
     };
     let frame_size = encoder.frame_size(); // 120 samples/canal
     let frame_len = frame_size * CHANNELS; // 240 f32 stéréo interleaved
-
-    // Resampler MONO natif → 48 kHz. Inerte (None) à 48k natif.
-    let mut resampler: Option<rubato::SincFixedIn<f32>> = if native_sr != 48000 {
-        let ratio = 48000.0 / native_sr as f64;
-        let params = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: rubato::SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-        match rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, 1024, 1) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::error!(
-                    target: "jamodio::encoder",
-                    error = %e,
-                    "voice: rubato init failed — talkback continuera SANS resampling"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    const RESAMPLE_CHUNK: usize = 1024;
-    let mut pre_resample: Vec<f32> = Vec::with_capacity(2048);
-    let mut resample_out: Vec<f32> = Vec::with_capacity(2048);
 
     // Accumulateur mono @ 48k jusqu'à une frame Opus (120 samples/canal).
     let mut acc: Vec<f32> = Vec::with_capacity(frame_size * 2);
@@ -3834,31 +3837,9 @@ fn voice_encode_stage_loop(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        // 1. → 48 kHz mono (passthrough si natif 48k).
-        let mono48: Vec<f32> = if let Some(rs) = resampler.as_mut() {
-            pre_resample.extend_from_slice(&raw);
-            let out_max = rs.output_frames_max();
-            if resample_out.len() < out_max {
-                resample_out.resize(out_max, 0.0);
-            }
-            let mut out = Vec::with_capacity(raw.len() + 64);
-            while pre_resample.len() >= RESAMPLE_CHUNK {
-                let waves_in: [&[f32]; 1] = [&pre_resample[..RESAMPLE_CHUNK]];
-                let mut waves_out: [&mut [f32]; 1] = [&mut resample_out[..]];
-                match rs.process_into_buffer(&waves_in, &mut waves_out, None) {
-                    Ok((_in_used, out_frames)) => out.extend_from_slice(&resample_out[..out_frames]),
-                    Err(e) => tracing::error!(
-                        target: "jamodio::encoder",
-                        error = %e,
-                        "voice: rubato process_into_buffer failed"
-                    ),
-                }
-                pre_resample.drain(..RESAMPLE_CHUNK);
-            }
-            out
-        } else {
-            raw
-        };
+        // 1. Bloc mono déjà @ 48 kHz (capture 48 k natif garanti — R2). Aucun
+        //    resampling : le tap voix arrive au bon rate directement.
+        let mono48: Vec<f32> = raw;
         if mono48.is_empty() {
             continue;
         }

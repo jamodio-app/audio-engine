@@ -244,6 +244,16 @@ fn main() {
         .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version, quit_app])
         .setup(|app| {
             tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
+            // Marqueur de build (robustesse ASIO) — permet d'identifier SANS
+            // AMBIGUÏTÉ quel binaire tourne, la version numérique seule ne
+            // distinguant pas debug/patché de la release du même numéro. Grep :
+            // « build ASIO robustesse ». Mettre à jour la liste des lots au fil.
+            tracing::info!(
+                target: "jamodio::lifecycle",
+                policy = "48kHz-only + ASIO-only(win) + hard-stop, no-resampler",
+                profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+                "build ASIO robustesse : 48 kHz natif obligatoire (décision 04/08)"
+            );
 
             // ─── Dump devices CPAL au démarrage (diagnostic) ─────
             audio::device::log_devices();

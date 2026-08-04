@@ -104,7 +104,9 @@ fn list_inputs_inner() -> Vec<AudioDevice> {
     }
 
     let host = super::host::active();
-    let default = host.default_input_device().and_then(|d| d.name().ok());
+    // Décision 04/08 : `is_default` reflète le défaut PRÉFÉRÉ (natif > wrapper),
+    // cohérent avec ce que l'agent ouvre réellement (`default_input_id`).
+    let default = preferred_default_input_name(&host);
 
     let Ok(devices) = host.input_devices() else { return vec![] };
     let list: Vec<AudioDevice> = devices
@@ -261,9 +263,46 @@ fn probe_output_openable(device: &cpal::Device) -> bool {
 /// Utilisé uniquement quand le browser n'a JAMAIS sélectionné de device
 /// (premier lancement). Une fois une sélection persistée côté browser,
 /// elle est l'unique source de vérité.
+/// Décision 04/08 (48k/ASIO-only) — vrai si le pilote est un WRAPPER logiciel
+/// (ASIO4ALL / FlexASIO) qui enveloppe le matériel via WASAPI au lieu d'un pilote
+/// ASIO NATIF d'interface. Un wrapper NE FORCE PAS le matériel en 48 kHz (il suit
+/// l'endpoint et se fait refuser hors 48), et peut rééchantillonner en silence.
+/// Détection par nom (seul signal disponible). Inerte hors Windows (aucun wrapper).
+pub fn is_wrapper_asio(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("asio4all") || n.contains("flexasio")
+}
+
+/// Nom du device d'entrée par défaut PRÉFÉRÉ. Décision 04/08 : si le défaut OS est
+/// un wrapper (ASIO4ALL/FlexASIO) ET qu'un pilote ASIO NATIF existe, on préfère le
+/// natif (il bascule le matériel en 48 kHz via `set_sample_rate` → « ça juste
+/// marche » ; le wrapper serait refusé hors 48). Sinon on garde le défaut OS.
+/// Inerte hors ASIO (aucun wrapper détecté → renvoie le défaut OS inchangé).
+fn preferred_default_input_name(host: &cpal::Host) -> Option<String> {
+    let os_default = host.default_input_device().and_then(|d| d.name().ok());
+    if !os_default.as_deref().map(is_wrapper_asio).unwrap_or(false) {
+        return os_default; // défaut OS non-wrapper (ou absent) → inchangé
+    }
+    // Défaut = wrapper : chercher le 1er pilote NATIF (non-wrapper).
+    let native = host
+        .input_devices()
+        .ok()
+        .and_then(|mut it| it.find_map(|d| d.name().ok().filter(|n| !is_wrapper_asio(n))));
+    // Si aucun natif → on gardera le wrapper (défaut OS) faute de mieux.
+    if let Some(n) = &native {
+        tracing::info!(
+            target: "jamodio::devices",
+            wrapper = %os_default.as_deref().unwrap_or("?"),
+            native = %n,
+            "défaut d'entrée : pilote natif préféré au wrapper ASIO (48 kHz forcé)"
+        );
+    }
+    native.or(os_default)
+}
+
 pub fn default_input_id() -> Option<String> {
     let host = super::host::active();
-    let default_name = host.default_input_device().and_then(|d| d.name().ok())?;
+    let default_name = preferred_default_input_name(&host)?;
     let devices = host.input_devices().ok()?;
     for (idx, d) in devices.enumerate() {
         if d.name().ok().as_deref() == Some(&default_name) {
@@ -278,7 +317,8 @@ pub fn default_input_id() -> Option<String> {
 /// est surprenant (aggregate device, virtuel, UID numérique CoreAudio, etc.).
 pub fn log_devices() {
     let host = super::host::active();
-    let def_in = host.default_input_device().and_then(|d| d.name().ok()).unwrap_or_default();
+    // Défaut PRÉFÉRÉ (natif > wrapper) — cohérent avec `default_input_id`/`list_inputs`.
+    let def_in = preferred_default_input_name(&host).unwrap_or_default();
     let def_out = host.default_output_device().and_then(|d| d.name().ok()).unwrap_or_default();
     tracing::info!(target: "jamodio::devices", default_input = %def_in, default_output = %def_out, "CPAL devices");
     if let Ok(devices) = host.input_devices() {

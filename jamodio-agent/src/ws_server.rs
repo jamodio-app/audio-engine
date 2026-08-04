@@ -1592,9 +1592,10 @@ fn is_valid_sfu_dest(sfu_ip: &str) -> bool {
 /// n'est jamais signalé → ce superviseur reste inerte (no-op).
 async fn audio_liveness_supervisor(
     pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
-    // Conservé pour un éventuel feedback browser ; aucun message envoyé pour
-    // l'instant (décision produit : on analyse via les logs avant toute UI).
-    _out_tx: tokio_mpsc::Sender<AgentMessage>,
+    // Canal vers le browser. Sert au HARD-STOP R4 (décision 48k/ASIO-only) :
+    // quand un reset rouvre le driver hors 48 kHz, ou que le détecteur de cadence
+    // confirme une dérive, on arrête la capture et on remonte un `CaptureError`.
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
 ) {
     use std::sync::atomic::Ordering;
     // Cadence du filet de liveness (le reset coopératif, lui, réagit via Notify).
@@ -1652,6 +1653,25 @@ async fn audio_liveness_supervisor(
     // est étranglé à `DEFAULT_OUT_POLL` (le tick liveness est à 250 ms).
     let mut last_default_out: Option<String> = None;
     let mut last_default_check = Instant::now();
+    // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE DE RATE (déterministe). On
+    // déduit le rate RÉEL du driver de son débit de callbacks
+    // (`cb_per_sec × frames_livrés_par_callback`) et on le confronte au 48 kHz
+    // ASSUMÉ. Un écart FRANC et PERSISTANT = le driver ne délivre plus du 48 kHz
+    // (re-clock silencieux qui ne passe pas par un reset) → HARD-STOP de la capture
+    // + erreur browser. Débounce (N fenêtres consécutives) pour ne JAMAIS tuer une
+    // session saine sur un glitch de mesure transitoire. Cas le plus fréquent (44,1
+    // avec kAsioResetRequest) reste capté en amont par le chemin reset (rate_drift_stop).
+    const DETECTOR_WINDOW: Duration = Duration::from_secs(2);
+    // Tolérance relative : au-delà = écart franc. Mesure sur 2 s (~1500 callbacks
+    // à 48 k/64) → précision ~0,1 %, donc 6 % est très au-dessus du bruit ET capte
+    // un vrai 44,1 (écart 8,1 %) — le cas « driver qui ment/dérive vers 44,1 ».
+    // Les re-clocks grossiers (11025=77 %, 33438=30 %) sont a fortiori captés.
+    const DETECTOR_TOLERANCE: f64 = 0.06;
+    // Nb de fenêtres consécutives en écart avant hard-stop (anti-faux-positif).
+    const DETECTOR_DEBOUNCE: u32 = 2;
+    let mut detector_prev_cap = 0u64;
+    let mut detector_window_start = Instant::now();
+    let mut detector_mismatch_streak: u32 = 0;
 
     loop {
         // Réveil : tick périodique (filet de liveness) OU demande de reset
@@ -1662,6 +1682,31 @@ async fn audio_liveness_supervisor(
             _ = interval.tick() => {}
             _ = reset_notify.notified() => {}
             _ = resume_notify.notified() => {}
+        }
+
+        // R4 (décision 48k/ASIO-only) — HARD-STOP SUR DÉRIVE DE RATE AU RESET. Un
+        // reset a-t-il rouvert le driver HORS 48 kHz depuis la dernière boucle ?
+        // Alors on n'a PAS le droit de resampler : on arrête la capture et on
+        // remonte l'erreur au browser (« règle en 48 kHz »). Drainé hors des
+        // branches de reset pour couvrir tous les chemins (reset coopératif,
+        // flatline, réveil de veille) d'un seul point. Locks brefs, hors thread audio.
+        if let Some(actual_sr) = { pipeline.lock().await.take_rate_drift_stop() } {
+            tracing::warn!(
+                target: "jamodio::ws",
+                actual_sr,
+                "dérive de rate en session (reset rouvert hors 48 kHz) — HARD-STOP de la capture (R4)"
+            );
+            { pipeline.lock().await.stop_all(); }
+            let _ = out_tx
+                .send(AgentMessage::CaptureError {
+                    reason: "rate-drift-48khz".into(),
+                    requested_device: None,
+                    detail: Some(format!("{} Hz", actual_sr)),
+                })
+                .await;
+            // Session arrêtée : rebase l'état et repars propre au prochain start.
+            session_active = false;
+            continue;
         }
 
         // 0.5.4-5 — relâche le driver ASIO gardé chaud si la grâce de park est
@@ -1701,7 +1746,83 @@ async fn audio_liveness_supervisor(
             // éviter un rebuild parasite au démarrage suivant.
             crate::audio::buffer_policy::take_rebuild_request();
             last_default_out = None; // hors session : oublie la base de suivi OS
+            detector_prev_cap = cap; // re-base le détecteur à l'entrée en session
+            detector_window_start = Instant::now();
             continue;
+        }
+
+        // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE. Toutes les
+        // `DETECTOR_WINDOW`, on déduit le rate réel du driver de son débit de
+        // callbacks et on le confronte au 48 kHz assumé. Écart franc PERSISTANT
+        // (débounce) = re-clock silencieux → HARD-STOP. Sondage hors thread audio.
+        if detector_window_start.elapsed() >= DETECTOR_WINDOW {
+            // Fenêtre chevauchant un reset récent (callbacks gelés pendant la
+            // reconstruction) → mesure faussée : on la JETTE et on re-base, sans
+            // évaluer. Le prochain fenêtrage repartira sur un flux continu.
+            let repair_in_window = last_repair
+                .map(|t| t.elapsed() < DETECTOR_WINDOW)
+                .unwrap_or(false);
+            let elapsed = detector_window_start.elapsed().as_secs_f64();
+            let cb_delta = cap.saturating_sub(detector_prev_cap);
+            // `input_frames` = frames RÉELLEMENT livrés par callback (publié à
+            // chaque callback, cf. `capture::log_first_callback`), donc robuste au
+            // cas où le driver ASIO ignore notre `Fixed(N)` et délivre sa propre
+            // taille de control panel — contrairement à `input_buffer_samples`
+            // (taille DEMANDÉE) qui ferait un faux positif ici.
+            let (assumed_sr, frames_per_cb) = {
+                let pl = pipeline.lock().await;
+                (
+                    pl.capture_native_sr(),
+                    pl.perfstats.input_frames.load(Ordering::Relaxed),
+                )
+            };
+            // Détecteur inerte tant que la géométrie n'est pas connue (frames = 0
+            // avant le 1er callback) ou que le rate assumé est nul (pas encore de
+            // capture confirmée).
+            let mut hard_stop_sr: Option<u32> = None;
+            if !repair_in_window && assumed_sr > 0 && frames_per_cb > 0 && elapsed > 0.0 && cb_delta > 0 {
+                let cb_per_sec = cb_delta as f64 / elapsed;
+                let measured_sr = cb_per_sec * frames_per_cb as f64;
+                let rel_err = (measured_sr - assumed_sr as f64).abs() / assumed_sr as f64;
+                if rel_err > DETECTOR_TOLERANCE {
+                    detector_mismatch_streak += 1;
+                    tracing::warn!(
+                        target: "jamodio::ws",
+                        assumed_sr,
+                        measured_sr = measured_sr as u32,
+                        frames_per_cb,
+                        cb_per_sec = cb_per_sec as u32,
+                        streak = detector_mismatch_streak,
+                        "dérive de rate détectée (débit de callbacks ≠ 48 kHz assumé)"
+                    );
+                    if detector_mismatch_streak >= DETECTOR_DEBOUNCE {
+                        hard_stop_sr = Some(measured_sr as u32);
+                    }
+                } else {
+                    detector_mismatch_streak = 0; // fenêtre saine → reset du débounce
+                }
+            }
+            detector_prev_cap = cap;
+            detector_window_start = Instant::now();
+
+            if let Some(measured) = hard_stop_sr {
+                tracing::warn!(
+                    target: "jamodio::ws",
+                    measured_sr = measured,
+                    "dérive de rate CONFIRMÉE — HARD-STOP de la capture (R4)"
+                );
+                { pipeline.lock().await.stop_all(); }
+                let _ = out_tx
+                    .send(AgentMessage::CaptureError {
+                        reason: "rate-drift-48khz".into(),
+                        requested_device: None,
+                        detail: Some(format!("~{} Hz", measured)),
+                    })
+                    .await;
+                session_active = false;
+                detector_mismatch_streak = 0;
+                continue;
+            }
         }
 
         // Lot A2 (0.5.10-3) — SUIVI LIVE DU DÉFAUT DE SORTIE OS. Quand la sélection
@@ -2092,6 +2213,27 @@ async fn handle_message(
                         reason: "input-device-not-found".into(),
                         requested_device: requested,
                         detail: None,
+                    }]
+                }
+                // R1 (décision 48k/ASIO-only) — host WASAPI : ASIO requis. L'UI
+                // bloque et demande d'installer un pilote ASIO (natif d'abord,
+                // ASIO4ALL à défaut d'interface).
+                Err(crate::pipeline::CaptureStartError::NoAsio) => {
+                    tracing::warn!(target: "jamodio::ws", "StartCapture refusé : WASAPI, ASIO requis (R1)");
+                    vec![AgentMessage::CaptureError {
+                        reason: "no-asio".into(),
+                        requested_device: input_device,
+                        detail: None,
+                    }]
+                }
+                // R2 (décision 48k/ASIO-only) — device hors 48 kHz natif. L'UI
+                // bloque et demande de régler l'interface en 48 kHz. `detail` = rate réel.
+                Err(crate::pipeline::CaptureStartError::NotForty8kHz { actual_sr }) => {
+                    tracing::warn!(target: "jamodio::ws", actual_sr, "StartCapture refusé : hors 48 kHz natif (R2)");
+                    vec![AgentMessage::CaptureError {
+                        reason: "not-48khz".into(),
+                        requested_device: input_device,
+                        detail: Some(format!("{} Hz", actual_sr)),
                     }]
                 }
                 // NB (Lot A 0.5.10) : plus de cas `OutputDeviceNotFound` — la sortie

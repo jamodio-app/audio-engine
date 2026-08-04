@@ -164,16 +164,11 @@ fn log_first_callback(
 /// si on a fallback sur `BufferSize::Default` (= le driver choisit, valeur
 /// non connue côté agent sans instrumenter le callback). Sert à la
 /// télémétrie `inputBufferMs` côté wire (cf. `protocol::Stats`). Le SR natif est
-/// **respecté tel quel** (pas forcé à 48000) pour rester compatible avec les
-/// devices Windows WASAPI shared mode (qui imposent le mix format Windows :
-/// souvent 44100 sur les chipsets Realtek onboard) — l'`encoder_thread`
-/// resample ensuite vers 48000 via `rubato` avant Opus encode.
-///
-/// Sur macOS CoreAudio fait un resampling implicite si on demande 48000 sur
-/// un device 44100 → ça marchait silencieusement. Sur Windows WASAPI shared
-/// le device REFUSE toute config qui diffère du mix format → erreur explicite
-/// `StreamConfigNotSupported`. D'où la stratégie "ouvrir au natif puis
-/// resampler côté Rust".
+/// renvoyé tel quel ; c'est `start_capture` (garde R2, décision 48k/ASIO-only)
+/// qui REFUSE la capture si le device n'est pas à 48 kHz natif — plus aucun
+/// resampling côté agent (le resampler ajoutait ~29 ms cachées = tout le budget
+/// latence). Ce chemin cpal ne sert plus qu'à macOS/CoreAudio (48 kHz natif) ;
+/// sur Windows, seul ASIO est accepté (R1).
 ///
 /// Le nombre de canaux retourné est la valeur hardware native (pas forcément 2)
 /// pour permettre l'extraction d'un canal mono précis sur les interfaces
