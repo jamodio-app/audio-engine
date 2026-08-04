@@ -2217,7 +2217,9 @@ async fn handle_message(
                 }
                 // R1 (décision 48k/ASIO-only) — host WASAPI : ASIO requis. L'UI
                 // bloque et demande d'installer un pilote ASIO (natif d'abord,
-                // ASIO4ALL à défaut d'interface).
+                // ASIO4ALL à défaut d'interface). Windows-only (le variant `NoAsio`
+                // est cfg(windows) → l'arme ne compile pas sur macOS).
+                #[cfg(target_os = "windows")]
                 Err(crate::pipeline::CaptureStartError::NoAsio) => {
                     tracing::warn!(target: "jamodio::ws", "StartCapture refusé : WASAPI, ASIO requis (R1)");
                     vec![AgentMessage::CaptureError {

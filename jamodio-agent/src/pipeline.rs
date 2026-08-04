@@ -576,7 +576,9 @@ pub enum CaptureStartError {
     /// R1 (décision 48k/ASIO-only, 04/08) — host WASAPI sur Windows (aucun driver
     /// ASIO) : la capture est REFUSÉE. Pas de fallback WASAPI (latence évitable).
     /// L'UI demande d'installer un pilote ASIO (natif de l'interface ; ASIO4ALL à
-    /// défaut d'interface).
+    /// défaut d'interface). Windows-only : R1 ne s'applique qu'à ASIO (hors Windows
+    /// ce variant n'est jamais construit → cfg pour éviter `dead_code` sur macOS).
+    #[cfg(target_os = "windows")]
     NoAsio,
     /// R2 (décision 48k/ASIO-only) — le device n'a pas pu être ouvert en 48 kHz
     /// natif (`actual_sr` = rate réel négocié). REFUS : jamais de resampling caché
@@ -596,6 +598,7 @@ impl std::fmt::Display for CaptureStartError {
             Self::InputDeviceNotFound { requested } => {
                 write!(f, "input device introuvable : {:?}", requested)
             }
+            #[cfg(target_os = "windows")]
             Self::NoAsio => write!(f, "host WASAPI : ASIO requis (installer un pilote ASIO)"),
             Self::NotForty8kHz { actual_sr } => {
                 write!(f, "device en {} Hz : 48 kHz natif requis", actual_sr)
@@ -1781,18 +1784,14 @@ impl PipelineState {
         // rate (le chemin même qu'a emprunté le test 04/08, sans jamais déclencher
         // Lot A). On probe le rate réel du driver (hors thread RT) : s'il diffère
         // → on REFUSE le reuse et on tombe dans le cold reopen propre ci-dessous.
-        // La probe n'a lieu que sur un candidat Windows/ASIO (device_match) ; le
-        // bloc cfg garde la compilation macOS/WASAPI (méthode host-only absente).
-        let reuse = device_match && {
-            #[cfg(target_os = "windows")]
-            {
-                self.warm_driver_rate_still_valid()
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                true
-            }
-        };
+        // La probe n'a lieu que sur un candidat Windows/ASIO (device_match) ; hors
+        // Windows (macOS/CoreAudio) il n'y a pas de driver ASIO à revalider → reuse
+        // selon `device_match` seul. (Deux `let` cfg-gardés plutôt qu'un `&& { cfg }`
+        // qui donnerait `device_match && true` sur Mac → clippy `needless_bool`.)
+        #[cfg(target_os = "windows")]
+        let reuse = device_match && self.warm_driver_rate_still_valid();
+        #[cfg(not(target_os = "windows"))]
+        let reuse = device_match;
 
         if reuse {
             // Rejoin sur driver chaud : on démonte SEULEMENT la session, on GARDE
