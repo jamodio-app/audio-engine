@@ -4,8 +4,8 @@
 //!
 //! Le chemin actuel (cpal) ouvre l'entrée et la sortie en DEUX `cpal::Stream`
 //! séparés (deux `ASIOStart`) sur un driver mono-client full-duplex → wedge
-//! Focusrite (mort des callbacks ~20 s, silence numérique). Jamulus/JUCE/RtAudio
-//! font l'inverse : **1 driver, 1 `ASIOCreateBuffers` couvrant entrée+sortie,
+//! Focusrite (mort des callbacks ~20 s, silence numérique). L'approche correcte
+//! (contrat ASIO) est l'inverse : **1 driver, 1 `ASIOCreateBuffers` couvrant entrée+sortie,
 //! 1 `bufferSwitch`**. Ce spike ouvre le driver EXACTEMENT comme ça (via
 //! `asio-sys` en direct, sans cpal) et vérifie une seule chose : **les callbacks
 //! survivent-ils au-delà de ~20 s ?** Si oui → l'approche duplex est validée et

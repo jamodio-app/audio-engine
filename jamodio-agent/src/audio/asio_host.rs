@@ -1,5 +1,5 @@
 //! Host ASIO duplex **single-owner** (Windows) — remplace les 2 streams cpal sur le
-//! chemin ASIO. Reprend les invariants éprouvés de Jamulus et JUCE, pour une
+//! chemin ASIO. Applique les invariants du contrat ASIO (single-owner), pour une
 //! robustesse **toutes interfaces** (pas seulement Focusrite) :
 //!
 //! 1. **Une seule** instance `asio_sys::Asio` → **un seul** `ASIOInit` (l'agent via
@@ -7,8 +7,8 @@
 //!    `ASIOInit` sur le driver mono-client pendant que l'entrée tournait).
 //! 2. **Taille de buffer snappée** à la grille légale du driver (min/max/granularité),
 //!    jamais une taille forcée hors-grille (asio-sys ne valide que `<= max`).
-//! 3. **Priming** (JUCE : create dummy → start → ~120 ms → stop → dispose) — « some
-//!    devices fail if we don't » : arme l'ADC des interfaces qui ne délivrent rien au
+//! 3. **Priming** (create dummy → start → ~120 ms → stop → dispose) : arme l'ADC des
+//!    interfaces récalcitrantes qui ne délivrent rien au
 //!    1ᵉʳ start à froid (le wedge « entrée figée au réveil de veille »).
 //! 4. **Un seul** `ASIOCreateBuffers(in+out)` + **un seul** `ASIOStart` (pas de churn).
 //! 5. **Start-timeout** : on attend le 1ᵉʳ callback ; s'il n'arrive pas, on le signale.
@@ -129,8 +129,8 @@ fn asio_buffer_sizes() -> Option<(i32, i32, i32, i32)> {
     (rc == 0).then_some((mn, mx, pf, gr))
 }
 
-/// Snappe une taille de buffer désirée à une taille **légale** du driver (algorithme
-/// JUCE/Jamulus). Ne renvoie JAMAIS une taille hors grille : hors `[min,max]` →
+/// Snappe une taille de buffer désirée à une taille **légale** du driver (min/max/
+/// granularité). Ne renvoie JAMAIS une taille hors grille : hors `[min,max]` →
 /// préférée ; granularité `-1` → puissance de 2 la plus proche ; `<= 0` → toute taille
 /// (on garde le désir) ; sinon → multiple de `gran` le plus proche.
 fn snap_buffer_size(desired: i32, min: i32, max: i32, pref: i32, gran: i32) -> i32 {
@@ -161,7 +161,7 @@ fn snap_buffer_size(desired: i32, min: i32, max: i32, pref: i32, gran: i32) -> i
     }
 }
 
-/// Priming JUCE : arme l'ADC des interfaces récalcitrantes. Crée des buffers, démarre
+/// Priming : arme l'ADC des interfaces récalcitrantes. Crée des buffers, démarre
 /// brièvement, attend, arrête, dispose. Aucun callback : on ne fait que faire tourner
 /// l'horloge/DMA le temps de la réchauffe. Best-effort (les erreurs sont ignorées :
 /// l'ouverture réelle qui suit reste tentée).
@@ -227,7 +227,7 @@ impl AsioDuplexHost {
             .load_driver(driver_name)
             .map_err(|e| format!("load_driver({driver_name}): {e:?}"))?;
 
-        // 2) Sample rate (best-effort ; reconfigure le driver comme JUCE/Jamulus).
+        // 2) Sample rate (best-effort ; reconfigure le driver au SR cible 48 kHz).
         let _ = driver.set_sample_rate(48_000.0);
         let native_sr = driver.sample_rate().unwrap_or(48_000.0) as u32;
 

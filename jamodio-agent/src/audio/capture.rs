@@ -228,7 +228,7 @@ pub fn build_capture_stream(
     //
     // - **ASIO (Windows)** : on DÉFÈRE à la taille PRÉFÉRÉE du driver
     //   (`BufferSize::Default` → asio-sys utilise `ASIOGetBufferSize().pref`),
-    //   exactement comme un DAW et comme JUCE/RtAudio/Jamulus. Forcer `Fixed(128)`
+    //   exactement comme un DAW. Forcer `Fixed(128)`
     //   était fautif : asio-sys ne valide QUE `demandé ≤ max` (il IGNORE le min,
     //   la taille préférée ET la granularité du driver). Sur le Focusrite USB,
     //   128 hors-grille était accepté par `ASIOCreateBuffers` mais faisait HALTER

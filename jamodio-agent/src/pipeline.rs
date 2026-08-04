@@ -3926,8 +3926,7 @@ fn voice_encode_stage_loop(
 // buffer n'est pas réalimenté → underrun → `adapt_up` colle la cible au plafond
 // 40 ms → +25 ms de latence (injouable). L'émission, elle, est RT (MMCSS) → le
 // self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
-// clément). Tous les concurrents (JackTrip/SonoBus/Jamulus) mettent la réception
-// sur un thread RT — jamais normal.
+// clément). La réception audio DOIT tourner sur un thread RT — jamais normal.
 //
 // Design (validé en triple revue senior) :
 //   - `recv_io_task` (async tokio, 1/pair) : recv UDP + horodatage d'arrivée +
