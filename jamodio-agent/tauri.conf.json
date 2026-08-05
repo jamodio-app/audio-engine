@@ -63,6 +63,9 @@
       }
     },
     "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
       "wix": {
         "language": "fr-FR",
         "bannerPath": "icons/wix/banner.bmp",
