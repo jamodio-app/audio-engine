@@ -5,6 +5,41 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-3] — 2026-08-05 (pré-release)
+
+Pré-release qui **embarque tout le cycle 0.5.11** : le correctif crash 32 canaux
+(0.5.11-1), le socle **WebView2** Windows (0.5.11-2) et le chantier **audio 48 kHz
+natif / ASIO-only** (0.5.11-3). Doctrine : 48 kHz natif obligatoire, **zéro
+resampler** (il coûtait ~29 ms ≈ tout le budget latence), ASIO obligatoire sous
+Windows, tout écart au 48 kHz → **refus explicite + sortie du studio** (jamais de
+repli silencieux). Docs autoritaires :
+`internal-docs/decisions/AUDIO-48K-ASIO-ONLY-2026-08.md` (règles R1-R5).
+
+### Ajouté
+- **48 kHz natif obligatoire (R2 entrée).** Ouverture de capture refusée si le
+  périphérique n'est pas en 48 kHz natif (`CaptureStartError` → raison
+  `not-48khz` / `no-asio` côté web) — plus aucun resample d'entrée caché.
+- **Gate 48 kHz sur la SORTIE (Mac, R2 sortie).** Refus d'une sortie hors 48 kHz
+  (`OutputNotForty8kHz` → `output-not-48khz`), qui supprime le dernier resample
+  CoreAudio caché. Windows n'est pas concerné (la sortie = device ASIO d'entrée,
+  déjà gaté). Gate conditionné à une entrée à 48 kHz pour ne pas accuser la sortie
+  quand le vrai fautif est l'entrée.
+- **WebView2 machine-wide (`embedBootstrapper`).** Socle Windows pour toutes les
+  0.5.11-x — corrige « Could not find the WebView2 Runtime » sur les Win10 sans
+  runtime préinstallé, sans embarquer l'installeur offline (~127 Mo).
+
+### Corrigé
+- **Fuite de callbacks fantômes CoreAudio (faux rate 96k/192k).** Un `cpal::Stream`
+  d'entrée droppé sans `pause()` continuait d'émettre ~750 callbacks/s et polluait
+  le **compteur partagé** → faux 2×/4× (96k/192k) qui piégeaient le détecteur de
+  dérive et le refus d'entrée. Racine : le gate sortie renvoyait `Err` en droppant
+  le stream **brut**. Fix : enveloppe du stream cpal en `SendStream` **dès sa
+  création** → tout `Err` en aval passe par `pause()`. On se fie au rate **déclaré**
+  par cpal (fiable sur Mac), pas à une mesure sur un compteur pollué.
+- **Crash ASIO 32 canaux (rappel 0.5.11-1)** : n'ouvre que `paire+2` canaux de
+  sortie (voir bloc 0.5.11-1 ci-dessous).
+
+
 ## [0.5.11-1] — non publié (pré-release)
 
 Correctif d'un **crash sur interface à beaucoup de canaux** introduit en 0.5.10.
