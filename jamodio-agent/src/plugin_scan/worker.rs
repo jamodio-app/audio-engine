@@ -87,8 +87,16 @@ fn run_loop(
             // stdin fermé/corrompu = fin de liste côté coordinateur.
             Err(_) => break,
         };
-        let item = line.trim();
-        if item.is_empty() {
+        // NE PAS trimmer l'item : un fourcc AU (fabricant/subtype) de moins de
+        // 4 caractères est complété par des ESPACES SIGNIFICATIVES (ex. fabricant
+        // « UVI » → « UVI », 4 octets avec espace finale). Les trimmer casse
+        // `fourcc_to_u32` (exige exactement 4 octets) → le plugin n'est jamais
+        // trouvé ; ET le begin/end renvoyé ne matche plus l'item attendu par le
+        // coordinateur (« begin hors séquence ») → l'item n'est jamais confirmé
+        // → rescans en boucle jusqu'à MAX_SESSIONS (256) puis abandon. `line`
+        // (issu de `.lines()`) est déjà sans \n/\r ; on ne saute que le vide.
+        let item = line.as_str();
+        if item.trim().is_empty() {
             continue;
         }
 
@@ -224,8 +232,12 @@ mod tests {
     }
 
     #[test]
-    fn run_loop_skips_blank_lines_and_trims() {
-        let input = "\n  /a.vst3  \n\n";
+    fn run_loop_skips_blank_lines_and_preserves_item() {
+        // Lignes vides sautées ; item passé TEL QUEL (pas de trim). Crucial : un
+        // item AU finit par l'espace du fourcc fabricant (« au:aufx/SpVb/UVI »
+        // → fabricant « UVI »). Trimmer casserait `fourcc_to_u32` (exige 4
+        // octets) ET la séquence begin/end du coordinateur (cf. bug 256 sessions).
+        let input = "\nau:aufx/SpVb/UVI \n\n";
         let mut out = Vec::new();
         let code = run_loop(input.as_bytes(), &mut out, |_| Vec::new());
         assert_eq!(code, 0);
@@ -233,8 +245,8 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                WorkerEvent::Begin { item: "/a.vst3".into() },
-                WorkerEvent::End { item: "/a.vst3".into() },
+                WorkerEvent::Begin { item: "au:aufx/SpVb/UVI ".into() },
+                WorkerEvent::End { item: "au:aufx/SpVb/UVI ".into() },
             ]
         );
     }

@@ -5,6 +5,23 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-5] — 2026-08-05 (pré-release)
+
+Correctif d'un bug du scan hors-process (macOS) qui faisait **disparaître les
+plugins d'un fabricant dont le code fourcc fait moins de 4 caractères** (ex.
+**UVI** → `« UVI »` avec espace finale : Falcon, Sparkverb, Thorus…). Distinct du
+correctif run loop de 0.5.11-4 (celui-ci concernait les plugins licenciés qui
+figeaient).
+
+### Corrigé
+- **Espace fourcc significative préservée.** Le worker de scan tronquait chaque
+  item (`line.trim()`), supprimant l'espace de complément d'un code fabricant/
+  subtype < 4 caractères (« UVI » → « UVI »). Double conséquence : `fourcc_to_u32`
+  (qui exige 4 octets) échouait → le plugin n'était jamais trouvé ; ET le
+  `begin/end` renvoyé ne correspondait plus à l'item attendu par le coordinateur
+  → l'item n'était jamais confirmé → rescans en boucle jusqu'à 256 sessions puis
+  abandon (scan lent + charge CPU inutile). Le worker ne tronque plus l'item.
+
 ## [0.5.11-4] — 2026-08-05 (pré-release)
 
 Correctif d'une **régression du scan de plugins hors-process** (macOS) : certains
