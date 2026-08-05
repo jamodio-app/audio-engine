@@ -561,9 +561,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
-            let (rms_data, master_mix, peer_voice_rms) = {
+            let (rms_data, master_mix, master_mix_peak, peer_voice_rms) = {
                 let m = pl.mixer.lock();
-                (m.stream_rms(), m.master_mix_rms(), m.inbound_voice_rms())
+                (m.stream_levels(), m.master_mix_rms(), m.master_mix_peak(), m.inbound_voice_rms())
             };
             // Sprint B talkback auto-mute : lit input_rms (instrument self post-plugin)
             // et midi_active (Note ON dans les ~200 dernières ms) pour piloter le
@@ -600,11 +600,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             if !rms_data.is_empty() || has_self_signal {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
-                    .map(|(producer_id, rms, rms_l, rms_r)| StreamLevel {
+                    .map(|(producer_id, rms, rms_l, rms_r, peak_l, peak_r)| StreamLevel {
                         producer_id,
                         rms,
                         rms_l: Some(rms_l),
                         rms_r: Some(rms_r),
+                        peak: Some(peak_l.max(peak_r)),
+                        peak_l: Some(peak_l),
+                        peak_r: Some(peak_r),
                     })
                     .collect();
                 // Point 3 (Lot 2) — niveaux MASTER + MIX en VRAI stéréo, mesurés
@@ -612,32 +615,48 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // browser les consomme pour les VU master/mix (au lieu d'un proxy
                 // mono). `rms` global = max des 2 canaux (back-compat affichage).
                 let (master_l, master_r, mix_l, mix_r) = master_mix;
+                let (master_pk_l, master_pk_r, mix_pk_l, mix_pk_r) = master_mix_peak;
                 levels.push(StreamLevel {
                     producer_id: "master".into(),
                     rms: master_l.max(master_r),
                     rms_l: Some(master_l),
                     rms_r: Some(master_r),
+                    peak: Some(master_pk_l.max(master_pk_r)),
+                    peak_l: Some(master_pk_l),
+                    peak_r: Some(master_pk_r),
                 });
                 levels.push(StreamLevel {
                     producer_id: "mix".into(),
                     rms: mix_l.max(mix_r),
                     rms_l: Some(mix_l),
                     rms_r: Some(mix_r),
+                    peak: Some(mix_pk_l.max(mix_pk_r)),
+                    peak_l: Some(mix_pk_l),
+                    peak_r: Some(mix_pk_r),
                 });
                 // Bug 2 — niveau du talkback agent (mono) pour le VU voix browser.
+                // Tranche VOIX : RMS uniquement (pas de pic) — mètre de comm vocale,
+                // le RMS est le standard ; le browser retombe sur le RMS (peak None).
                 levels.push(StreamLevel {
                     producer_id: "voice".into(),
                     rms: voice_rms,
                     rms_l: Some(voice_rms),
                     rms_r: Some(voice_rms),
+                    peak: None,
+                    peak_l: None,
+                    peak_r: None,
                 });
                 // Lot C — niveau agrégé de la voix des PAIRS reçue via l'agent
                 // (mono, une tranche) → VU voix navigateur en mode agent-routé.
+                // Idem voix : RMS seul.
                 levels.push(StreamLevel {
                     producer_id: "peer-voice".into(),
                     rms: peer_voice_rms,
                     rms_l: Some(peer_voice_rms),
                     rms_r: Some(peer_voice_rms),
+                    peak: None,
+                    peak_l: None,
+                    peak_r: None,
                 });
                 let msg = AgentMessage::StreamLevels {
                     levels,

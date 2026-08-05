@@ -5,6 +5,25 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-6] — 2026-08-05 (pré-release)
+
+**Peak-mètre DAW** : diffusion du **pic échantillon** (dBFS peak) par stream pour
+les VU du studio, en plus du RMS. Côté browser, la barre du VU devient un vrai
+peak-mètre (attack instantané + descente à taux fixe), au lieu d'un mètre RMS qui
+« s'affolait » et masquait les transitoires. Le pic alimente aussi une détection
+de CLIP fiable en mode agent (l'ancien proxy RMS ne s'allumait quasi jamais).
+
+### Ajouté
+- **Pic échantillon par stream + master + mix** (`stereo_peak`, champs `peak_l/
+  peak_r` sur `StreamState`, `master_peak_*`/`mix_peak_*` sur le mixer), calculé
+  **dans les passes RMS existantes** (aucune allocation ni passe supplémentaire →
+  zéro impact latence, hors thread audio RT). Exposé via `stream_levels()` (ex
+  `stream_rms()`, tuple étendu) et `master_mix_peak()`.
+- **Protocole** — `StreamLevel` gagne `peak` / `peakL` / `peakR` (optionnels,
+  omis si absents). Les tranches **VOIX** restent en RMS (mètre de communication
+  vocale : le RMS est le standard). Back-compat : un browser sans support du pic
+  ignore ces champs ; un agent sans pic → le browser retombe sur le RMS.
+
 ## [0.5.11-5] — 2026-08-05 (pré-release)
 
 Correctif d'un bug du scan hors-process (macOS) qui faisait **disparaître les

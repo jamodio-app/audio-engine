@@ -1019,6 +1019,16 @@ pub struct StreamLevel {
     pub rms_l: Option<f32>,
     #[serde(rename = "rmsR", skip_serializing_if = "Option::is_none")]
     pub rms_r: Option<f32>,
+    /// Pic échantillon (|max|) — alimente le peak-mètre DAW du browser (barre =
+    /// pic, pas RMS) pour les mètres instrument/mix/master. Absent pour les
+    /// tranches VOIX (talkback), qui restent en RMS. `None` → le browser retombe
+    /// sur le RMS (back-compat agents < diffusion du pic).
+    #[serde(rename = "peak", skip_serializing_if = "Option::is_none")]
+    pub peak: Option<f32>,
+    #[serde(rename = "peakL", skip_serializing_if = "Option::is_none")]
+    pub peak_l: Option<f32>,
+    #[serde(rename = "peakR", skip_serializing_if = "Option::is_none")]
+    pub peak_r: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]

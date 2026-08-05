@@ -89,6 +89,13 @@ pub struct AudioMixer {
     master_rms_r: f32,
     mix_rms_l: f32,
     mix_rms_r: f32,
+    /// Pic échantillon L/R du MASTER (sortie finale) et du MIX (tap post-fader),
+    /// mesurés dans `mix_into` en parallèle des RMS ci-dessus. Alimentent le
+    /// peak-mètre DAW MASTER/MIX du browser. Lus via `master_mix_peak()`.
+    master_peak_l: f32,
+    master_peak_r: f32,
+    mix_peak_l: f32,
+    mix_peak_r: f32,
     /// Lot C (0.5.10-4) — accumulateur de la VOIX des pairs (talkback entrant).
     /// Les streams `StreamKind::Voice` sont sommés ici (passe 1), puis ajoutés à
     /// `output` dans `mix_into` APRÈS le tap RECORD et le DIM (comme la référence)
@@ -118,6 +125,18 @@ fn stereo_rms(buf: &[f32]) -> (f32, f32) {
     ((sq_l / frames as f32).sqrt(), (sq_r / frames as f32).sqrt())
 }
 
+/// Pic échantillon (|max|) par canal d'un buffer stéréo entrelacé. `(0,0)` si
+/// vide. Alimente le VRAI peak-mètre DAW côté browser (mètres instrument/mix/
+/// master) — capte les transitoires que le RMS lisse.
+fn stereo_peak(buf: &[f32]) -> (f32, f32) {
+    let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
+    for pair in buf.chunks_exact(2) {
+        pk_l = pk_l.max(pair[0].abs());
+        pk_r = pk_r.max(pair[1].abs());
+    }
+    (pk_l, pk_r)
+}
+
 struct StreamState {
     jitter: JitterBuffer,
     /// Lot C — nature du flux : `Instrument` (sommé dans le mix enregistré/duckable)
@@ -135,6 +154,10 @@ struct StreamState {
     /// indépendantes). `rms` reste le niveau global (back-compat peers).
     rms_l: f32,
     rms_r: f32,
+    /// Pic échantillon par canal (|max| sur le dernier bloc poussé) — alimente
+    /// le peak-mètre DAW du browser (barre = pic, pas RMS). Pré-pan comme rms_*.
+    peak_l: f32,
+    peak_r: f32,
     /// Snapshot du `overflow_drops` du jitter au précédent push, pour ne
     /// loguer que sur événement (rate-limited via puissance de 2).
     last_overflow_drops: u64,
@@ -171,6 +194,10 @@ impl AudioMixer {
             master_rms_r: 0.0,
             mix_rms_l: 0.0,
             mix_rms_r: 0.0,
+            master_peak_l: 0.0,
+            master_peak_r: 0.0,
+            mix_peak_l: 0.0,
+            mix_peak_r: 0.0,
             voice_buf: Vec::new(),
             voice_gain: 1.0,
             voice_pan: 0.0,
@@ -184,6 +211,12 @@ impl AudioMixer {
     /// stéréo réels côté browser (pan + faders visibles).
     pub fn master_mix_rms(&self) -> (f32, f32, f32, f32) {
         (self.master_rms_l, self.master_rms_r, self.mix_rms_l, self.mix_rms_r)
+    }
+
+    /// Pic échantillon L/R du MASTER et du MIX (parité `master_mix_rms`, pour le
+    /// peak-mètre DAW). `(master_peak_l, master_peak_r, mix_peak_l, mix_peak_r)`.
+    pub fn master_mix_peak(&self) -> (f32, f32, f32, f32) {
+        (self.master_peak_l, self.master_peak_r, self.mix_peak_l, self.mix_peak_r)
     }
 
     /// DIM factor (= ducking des instruments quand le user veut entendre
@@ -253,6 +286,8 @@ impl AudioMixer {
             rms: 0.0,
             rms_l: 0.0,
             rms_r: 0.0,
+            peak_l: 0.0,
+            peak_r: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
             last_drift_drops: 0,
@@ -289,6 +324,8 @@ impl AudioMixer {
             rms: 0.0,
             rms_l: 0.0,
             rms_r: 0.0,
+            peak_l: 0.0,
+            peak_r: 0.0,
             last_overflow_drops: 0,
             buffer_full_count: 0,
             last_drift_drops: 0,
@@ -554,21 +591,30 @@ impl AudioMixer {
                 let n = samples.len();
                 let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
                 stream.rms = (sum_sq / n as f32).sqrt();
+                // Pic global (|max|) — fallback pour le cas dégénéré mono.
+                let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
                 // L = samples pairs, R = samples impairs (entrelacé stéréo). Si
                 // longueur impaire (cas dégénéré), on retombe sur le global.
                 if n >= 2 && n.is_multiple_of(2) {
                     let half = (n / 2) as f32;
                     let mut sq_l = 0.0f32;
                     let mut sq_r = 0.0f32;
+                    let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
                     for pair in samples.chunks_exact(2) {
                         sq_l += pair[0] * pair[0];
                         sq_r += pair[1] * pair[1];
+                        pk_l = pk_l.max(pair[0].abs());
+                        pk_r = pk_r.max(pair[1].abs());
                     }
                     stream.rms_l = (sq_l / half).sqrt();
                     stream.rms_r = (sq_r / half).sqrt();
+                    stream.peak_l = pk_l;
+                    stream.peak_r = pk_r;
                 } else {
                     stream.rms_l = stream.rms;
                     stream.rms_r = stream.rms;
+                    stream.peak_l = peak;
+                    stream.peak_r = peak;
                 }
             }
 
@@ -719,6 +765,9 @@ impl AudioMixer {
         let (mix_l, mix_r) = stereo_rms(output);
         self.mix_rms_l = mix_l;
         self.mix_rms_r = mix_r;
+        let (mix_pk_l, mix_pk_r) = stereo_peak(output);
+        self.mix_peak_l = mix_pk_l;
+        self.mix_peak_r = mix_pk_r;
 
         // DIM factor — atténue les instruments quand l'user veut entendre le
         // talkback clairement. Skip si == 1.0 (cas par défaut majoritaire).
@@ -791,28 +840,39 @@ impl AudioMixer {
         let (master_l, master_r) = stereo_rms(output);
         self.master_rms_l = master_l;
         self.master_rms_r = master_r;
+        let (master_pk_l, master_pk_r) = stereo_peak(output);
+        self.master_peak_l = master_pk_l;
+        self.master_peak_r = master_pk_r;
 
         // Report drift drains (rate-limité à puissances de 2). Coût formatage
         // négligeable hors événement (1 if + un getter atomic-free par stream).
         self.report_drift_drops();
     }
 
-    /// RMS level per stream (for VU meters sent to browser).
-    /// Retourne `(producer_id, rms_global, rms_l, rms_r)` par stream. Le global
-    /// reste utilisé pour les VU peers (1 valeur) ; L/R alimentent le VU self
-    /// stéréo (2 barres indépendantes) côté browser. Lot C : les flux VOIX sont
-    /// EXCLUS (les VU pairs = instruments+self seuls) — la voix est un agrégat
-    /// unique remonté par `inbound_voice_rms()` (tranche voix navigateur).
-    pub fn stream_rms(&self) -> Vec<(String, f32, f32, f32)> {
+    /// Niveaux par stream pour les VU du browser.
+    /// Retourne `(producer_id, rms_global, rms_l, rms_r, peak_l, peak_r)` par
+    /// stream (RMS + pic échantillon, tous POST-pan). Le global RMS reste utilisé
+    /// pour les VU peers mono ; L/R alimentent le VU stéréo ; les pics alimentent
+    /// le peak-mètre DAW (barre = pic). Lot C : les flux VOIX sont EXCLUS (les VU
+    /// pairs = instruments+self seuls) — la voix est un agrégat unique remonté par
+    /// `inbound_voice_rms()` (tranche voix navigateur, RMS).
+    pub fn stream_levels(&self) -> Vec<(String, f32, f32, f32, f32, f32)> {
         self.streams.iter()
             .filter(|(_, stream)| stream.kind != StreamKind::Voice)
             .map(|(id, stream)| {
                 // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
-                // aux RMS L/R (stockés pré-pan) → le VU reflète le placement stéréo
-                // exactement comme le rendu (self + peers). Un flux mono a
-                // `rms_l = rms_r = rms` en amont ; le pan crée alors l'asymétrie.
+                // aux niveaux L/R (stockés pré-pan) → le VU reflète le placement
+                // stéréo exactement comme le rendu (self + peers). Un flux mono a
+                // `rms_l = rms_r = rms` (idem pic) en amont ; le pan crée l'asymétrie.
                 let (gl, gr) = pan_gains(stream.pan);
-                (id.clone(), stream.rms, stream.rms_l * gl, stream.rms_r * gr)
+                (
+                    id.clone(),
+                    stream.rms,
+                    stream.rms_l * gl,
+                    stream.rms_r * gr,
+                    stream.peak_l * gl,
+                    stream.peak_r * gr,
+                )
             }).collect()
     }
 
@@ -947,7 +1007,7 @@ mod tests {
         let mut s = Vec::new();
         for _ in 0..100 { s.push(1.0); s.push(0.0); }
         m.push_samples("p1", &s);
-        let (_, rms, rms_l, rms_r) = m.stream_rms().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        let (_, rms, rms_l, rms_r, _, _) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
         assert!((rms_l - 1.0).abs() < 1e-4, "rms_l ≈ 1 (canal gauche plein)");
         assert!(rms_r.abs() < 1e-4, "rms_r ≈ 0 (canal droit silencieux)");
         // rms global = sqrt(moyenne sur tous) = sqrt(0.5) ≈ 0.707.
@@ -965,7 +1025,7 @@ mod tests {
         let s = vec![1.0f32; 200];
         m.push_samples("p1", &s);
         let lr = |m: &AudioMixer| {
-            let (_, _, l, r) = m.stream_rms().into_iter().find(|(id, ..)| id == "p1").unwrap();
+            let (_, _, l, r, _, _) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
             (l, r)
         };
         // Centre : L = R.
@@ -981,6 +1041,54 @@ mod tests {
         let (lr_, rr) = lr(&m);
         assert!(lr_.abs() < 1e-4, "full right : rms_l ≈ 0, got {lr_}");
         assert!((rr - 1.0).abs() < 1e-4, "full right : rms_r ≈ 1, got {rr}");
+    }
+
+    /// Peak-mètre DAW — le PIC échantillon capté par stream doit dépasser le RMS
+    /// sur un signal à transitoires, et suivre le pan comme le RMS. Ici : L plein
+    /// (1.0) avec un transitoire à 1.0 → peak_l ≈ 1 > rms_l ; R quasi nul.
+    #[test]
+    fn stream_peak_capte_le_transitoire_et_le_pan() {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        // Canal L : rampe faible (RMS bas) + 1 transitoire plein ; canal R : nul.
+        let mut s = Vec::new();
+        for i in 0..100 {
+            s.push(if i == 50 { 1.0 } else { 0.05 }); // L : bruit faible + 1 pic
+            s.push(0.0);                                // R : silence
+        }
+        m.push_samples("p1", &s);
+        let (_, _, rms_l, _, peak_l, peak_r) =
+            m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        assert!((peak_l - 1.0).abs() < 1e-4, "peak_l capte le transitoire (≈1), got {peak_l}");
+        assert!(peak_l > rms_l + 0.5, "peak_l ({peak_l}) >> rms_l ({rms_l}) — le pic voit le transitoire que le RMS lisse");
+        assert!(peak_r.abs() < 1e-4, "peak_r ≈ 0 (canal droit muet), got {peak_r}");
+        // Pané full-left → peak_r reste nul, peak_l conservé.
+        m.set_pan("p1", -1.0);
+        m.push_samples("p1", &s);
+        let (_, _, _, _, pl, pr) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        assert!((pl - 1.0).abs() < 1e-4, "full left : peak_l ≈ 1, got {pl}");
+        assert!(pr.abs() < 1e-4, "full left : peak_r ≈ 0, got {pr}");
+    }
+
+    /// Peak-mètre DAW — MASTER/MIX : le pic de sortie doit dépasser le RMS sur un
+    /// signal à transitoires, et être exposé par `master_mix_peak()`.
+    #[test]
+    fn master_mix_peak_expose_le_pic_de_sortie() {
+        let mut m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        let mut out = vec![0.0f32; 512];
+        // Gros buffer (amorce le jitter) : faible (0.05) partout + transitoires
+        // pleins réguliers sur L ET R → toute fenêtre de sortie en contient.
+        let mut s = vec![0.05f32; 48_000];
+        let mut i = 0;
+        while i + 1 < s.len() { s[i] = 1.0; s[i + 1] = 1.0; i += 16; }
+        m.push_samples("p1", &s);
+        m.mix_into(&mut out);
+        let (mpl, mpr, xpl, xpr) = m.master_mix_peak();
+        let (mrl, _, xrl, _) = m.master_mix_rms();
+        assert!(mpl > mrl + 0.3, "master : peak ({mpl}) >> rms ({mrl})");
+        assert!(xpl > xrl + 0.3, "mix : peak ({xpl}) >> rms ({xrl})");
+        assert!(mpr > 0.0 && xpr > 0.0, "canal R non nul (source centrée)");
     }
 
     /// Point 3 (Lot 2) — le VU MASTER/MIX doit refléter le pan du mix réel :
