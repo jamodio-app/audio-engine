@@ -158,6 +158,59 @@ fn log_first_callback(
     );
 }
 
+/// R2 (48k) — mesure le rate RÉEL délivré par le device de capture (~400 ms après le
+/// start) : `cb_per_sec × frames/callback`, snappé au rate standard le plus proche. Sur
+/// macOS/CoreAudio, `default_input_config()` peut DÉCLARER un rate (48000) qui diverge du
+/// rate RÉELLEMENT délivré (ex. 96000 après un changement Audio-MIDI non répercuté par
+/// cpal) → on MESURE, on ne se fie PAS au déclaré (doctrine 48k). Renvoie `declared` en
+/// garde-fou si aucun callback n'est encore arrivé (géométrie inconnue).
+///
+/// À appeler sur le thread com_exec (hors RT) APRÈS `stream.play()`. Le sleep de 400 ms y
+/// est acceptable (parité avec la mesure ASIO `asio_host.rs`) : il retarde le join, pas
+/// l'audio temps-réel (les callbacks tournent sur le thread RT du driver).
+pub fn measure_capture_rate(
+    capture_callbacks: &AtomicU64,
+    input_frames: &AtomicU32,
+    declared: u32,
+) -> u32 {
+    let start = capture_callbacks.load(Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(400));
+    let dt = t0.elapsed().as_secs_f64();
+    let cb = capture_callbacks.load(Ordering::Relaxed).saturating_sub(start);
+    let frames = input_frames.load(Ordering::Relaxed);
+    if cb == 0 || frames == 0 || dt <= 0.0 {
+        return declared; // pas de callback / géométrie inconnue → on garde le déclaré
+    }
+    let measured = (cb as f64 / dt) * frames as f64;
+    let snapped = snap_standard_sr(measured);
+    if snapped != declared {
+        tracing::warn!(
+            target: "jamodio::capture",
+            declared,
+            measured_sr = measured as u32,
+            snapped,
+            frames_per_cb = frames,
+            cb_per_sec = (cb as f64 / dt) as u32,
+            "device MENT sur son rate (déclaré ≠ mesuré) — on retient le rate RÉEL mesuré (R2 refusera si ≠ 48 kHz)"
+        );
+    }
+    snapped
+}
+
+/// Snap une fréquence mesurée (±~1 % de bruit) au rate audio standard le plus proche.
+fn snap_standard_sr(measured: f64) -> u32 {
+    const STD: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+    STD.into_iter()
+        .min_by(|&a, &b| {
+            (measured - a as f64)
+                .abs()
+                .partial_cmp(&(measured - b as f64).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(48_000)
+}
+
 /// Start capturing audio from the given device.
 /// Returns `(stream, channels_captured, native_sample_rate, fixed_buffer)`.
 /// `fixed_buffer` = `Some(N)` si on a appliqué `BufferSize::Fixed(N)`, `None`

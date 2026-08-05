@@ -362,8 +362,8 @@ fn open_duplex_on_com(
                 &device,
                 sample_tx,
                 capture_drops,
-                capture_callbacks,
-                input_frames,
+                capture_callbacks.clone(),
+                input_frames.clone(),
                 capture_feeding,
             )
             .map_err(|e| CaptureStartError::Other(format!("CPAL input: {}", e)))?;
@@ -440,6 +440,16 @@ fn open_duplex_on_com(
         in_stream
             .play()
             .map_err(|e| CaptureStartError::Other(format!("CPAL input play: {}", e)))?;
+
+        // R2 (48k) — on MESURE le rate RÉEL délivré (débit de callbacks × frames/callback),
+        // on ne se fie PAS au déclaré. Sur CoreAudio, `default_input_config()` peut annoncer
+        // 48000 alors que le device délivre 96000 (changement Audio-MIDI non répercuté par
+        // cpal) → sans ça on ENTRE puis le détecteur de dérive hard-stop EN BOUCLE. La mesure
+        // (~400 ms, sur ce thread com_exec hors RT) rend le VRAI rate ; R2 (start_capture)
+        // refuse s'il ≠ 48000, AVANT l'entrée. Symétrique de la mesure ASIO. Windows/ASIO
+        // n'atteint pas ce chemin (host ASIO dédié) → de fait macOS/CoreAudio.
+        let native_sr =
+            crate::audio::capture::measure_capture_rate(&capture_callbacks, &input_frames, native_sr);
 
         // 0.5.4-2 — enregistre le callback `kAsioResetRequest` sur le driver
         // d'entrée (no-op hors ASIO). Sur ce thread COM-STA, `device` tient
