@@ -1075,17 +1075,54 @@ int jmo_au_probe(uint32_t au_type, uint32_t au_subtype, uint32_t au_manuf,
     CFStringGetCString(cf_name, name_buf, name_size, kCFStringEncodingUTF8);
     CFRelease(cf_name);
 
-    // Instanciation réelle — c'est ICI qu'un plugin défectueux crashe (le
-    // worker). Échec PROPRE (err) = défauts sûrs, le composant reste listé.
-    NSError *err = nil;
-    AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:desc
-                                                                   options:0
-                                                                     error:&err];
-    if (probe && !err) {
-        *latency_samples = (uint32_t)lround(probe.latency * kSampleRate);
-        *has_input_bus = (probe.inputBusses.count > 0) ? 1 : 0;
-        probe = nil; // ARC release
-    }
+    // Instanciation réelle — SUR LE MAIN THREAD (comme loadType), via
+    // jmo_run_on_main_sync. Les plugins licenciés (BFD, AmpliTube, Kontakt,
+    // iLok…) font un XPC SYNCHRONE vers leur daemon à l'init, qui ne répond
+    // QUE si une run loop pompe les messages. Le worker de scan fait tourner
+    // la run loop main (jmo_run_main_loop) → ce dispatch s'exécute sur un main
+    // POMPÉ, exactement comme le chargement live. Avant 0.5.11-4 la probe
+    // s'instanciait directement sur le thread du worker (sans run loop) → hang
+    // → timeout coordinateur → blocklist DÉFINITIVE (empreinte AU = None) : les
+    // plugins licenciés « disparaissaient » du picker. C'est ICI aussi qu'un
+    // plugin défectueux crashe (le worker) ; échec PROPRE (err) = défauts sûrs,
+    // le composant reste listé.
+    __block uint32_t lat = 0;
+    __block int has_in = 1;
+    jmo_run_on_main_sync(^{
+        NSError *err = nil;
+        AUAudioUnit *probe = [[AUAudioUnit alloc] initWithComponentDescription:desc
+                                                                       options:0
+                                                                         error:&err];
+        if (probe && !err) {
+            lat = (uint32_t)lround(probe.latency * kSampleRate);
+            has_in = (probe.inputBusses.count > 0) ? 1 : 0;
+            probe = nil; // ARC release
+        }
+    });
+    *latency_samples = lat;
+    *has_input_bus = has_in;
+    return 1;
+}
+
+// 0.5.11-4 — nom lisible d'un composant AU, SANS instanciation (lecture seule
+// du registre via AudioComponentCopyName). Sûr même dans le process agent :
+// aucun code plugin exécuté. Sert à nommer un plugin BLOCKLISTÉ (logs worker +
+// UI) — l'instanciation ayant échoué, on n'a pas son nom « propre » autrement,
+// juste son id 4-CC cryptique. Retourne 1 + remplit name_buf si trouvé, 0 sinon.
+int jmo_au_name(uint32_t au_type, uint32_t au_subtype, uint32_t au_manuf,
+                char *name_buf, size_t name_size) {
+    if (!name_buf || name_size == 0) return 0;
+    name_buf[0] = '\0';
+    AudioComponentDescription desc = {0, 0, 0, 0, 0};
+    desc.componentType = au_type;
+    desc.componentSubType = au_subtype;
+    desc.componentManufacturer = au_manuf;
+    AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
+    if (!comp) return 0;
+    CFStringRef cf_name = nullptr;
+    if (AudioComponentCopyName(comp, &cf_name) != noErr || !cf_name) return 0;
+    CFStringGetCString(cf_name, name_buf, name_size, kCFStringEncodingUTF8);
+    CFRelease(cf_name);
     return 1;
 }
 
@@ -1097,6 +1134,21 @@ void jmo_suppress_dock(void) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    }
+}
+
+// 0.5.11-4 — fait tourner la run loop Cocoa du thread PRINCIPAL du worker de
+// scan. Indispensable : le scan instancie les plugins via un dispatch sur la
+// main queue (jmo_au_probe → jmo_run_on_main_sync). Sans une run loop qui pompe
+// cette queue, l'XPC de licence des plugins lourds ne répond jamais → hang →
+// timeout worker → blocklist. En production l'agent (Tauri) pompe déjà cette
+// run loop ; le worker OOP doit faire pareil, sinon régression du scan.
+// Prérequis : jmo_suppress_dock (donc [NSApplication sharedApplication]) déjà
+// appelé → NSApp != nil. Ne retourne pas en usage normal : le thread de scan
+// sort le process (exit) quand la liste d'items est épuisée.
+void jmo_run_main_loop(void) {
+    @autoreleasepool {
+        [NSApp run];
     }
 }
 

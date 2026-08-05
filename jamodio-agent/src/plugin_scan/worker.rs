@@ -36,10 +36,40 @@ pub fn run() -> ! {
         version = env!("CARGO_PKG_VERSION"),
         "plugin scan worker starting"
     );
-    let stdin = std::io::stdin().lock();
-    let stdout = std::io::stdout().lock();
-    let code = run_loop(stdin, stdout, scan_item);
-    std::process::exit(code);
+
+    // macOS : l'instanciation d'un plugin doit tourner sur le thread PRINCIPAL
+    // avec une run loop Cocoa POMPÉE (jmo_au_probe dispatche sur la main queue
+    // via jmo_run_on_main_sync). Les plugins licenciés font un XPC synchrone à
+    // l'init qui ne répond que si la run loop pompe → sinon hang → timeout →
+    // blocklist (régression du scan OOP, 0.5.9→0.5.11). On calque donc
+    // l'environnement de l'agent (Tauri) : le scan (lecture stdin + probe) part
+    // sur un thread de FOND, le thread principal fait tourner la run loop. Le
+    // thread de fond sort le process (`exit`) dès la liste épuisée — la run
+    // loop idle meurt avec.
+    #[cfg(target_os = "macos")]
+    {
+        std::thread::Builder::new()
+            .name("plugin-scan".into())
+            .spawn(|| {
+                let stdin = std::io::stdin().lock();
+                let stdout = std::io::stdout().lock();
+                let code = run_loop(stdin, stdout, scan_item);
+                std::process::exit(code);
+            })
+            .expect("spawn du thread de scan");
+        jamodio_au_host::run_main_loop();
+        // run_main_loop ne rend la main qu'anormalement (run loop stoppée sans
+        // exit du thread de scan) → filet : sortie neutre plutôt que retour.
+        std::process::exit(0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stdin = std::io::stdin().lock();
+        let stdout = std::io::stdout().lock();
+        let code = run_loop(stdin, stdout, scan_item);
+        std::process::exit(code);
+    }
 }
 
 /// Boucle du worker, factorisée pour les tests (I/O et scan injectés).
@@ -127,6 +157,13 @@ fn scan_item(item: &str) -> Vec<PluginInfo> {
         tracing::warn!(target: "jamodio::scan-worker", item, "item AU invalide — ignoré");
         return Vec::new();
     };
+    // Breadcrumb NOMMÉ avant l'instanciation : sur un hang (plugin qui fige à
+    // l'init), cette ligne est la DERNIÈRE du log worker → identifie le coupable
+    // par son nom (diagnostic à distance via export bug-report). Lecture registre
+    // seule, aucune instanciation ici.
+    let name = jamodio_au_host::component_name(&au.au_type, &au.subtype, &au.manufacturer)
+        .unwrap_or_else(|| item.to_string());
+    tracing::info!(target: "jamodio::scan-worker", plugin = %name, item, "probe AU");
     jamodio_au_host::scan_component(&au.au_type, &au.subtype, &au.manufacturer)
         .into_iter()
         .collect()

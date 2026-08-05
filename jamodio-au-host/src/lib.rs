@@ -58,6 +58,8 @@ extern "C" {
     fn jmo_au_enumerate(cb: AuEnumCb, ctx: *mut c_void);
     // 0.5.9-4 — masque le process worker de scan (Dock/focus). Cf. suppress_dock.
     fn jmo_suppress_dock();
+    // 0.5.11-4 — fait tourner la run loop main du worker de scan. Cf. run_main_loop.
+    fn jmo_run_main_loop();
     fn jmo_au_probe(
         au_type: u32,
         au_subtype: u32,
@@ -66,6 +68,14 @@ extern "C" {
         name_size: usize,
         latency_samples: *mut u32,
         has_input_bus: *mut c_int,
+    ) -> c_int;
+    // 0.5.11-4 — nom lisible d'un AU sans instanciation. Cf. component_name.
+    fn jmo_au_name(
+        au_type: u32,
+        au_subtype: u32,
+        au_manuf: u32,
+        name_buf: *mut c_char,
+        name_size: usize,
     ) -> c_int;
 }
 
@@ -253,6 +263,37 @@ pub fn scan_component(au_type: &str, subtype: &str, manufacturer: &str) -> Optio
 /// le Dock le temps du scan. `NSApplicationActivationPolicyProhibited`.
 pub fn suppress_dock_for_helper() {
     unsafe { jmo_suppress_dock() };
+}
+
+/// Fait tourner la run loop Cocoa du thread APPELANT (le thread principal du
+/// worker de scan). Cf. au_host.mm#jmo_run_main_loop : indispensable pour que
+/// l'instanciation des plugins (dispatchée sur la main queue) s'exécute sur un
+/// main pompé — sinon l'XPC de licence des plugins lourds hang → blocklist.
+/// Doit être appelée APRÈS `suppress_dock_for_helper` (qui crée `NSApp`). Ne
+/// retourne pas en usage normal : le thread de scan sort le process via `exit`.
+pub fn run_main_loop() {
+    unsafe { jmo_run_main_loop() };
+}
+
+/// Nom lisible d'un composant AU, SANS instanciation (lecture seule du registre
+/// AudioComponent — aucun code plugin exécuté, sûr partout). Utilisé pour nommer
+/// un plugin blocklisté (logs worker + note UI) alors que l'instanciation a
+/// échoué. `None` si le composant est introuvable ou sans nom.
+pub fn component_name(au_type: &str, subtype: &str, manufacturer: &str) -> Option<String> {
+    let t = fourcc_to_u32(au_type)?;
+    let st = fourcc_to_u32(subtype)?;
+    let mf = fourcc_to_u32(manufacturer)?;
+    let mut name_buf = [0u8; 256];
+    let found =
+        unsafe { jmo_au_name(t, st, mf, name_buf.as_mut_ptr() as *mut c_char, name_buf.len()) };
+    if found == 0 {
+        return None;
+    }
+    let raw = CStr::from_bytes_until_nul(&name_buf).ok()?.to_str().ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
 // ---------- Trait impl ----------

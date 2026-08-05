@@ -2821,13 +2821,45 @@ async fn handle_message(
                 let blocked = blocked_items
                     .iter()
                     .map(|b| {
-                        jamodio_audio_core::protocol::BlockedPlugin::from_item(
+                        #[allow(unused_mut)]
+                        let mut bp = jamodio_audio_core::protocol::BlockedPlugin::from_item(
                             &b.item,
                             b.reason.as_wire(),
-                        )
+                        );
+                        // 0.5.11-4 — nom réel (registre, sans instanciation) au
+                        // lieu de l'id `au:` cryptique : la note « bloqués » de
+                        // l'UI nomme le plugin. VST3 (Windows) garde son basename.
+                        #[cfg(target_os = "macos")]
+                        if let Some(au) = crate::plugin_scan::protocol::AuItem::decode(&b.item) {
+                            if let Some(name) = jamodio_au_host::component_name(
+                                &au.au_type,
+                                &au.subtype,
+                                &au.manufacturer,
+                            ) {
+                                bp.name = name;
+                            }
+                        }
+                        bp
                     })
                     .collect();
                 vec![AgentMessage::PluginList { items, scanning, blocked }]
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
+            }
+        }
+
+        // 0.5.11-4 — rescan forcé (bouton « Rescanner »). Relance un scan qui
+        // ignore le cache disque, puis répond `scanning:true` : l'UI réaffiche
+        // « Scan… » et repolle jusqu'au `PluginList` final.
+        BrowserMessage::RescanPlugins => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                if let Some(pl) = lock_pipeline_wait(pipeline).await {
+                    pl.spawn_plugin_scan_forced();
+                }
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![] }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {

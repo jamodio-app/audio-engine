@@ -1346,18 +1346,38 @@ impl PipelineState {
     /// Le `plugin_host` n'est plus touché ici (il ne sert qu'au load réel).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn spawn_plugin_scan(&self) {
+        self.spawn_scan_inner(false);
+    }
+
+    /// 0.5.11-4 — rescan FORCÉ demandé par l'utilisateur (bouton « Rescanner »).
+    /// Repasse le cache en `Scanning` (l'UI réaffiche « Scan… » + repolle) puis
+    /// relance un scan qui IGNORE le cache disque → les AU blocklistés à tort
+    /// retentent leur chance. Cf. `plugin_scan::run_full_scan_forced`.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn spawn_plugin_scan_forced(&self) {
+        *self.plugin_scan_cache.lock() = PluginScanCache::Scanning;
+        self.spawn_scan_inner(true);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn spawn_scan_inner(&self, forced: bool) {
         let cache = self.plugin_scan_cache.clone();
         let kind = if cfg!(target_os = "macos") { "AU" } else { "VST3" };
         std::thread::Builder::new()
             .name("plugin-scan".into())
             .spawn(move || {
                 let t0 = std::time::Instant::now();
-                tracing::info!(target: "jamodio::plugin", kind, "plugin scan starting (out-of-process)");
-                let scan = crate::plugin_scan::run_full_scan();
+                tracing::info!(target: "jamodio::plugin", kind, forced, "plugin scan starting (out-of-process)");
+                let scan = if forced {
+                    crate::plugin_scan::run_full_scan_forced()
+                } else {
+                    crate::plugin_scan::run_full_scan()
+                };
                 let elapsed_ms = t0.elapsed().as_millis();
                 tracing::info!(
                     target: "jamodio::plugin",
                     kind,
+                    forced,
                     count = scan.plugins.len(),
                     blocked = scan.blocked.len(),
                     scanned = scan.scanned,

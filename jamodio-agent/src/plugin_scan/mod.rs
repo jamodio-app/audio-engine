@@ -81,6 +81,22 @@ pub struct FullScan {
 /// les crashs sont blocklistés et le cache réécrit.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn run_full_scan() -> FullScan {
+    run_full_scan_impl(false)
+}
+
+/// Rescan FORCÉ (bouton « Rescanner les plugins ») : ignore le cache disque
+/// (entries réutilisées + blocklist) → TOUT est re-scanné, y compris les AU
+/// blocklistés à tort. C'est la voie de récupération pilotée par l'utilisateur :
+/// un AU sans empreinte fichier (retenu à vie par la réconciliation normale)
+/// retente ainsi sa chance sans qu'on ait à re-figer le scan à chaque lancement.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub fn run_full_scan_forced() -> FullScan {
+    run_full_scan_impl(true)
+}
+
+/// Cœur du scan. `force` = ignorer le cache disque comme prior (rescan total).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn run_full_scan_impl(force: bool) -> FullScan {
     use std::collections::HashMap;
 
     let items = discovery::discover_items();
@@ -91,7 +107,13 @@ pub fn run_full_scan() -> FullScan {
     let fp_by_item: HashMap<String, Option<cache::FileFingerprint>> =
         discovered.iter().cloned().collect();
 
-    let prior = cache::load();
+    // Rescan forcé : prior vide (scanner_abi = 0 ≠ SCANNER_ABI) → la
+    // réconciliation bascule sur « tout rescanner, blocklist ignorée ».
+    let prior = if force {
+        cache::CacheFile::default()
+    } else {
+        cache::load()
+    };
     let plan = cache::reconcile(&discovered, &prior);
     tracing::info!(
         target: "jamodio::plugin",

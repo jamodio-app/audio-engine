@@ -250,6 +250,11 @@ pub enum BrowserMessage {
     /// scan. Si le scan tourne encore (au démarrage de l'agent), `scanning =
     /// true` et `items` peut être vide → le browser repolle.
     ListPlugins,
+    /// 0.5.11-4 — force un rescan complet des plugins en IGNORANT le cache
+    /// disque (entries + blocklist). Recovery à la main de l'utilisateur : un
+    /// AU blocklisté (empreinte absente → retenu à vie sinon) retente sa chance.
+    /// L'agent répond `PluginList { scanning: true }` puis le browser repolle.
+    RescanPlugins,
     /// Sprint INSERT (S1) — charge un plugin sur la tranche instrument self.
     /// Réponse : `InstrumentPluginLoaded` ou `InstrumentPluginError`.
     /// Charge UN seul plugin à la fois côté MVP (1 slot) — un appel quand un

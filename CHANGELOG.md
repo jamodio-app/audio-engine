@@ -5,6 +5,34 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-4] — 2026-08-05 (pré-release)
+
+Correctif d'une **régression du scan de plugins hors-process** (macOS) : certains
+**AU tiers licenciés** (BFD, AmpliTube, Kontakt, plugins iLok…) n'étaient **plus
+détectés** — ils figeaient à l'instanciation faute de **run loop Cocoa pompée**
+dans le worker de scan, puis étaient blocklistés **à vie** (un item AU n'a pas
+d'empreinte fichier). Le chargement live n'était pas affecté (l'agent, lui, pompe
+sa run loop) : seule la découverte était cassée.
+
+### Corrigé
+- **Racine — run loop du worker de scan.** `jmo_au_probe` instancie désormais le
+  plugin **sur le thread principal avec la run loop pompée** (comme le chargement
+  live), et le worker fait tourner `[NSApp run]` sur le main (scan sur un thread
+  de fond). L'XPC de licence des plugins lourds répond → plus de hang → plus de
+  blocklist à tort. Aucune touche au chemin temps-réel / self-monitor.
+- **Invalidation des blocklists périmées.** `SCANNER_ABI` 1→2 → rescan complet au
+  1er lancement : les AU blocklistés à tort en 0.5.9→0.5.11-3 retentent leur chance.
+
+### Ajouté
+- **Diagnostic par nom.** Le worker journalise le plugin scanné **par son nom
+  réel** (lecture registre, sans instanciation) avant l'instanciation → sur un
+  hang, le log nomme le coupable. La note « bloqués » de l'UI affiche aussi le
+  **nom réel** au lieu de l'id `au:` cryptique.
+- **Bouton « Rescanner ».** Relance une détection complète en ignorant le cache
+  (récupération pilotée par l'utilisateur, ex. après réparation/màj d'un plugin),
+  avec note « bloqués » revue (icône de marque + forme + texte, daltonien-safe ;
+  plus d'emoji).
+
 ## [0.5.11-3] — 2026-08-05 (pré-release)
 
 Pré-release qui **embarque tout le cycle 0.5.11** : le correctif crash 32 canaux

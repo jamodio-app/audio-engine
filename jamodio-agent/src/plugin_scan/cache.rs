@@ -24,9 +24,14 @@ use serde::{Deserialize, Serialize};
 use super::protocol::AuItemPrefix;
 use super::session::{BlockReason, BlockedItem};
 
-/// Version du format ET de ce qu'on extrait. Bump = invalidation totale.
+/// Version du format ET de ce qu'on extrait. Bump = invalidation totale
+/// (rescan complet, blocklist du cache ignorée — cf. `reconcile`).
 /// v1 : scan out-of-process, probe AU tous fabricants (0.5.9-2).
-const SCANNER_ABI: u32 = 1;
+/// v2 : probe AU sur main thread pompé (0.5.11-4). Indispensable : sans ce
+///      bump, les AU licenciés blocklistés à tort en v1 (empreinte AU = None →
+///      retenus À VIE) ne seraient jamais re-scannés, donc le correctif run
+///      loop ne réparerait AUCUN utilisateur déjà touché.
+const SCANNER_ABI: u32 = 2;
 
 const CACHE_FILENAME: &str = "plugin-scan-cache-v1.json";
 
