@@ -558,6 +558,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             return;
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        // Talkback gate (Lot 2) — dernier état poussé, pour forcer un push sur
+        // TRANSITION même en idle (sinon la fermeture du gate après le hold,
+        // alors que voice_rms est déjà à 0, ne serait jamais transmise → le
+        // voyant resterait bloqué sur ON AIR).
+        let mut last_gate_open = false;
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
@@ -588,6 +593,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
             let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
+            let voice_gate_open = pl.voice_gate_open.load(std::sync::atomic::Ordering::Relaxed);
             drop(pl);
             // Push si on a soit des niveaux peers, soit un signal LOCAL (instrument
             // RMS > 0, MIDI actif, OU talkback voix RMS > 0). En idle complet, on
@@ -597,7 +603,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // push. Sans lui, parler SEUL — pas de peer, instrument silencieux —
             // n'émettait aucun StreamLevels et le VU talkback restait figé.
             let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0 || peer_voice_rms > 0.0;
-            if !rms_data.is_empty() || has_self_signal {
+            // Force un push si le gate a CHANGÉ d'état, même sans autre signal
+            // (fermeture après le hold en silence → sinon voyant bloqué ON AIR).
+            let gate_changed = voice_gate_open != last_gate_open;
+            last_gate_open = voice_gate_open;
+            if !rms_data.is_empty() || has_self_signal || gate_changed {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
                     .map(|(producer_id, rms, rms_l, rms_r, peak_l, peak_r)| StreamLevel {
@@ -662,6 +672,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     levels,
                     input_rms: Some(input_rms),
                     midi_active: Some(midi_active),
+                    voice_gate_open: Some(voice_gate_open),
                 };
                 if levels_tx.send(msg).await.is_err() {
                     break;

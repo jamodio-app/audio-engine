@@ -671,6 +671,11 @@ pub enum AgentMessage {
         input_rms: Option<f32>,
         #[serde(rename = "midiActive", skip_serializing_if = "Option::is_none")]
         midi_active: Option<bool>,
+        /// Talkback noise-gate (Lot 2) : état LIVE du gate voix agent (true =
+        /// ouvert, on parle). Alimente le voyant ON AIR/PRÊT de la tranche voix
+        /// en mode agent. Absent si l'agent ne capture pas la voix (back-compat).
+        #[serde(rename = "voiceGateOpen", skip_serializing_if = "Option::is_none")]
+        voice_gate_open: Option<bool>,
     },
     /// Réponse à `GetLogsArchive`. Contient les logs agent concaténés en
     /// plain text (UTF-8), avec entêtes par fichier `====== agent.log.YYYY-MM-DD ======`.

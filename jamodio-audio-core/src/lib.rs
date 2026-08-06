@@ -6,3 +6,4 @@ pub mod plugin_host;
 pub mod protocol;
 pub mod record;
 pub mod sync;
+pub mod voice_gate;
