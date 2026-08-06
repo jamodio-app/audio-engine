@@ -558,11 +558,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             return;
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        // Talkback gate (Lot 2) — dernier état poussé, pour forcer un push sur
-        // TRANSITION même en idle (sinon la fermeture du gate après le hold,
-        // alors que voice_rms est déjà à 0, ne serait jamais transmise → le
-        // voyant resterait bloqué sur ON AIR).
-        let mut last_gate_open = false;
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
@@ -570,12 +565,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let m = pl.mixer.lock();
                 (m.stream_levels(), m.master_mix_rms(), m.master_mix_peak(), m.inbound_voice_rms())
             };
-            // Sprint B talkback auto-mute : lit input_rms (instrument self post-plugin)
-            // et midi_active (Note ON dans les ~200 dernières ms) pour piloter le
-            // détecteur d'activité côté browser. Ces 2 valeurs sont reset entre les
-            // captures (Pipeline::new), donc Some(...) toujours valides côté agent
-            // — le serializer écrira `null`/absent uniquement si l'utilisateur veut
-            // un payload minimaliste (back-compat).
+            // input_rms (instrument self post-plugin) alimente le VU d'entrée
+            // browser ; midi_active (Note ON dans les ~200 dernières ms) est conservé
+            // par back-compat du protocole. Ces 2 valeurs sont reset entre les
+            // captures (Pipeline::new), donc Some(...) toujours valides côté agent.
             // 0.5.4-18 — pendant un re-init long-settle du driver ASIO, l'alim
             // encodeur est coupée (`capture_feeding=false`) et les streams fermés :
             // on force le VU d'entrée à 0 pour toute la durée du settle. Sinon le
@@ -593,7 +586,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
             let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
-            let voice_gate_open = pl.voice_gate_open.load(std::sync::atomic::Ordering::Relaxed);
             drop(pl);
             // Push si on a soit des niveaux peers, soit un signal LOCAL (instrument
             // RMS > 0, MIDI actif, OU talkback voix RMS > 0). En idle complet, on
@@ -603,11 +595,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // push. Sans lui, parler SEUL — pas de peer, instrument silencieux —
             // n'émettait aucun StreamLevels et le VU talkback restait figé.
             let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0 || peer_voice_rms > 0.0;
-            // Force un push si le gate a CHANGÉ d'état, même sans autre signal
-            // (fermeture après le hold en silence → sinon voyant bloqué ON AIR).
-            let gate_changed = voice_gate_open != last_gate_open;
-            last_gate_open = voice_gate_open;
-            if !rms_data.is_empty() || has_self_signal || gate_changed {
+            if !rms_data.is_empty() || has_self_signal {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
                     .map(|(producer_id, rms, rms_l, rms_r, peak_l, peak_r)| StreamLevel {
@@ -672,7 +660,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     levels,
                     input_rms: Some(input_rms),
                     midi_active: Some(midi_active),
-                    voice_gate_open: Some(voice_gate_open),
                 };
                 if levels_tx.send(msg).await.is_err() {
                     break;

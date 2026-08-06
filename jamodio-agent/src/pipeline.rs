@@ -17,7 +17,6 @@ use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, Plugi
 use crate::audio::midi::CapturedMidiEvent;
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
-use jamodio_audio_core::voice_gate::{SidechainBandpass, VoiceGate, VoiceGateParams};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 use jamodio_audio_core::sync::jitter::JitterEstimator;
 #[cfg(target_os = "macos")]
@@ -756,11 +755,10 @@ pub struct PipelineState {
     pub output_buffer_samples: Option<u32>,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
-    /// Talkback auto-mute (Sprint B) — true tant qu'au moins un MIDI Note ON
-    /// a été reçu dans les ~200 dernières ms. Reset par la boucle process_stage
-    /// quand le délai est dépassé sans nouvel event. Lu par ws_server.rs au
-    /// push 100 ms des StreamLevels pour piloter l'auto-mute talkback côté
-    /// browser quand l'utilisateur joue en MIDI (clavier USB ou virtuel).
+    /// MIDI Note ON récent — true tant qu'au moins un Note ON a été reçu dans
+    /// les ~200 dernières ms. Reset par la boucle process_stage quand le délai
+    /// est dépassé sans nouvel event. Diffusé dans les StreamLevels (`midiActive`)
+    /// par back-compat du protocole.
     pub midi_active: Arc<std::sync::atomic::AtomicBool>,
     /// Timestamp ms (depuis epoch process) du dernier MIDI Note ON détecté.
     /// Utilisé en interne par process_stage pour le timeout de midi_active.
@@ -794,11 +792,6 @@ pub struct PipelineState {
     /// `voice`) → alimente le VU talkback côté browser en mode agent voix (sinon
     /// plat : pas d'analyser navigateur). `0.0` hors voix active.
     pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
-    /// Talkback noise-gate (Lot 2) — état LIVE du gate voix, écrit par
-    /// `voice_encode_stage_loop` et diffusé dans `stream-levels`
-    /// (`voiceGateOpen`) → voyant ON AIR/PRÊT de la tranche voix en mode agent.
-    /// `false` hors voix active.
-    pub voice_gate_open: Arc<std::sync::atomic::AtomicBool>,
     /// Nb de canaux physiques + sample rate natif de la capture courante,
     /// mémorisés au `start_capture`. Permettent de greffer la voix (validation
     /// du canal demandé + config resampler voix) SANS redémarrer la capture
@@ -1216,7 +1209,6 @@ impl PipelineState {
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            voice_gate_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
@@ -2307,7 +2299,6 @@ impl PipelineState {
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
-        let voice_gate_open = self.voice_gate_open.clone();
         let output_device_name = self
             .output_device_id
             .as_deref()
@@ -2323,7 +2314,6 @@ impl PipelineState {
                     payload_type,
                     voice_gain,
                     voice_rms,
-                    voice_gate_open,
                     output_device_name,
                 );
             })
@@ -3858,7 +3848,6 @@ fn voice_encode_stage_loop(
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<std::sync::atomic::AtomicU32>,
-    voice_gate_open: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3892,16 +3881,6 @@ fn voice_encode_stage_loop(
     let attack_coeff = 1.0 - (-1.0f32 / (0.015 * 48000.0)).exp();
     let release_coeff = 1.0 - (-1.0f32 / (0.080 * 48000.0)).exp();
 
-    // Noise-gate présence-voix (Lot 2) — parité avec le cœur JS browser. Le
-    // side-chain (bande-voix ~300–3400 Hz) décide de l'ouverture ; son gain
-    // s'applique EN PLUS du mute utilisateur (voice_gain). PAS de look-ahead
-    // côté agent : zéro latence ajoutée au pipeline (doctrine) — l'attaque
-    // rapide du gate suffit ; seul le browser porte le look-ahead (chemin non
-    // critique là-bas). L'état `open` remonte via `voice_gate_open` (voyant).
-    let mut gate = VoiceGate::new(VoiceGateParams::default());
-    let mut sidechain = SidechainBandpass::new(48000.0);
-    let mut prev_gate_gain = 0.0f32;
-
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(raw) => raw,
@@ -3916,23 +3895,14 @@ fn voice_encode_stage_loop(
             continue;
         }
 
-        // 2. Noise-gate : side-chain bande-voix du bloc BRUT (pré-mute) →
-        //    décision + gain lissé (ramp intra-bloc pour rester click-free).
-        let block_ms = mono48.len() as f32 / 48000.0 * 1000.0;
-        let sc_rms = sidechain.block_rms(&mono48);
-        let (gate_gain, gate_is_open) = gate.process(sc_rms, block_ms);
-        voice_gate_open.store(gate_is_open, std::sync::atomic::Ordering::Relaxed);
-        let gate_ramp = (gate_gain - prev_gate_gain) / mono48.len() as f32;
-
-        // 3. Gain lissé par-sample (mute) × gate → accumulation → frames Opus
-        //    stéréo (L=R). On mesure au passage le RMS POST-gain (VU talkback).
+        // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
+        //    (L=R). On mesure au passage le RMS POST-gain (VU talkback).
         let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
         let mut sum_sq = 0.0f32;
-        for (i, &s) in mono48.iter().enumerate() {
+        for &s in mono48.iter() {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
             cur_gain += (target - cur_gain) * coeff;
-            let gg = prev_gate_gain + gate_ramp * i as f32;
-            let g = s * cur_gain * gg;
+            let g = s * cur_gain;
             sum_sq += g * g;
             acc.push(g);
             if acc.len() == frame_size {
@@ -3965,7 +3935,6 @@ fn voice_encode_stage_loop(
                 acc.clear();
             }
         }
-        prev_gate_gain = gate_gain;
         // RMS post-gain du bloc → VU talkback (mono). Bits f32, comme input_rms.
         let n = mono48.len();
         if n > 0 {
@@ -3973,9 +3942,8 @@ fn voice_encode_stage_loop(
             voice_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
         }
     }
-    // Voix arrêtée : VU talkback à zéro + gate refermé (voyant PRÊT).
+    // Voix arrêtée : VU talkback à zéro.
     voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    voice_gate_open.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
 }
 

@@ -5,6 +5,23 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-9] — 2026-08-06 (pré-release)
+
+**Retrait du noise-gate voix talkback** (présent en 0.5.11-7/-8). Un gate à seuil
+ne sépare pas la voix des instruments qui repissent dans le même micro (guitare
+acoustique = plein dans la bande voix) → best-effort, écarté. Le talkback repasse
+en **toujours-ON + bouton mute** (comportement d'avant le gate). L'isolation de
+voix (séparation de sources neuronale) le remplacera dans un chantier dédié.
+
+### Retiré
+- **`voice_gate` (module `jamodio-audio-core`)** et son câblage dans
+  `voice_encode_stage_loop` (`pipeline.rs`) : plus de side-chain bande-voix ni
+  d'enveloppe de gate. Seul le gain de **mute** utilisateur (`voice_gain`) reste
+  sur le tap voix — aucune latence ajoutée.
+- **Protocole** — champ `voiceGateOpen` de `StreamLevels` (et son push forcé sur
+  transition côté `ws_server`). Back-compat : un browser qui l'ignorait déjà n'est
+  pas affecté.
+
 ## [0.5.11-6] — 2026-08-05 (pré-release)
 
 **Peak-mètre DAW** : diffusion du **pic échantillon** (dBFS peak) par stream pour
