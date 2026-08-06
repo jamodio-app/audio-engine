@@ -2,15 +2,22 @@
 //!
 //! Portage **1:1** du cœur JS `web/app/js/lib/groupe-audio/voice-gate-core.js`
 //! (mode browser) → parité de comportement browser ↔ agent (spec unique :
-//! `internal-docs/plans/PLAN-TALKBACK-GATE-2026-08.md` §3).
+//! `internal-docs/plans/PLAN-TALKBACK-GATE-2026-08.md`).
 //!
-//! Racine du chantier : le side-chain est la PRÉSENCE DE VOIX (bande-parole
-//! ~300–3400 Hz), pas le niveau instrument. Auto-réparant : fail-open +
-//! calibration continue asymétrique (suivi de minimum) + override voix soutenue.
+//! ── Principe (suivi de MINIMUM adaptatif) ──
+//! Le plancher de bruit suit le MINIMUM du niveau bande-voix : il DESCEND vite
+//! (calib_down) vers le vrai silence, REMONTE lentement (calib_up), et tourne EN
+//! PERMANENCE (même gate ouvert). Conséquences :
+//! - démarrage : plancher initial HAUT → gate FERMÉ, puis convergence descendante
+//!   rapide → marche quels que soient les niveaux absolus ;
+//! - un bruit STEADY (ambiance plate / bleed) fait remonter le plancher jusqu'à
+//!   REFERMER le gate → pas de « toujours ON AIR » (anti-deadlock) ;
+//! - la VOIX est DYNAMIQUE : ses creux inter-mots (down-fast) gardent le plancher
+//!   au niveau du silence → elle ouvre franchement et n'est pas avalée.
 //!
-//! Pur (aucune I/O, aucun état global) → testable et réutilisable. Le side-chain
-//! attendu par [`VoiceGate::process`] est le RMS d'un signal DÉJÀ filtré
-//! bande-voix — voir [`SidechainBandpass`].
+//! Pur (aucune I/O) → testable et réutilisable. Le side-chain attendu par
+//! [`VoiceGate::process`] est le RMS d'un signal DÉJÀ filtré bande-voix — voir
+//! [`SidechainBandpass`].
 
 /// Paramètres du gate (mêmes valeurs que le cœur JS). Surchageables pour tuning.
 #[derive(Clone, Copy, Debug)]
@@ -27,13 +34,9 @@ pub struct VoiceGateParams {
     pub release_ms: f32,
     /// EMA du plancher quand le niveau DESCEND — suivi rapide du silence (ms).
     pub calib_down_ms: f32,
-    /// EMA du plancher quand le niveau MONTE — lent, n'avale pas une voix douce (ms).
+    /// EMA du plancher quand le niveau MONTE — lent, n'avale pas la voix (ms).
     pub calib_up_ms: f32,
-    /// Durée de voix soutenue → override (force l'ouverture + ré-apprend) (ms).
-    pub sustained_ms: f32,
-    /// Au-dessus de plancher+offset en continu → compte comme voix soutenue (dB).
-    pub sustained_offset_db: f32,
-    /// Plancher initial prudent-bas (FAIL-OPEN au démarrage) (dB).
+    /// Plancher initial HAUT → gate FERMÉ au démarrage, convergence descendante (dB).
     pub initial_floor_db: f32,
     /// Plafond du plancher appris (dB).
     pub floor_max_db: f32,
@@ -49,12 +52,10 @@ impl Default for VoiceGateParams {
             attack_ms: 8.0,
             hold_ms: 280.0,
             release_ms: 220.0,
-            calib_down_ms: 300.0,
-            calib_up_ms: 8000.0,
-            sustained_ms: 1600.0,
-            sustained_offset_db: 6.0,
-            initial_floor_db: -68.0,
-            floor_max_db: -30.0,
+            calib_down_ms: 150.0,
+            calib_up_ms: 4000.0,
+            initial_floor_db: -20.0,
+            floor_max_db: -18.0,
             floor_min_db: -90.0,
         }
     }
@@ -67,13 +68,12 @@ pub struct VoiceGate {
     open: bool,
     gain: f32,
     hold_left: f32,
-    sust_acc: f32,
 }
 
 impl VoiceGate {
     pub fn new(p: VoiceGateParams) -> Self {
         let floor = p.initial_floor_db;
-        Self { p, floor_db: floor, open: false, gain: 0.0, hold_left: 0.0, sust_acc: 0.0 }
+        Self { p, floor_db: floor, open: false, gain: 0.0, hold_left: 0.0 }
     }
 
     fn to_db(rms: f32) -> f32 {
@@ -100,21 +100,6 @@ impl VoiceGate {
         let open_thresh = self.floor_db + self.p.open_offset_db;
         let close_thresh = self.floor_db + self.p.close_offset_db;
 
-        // ── Override « voix soutenue » (auto-réparation) ──
-        if lvl > self.floor_db + self.p.sustained_offset_db {
-            self.sust_acc += dt;
-            if self.sust_acc >= self.p.sustained_ms {
-                self.open = true;
-                self.hold_left = self.p.hold_ms;
-                let target = lvl - self.p.open_offset_db - 2.0;
-                if target < self.floor_db {
-                    self.floor_db = target.max(self.p.floor_min_db);
-                }
-            }
-        } else {
-            self.sust_acc = 0.0;
-        }
-
         // ── Machine d'états seuil + hystérésis + hold ──
         if lvl > open_thresh {
             self.open = true;
@@ -130,8 +115,8 @@ impl VoiceGate {
             }
         }
 
-        // ── Calibration continue asymétrique (suivi de minimum) ──
-        if !self.open && lvl < open_thresh {
+        // ── Calibration : suivi de MINIMUM adaptatif (TOUJOURS actif) ──
+        {
             let tau = if lvl < self.floor_db { self.p.calib_down_ms } else { self.p.calib_up_ms };
             let a = Self::alpha(dt, tau);
             self.floor_db += a * (lvl - self.floor_db);
@@ -160,7 +145,6 @@ impl VoiceGate {
         self.open = false;
         self.gain = 0.0;
         self.hold_left = 0.0;
-        self.sust_acc = 0.0;
     }
 }
 
@@ -228,12 +212,10 @@ impl SidechainBandpass {
 mod tests {
     use super::*;
 
-    // dBFS → RMS linéaire.
     fn rms(db: f32) -> f32 {
         10f32.powf(db / 20.0)
     }
 
-    // Alimente le gate `ms` ms à niveau constant `db` (pas de 10 ms).
     fn feed(g: &mut VoiceGate, db: f32, ms: f32) -> (f32, bool) {
         let dt = 10.0;
         let n = (ms / dt).round() as i32;
@@ -245,68 +227,70 @@ mod tests {
     }
 
     #[test]
-    fn silence_stays_closed() {
+    fn starts_closed() {
         let mut g = VoiceGate::new(Default::default());
-        let (gain, open) = feed(&mut g, -80.0, 1000.0);
+        assert!(!g.process(rms(-30.0), 10.0).1, "démarre fermé (plancher haut)");
+    }
+
+    #[test]
+    fn silence_converges_and_closed() {
+        let mut g = VoiceGate::new(Default::default());
+        let (gain, open) = feed(&mut g, -70.0, 800.0);
         assert!(!open);
-        assert!(gain < 0.02, "gain ~0 attendu, obtenu {gain}");
+        assert!(g.noise_floor_db() < -60.0, "plancher={}", g.noise_floor_db());
+        assert!(gain < 0.02);
     }
 
     #[test]
-    fn voice_opens_and_rises() {
+    fn voice_opens_after_calibration() {
         let mut g = VoiceGate::new(Default::default());
-        let (_, open) = g.process(rms(-30.0), 10.0);
+        feed(&mut g, -65.0, 800.0);
+        let (gain, open) = feed(&mut g, -30.0, 80.0);
         assert!(open);
-        let (gain, _) = feed(&mut g, -30.0, 60.0);
-        assert!(gain > 0.95, "gain ~1 attendu, obtenu {gain}");
+        assert!(gain > 0.9, "gain={gain}");
+    }
+
+    // Régression terrain : « toujours ON AIR ».
+    #[test]
+    fn steady_ambient_does_not_stay_open() {
+        let mut g = VoiceGate::new(Default::default());
+        assert!(!feed(&mut g, -45.0, 3000.0).1, "ambiance -45 doit rester fermée");
+        let mut g2 = VoiceGate::new(Default::default());
+        assert!(!feed(&mut g2, -35.0, 3000.0).1, "ambiance -35 doit rester fermée");
     }
 
     #[test]
-    fn fail_open_initial_floor_permissive() {
+    fn voice_then_ambient_recloses() {
         let mut g = VoiceGate::new(Default::default());
-        let (_, open) = g.process(rms(-52.0), 10.0); // -52 > openThresh initial (-56)
-        assert!(open);
+        feed(&mut g, -60.0, 500.0);
+        feed(&mut g, -25.0, 500.0);
+        assert!(g.is_open());
+        assert!(!feed(&mut g, -45.0, 6000.0).1, "doit se refermer, pas stuck ON AIR");
     }
 
     #[test]
     fn hysteresis_stays_open_between_thresholds() {
         let mut g = VoiceGate::new(Default::default());
+        feed(&mut g, -65.0, 800.0);
         feed(&mut g, -30.0, 100.0);
-        let (_, open) = feed(&mut g, -60.0, 600.0); // -60 > closeThresh (-62)
-        assert!(open);
+        assert!(feed(&mut g, -56.0, 500.0).1, "-56 entre close et open → reste ouvert");
+    }
+
+    #[test]
+    fn hold_bridges_short_dip() {
+        let mut g = VoiceGate::new(Default::default());
+        feed(&mut g, -65.0, 800.0);
+        feed(&mut g, -30.0, 100.0);
+        feed(&mut g, -90.0, 150.0);
+        assert!(g.is_open(), "le hold doit maintenir ouvert");
     }
 
     #[test]
     fn closes_after_hold() {
         let mut g = VoiceGate::new(Default::default());
+        feed(&mut g, -65.0, 800.0);
         feed(&mut g, -30.0, 100.0);
-        let (_, open) = feed(&mut g, -90.0, 400.0);
-        assert!(!open);
-    }
-
-    #[test]
-    fn calibration_tracks_lower_silence() {
-        let mut g = VoiceGate::new(Default::default());
-        feed(&mut g, -85.0, 1000.0);
-        assert!(g.noise_floor_db() < -80.0, "plancher={}", g.noise_floor_db());
-    }
-
-    #[test]
-    fn sustained_override_forces_open() {
-        let mut g = VoiceGate::new(Default::default());
-        let (_, before) = feed(&mut g, -58.0, 1200.0); // sous openThresh, > floor+6
-        assert!(!before);
-        let (_, after) = feed(&mut g, -58.0, 700.0); // ~1.9 s soutenu
-        assert!(after, "override doit forcer l'ouverture");
-        assert!(g.noise_floor_db() < -68.0, "plancher ré-appris vers le bas");
-    }
-
-    #[test]
-    fn isolated_peak_does_not_trigger_override() {
-        let mut g = VoiceGate::new(Default::default());
-        g.process(rms(-58.0), 10.0);
-        feed(&mut g, -90.0, 500.0);
-        assert!(!g.is_open());
+        assert!(!feed(&mut g, -95.0, 400.0).1);
     }
 
     #[test]
@@ -315,13 +299,11 @@ mod tests {
         feed(&mut g, -30.0, 200.0);
         g.reset();
         assert!(!g.is_open());
-        assert_eq!(g.noise_floor_db(), -68.0);
+        assert_eq!(g.noise_floor_db(), -20.0);
     }
 
     #[test]
     fn bandpass_passes_speech_more_than_sub_bass() {
-        // Une sinus 1 kHz (bande voix) doit ressortir plus fort qu'une 60 Hz
-        // (corps grave d'un ampli) à amplitude égale.
         let fs = 48000.0f32;
         let block: Vec<f32> = (0..4800)
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / fs).sin())
