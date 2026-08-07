@@ -11,8 +11,7 @@ Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz nati
 / ASIO-only, crash 32 canaux, faux rate CoreAudio), détection de plugins (AU
 licenciés, fabricants UVI), VU peak-mètre DAW, respect de l'autostart, MIX REC des
 pistes armées, et **mises à jour obligatoires mais annoncées** (fin de l'install
-silencieuse au boot). Détail par sous-version dans l'historique git (tags
-`v0.5.11-1` … `v0.5.11-10`).
+silencieuse au boot). Détail des correctifs dans l'historique git de la 0.5.11.
 
 ### Ajouté
 - **Audio 48 kHz natif / ASIO-only (R1–R5).** 48 kHz natif obligatoire (entrée ET
