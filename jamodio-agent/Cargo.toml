@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.11-9"
+version = "0.5.11-10"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -96,3 +96,9 @@ jamodio-au-host = { path = "../jamodio-au-host" }
 # fallback QoS+time-constraint quand os_workgroup_join échoue. Cf. rt_priority.rs.
 mach2 = "0.4"
 libc = "0.2"
+# 0.5.11-10 — un seul appel Objective-C : `[NSApp disableRelaunchOnLogin]` au
+# démarrage. macOS « rouvre les apps à la reconnexion » relance toute app
+# Regular qui tournait au reboot, indépendamment du LaunchAgent → l'autostart
+# décoché n'était pas respecté sur Mac. On opte-out de cette restauration pour
+# que le LaunchAgent (= notre toggle) soit l'UNIQUE mécanisme de démarrage.
+objc2 = "0.6"

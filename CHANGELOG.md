@@ -5,6 +5,21 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.11-10] — 2026-08-07 (pré-release)
+
+**Fix autostart macOS.** Décocher « Démarrer avec l'ordinateur » n'était pas
+respecté sur Mac : macOS **relance au login toute app Regular qui tournait au
+reboot** (restauration de session), indépendamment de notre LaunchAgent (qui,
+lui, était bien retiré). On appelle **`[NSApp disableRelaunchOnLogin]`** au
+démarrage → macOS ne restaure plus l'agent tout seul, et le LaunchAgent (= le
+toggle) redevient l'**unique** mécanisme de démarrage. Aucun impact Windows (déjà
+correct via la clé Run du registre).
+
+### Corrigé
+- **Autostart Mac respecté** : ajout de `disable_macos_relaunch_on_login()`
+  (`main.rs`, `#[cfg(target_os = "macos")]`, dépendance `objc2`). Appelé une fois
+  au `setup()`.
+
 ## [0.5.11-9] — 2026-08-06 (pré-release)
 
 Trois chantiers UX/robustesse (autostart, MIX REC, mises à jour) + retrait du

@@ -110,6 +110,32 @@ fn first_run_marker_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         .map(|d| d.join("autostart-initialized"))
 }
 
+/// macOS (0.5.11-10) — opt-out de la « réouverture des apps à la reconnexion ».
+/// macOS relance au login toute app Regular (Dock) qui tournait au reboot,
+/// INDÉPENDAMMENT du LaunchAgent → décocher notre autostart n'empêchait pas le
+/// redémarrage sur Mac (le LaunchAgent était bien retiré, mais loginwindow
+/// restaurait l'app). `[NSApp disableRelaunchOnLogin]` désactive cette
+/// restauration pour la session courante → le LaunchAgent (= notre toggle)
+/// redevient l'UNIQUE mécanisme de démarrage. Appelé à chaque boot (l'effet vaut
+/// pour le prochain login). No-op silencieux si l'app AppKit n'est pas prête.
+#[cfg(target_os = "macos")]
+fn disable_macos_relaunch_on_login() {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    // SÉCURITÉ : un seul message Objective-C sans argument ni retour. `NSApp`
+    // (sharedApplication) est instancié dès l'init AppKit du process Tauri.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if !app.is_null() {
+            let _: () = msg_send![app, disableRelaunchOnLogin];
+            tracing::info!(
+                target: "jamodio::lifecycle",
+                "macOS: disableRelaunchOnLogin — restauration de session désactivée (autostart = LaunchAgent seul)"
+            );
+        }
+    }
+}
+
 /// Quitte proprement l'agent : informe les browsers connectés
 /// (`Shutdown { reason }`) puis termine le process après un court délai
 /// (le temps que la frame WS parte). Utilisé par le bouton « Quitter
@@ -454,6 +480,10 @@ fn main() {
                     let _ = win.set_focus();
                 }
             });
+
+            // ─── macOS : autostart = LaunchAgent SEUL (pas la restauration OS) ──
+            #[cfg(target_os = "macos")]
+            disable_macos_relaunch_on_login();
 
             // ─── Autostart : défaut ON au 1ER LANCEMENT, puis RESPECTÉ ──────
             // Racine (0.5.11-10) : on NE ré-force PLUS `enable()` à chaque boot.
