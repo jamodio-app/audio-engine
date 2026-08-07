@@ -118,6 +118,18 @@ fn make_hello() -> AgentMessage {
     }
 }
 
+/// Lot 2 — event de progression d'update, broadcasté à tous les clients via
+/// `update_progress_tx` puis forwardé en `AgentMessage::UpdateProgress`. Type
+/// dédié Clone (le broadcast channel l'exige) plutôt que l'`AgentMessage` (non
+/// Clone). `phase` : "downloading" | "installing" | "restarting" | "error".
+#[derive(Clone)]
+pub struct UpdateProgressEvent {
+    pub phase: &'static str,
+    pub downloaded: Option<u64>,
+    pub total: Option<u64>,
+    pub message: Option<String>,
+}
+
 /// Handle partagé pour le serveur WS. Permet :
 ///   - Single-client policy avec **kick automatique** du précédent (v0.4.3) :
 ///     `client_active` reste un AtomicBool de monitoring, mais le slot est
@@ -144,6 +156,10 @@ pub struct WsServerHandle {
     /// pratique avec single-client) qu'un shutdown est imminent (auto-update).
     /// Capacité 4 : largement suffisant pour les ~quelques events de cycle de vie.
     shutdown_tx: broadcast::Sender<&'static str>,
+    /// Lot 2 — broadcast des events de progression d'update (download %, install,
+    /// restart, error). Chaque connexion s'y abonne et forwarde vers son client.
+    /// Capacité 16 : le throttle côté `check_for_update` borne le débit.
+    update_progress_tx: broadcast::Sender<UpdateProgressEvent>,
     /// Handle Tauri — permet de déclencher le flux d'auto-update + restart à la
     /// demande (message browser `Restart`, bouton « Relancer mon agent »).
     /// `OnceLock` car le handle n'est connu qu'au `setup()` (après `new`), mais
@@ -154,13 +170,21 @@ pub struct WsServerHandle {
 impl WsServerHandle {
     pub fn new(pipeline: Arc<tokio::sync::Mutex<PipelineState>>) -> Self {
         let (shutdown_tx, _rx) = broadcast::channel::<&'static str>(4);
+        let (update_progress_tx, _prx) = broadcast::channel::<UpdateProgressEvent>(16);
         Self {
             pipeline,
             client_active: Arc::new(AtomicBool::new(false)),
             active_client_killer: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_tx,
+            update_progress_tx,
             app: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Lot 2 — broadcaste un event de progression d'update à tous les clients
+    /// connectés. No-op silencieux si aucun abonné (send Err ignoré).
+    pub fn broadcast_update_progress(&self, ev: UpdateProgressEvent) {
+        let _ = self.update_progress_tx.send(ev);
     }
 
     /// Injecte le `AppHandle` Tauri (appelé une fois au `setup()`). Idempotent :
@@ -190,6 +214,24 @@ impl WsServerHandle {
         };
         let me = self.clone();
         tauri::async_runtime::spawn(async move {
+            // Garde-fou (Lot 2) : ne JAMAIS installer une MàJ pendant une session
+            // audio active — ça couperait le jam. En usage normal le gate d'entrée
+            // déclenche la MàJ AVANT toute capture, donc ce refus n'arrive pas ;
+            // c'est un filet (pas de fallback silencieux → on signale au browser).
+            let capturing = {
+                let pl = me.pipeline.lock().await;
+                matches!(pl.state, AgentState::Capturing)
+            };
+            if capturing {
+                tracing::warn!(target: "jamodio::updater", "update refused: audio session active");
+                me.broadcast_update_progress(UpdateProgressEvent {
+                    phase: "error",
+                    downloaded: None,
+                    total: None,
+                    message: Some("session-active".to_string()),
+                });
+                return;
+            }
             crate::check_for_update(app, me).await;
         });
     }
@@ -543,6 +585,32 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 .await;
             // Petit délai pour laisser le temps au browser de recevoir + handle
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    });
+
+    // Subscribe au broadcast de progression d'update (Lot 2). Contrairement au
+    // shutdown (one-shot), la progression émet plusieurs events → BOUCLE. Chaque
+    // event est forwardé en `AgentMessage::UpdateProgress` vers ce client.
+    let mut progress_rx = handle.update_progress_tx.subscribe();
+    let progress_out = out_tx.clone();
+    let progress_task = tokio::spawn(async move {
+        loop {
+            match progress_rx.recv().await {
+                Ok(ev) => {
+                    let _ = progress_out
+                        .send(AgentMessage::UpdateProgress {
+                            phase: ev.phase.to_string(),
+                            downloaded: ev.downloaded,
+                            total: ev.total,
+                            message: ev.message,
+                        })
+                        .await;
+                }
+                // Le throttle borne le débit, mais on tolère un lag sans casser
+                // le forward (on saute les events trop vieux — la barre rattrape).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
@@ -1361,6 +1429,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     liveness_task.abort();
     send_task.abort();
     shutdown_task.abort();
+    progress_task.abort();
 
     // v0.4.3 — Cleanup pipeline UNIQUEMENT pour les clients externes
     // qui ont été PROMUS (= ont envoyé au moins un BrowserMessage et donc
@@ -2541,6 +2610,16 @@ async fn handle_message(
             };
             // DIM = ducking des instruments pour laisser passer le talkback.
             pl.mixer.lock().set_dim(factor);
+            vec![]
+        }
+
+        BrowserMessage::SetRecordArm { self_armed, armed_peers } => {
+            let Some(pl) = try_lock_pipeline(pipeline).await else {
+                return vec![];
+            };
+            // Point 4 — snapshot d'armement MIX REC : le mixer ne somme dans le
+            // bus enregistré/VU que les sources armées (monitoring inchangé).
+            pl.mixer.lock().set_record_arm(self_armed, &armed_peers);
             vec![]
         }
 

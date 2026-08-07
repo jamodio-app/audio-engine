@@ -58,6 +58,58 @@ fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// État courant de l'autostart (lu depuis l'OS : plist LaunchAgent sur macOS,
+/// clé Run du registre sur Windows). Alimente la case à cocher de la fenêtre
+/// agent à l'ouverture. `false` en cas d'erreur de lecture (fail-safe visuel).
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> bool {
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Active/désactive l'autostart selon le choix explicite de l'utilisateur
+/// (toggle fenêtre agent). Renvoie l'état RÉEL relu après l'opération pour que
+/// l'UI reflète la vérité OS (jamais un faux « activé » si l'enregistrement a
+/// échoué). Erreur explicite propagée au front — pas de fallback silencieux.
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    let al = app.autolaunch();
+    let res = if enabled { al.enable() } else { al.disable() };
+    res.map_err(|e| format!("autostart toggle failed: {e}"))?;
+    let now = al.is_enabled().unwrap_or(enabled);
+    tracing::info!(target: "jamodio::lifecycle", requested = enabled, effective = now, "autostart set by user");
+    Ok(now)
+}
+
+/// Décision d'autostart au boot : appliquer le défaut (ON) une seule fois, ou
+/// respecter l'état existant. Isolé en fonction pure (I/O = simple `exists()`)
+/// pour être testable sans Tauri.
+#[derive(Debug, PartialEq, Eq)]
+enum AutostartBoot {
+    /// Premier lancement (marqueur absent) → appliquer le défaut ON.
+    EnableDefault,
+    /// Déjà initialisé → NE PAS re-forcer, respecter le choix utilisateur / OS.
+    Respect,
+}
+
+fn autostart_boot_action(marker: &std::path::Path) -> AutostartBoot {
+    if marker.exists() {
+        AutostartBoot::Respect
+    } else {
+        AutostartBoot::EnableDefault
+    }
+}
+
+/// Chemin du marqueur « défaut autostart déjà appliqué » dans le dossier de
+/// config de l'app. Sa présence garantit qu'on ne ré-impose plus jamais
+/// `enable()` au boot (on respecte le choix utilisateur). `None` si le dossier
+/// de config est indisponible (cas dégradé → on ne force rien).
+fn first_run_marker_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("autostart-initialized"))
+}
+
 /// Quitte proprement l'agent : informe les browsers connectés
 /// (`Shutdown { reason }`) puis termine le process après un court délai
 /// (le temps que la frame WS parte). Utilisé par le bouton « Quitter
@@ -93,6 +145,13 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(target: "jamodio::updater", error = %e, "updater unavailable");
+            // Le gate d'entrée attend un dénouement : pas de fallback silencieux.
+            ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                phase: "error",
+                downloaded: None,
+                total: None,
+                message: Some("updater-unavailable".to_string()),
+            });
             return;
         }
     };
@@ -106,10 +165,22 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
                 "update available — downloading & installing"
             );
             let mut downloaded: u64 = 0;
+            let mut last_emit: u64 = 0;
             let download_result = update
                 .download_and_install(
                     |chunk_length, content_length| {
                         downloaded += chunk_length as u64;
+                        // Throttle ~256 Ko : le callback fire par chunk (des
+                        // centaines) — on borne le débit WS, la barre web rattrape.
+                        if downloaded - last_emit >= 256 * 1024 {
+                            last_emit = downloaded;
+                            ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                                phase: "downloading",
+                                downloaded: Some(downloaded),
+                                total: content_length,
+                                message: None,
+                            });
+                        }
                         if let Some(total) = content_length {
                             tracing::debug!(
                                 target: "jamodio::updater",
@@ -118,13 +189,29 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
                             );
                         }
                     },
-                    || tracing::info!(target: "jamodio::updater", "download finished, installing"),
+                    || {
+                        tracing::info!(target: "jamodio::updater", "download finished, installing");
+                        ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                            phase: "installing",
+                            downloaded: None,
+                            total: None,
+                            message: None,
+                        });
+                    },
                 )
                 .await;
 
             match download_result {
                 Ok(_) => {
                     tracing::info!(target: "jamodio::updater", "update installed — broadcasting Shutdown then restart");
+                    // Phase finale : la barre web passe à « redémarrage » avant
+                    // que la WS ne tombe.
+                    ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                        phase: "restarting",
+                        downloaded: None,
+                        total: None,
+                        message: None,
+                    });
                     // Broadcast aux clients WS connectés AVANT restart.
                     // ws_server::handle_connection sleep 200ms après l'envoi
                     // pour laisser le browser recevoir + traiter.
@@ -134,11 +221,21 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     app.restart();
                 }
-                Err(e) => tracing::error!(
-                    target: "jamodio::updater",
-                    error = %e,
-                    "download/install failed"
-                ),
+                Err(e) => {
+                    tracing::error!(
+                        target: "jamodio::updater",
+                        error = %e,
+                        "download/install failed"
+                    );
+                    // Pas de fallback silencieux : le web sait que la MàJ a échoué
+                    // (la modale d'entrée propose de réessayer / DL manuel).
+                    ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                        phase: "error",
+                        downloaded: None,
+                        total: None,
+                        message: Some(format!("{e}")),
+                    });
+                }
             }
         }
         Ok(None) => {
@@ -147,12 +244,29 @@ pub(crate) async fn check_for_update(app: tauri::AppHandle, ws_handle: WsServerH
                 version = env!("CARGO_PKG_VERSION"),
                 "already on latest version"
             );
+            // L'updater ne voit pas de MàJ (endpoint `latest.json`). Si le gate
+            // avait déclenché ceci, on le débloque (la modale affiche « aucune
+            // MàJ trouvée » plutôt que de tourner indéfiniment).
+            ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                phase: "error",
+                downloaded: None,
+                total: None,
+                message: Some("no-update".to_string()),
+            });
         }
-        Err(e) => tracing::warn!(
-            target: "jamodio::updater",
-            error = %e,
-            "update check failed (offline ? endpoint down ?)"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                target: "jamodio::updater",
+                error = %e,
+                "update check failed (offline ? endpoint down ?)"
+            );
+            ws_handle.broadcast_update_progress(ws_server::UpdateProgressEvent {
+                phase: "error",
+                downloaded: None,
+                total: None,
+                message: Some("check-failed".to_string()),
+            });
+        }
     }
 }
 
@@ -241,7 +355,14 @@ fn main() {
         ))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![open_log_dir, get_log_dir, get_version, quit_app])
+        .invoke_handler(tauri::generate_handler![
+            open_log_dir,
+            get_log_dir,
+            get_version,
+            get_autostart,
+            set_autostart,
+            quit_app
+        ])
         .setup(|app| {
             tracing::info!(target: "jamodio::lifecycle", version = env!("CARGO_PKG_VERSION"), "setup phase");
             // Marqueur de build (robustesse ASIO) — permet d'identifier SANS
@@ -334,11 +455,50 @@ fn main() {
                 }
             });
 
-            // ─── Enable auto-start ──────────────────────────
-            let autostart = app.autolaunch();
-            if !autostart.is_enabled().unwrap_or(false) {
-                let _ = autostart.enable();
-                tracing::info!(target: "jamodio::lifecycle", "autostart enabled");
+            // ─── Autostart : défaut ON au 1ER LANCEMENT, puis RESPECTÉ ──────
+            // Racine (0.5.11-10) : on NE ré-force PLUS `enable()` à chaque boot.
+            // L'ancien ré-enable inconditionnel écrasait tout choix utilisateur
+            // (désactivation via le toggle de cette fenêtre ou via l'OS) — viol
+            // direct de « si l'utilisateur choisit X, il a X ». On applique le
+            // défaut (ON) UNE seule fois, tracé par un marqueur dans
+            // app_config_dir ; ensuite l'état OS fait foi. Le toggle
+            // `set_autostart` (fenêtre agent) pilote le reste.
+            match first_run_marker_path(app.handle()) {
+                Some(marker) => match autostart_boot_action(&marker) {
+                    AutostartBoot::EnableDefault => {
+                        match app.autolaunch().enable() {
+                            Ok(()) => tracing::info!(
+                                target: "jamodio::lifecycle",
+                                "autostart enabled (défaut 1er lancement)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                target: "jamodio::lifecycle", error = %e,
+                                "autostart: enable initial a échoué"
+                            ),
+                        }
+                        // Marqueur écrit MÊME si enable a échoué : on ne re-tente
+                        // pas à chaque boot (ce serait re-forcer, précisément ce
+                        // qu'on supprime). L'utilisateur garde le toggle.
+                        if let Some(parent) = marker.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = std::fs::write(&marker, b"1") {
+                            tracing::warn!(
+                                target: "jamodio::lifecycle", error = %e,
+                                "autostart: écriture du marqueur 1er lancement impossible"
+                            );
+                        }
+                    }
+                    AutostartBoot::Respect => tracing::info!(
+                        target: "jamodio::lifecycle",
+                        enabled = app.autolaunch().is_enabled().unwrap_or(false),
+                        "autostart: état existant respecté (pas le 1er lancement)"
+                    ),
+                },
+                None => tracing::warn!(
+                    target: "jamodio::lifecycle",
+                    "autostart: app_config_dir indisponible — marqueur ignoré, pas de ré-enable forcé"
+                ),
             }
 
             // ─── Spawn WS server (audio pipeline) ───────────
@@ -369,18 +529,15 @@ fn main() {
                 ws_server::start(ws_handle_for_server).await;
             });
 
-            // ─── Vérification d'update au boot ──────────────
-            // Endpoint + pubkey configurés dans tauri.conf.json (`updater` bloc).
-            // Délai de 5 s pour laisser le démarrage se finir avant de hit
-            // GitHub releases. Fire-and-forget : si l'install échoue ou si
-            // l'user n'a pas le réseau, on log et on n'embête pas l'utilisateur.
-            // Passe le ws_handle pour pouvoir broadcaster Shutdown avant restart.
-            let app_handle = app.handle().clone();
-            let ws_handle_for_update = ws_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                check_for_update(app_handle, ws_handle_for_update).await;
-            });
+            // ─── PAS de MàJ automatique au boot (Lot 2, 0.5.11-9) ───────────
+            // Retrait volontaire de l'install auto au démarrage : elle tournait
+            // en douce ~5 s après le boot (autostart au login), pouvait afficher
+            // une fenêtre d'installeur PENDANT le chargement des drivers ASIO, et
+            // n'informait pas l'utilisateur. La MàJ est désormais OBLIGATOIRE mais
+            // AU MOMENT DE L'USAGE : le web bloque l'entrée en studio si l'agent
+            // est en retard et déclenche `check_for_update` via le message
+            // `restart` (barre de progression + garde-fou session active). Voir
+            // `trigger_restart` (ws_server) et la modale d'entrée côté web.
 
             Ok(())
         })
@@ -411,4 +568,29 @@ fn main() {
             // Évite les warnings unused sur les autres OS / variantes.
             let _ = (app_handle, &event);
         });
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::{autostart_boot_action, AutostartBoot};
+
+    /// Le défaut ON ne s'applique QU'au premier lancement : marqueur absent →
+    /// EnableDefault ; une fois posé → Respect (on ne re-force plus jamais,
+    /// donc un utilisateur qui a désactivé garde son choix au reboot).
+    #[test]
+    fn default_on_first_run_then_respect() {
+        let dir = std::env::temp_dir().join(format!("jamodio-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("autostart-initialized");
+
+        // 1er lancement : marqueur absent → on applique le défaut.
+        assert_eq!(autostart_boot_action(&marker), AutostartBoot::EnableDefault);
+
+        // Après pose du marqueur : on respecte l'état existant.
+        std::fs::write(&marker, b"1").unwrap();
+        assert_eq!(autostart_boot_action(&marker), AutostartBoot::Respect);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

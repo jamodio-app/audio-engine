@@ -49,6 +49,12 @@
         <span class="value" id="underruns">0</span>
       </div>
     </div>
+    <div class="settings">
+      <label class="row setting" for="autostart-toggle" title="Lance automatiquement l'Audio Engine à l'ouverture de session de votre ordinateur. Décochez pour ne le démarrer que manuellement (ou depuis jamodio.com).">
+        <span class="label">Démarrer avec l'ordinateur</span>
+        <input type="checkbox" id="autostart-toggle" class="toggle">
+      </label>
+    </div>
     <div class="actions">
       <button id="export-logs" type="button">Exporter les logs</button>
       <!-- Filet quit OS-agnostic : indispensable sur Windows quand l'icône
@@ -119,6 +125,29 @@
         quitBtn.textContent = 'Fermeture…';
         quitBtn.disabled = true;
         tauriInvoke('quit_app');
+      });
+    }
+
+    // ─── Toggle "Démarrer avec l'ordinateur" ───────────────────
+    // Reflète l'état OS réel au boot (get_autostart) puis pilote l'autostart
+    // sur changement. On relit l'état effectif renvoyé par set_autostart pour
+    // ne jamais afficher un faux "activé" ; en cas d'échec, on revert la case.
+    const autostartToggle = $('autostart-toggle');
+    if (autostartToggle) {
+      tauriInvoke('get_autostart').then(v => {
+        if (v !== null) autostartToggle.checked = !!v;
+      }).catch(() => {});
+      autostartToggle.addEventListener('change', async () => {
+        const want = autostartToggle.checked;
+        autostartToggle.disabled = true;
+        try {
+          const now = await tauriInvoke('set_autostart', { enabled: want });
+          if (now !== null) autostartToggle.checked = !!now;
+        } catch {
+          autostartToggle.checked = !want;  // échec → on ne ment pas sur l'état
+        } finally {
+          autostartToggle.disabled = false;
+        }
       });
     }
 

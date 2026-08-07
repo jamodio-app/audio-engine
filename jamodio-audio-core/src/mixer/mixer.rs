@@ -96,6 +96,12 @@ pub struct AudioMixer {
     master_peak_r: f32,
     mix_peak_l: f32,
     mix_peak_r: f32,
+    /// Point 4 — accumulateur du bus MIX REC : somme des instruments **armés**
+    /// uniquement (post-fader/pan), mesuré en parallèle de `output` dans la
+    /// passe 1 de `mix_into`. Source du tap record (`PushMix`) et des
+    /// `mix_rms/mix_peak`. Distinct de `output` (= monitoring/MASTER, tous les
+    /// instruments). Réutilisé bloc à bloc → zéro alloc RT.
+    mix_buf: Vec<f32>,
     /// Lot C (0.5.10-4) — accumulateur de la VOIX des pairs (talkback entrant).
     /// Les streams `StreamKind::Voice` sont sommés ici (passe 1), puis ajoutés à
     /// `output` dans `mix_into` APRÈS le tap RECORD et le DIM (comme la référence)
@@ -142,6 +148,11 @@ struct StreamState {
     /// Lot C — nature du flux : `Instrument` (sommé dans le mix enregistré/duckable)
     /// ou `Voice` (talkback pair, sommé post-tap/post-DIM via `voice_buf`).
     kind: StreamKind,
+    /// Point 4 — armé pour le bus MIX REC. `true` = ce stream est sommé dans
+    /// `mix_buf` (tap fichier enregistré + VU MIX REC) ; `false` = exclu du MIX
+    /// mais TOUJOURS dans le monitoring (`output`/MASTER). Défaut `false` (rien
+    /// armé). Piloté par snapshot via `set_record_arm`.
+    mix_armed: bool,
     volume: f32,
     /// Pan range [-1.0, 1.0]. -1 = full left, 0 = center, +1 = full right.
     /// Loi de BALANCE stéréo linéaire dans `mix_into` (0 dB au centre :
@@ -198,6 +209,7 @@ impl AudioMixer {
             master_peak_r: 0.0,
             mix_peak_l: 0.0,
             mix_peak_r: 0.0,
+            mix_buf: Vec::new(),
             voice_buf: Vec::new(),
             voice_gain: 1.0,
             voice_pan: 0.0,
@@ -233,6 +245,22 @@ impl AudioMixer {
     /// au start_recording / stop_recording.
     pub fn set_record_tx(&mut self, tx: Option<Sender<RecordCmd>>) {
         self.record_tx = tx;
+    }
+
+    /// Point 4 — applique l'armement MIX REC en SNAPSHOT (état complet poussé
+    /// par le web à chaque mutation). Ne somme dans le bus MIX (fichier + VU)
+    /// que le self-monitor si `self_armed` et les pairs dont le producer_id est
+    /// dans `armed_peers`. Tous les autres instruments passent à `mix_armed =
+    /// false` — donc un désarmement ou un peer retiré de la liste est appliqué
+    /// sans état résiduel. N'affecte JAMAIS le monitoring/MASTER (`output`).
+    pub fn set_record_arm(&mut self, self_armed: bool, armed_peers: &[String]) {
+        for (id, stream) in self.streams.iter_mut() {
+            stream.mix_armed = if id == SELF_MONITOR_ID {
+                self_armed
+            } else {
+                armed_peers.iter().any(|p| p == id)
+            };
+        }
     }
 
     /// Master gain global appliqué dans `mix_into`. Clamp défensif dans
@@ -281,6 +309,7 @@ impl AudioMixer {
         self.streams.insert(producer_id.to_string(), StreamState {
             jitter,
             kind,
+            mix_armed: false,
             volume: 1.0,
             pan: 0.0,
             rms: 0.0,
@@ -319,6 +348,7 @@ impl AudioMixer {
         self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
             jitter,
             kind: StreamKind::Instrument, // self-monitor = instrument (enregistré/duckable)
+            mix_armed: false,
             volume: 0.0,
             pan: 0.0,
             rms: 0.0,
@@ -700,6 +730,12 @@ impl AudioMixer {
         }
         self.voice_buf.fill(0.0);
         let mut any_voice = false;
+        // Point 4 — accumulateur MIX REC (instruments ARMÉS), rempli en passe 1
+        // en parallèle de `output`. Remis à zéro à chaque bloc (comme voice_buf).
+        if self.mix_buf.len() != output.len() {
+            self.mix_buf.resize(output.len(), 0.0);
+        }
+        self.mix_buf.fill(0.0);
 
         // PASSE 1 — chaque stream est pull UNE fois (le jitter buffer se consomme) :
         //   - INSTRUMENT/self → sommé (fader+balance) dans `output` ;
@@ -718,6 +754,10 @@ impl AudioMixer {
             }
 
             let vol = stream.volume;
+            // Point 4 — un instrument armé alimente AUSSI le bus MIX REC
+            // (`mix_buf`) avec exactement le même échantillon post-fader/pan que
+            // le monitoring. Non armé → seul `output` (monitoring/MASTER) reçoit.
+            let armed = stream.mix_armed;
             // Balance stéréo — loi LINÉAIRE 0 dB au centre. Les streams sont
             // STÉRÉO interleaved (L,R,L,R…) : ce contrôle est un *balance*,
             // pas un pan mono → la loi correcte atténue un canal sans toucher
@@ -727,8 +767,23 @@ impl AudioMixer {
             // normalisée au centre → saut de −3 dB sur les DEUX canaux dès
             // que le fader quittait pan=0 exact (bug audible, review 11/06).
             if stream.pan.abs() < f32::EPSILON {
-                for (out, &sample) in output.iter_mut().zip(self.temp_buf.iter()) {
-                    *out += sample * vol;
+                let n = self.temp_buf.len().min(output.len());
+                if armed {
+                    // `output` (monitoring) ET `mix_buf` (MIX REC) reçoivent le
+                    // même échantillon post-fader — calculé une fois.
+                    for ((o, mb), &t) in output[..n]
+                        .iter_mut()
+                        .zip(self.mix_buf[..n].iter_mut())
+                        .zip(self.temp_buf[..n].iter())
+                    {
+                        let s = t * vol;
+                        *o += s;
+                        *mb += s;
+                    }
+                } else {
+                    for (o, &t) in output[..n].iter_mut().zip(self.temp_buf[..n].iter()) {
+                        *o += t * vol;
+                    }
                 }
             } else {
                 let (gl, gr) = pan_gains(stream.pan);
@@ -736,8 +791,14 @@ impl AudioMixer {
                 let gain_r = vol * gr;
                 let mut i = 0;
                 while i + 1 < self.temp_buf.len() && i + 1 < output.len() {
-                    output[i]   += self.temp_buf[i]   * gain_l;
-                    output[i+1] += self.temp_buf[i+1] * gain_r;
+                    let l = self.temp_buf[i] * gain_l;
+                    let r = self.temp_buf[i + 1] * gain_r;
+                    output[i] += l;
+                    output[i + 1] += r;
+                    if armed {
+                        self.mix_buf[i] += l;
+                        self.mix_buf[i + 1] += r;
+                    }
                     i += 2;
                 }
             }
@@ -751,21 +812,24 @@ impl AudioMixer {
             tracing::debug!(target: "jamodio::mixer", streams = self.streams.len(), rms, "mix_into heartbeat");
         }
 
-        // REC-3 : tap MIX positionné ICI = APRÈS la somme des streams post-fader/pan
-        // mais AVANT dim_factor + master_gain + clamp. Sémantique : le fichier MIX
-        // enregistré reflète "le mix post-fader des instruments seul", pas mes
-        // réglages d'écoute locaux (dim/master). Cohérent avec le tap browser sur
-        // `instrumentMixBus` qui est PRE-dim/PRE-master côté Web Audio.
+        // REC-3 / Point 4 : tap MIX = `mix_buf` (instruments ARMÉS uniquement),
+        // pré-dim/master (parité browser `instrumentMixBus` post-`armGain`).
+        // Sémantique : le fichier MIX enregistré ne contient QUE les pistes
+        // armées, post-fader, indépendamment de mon écoute locale (dim/master)
+        // et du monitoring (`output` = tous les instruments). Rien armé →
+        // `mix_buf` silencieux → fichier MIX silencieux.
         if self.record_tx.is_some() {
-            self.record_send(RecordCmd::PushMix(output.to_vec()));
+            self.record_send(RecordCmd::PushMix(self.mix_buf.clone()));
         }
 
-        // Point 3 — RMS L/R du MIX (instruments post-fader, pré-dim/master) pour
-        // le VU MIX REC stéréo. Mesuré ICI (parité browser `instrumentMixBus`).
-        let (mix_l, mix_r) = stereo_rms(output);
+        // Point 3/4 — RMS + pic L/R du MIX REC (instruments ARMÉS post-fader,
+        // pré-dim/master) pour le VU MIX REC stéréo. Mesuré sur `mix_buf` → le VU
+        // reflète EXACTEMENT ce qui sera enregistré (rien armé → VU au plancher,
+        // distinct du MASTER).
+        let (mix_l, mix_r) = stereo_rms(&self.mix_buf);
         self.mix_rms_l = mix_l;
         self.mix_rms_r = mix_r;
-        let (mix_pk_l, mix_pk_r) = stereo_peak(output);
+        let (mix_pk_l, mix_pk_r) = stereo_peak(&self.mix_buf);
         self.mix_peak_l = mix_pk_l;
         self.mix_peak_r = mix_pk_r;
 
@@ -1076,6 +1140,7 @@ mod tests {
     fn master_mix_peak_expose_le_pic_de_sortie() {
         let mut m = AudioMixer::new();
         m.add_stream("p1", StreamKind::Instrument);
+        m.set_record_arm(false, &["p1".to_string()]); // Point 4 : armer pour peupler le MIX
         let mut out = vec![0.0f32; 512];
         // Gros buffer (amorce le jitter) : faible (0.05) partout + transitoires
         // pleins réguliers sur L ET R → toute fenêtre de sortie en contient.
@@ -1097,6 +1162,7 @@ mod tests {
     fn master_rms_reflete_le_mix_pane() {
         let mut m = AudioMixer::new();
         m.add_stream("p1", StreamKind::Instrument);
+        m.set_record_arm(false, &["p1".to_string()]); // Point 4 : armer pour peupler le MIX
         let ones = vec![1.0f32; 48_000];
         let mut out = vec![0.0f32; 512];
         // Centre.
@@ -1221,6 +1287,7 @@ mod tests {
         m.set_record_tx(Some(tx));
         m.add_stream("inst", StreamKind::Instrument);
         m.add_stream("voice", StreamKind::Voice);
+        m.set_record_arm(false, &["inst".to_string()]); // Point 4 : instrument armé dans le MIX
         let ones = vec![1.0f32; 48_000];
         m.push_samples("inst", &ones);   // → stem PushPeer("inst")
         m.push_samples("voice", &ones);  // → PAS de stem (voix)
@@ -1277,6 +1344,7 @@ mod tests {
         let mut m = AudioMixer::new();
         m.set_record_tx(Some(tx));
         m.add_stream("inst", StreamKind::Instrument);
+        m.set_record_arm(false, &["inst".to_string()]); // Point 4 : instrument armé dans le MIX
         m.push_samples("inst", &vec![1.0f32; 48_000]);
         m.preview_begin(2000);
         m.preview_push(&vec![0.8f32; 4000]);
@@ -1299,5 +1367,64 @@ mod tests {
         // MIX = instrument seul (~1.0). Si l'aperçu (0.8) avait fuité dans le tap,
         // le mix serait sensiblement > 1.0.
         assert!((mix_rms - 1.0).abs() < 0.2, "MIX enregistré = instruments seuls, aperçu exclu (rms={mix_rms})");
+    }
+
+    // ─── Point 4 — armement du bus MIX REC (armés-seulement) ──────────────────
+
+    /// INVARIANT : l'armement gate le bus MIX REC (fichier + VU) SANS toucher le
+    /// monitoring (MASTER). Non armé → absent du MIX, présent au MASTER ; armé →
+    /// présent aux deux ; désarmé → de nouveau absent (snapshot sans résidu).
+    #[test]
+    fn record_arm_gates_mix_not_master() {
+        let mut m = AudioMixer::new();
+        m.add_stream("peer", StreamKind::Instrument);
+        let ones = vec![1.0f32; 48_000];
+        let mut out = vec![0.0f32; 512];
+
+        // Défaut : rien armé → MIX silencieux, MASTER présent (monitoring).
+        m.push_samples("peer", &ones);
+        m.mix_into(&mut out);
+        let (ml, _mr, xl, _xr) = m.master_mix_rms();
+        assert!(ml > 0.1, "MASTER présent même sans armement (monitoring), got {ml}");
+        assert!(xl < 1e-4, "MIX silencieux tant que rien n'est armé, got {xl}");
+
+        // Peer armé → MIX présent, MASTER inchangé.
+        m.set_record_arm(false, &["peer".to_string()]);
+        m.push_samples("peer", &ones);
+        m.mix_into(&mut out);
+        let (ml2, _, xl2, _) = m.master_mix_rms();
+        assert!((ml2 - ml).abs() < 1e-3, "MASTER inchangé par l'armement ({ml} vs {ml2})");
+        assert!(xl2 > 0.1, "MIX présent une fois le peer armé, got {xl2}");
+
+        // Désarmement (snapshot vide) → MIX de nouveau silencieux, sans résidu.
+        m.set_record_arm(false, &[]);
+        m.push_samples("peer", &ones);
+        m.mix_into(&mut out);
+        let (_, _, xl3, _) = m.master_mix_rms();
+        assert!(xl3 < 1e-4, "désarmement → MIX de nouveau silencieux, got {xl3}");
+    }
+
+    /// INVARIANT : `self_armed` cible bien le self-monitor (clé SELF_MONITOR_ID).
+    /// Fader moi ouvert : non armé → self hors MIX ; armé → self dans le MIX.
+    #[test]
+    fn record_arm_targets_self_monitor() {
+        let mut m = AudioMixer::new();
+        m.add_local_stream(); // self-monitor (SELF_MONITOR_ID = "self")
+        m.set_self_monitor_volume(1.0); // ouvrir le fader moi (défaut 0.0)
+        let ones = vec![1.0f32; 48_000];
+        let mut out = vec![0.0f32; 512];
+
+        // Self non armé → MIX silencieux.
+        m.push_self_samples(&ones);
+        m.mix_into(&mut out);
+        let (_, _, xl, _) = m.master_mix_rms();
+        assert!(xl < 1e-4, "self non armé → MIX silencieux, got {xl}");
+
+        // Self armé → MIX présent.
+        m.set_record_arm(true, &[]);
+        m.push_self_samples(&ones);
+        m.mix_into(&mut out);
+        let (_, _, xl2, _) = m.master_mix_rms();
+        assert!(xl2 > 0.1, "self armé → MIX présent, got {xl2}");
     }
 }

@@ -7,11 +7,41 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.5.11-9] — 2026-08-06 (pré-release)
 
-**Retrait du noise-gate voix talkback** (présent en 0.5.11-7/-8). Un gate à seuil
-ne sépare pas la voix des instruments qui repissent dans le même micro (guitare
-acoustique = plein dans la bande voix) → best-effort, écarté. Le talkback repasse
-en **toujours-ON + bouton mute** (comportement d'avant le gate). L'isolation de
-voix (séparation de sources neuronale) le remplacera dans un chantier dédié.
+Trois chantiers UX/robustesse (autostart, MIX REC, mises à jour) + retrait du
+noise-gate voix talkback.
+
+### Autostart respecté (fin d'un « re-forçage » qui écrasait le choix utilisateur)
+- L'agent ne **ré-impose plus** `enable()` à chaque démarrage. Le défaut ON n'est
+  appliqué qu'**au 1er lancement** (marqueur `autostart-initialized` dans
+  `app_config_dir`) ; ensuite l'état OS / le choix utilisateur fait foi.
+- **Toggle** « Démarrer avec l'ordinateur » dans la fenêtre agent (commandes Tauri
+  `get_autostart` / `set_autostart`, relecture de l'état OS réel).
+
+### Bus MIX REC = pistes ARMÉES uniquement (mode agent)
+- Le tap record (`PushMix`) et le VU MIX REC ne somment plus que les sources
+  **armées** (`mix_buf` dédié dans `mix_into`) ; le monitoring/MASTER reste le mix
+  complet, inchangé. Rien d'armé → MIX silencieux, distinct du MASTER. Parité avec
+  le mode navigateur. Zéro latence ajoutée (add conditionnel par stream armé).
+- **Protocole** — nouveau `set-record-arm { selfArmed, armedPeers }` (snapshot
+  idempotent d'armement poussé par le web).
+
+### Mise à jour OBLIGATOIRE mais annoncée (fin de l'install silencieuse au boot)
+- **Retrait de la MàJ automatique au démarrage** (elle s'installait en douce ~5 s
+  après le boot → risque de conflit avec le chargement des drivers ASIO + fenêtre
+  d'installeur surprise).
+- La MàJ est désormais déclenchée **au moment de l'usage** : le web **bloque
+  l'entrée en studio** si l'agent est en retard sur la dernière stable et lance
+  `check_for_update` via le message `restart`.
+- **Garde-fou** : refus d'installer pendant une **session audio active** (jamais de
+  jam coupé), signalé explicitement au browser.
+- **Protocole** — nouveau `update-progress { phase, downloaded, total, message }`
+  (barre de progression + phases de la modale d'entrée).
+
+### Retrait du noise-gate voix talkback (présent en 0.5.11-7/-8)
+Un gate à seuil ne sépare pas la voix des instruments qui repissent dans le même
+micro (guitare acoustique = plein dans la bande voix) → best-effort, écarté. Le
+talkback repasse en **toujours-ON + bouton mute**. L'isolation de voix (séparation
+de sources neuronale) le remplacera dans un chantier dédié.
 
 ### Retiré
 - **`voice_gate` (module `jamodio-audio-core`)** et son câblage dans

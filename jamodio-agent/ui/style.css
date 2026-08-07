@@ -126,6 +126,27 @@ body {
   color: var(--text2);
 }
 
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.setting {
+  cursor: pointer;
+}
+
+.setting .toggle {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.setting:hover .label {
+  color: var(--text2);
+}
+
 .actions {
   display: flex;
   justify-content: center;

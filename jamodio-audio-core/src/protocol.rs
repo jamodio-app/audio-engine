@@ -235,6 +235,19 @@ pub enum BrowserMessage {
     SetDim {
         factor: f32,
     },
+    /// Point 4 (0.5.11-9) — armement des sources pour le bus MIX REC. Snapshot
+    /// idempotent : le web pousse l'état COMPLET (self + liste des producer_ids
+    /// pairs armés) à chaque mutation. Le mixer ne somme dans le tap MIX
+    /// (fichier enregistré + VU MIX REC) QUE les streams armés — le monitoring
+    /// (MASTER) reste le mix complet, inchangé. Parité mode browser
+    /// (`selfArmGain`/`p.armGain` sur `instrumentMixBus`). `self_armed` cible le
+    /// self-monitor (`SELF_MONITOR_ID`).
+    SetRecordArm {
+        #[serde(rename = "selfArmed")]
+        self_armed: bool,
+        #[serde(rename = "armedPeers")]
+        armed_peers: Vec<String>,
+    },
     /// Lot C (0.5.10-4) — gain du BUS voix (talkback des pairs reçu via l'agent).
     /// Tranche unique : le web envoie le gain EFFECTIF (valeur du fader, ou `0.0`
     /// pour le mute « M »). Distinct de `set-voice-gain` (capture/envoi).
@@ -506,6 +519,21 @@ pub enum AgentMessage {
     /// Le browser doit considérer la WS comme partant et préparer un fallback.
     Shutdown {
         reason: String,
+    },
+    /// Lot 2 (0.5.11-9) — progression de la mise à jour, déclenchée par le
+    /// message `restart`. Alimente la barre de progression de la modale d'entrée
+    /// obligatoire. `phase` ∈ "downloading" | "installing" | "restarting" |
+    /// "error". `downloaded`/`total` en octets (phase downloading) ; `message` =
+    /// raison lisible en phase "error" (ex. "session-active" = MàJ refusée car
+    /// une session audio est en cours, jamais coupée).
+    UpdateProgress {
+        phase: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        downloaded: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// Notification de rejet d'une connexion (single-client policy).
     /// Envoyé immédiatement avant fermeture de la 2e WS si une 1re est déjà active.
@@ -1154,6 +1182,53 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    // Contrat wire Lot 4 — `set-record-arm` (snapshot armement MIX REC).
+    // Tag kebab + champs camelCase (matchés par studio-record.js côté browser).
+    #[test]
+    fn set_record_arm_parses_from_wire() {
+        let m = serde_json::from_str::<BrowserMessage>(
+            r#"{"type":"set-record-arm","selfArmed":true,"armedPeers":["p1","p2"]}"#,
+        )
+        .unwrap();
+        match m {
+            BrowserMessage::SetRecordArm { self_armed, armed_peers } => {
+                assert!(self_armed);
+                assert_eq!(armed_peers, vec!["p1".to_string(), "p2".to_string()]);
+            }
+            _ => panic!("mauvais variant"),
+        }
+    }
+
+    // Contrat wire Lot 2 — `update-progress` (barre de progression modale
+    // d'entrée). Tag kebab ; `downloaded`/`total`/`message` omis si None.
+    #[test]
+    fn update_progress_serializes_to_wire() {
+        let s = serde_json::to_string(&AgentMessage::UpdateProgress {
+            phase: "downloading".to_string(),
+            downloaded: Some(1024),
+            total: Some(4096),
+            message: None,
+        })
+        .unwrap();
+        assert!(s.contains(r#""type":"update-progress""#));
+        assert!(s.contains(r#""phase":"downloading""#));
+        assert!(s.contains(r#""downloaded":1024"#));
+        assert!(s.contains(r#""total":4096"#));
+        assert!(!s.contains("message"), "message omis si None");
+
+        let e = serde_json::to_string(&AgentMessage::UpdateProgress {
+            phase: "error".to_string(),
+            downloaded: None,
+            total: None,
+            message: Some("session-active".to_string()),
+        })
+        .unwrap();
+        assert!(e.contains(r#""phase":"error""#));
+        assert!(e.contains(r#""message":"session-active""#));
+        assert!(!e.contains("downloaded"), "downloaded omis si None");
+        assert!(!e.contains("total"), "total omis si None");
     }
 
     // Contrat wire Option B — les tags kebab-case + champs (camelCase) doivent
