@@ -5,187 +5,66 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.5.11-10] — 2026-08-07 (pré-release)
+## [0.5.11] — 2026-08-07
 
-**Fix autostart macOS.** Décocher « Démarrer avec l'ordinateur » n'était pas
-respecté sur Mac : macOS **relance au login toute app Regular qui tournait au
-reboot** (restauration de session), indépendamment de notre LaunchAgent (qui,
-lui, était bien retiré). On appelle **`[NSApp disableRelaunchOnLogin]`** au
-démarrage → macOS ne restaure plus l'agent tout seul, et le LaunchAgent (= le
-toggle) redevient l'**unique** mécanisme de démarrage. Aucun impact Windows (déjà
-correct via la clé Run du registre).
-
-### Corrigé
-- **Autostart Mac respecté** : ajout de `disable_macos_relaunch_on_login()`
-  (`main.rs`, `#[cfg(target_os = "macos")]`, dépendance `objc2`). Appelé une fois
-  au `setup()`.
-
-## [0.5.11-9] — 2026-08-06 (pré-release)
-
-Trois chantiers UX/robustesse (autostart, MIX REC, mises à jour) + retrait du
-noise-gate voix talkback.
-
-### Autostart respecté (fin d'un « re-forçage » qui écrasait le choix utilisateur)
-- L'agent ne **ré-impose plus** `enable()` à chaque démarrage. Le défaut ON n'est
-  appliqué qu'**au 1er lancement** (marqueur `autostart-initialized` dans
-  `app_config_dir`) ; ensuite l'état OS / le choix utilisateur fait foi.
-- **Toggle** « Démarrer avec l'ordinateur » dans la fenêtre agent (commandes Tauri
-  `get_autostart` / `set_autostart`, relecture de l'état OS réel).
-
-### Bus MIX REC = pistes ARMÉES uniquement (mode agent)
-- Le tap record (`PushMix`) et le VU MIX REC ne somment plus que les sources
-  **armées** (`mix_buf` dédié dans `mix_into`) ; le monitoring/MASTER reste le mix
-  complet, inchangé. Rien d'armé → MIX silencieux, distinct du MASTER. Parité avec
-  le mode navigateur. Zéro latence ajoutée (add conditionnel par stream armé).
-- **Protocole** — nouveau `set-record-arm { selfArmed, armedPeers }` (snapshot
-  idempotent d'armement poussé par le web).
-
-### Mise à jour OBLIGATOIRE mais annoncée (fin de l'install silencieuse au boot)
-- **Retrait de la MàJ automatique au démarrage** (elle s'installait en douce ~5 s
-  après le boot → risque de conflit avec le chargement des drivers ASIO + fenêtre
-  d'installeur surprise).
-- La MàJ est désormais déclenchée **au moment de l'usage** : le web **bloque
-  l'entrée en studio** si l'agent est en retard sur la dernière stable et lance
-  `check_for_update` via le message `restart`.
-- **Garde-fou** : refus d'installer pendant une **session audio active** (jamais de
-  jam coupé), signalé explicitement au browser.
-- **Protocole** — nouveau `update-progress { phase, downloaded, total, message }`
-  (barre de progression + phases de la modale d'entrée).
-
-### Retrait du noise-gate voix talkback (présent en 0.5.11-7/-8)
-Un gate à seuil ne sépare pas la voix des instruments qui repissent dans le même
-micro (guitare acoustique = plein dans la bande voix) → best-effort, écarté. Le
-talkback repasse en **toujours-ON + bouton mute**. L'isolation de voix (séparation
-de sources neuronale) le remplacera dans un chantier dédié.
-
-### Retiré
-- **`voice_gate` (module `jamodio-audio-core`)** et son câblage dans
-  `voice_encode_stage_loop` (`pipeline.rs`) : plus de side-chain bande-voix ni
-  d'enveloppe de gate. Seul le gain de **mute** utilisateur (`voice_gain`) reste
-  sur le tap voix — aucune latence ajoutée.
-- **Protocole** — champ `voiceGateOpen` de `StreamLevels` (et son push forcé sur
-  transition côté `ws_server`). Back-compat : un browser qui l'ignorait déjà n'est
-  pas affecté.
-
-## [0.5.11-6] — 2026-08-05 (pré-release)
-
-**Peak-mètre DAW** : diffusion du **pic échantillon** (dBFS peak) par stream pour
-les VU du studio, en plus du RMS. Côté browser, la barre du VU devient un vrai
-peak-mètre (attack instantané + descente à taux fixe), au lieu d'un mètre RMS qui
-« s'affolait » et masquait les transitoires. Le pic alimente aussi une détection
-de CLIP fiable en mode agent (l'ancien proxy RMS ne s'allumait quasi jamais).
+Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz natif
+/ ASIO-only, crash 32 canaux, faux rate CoreAudio), détection de plugins (AU
+licenciés, fabricants UVI), VU peak-mètre DAW, respect de l'autostart, MIX REC des
+pistes armées, et **mises à jour obligatoires mais annoncées** (fin de l'install
+silencieuse au boot). Détail par sous-version dans l'historique git (tags
+`v0.5.11-1` … `v0.5.11-10`).
 
 ### Ajouté
-- **Pic échantillon par stream + master + mix** (`stereo_peak`, champs `peak_l/
-  peak_r` sur `StreamState`, `master_peak_*`/`mix_peak_*` sur le mixer), calculé
-  **dans les passes RMS existantes** (aucune allocation ni passe supplémentaire →
-  zéro impact latence, hors thread audio RT). Exposé via `stream_levels()` (ex
-  `stream_rms()`, tuple étendu) et `master_mix_peak()`.
-- **Protocole** — `StreamLevel` gagne `peak` / `peakL` / `peakR` (optionnels,
-  omis si absents). Les tranches **VOIX** restent en RMS (mètre de communication
-  vocale : le RMS est le standard). Back-compat : un browser sans support du pic
-  ignore ces champs ; un agent sans pic → le browser retombe sur le RMS.
-
-## [0.5.11-5] — 2026-08-05 (pré-release)
-
-Correctif d'un bug du scan hors-process (macOS) qui faisait **disparaître les
-plugins d'un fabricant dont le code fourcc fait moins de 4 caractères** (ex.
-**UVI** → `« UVI »` avec espace finale : Falcon, Sparkverb, Thorus…). Distinct du
-correctif run loop de 0.5.11-4 (celui-ci concernait les plugins licenciés qui
-figeaient).
-
-### Corrigé
-- **Espace fourcc significative préservée.** Le worker de scan tronquait chaque
-  item (`line.trim()`), supprimant l'espace de complément d'un code fabricant/
-  subtype < 4 caractères (« UVI » → « UVI »). Double conséquence : `fourcc_to_u32`
-  (qui exige 4 octets) échouait → le plugin n'était jamais trouvé ; ET le
-  `begin/end` renvoyé ne correspondait plus à l'item attendu par le coordinateur
-  → l'item n'était jamais confirmé → rescans en boucle jusqu'à 256 sessions puis
-  abandon (scan lent + charge CPU inutile). Le worker ne tronque plus l'item.
-
-## [0.5.11-4] — 2026-08-05 (pré-release)
-
-Correctif d'une **régression du scan de plugins hors-process** (macOS) : certains
-**AU tiers licenciés** (BFD, AmpliTube, Kontakt, plugins iLok…) n'étaient **plus
-détectés** — ils figeaient à l'instanciation faute de **run loop Cocoa pompée**
-dans le worker de scan, puis étaient blocklistés **à vie** (un item AU n'a pas
-d'empreinte fichier). Le chargement live n'était pas affecté (l'agent, lui, pompe
-sa run loop) : seule la découverte était cassée.
+- **Audio 48 kHz natif / ASIO-only (R1–R5).** 48 kHz natif obligatoire (entrée ET
+  sortie Mac) ; tout écart → refus explicite + sortie du studio, **jamais de repli
+  silencieux**. Zéro resampler (il coûtait ~29 ms ≈ tout le budget latence). ASIO
+  obligatoire sous Windows. Docs : `internal-docs/decisions/AUDIO-48K-ASIO-ONLY-2026-08.md`.
+- **WebView2 machine-wide (`embedBootstrapper`).** Corrige « Could not find the
+  WebView2 Runtime » sur les Win10 sans runtime préinstallé, sans embarquer
+  l'installeur offline (~127 Mo).
+- **VU peak-mètre DAW.** Pic échantillon (dBFS) par stream + master + mix, calculé
+  dans les passes RMS existantes (**zéro impact latence**, hors thread audio RT).
+  La barre devient un vrai peak-mètre (attack instantané, descente à taux fixe) et
+  alimente une détection de CLIP fiable en mode agent.
+- **Bouton « Rescanner » les plugins** + **diagnostic par nom** : les plugins
+  écartés s'affichent par leur **nom réel** (icône + forme + texte, daltonien-safe ;
+  plus d'emoji dans l'UI).
+- **Autostart au choix.** Toggle « Démarrer avec l'ordinateur » dans la fenêtre
+  agent (commandes `get_autostart` / `set_autostart`), **respecté** ; défaut ON au
+  1er lancement (marqueur `app_config_dir`) puis l'état OS fait foi.
+- **MIX REC = pistes armées uniquement (mode agent).** Le bus d'enregistrement
+  (fichier mix + VU MIX REC) ne somme que les sources **armées** (`mix_buf` dédié
+  dans `mix_into`) ; le monitoring/MASTER reste le mix complet. Zéro latence
+  ajoutée. Protocole `set-record-arm`.
+- **Mises à jour obligatoires mais annoncées.** Fin de l'installation silencieuse
+  au démarrage (risque de conflit avec le chargement des drivers ASIO + fenêtre
+  surprise). Quand l'agent est en retard sur la dernière stable, le web **bloque
+  l'entrée en studio** par une modale « Mise à jour requise » (barre de progression
+  + phases), **jamais pendant une session active**. Protocole `update-progress`.
+- **Hook panic Rust → `agent.log`** — un panic partait sur stderr (invisible sur
+  une app GUI Windows) ; il est désormais dans le bundle support.
 
 ### Corrigé
-- **Racine — run loop du worker de scan.** `jmo_au_probe` instancie désormais le
-  plugin **sur le thread principal avec la run loop pompée** (comme le chargement
-  live), et le worker fait tourner `[NSApp run]` sur le main (scan sur un thread
-  de fond). L'XPC de licence des plugins lourds répond → plus de hang → plus de
-  blocklist à tort. Aucune touche au chemin temps-réel / self-monitor.
-- **Invalidation des blocklists périmées.** `SCANNER_ABI` 1→2 → rescan complet au
-  1er lancement : les AU blocklistés à tort en 0.5.9→0.5.11-3 retentent leur chance.
-
-### Ajouté
-- **Diagnostic par nom.** Le worker journalise le plugin scanné **par son nom
-  réel** (lecture registre, sans instanciation) avant l'instanciation → sur un
-  hang, le log nomme le coupable. La note « bloqués » de l'UI affiche aussi le
-  **nom réel** au lieu de l'id `au:` cryptique.
-- **Bouton « Rescanner ».** Relance une détection complète en ignorant le cache
-  (récupération pilotée par l'utilisateur, ex. après réparation/màj d'un plugin),
-  avec note « bloqués » revue (icône de marque + forme + texte, daltonien-safe ;
-  plus d'emoji).
-
-## [0.5.11-3] — 2026-08-05 (pré-release)
-
-Pré-release qui **embarque tout le cycle 0.5.11** : le correctif crash 32 canaux
-(0.5.11-1), le socle **WebView2** Windows (0.5.11-2) et le chantier **audio 48 kHz
-natif / ASIO-only** (0.5.11-3). Doctrine : 48 kHz natif obligatoire, **zéro
-resampler** (il coûtait ~29 ms ≈ tout le budget latence), ASIO obligatoire sous
-Windows, tout écart au 48 kHz → **refus explicite + sortie du studio** (jamais de
-repli silencieux). Docs autoritaires :
-`internal-docs/decisions/AUDIO-48K-ASIO-ONLY-2026-08.md` (règles R1-R5).
-
-### Ajouté
-- **48 kHz natif obligatoire (R2 entrée).** Ouverture de capture refusée si le
-  périphérique n'est pas en 48 kHz natif (`CaptureStartError` → raison
-  `not-48khz` / `no-asio` côté web) — plus aucun resample d'entrée caché.
-- **Gate 48 kHz sur la SORTIE (Mac, R2 sortie).** Refus d'une sortie hors 48 kHz
-  (`OutputNotForty8kHz` → `output-not-48khz`), qui supprime le dernier resample
-  CoreAudio caché. Windows n'est pas concerné (la sortie = device ASIO d'entrée,
-  déjà gaté). Gate conditionné à une entrée à 48 kHz pour ne pas accuser la sortie
-  quand le vrai fautif est l'entrée.
-- **WebView2 machine-wide (`embedBootstrapper`).** Socle Windows pour toutes les
-  0.5.11-x — corrige « Could not find the WebView2 Runtime » sur les Win10 sans
-  runtime préinstallé, sans embarquer l'installeur offline (~127 Mo).
-
-### Corrigé
-- **Fuite de callbacks fantômes CoreAudio (faux rate 96k/192k).** Un `cpal::Stream`
-  d'entrée droppé sans `pause()` continuait d'émettre ~750 callbacks/s et polluait
-  le **compteur partagé** → faux 2×/4× (96k/192k) qui piégeaient le détecteur de
-  dérive et le refus d'entrée. Racine : le gate sortie renvoyait `Err` en droppant
-  le stream **brut**. Fix : enveloppe du stream cpal en `SendStream` **dès sa
-  création** → tout `Err` en aval passe par `pause()`. On se fie au rate **déclaré**
-  par cpal (fiable sur Mac), pas à une mesure sur un compteur pollué.
-- **Crash ASIO 32 canaux (rappel 0.5.11-1)** : n'ouvre que `paire+2` canaux de
-  sortie (voir bloc 0.5.11-1 ci-dessous).
-
-
-## [0.5.11-1] — non publié (pré-release)
-
-Correctif d'un **crash sur interface à beaucoup de canaux** introduit en 0.5.10.
-
-### Corrigé
-- **Crash ASIO 32 canaux (corruption de tas / `STATUS_HEAP_CORRUPTION`).** En
-  0.5.10, l'agent ouvrait **tous** les canaux de sortie de l'interface pour le swap
-  de paire live ; sur un Behringer WING (32 in / 32 out) → `ASIOCreateBuffers` sur
-  64 buffers + 32 écritures FFI/callback → corruption de tas côté asio-sys/driver
-  (crash-loop « le moteur ne veut plus se lancer »). L'agent n'ouvre désormais que
-  **`paire+2`** canaux de sortie (régime éprouvé 0.5.9). Limite connue et cible
-  « niveau DAW » (ouverture de canaux précis) documentées dans
-  `internal-docs/plans/PLAN-ASIO-OUTPUT-PAIR-2026-07.md`.
-
-### Ajouté
-- **Hook panic Rust → `agent.log`.** Un panic Rust partait par défaut sur stderr
-  (jeté sur une app GUI Windows, invisible dans le bug-report). Il est désormais
-  routé vers le log fichier (message + localisation + backtrace), donc présent dans
-  le bundle support. (Les crashs natifs/SEH restent à couvrir — cf. plan ci-dessus.)
-
+- **Crash ASIO 32 canaux** (corruption de tas / `STATUS_HEAP_CORRUPTION` sur
+  Behringer WING 32 in/out) : l'agent n'ouvre plus que **`paire+2`** canaux de
+  sortie (régime éprouvé 0.5.9) au lieu de tous les canaux.
+- **Fuite de callbacks fantômes CoreAudio** (faux rate 96k/192k qui piégeaient le
+  détecteur de dérive) : un `cpal::Stream` droppé sans `pause()` continuait
+  d'émettre ~750 callbacks/s → compteur pollué. Fix : enveloppe `SendStream` dès la
+  création → tout `Err` en aval passe par `pause()`.
+- **AU tiers licenciés à nouveau détectés sur Mac** (BFD, AmpliTube, Kontakt,
+  plugins iLok…) : le worker de scan pompe désormais sa run loop Cocoa comme le
+  chargement live → plus de hang → plus de blocklist à tort (`SCANNER_ABI` 1→2 =
+  rescan complet au 1er lancement).
+- **Plugins d'un fabricant à code fourcc < 4 caractères** (UVI/Falcon, Sparkverb,
+  Thorus…) à nouveau détectés : le worker ne tronque plus l'espace de complément du
+  code (« UVI » ≠ « UVI »).
+- **Sélecteur de plugins bloqué sur « Scan… »** : conséquence des rescans en boucle
+  ci-dessus (jusqu'à 256 sessions) — corrigé (plus besoin de recharger la page) ;
+  scan plus rapide et plus léger au démarrage.
+- **Autostart Mac respecté** (`[NSApp disableRelaunchOnLogin]`) : macOS ne relance
+  plus l'agent via la restauration de session au login → seul le LaunchAgent (= le
+  toggle utilisateur) contrôle le démarrage.
 
 ## [0.5.10] — 2026-07-28
 
