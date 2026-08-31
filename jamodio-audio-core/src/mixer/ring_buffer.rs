@@ -79,6 +79,13 @@ pub struct JitterBuffer {
     rs_has_prev: bool,
     /// Buffer de sortie réutilisé du resampler (zéro-alloc en régime).
     rs_scratch: Vec<f32>,
+    /// C1 — pression d'underrun en fuite (leaky bucket) pilotant la RÉCUPÉRATION
+    /// du filet réactif en mode réseau. Sans horloge murale → déterministe.
+    /// Cf. constantes `UNDERRUN_PRESSURE_*` / `REACTIVE_RECOVER_SAMPLES_PER_PULL`.
+    underrun_pressure: f32,
+    /// C1 — accumulateur fractionnaire de réduction du filet (samples), pour une
+    /// descente lisse à `REACTIVE_RECOVER_SAMPLES_PER_PULL` par pull.
+    shrink_accum: f32,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -142,6 +149,36 @@ const RESAMPLE_MAX_ADJ: f64 = 0.005;
 /// lentement (faible bande passante, façon DLL) → aucun wobble de hauteur audible.
 const RESAMPLE_SLEW_PER_PUSH: f64 = 0.00002;
 
+// ── C1 (2026-08) — RÉCUPÉRATION du filet réactif (streams RÉSEAU) ───────────
+// Le filet réactif (`adapt_up`, +5 ms/underrun) protège contre les trous ; il
+// reste INCHANGÉ. Mais l'ancienne récupération (`adapt_down`, palier 5 s ré-armé
+// par CHAQUE underrun, −2,5 ms/5 s) était trop lente ET bloquée par un underrun
+// isolé → sur lien jittery (WiFi) le buffer restait coincé haut (mesuré 17–40 ms
+// alors que la gigue réelle justifiait 6–9 ms — cf.
+// `studies/ETUDE-LATENCE-MONITOR-EMISSION-2026-08.md` §9ter).
+//
+// C1 remplace ce gating horloge (RÉSEAU uniquement) par une PRESSION D'UNDERRUN
+// EN FUITE (leaky bucket, sans horloge murale → déterministe et testable) : tant
+// que la pression dépasse le seuil, on tient le filet (protection identique) ;
+// sous le seuil (calme), on draine le filet vers 0 à vitesse bornée → retour au
+// plancher tail-aware. Un underrun ISOLÉ ne bloque plus la récupération (la
+// pression retombe seule), une CADENCE d'underruns la maintient (buffer tenu).
+// Le self-monitor local (`local_mode`) garde son adaptation bornée historique.
+//
+/// Pression ajoutée par underrun.
+const UNDERRUN_PRESSURE_STEP: f32 = 1.0;
+/// Fuite de la pression par pull « plein ». À ~750 pull/s (buffer 64), 0.990 ⇒
+/// un underrun ISOLÉ retombe sous le seuil en ~70 pulls (~90 ms), alors qu'une
+/// cadence d'underruns plus serrée maintient le filet. CONSTANTE DE CALIBRATION
+/// (dimensionnée buffer 64 ; à revalider en réel WiFi/Ethernet).
+const UNDERRUN_PRESSURE_LEAK: f32 = 0.990;
+/// Seuil « calme » : sous cette pression, on récupère (draine le filet réactif).
+const UNDERRUN_PRESSURE_CALM: f32 = 0.5;
+/// Vitesse de récupération du filet réactif au calme (samples interleaved/pull).
+/// 1,0 sample/pull ⇒ ~750 samples/s à 750 pull/s ≈ 7,8 ms/s → un overshoot de
+/// ~30 ms revient au plancher en ~4 s (vs ~60 s avant). CONSTANTE DE CALIBRATION.
+const REACTIVE_RECOVER_SAMPLES_PER_PULL: f32 = 1.0;
+
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
     (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
@@ -182,6 +219,8 @@ impl JitterBuffer {
             rs_prev: [0.0; CHANNELS],
             rs_has_prev: false,
             rs_scratch: Vec::with_capacity(2048),
+            underrun_pressure: 0.0,
+            shrink_accum: 0.0,
         }
     }
 
@@ -205,6 +244,8 @@ impl JitterBuffer {
         let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
         self.primed = false;
         self.reactive_extra_samples = 0;
+        self.underrun_pressure = 0.0;
+        self.shrink_accum = 0.0;
         self.floor_samples = initial;
         self.target_samples = initial;
         self.last_adapt = std::time::Instant::now();
@@ -373,7 +414,9 @@ impl JitterBuffer {
         let needed = output.len();
         let pulled = if available >= needed {
             self.consumer.pop_slice(&mut output[..needed]);
-            self.adapt_down();
+            // C1 — audio qui coule normalement : fuite de la pression + éventuelle
+            // récupération du filet réactif (réseau) ; self-monitor local inchangé.
+            self.recover_after_full_pull();
             needed
         } else {
             if available > 0 {
@@ -394,6 +437,9 @@ impl JitterBuffer {
             output[available..].fill(0.0);
             self.underruns += 1;
             self.adapt_up();
+            // C1 — un underrun pousse la pression : tant qu'elle reste au-dessus du
+            // seuil, la récupération du filet est suspendue (buffer tenu haut).
+            self.underrun_pressure += UNDERRUN_PRESSURE_STEP;
             self.primed = false;
             // Phase C — un trou de playout casse la continuité d'entrée : on
             // ré-amorce le resampler (sinon interpolation sur une frame périmée).
@@ -542,6 +588,42 @@ impl JitterBuffer {
             self.reactive_extra_samples = self.reactive_extra_samples.saturating_sub(shrink);
             self.recompute_target();
             self.last_adapt = std::time::Instant::now();
+        }
+    }
+
+    /// C1 — appelé sur chaque pull PLEIN (audio qui coule normalement). Fait
+    /// fuir la pression d'underrun, puis — en mode RÉSEAU et si c'est calme —
+    /// draine le filet réactif vers le plancher tail-aware à vitesse bornée.
+    ///
+    /// Additif + backstop : la CROISSANCE (`adapt_up`) est inchangée ; on ne fait
+    /// qu'améliorer la DESCENTE. Pire cas (pression toujours au-dessus du seuil) =
+    /// aucune récupération = comportement d'avant. Le self-monitor local
+    /// (`local_mode`) garde son adaptation temporelle historique (`adapt_down`)
+    /// — INTOUCHÉ (scope réseau uniquement).
+    fn recover_after_full_pull(&mut self) {
+        self.underrun_pressure *= UNDERRUN_PRESSURE_LEAK;
+        if self.local_mode {
+            self.adapt_down();
+            return;
+        }
+        // Encore des underruns récents → on tient le filet (protection).
+        if self.underrun_pressure >= UNDERRUN_PRESSURE_CALM {
+            return;
+        }
+        // Déjà au plancher : rien à drainer, on repart d'un accumulateur propre.
+        if self.reactive_extra_samples == 0 {
+            self.shrink_accum = 0.0;
+            return;
+        }
+        // Calme installé : draine le filet réactif (descente lisse < 1 sample/pull
+        // possible via l'accumulateur). Le plancher tail-aware reste le minimum
+        // (on ne touche jamais `floor_samples` ici).
+        self.shrink_accum += REACTIVE_RECOVER_SAMPLES_PER_PULL;
+        if self.shrink_accum >= 1.0 {
+            let dec = self.shrink_accum as usize;
+            self.reactive_extra_samples = self.reactive_extra_samples.saturating_sub(dec);
+            self.shrink_accum -= dec as f32;
+            self.recompute_target();
         }
     }
 }
@@ -874,5 +956,114 @@ mod tests {
         assert!(jb.resample_enabled, "réseau : resampling actif par défaut");
         jb.set_local_mode(true);
         assert!(!jb.resample_enabled, "self-monitor : resampling désactivé");
+    }
+
+    // ─── C1 — récupération du filet réactif (réseau) ─────────────────────────
+
+    /// Amène un stream réseau à un underrun (le filet réactif remonte la cible
+    /// au-dessus du plancher). Retourne la cible (ms) juste après l'underrun.
+    fn network_underrun_once(jb: &mut JitterBuffer) -> usize {
+        let five_ms = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![0.1_f32; five_ms]);
+        let mut out = vec![0.0_f32; five_ms];
+        jb.pull(&mut out); // prime + consomme tout
+        jb.pull(&mut out); // buffer vide → underrun → adapt_up + pression
+        jb.target_ms()
+    }
+
+    /// Fait `n` pulls PLEINS de `len` samples en gardant le ring alimenté (pousse
+    /// un peu plus qu'on ne tire ; le drift-drain borne le haut). Aucun underrun.
+    fn drive_full_pulls(jb: &mut JitterBuffer, len: usize, n: usize) {
+        let mut out = vec![0.0_f32; len];
+        let feed = vec![0.1_f32; len + len / 4];
+        for _ in 0..n {
+            jb.push(&feed);
+            jb.pull(&mut out);
+        }
+    }
+
+    #[test]
+    fn network_reactive_recovers_to_floor_when_calm() {
+        // Cœur de C1 : après un underrun (filet réactif remonté), une période
+        // CALME (pulls pleins, plus d'underrun) doit ramener la cible au plancher
+        // tail-aware — au lieu de rester coincée haut comme avant.
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher réseau = 5 ms
+        let t_after = network_underrun_once(&mut jb);
+        assert!(t_after > 5, "le filet doit remonter la cible: {t_after} ms");
+
+        drive_full_pulls(&mut jb, 240, 8000); // calme prolongé
+        assert_eq!(jb.target_ms(), 5, "revenu au plancher après le calme: {} ms", jb.target_ms());
+    }
+
+    #[test]
+    fn network_reactive_held_right_after_underrun() {
+        // Backstop : un underrun TRÈS récent (pression au-dessus du seuil) NE doit
+        // PAS déclencher de récupération prématurée — le filet tient (protection).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        let t_after = network_underrun_once(&mut jb);
+
+        // Un seul pull plein juste après : pression ≈ 0.99 > seuil → cible inchangée.
+        jb.push(&vec![0.1_f32; 60 * SAMPLE_RATE * CHANNELS / 1000]); // re-prime large
+        let mut out = vec![0.0_f32; 240];
+        jb.pull(&mut out);
+        assert_eq!(jb.target_ms(), t_after, "pas de récupération sous pression: {} ms", jb.target_ms());
+    }
+
+    #[test]
+    fn network_reactive_recovery_is_bounded_per_pull() {
+        // La descente est BORNÉE (≤ quelques samples/pull) : pas de saut sec de
+        // cible. La récupération est graduelle, pilotée par
+        // `REACTIVE_RECOVER_SAMPLES_PER_PULL` — contraste avec un reset brutal.
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        let floor_samples = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        // Pompe le filet par plusieurs underruns francs.
+        for _ in 0..4 {
+            jb.push(&vec![0.1_f32; jb.target_samples + 1]);
+            let t = jb.target_samples;
+            jb.pull(&mut vec![0.0_f32; t]);     // consomme (plein)
+            jb.pull(&mut vec![0.0_f32; t * 4]); // underrun franc
+        }
+        let peak = jb.target_samples;
+        assert!(peak > floor_samples, "filet pompé au-dessus du plancher");
+
+        // Purge la pression (calme prolongé) → la récupération s'amorce.
+        drive_full_pulls(&mut jb, 240, 500);
+        let before = jb.target_samples;
+        assert!(before < peak, "la récupération a bien commencé (before<peak)");
+
+        // Un SEUL pull de plus : la cible ne chute que d'un pas borné.
+        drive_full_pulls(&mut jb, 240, 1);
+        let after = jb.target_samples;
+        assert!(after <= before, "monotone décroissant");
+        assert!(before - after <= 4, "descente bornée par pull: {} samples", before - after);
+        assert!(after >= floor_samples, "jamais sous le plancher tail-aware");
+    }
+
+    #[test]
+    fn local_mode_recovery_path_unchanged() {
+        // Garantie « self-monitor intouché » : en mode local, la récupération
+        // rapide C1 ne s'applique PAS — c'est `adapt_down` (palier temporel) qui
+        // gouverne. Sans 8 s écoulées, la cible NE redescend pas via des pulls
+        // calmes (contraste avec le réseau ci-dessus).
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(5);
+        let five_ms = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![0.1_f32; five_ms]);
+        let mut out = vec![0.0_f32; five_ms];
+        jb.pull(&mut out); // prime + consomme
+        jb.pull(&mut vec![0.0_f32; five_ms * 3]); // underrun → adapt_up (borné LOCAL_MAX)
+        let t_after = jb.target_ms();
+        assert!(t_after > 5, "local : le filet a bien remonté: {t_after} ms");
+
+        drive_full_pulls(&mut jb, 240, 8000); // beaucoup de pulls calmes, mais < 8 s
+        assert_eq!(
+            jb.target_ms(), t_after,
+            "local : pas de récupération rapide C1 (chemin adapt_down intact): {} ms",
+            jb.target_ms()
+        );
     }
 }

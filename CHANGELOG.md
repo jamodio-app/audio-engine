@@ -5,6 +5,34 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.12] — non publiée
+
+### Fixed — Jitter buffer de réception : RÉCUPÉRATION (le buffer redescend enfin)
+
+Sur lien jittery (WiFi), le jitter buffer de réception d'un pair **gonflait et
+restait coincé haut** : mesuré à **17–40 ms** alors que la gigue réseau réelle
+(`jitter_ms` RFC ~1,3 ms, queue tail 3–6 ms) n'en justifiait que **6–9 ms** — soit
+**9 à 34 ms de latence évitable** sur ce que tu entends de chaque pair (étude
+`internal-docs/studies/ETUDE-LATENCE-MONITOR-EMISSION-2026-08.md`, plan
+`PLAN-JITTER-RECOVERY-C1`).
+
+**Cause racine** : le filet réactif (`adapt_up`, +5 ms/underrun) protège bien, mais
+la récupération (`adapt_down`) était (a) trop lente (−2,5 ms/5 s) et (b) **ré-armée
+par chaque underrun** (`last_adapt = now`) → sur une cadence d'underruns WiFi, elle
+ne se déclenchait quasiment jamais et le buffer restait collé, jusqu'au plafond 40 ms.
+
+**Correctif (streams réseau uniquement, ADDITIF + BACKSTOP)** : la croissance du
+filet est **inchangée** (protection identique). Seule la DESCENTE est revue : une
+**pression d'underrun en fuite** (leaky bucket, sans horloge murale → déterministe)
+pilote la récupération. Tant que la pression dépasse le seuil, le filet est tenu ;
+sous le seuil (calme), il draine vers 0 à vitesse bornée → **retour au plancher
+tail-aware (6–8 ms) en quelques secondes** au lieu de rester coincé. Un underrun
+ISOLÉ ne bloque plus la récupération ; une cadence soutenue la maintient. Pire cas =
+comportement d'avant (on ne peut pas régresser la protection). **Le self-monitor
+local (`local_mode`) garde son adaptation bornée historique — intouché.** Couvert
+par 4 tests unitaires (récupération au calme, tenue post-underrun, borne par pull,
+non-régression du chemin local).
+
 ## [0.5.11] — 2026-08-07
 
 Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz natif
