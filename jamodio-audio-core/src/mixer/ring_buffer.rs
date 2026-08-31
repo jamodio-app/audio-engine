@@ -167,17 +167,28 @@ const RESAMPLE_SLEW_PER_PUSH: f64 = 0.00002;
 //
 /// Pression ajoutée par underrun.
 const UNDERRUN_PRESSURE_STEP: f32 = 1.0;
-/// Fuite de la pression par pull « plein ». À ~750 pull/s (buffer 64), 0.990 ⇒
-/// un underrun ISOLÉ retombe sous le seuil en ~70 pulls (~90 ms), alors qu'une
-/// cadence d'underruns plus serrée maintient le filet. CONSTANTE DE CALIBRATION
-/// (dimensionnée buffer 64 ; à revalider en réel WiFi/Ethernet).
-const UNDERRUN_PRESSURE_LEAK: f32 = 0.990;
+/// Fuite de la pression par pull « plein ». **P1 (calibration réelle 0.5.12-1) :**
+/// la première valeur (0.990, demi-vie ~90 ms) récupérait TROP vite sur WiFi — le
+/// buffer retombait au plancher puis se faisait cueillir par un pic WiFi → hausse
+/// des underruns (mesuré Mac 116 / PC 342 sur une session). On ralentit la fuite
+/// pour donner une MÉMOIRE d'underrun de plusieurs secondes (grâce implicite) : à
+/// ~750 pull/s (buffer 64), 0.9995 ⇒ demi-vie ~1,85 s ; un underrun isolé retombe
+/// sous le seuil en ~1,8 s, une rafale de 4 en ~5,5 s. On ne récupère donc qu'après
+/// un calme RÉELLEMENT installé. CONSTANTE DE CALIBRATION (à re-mesurer WiFi/Ethernet).
+const UNDERRUN_PRESSURE_LEAK: f32 = 0.9995;
 /// Seuil « calme » : sous cette pression, on récupère (draine le filet réactif).
 const UNDERRUN_PRESSURE_CALM: f32 = 0.5;
+/// Plafond de pression : borne la MÉMOIRE d'underrun. Sans lui, une longue passe
+/// jittery ferait grimper la pression sans limite → le buffer resterait tenu très
+/// longtemps après le retour au calme. À 4,0 (avec `UNDERRUN_PRESSURE_LEAK`), la
+/// récupération démarre au plus tard ~5,5 s après le DERNIER underrun, même après
+/// une grosse rafale. CONSTANTE DE CALIBRATION.
+const UNDERRUN_PRESSURE_MAX: f32 = 4.0;
 /// Vitesse de récupération du filet réactif au calme (samples interleaved/pull).
-/// 1,0 sample/pull ⇒ ~750 samples/s à 750 pull/s ≈ 7,8 ms/s → un overshoot de
-/// ~30 ms revient au plancher en ~4 s (vs ~60 s avant). CONSTANTE DE CALIBRATION.
-const REACTIVE_RECOVER_SAMPLES_PER_PULL: f32 = 1.0;
+/// **P1 :** abaissé de 1,0 à 0,5 (drainage plus doux) — ~375 samples/s à 750 pull/s
+/// ≈ 3,9 ms/s → un overshoot de ~30 ms revient au plancher en ~8 s. Descente
+/// graduelle, jamais de saut sec. CONSTANTE DE CALIBRATION.
+const REACTIVE_RECOVER_SAMPLES_PER_PULL: f32 = 0.5;
 
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
@@ -437,9 +448,10 @@ impl JitterBuffer {
             output[available..].fill(0.0);
             self.underruns += 1;
             self.adapt_up();
-            // C1 — un underrun pousse la pression : tant qu'elle reste au-dessus du
-            // seuil, la récupération du filet est suspendue (buffer tenu haut).
-            self.underrun_pressure += UNDERRUN_PRESSURE_STEP;
+            // C1 — un underrun pousse la pression (bornée) : tant qu'elle reste
+            // au-dessus du seuil, la récupération du filet est suspendue (buffer tenu).
+            self.underrun_pressure =
+                (self.underrun_pressure + UNDERRUN_PRESSURE_STEP).min(UNDERRUN_PRESSURE_MAX);
             self.primed = false;
             // Phase C — un trou de playout casse la continuité d'entrée : on
             // ré-amorce le resampler (sinon interpolation sur une frame périmée).
@@ -992,7 +1004,13 @@ mod tests {
         let t_after = network_underrun_once(&mut jb);
         assert!(t_after > 5, "le filet doit remonter la cible: {t_after} ms");
 
-        drive_full_pulls(&mut jb, 240, 8000); // calme prolongé
+        // Calme prolongé : on tire jusqu'au retour au plancher (borné, robuste à
+        // la calibration des constantes de récupération).
+        let mut guard = 0;
+        while jb.target_ms() > 5 && guard < 400_000 {
+            drive_full_pulls(&mut jb, 240, 500);
+            guard += 500;
+        }
         assert_eq!(jb.target_ms(), 5, "revenu au plancher après le calme: {} ms", jb.target_ms());
     }
 
@@ -1029,8 +1047,13 @@ mod tests {
         let peak = jb.target_samples;
         assert!(peak > floor_samples, "filet pompé au-dessus du plancher");
 
-        // Purge la pression (calme prolongé) → la récupération s'amorce.
-        drive_full_pulls(&mut jb, 240, 500);
+        // Tire jusqu'à ce que la récupération DÉMARRE (target < peak), borné —
+        // robuste à la calibration (fuite de pression plus ou moins lente).
+        let mut guard = 0;
+        while jb.target_samples >= peak && guard < 400_000 {
+            drive_full_pulls(&mut jb, 240, 500);
+            guard += 500;
+        }
         let before = jb.target_samples;
         assert!(before < peak, "la récupération a bien commencé (before<peak)");
 
@@ -1040,6 +1063,25 @@ mod tests {
         assert!(after <= before, "monotone décroissant");
         assert!(before - after <= 4, "descente bornée par pull: {} samples", before - after);
         assert!(after >= floor_samples, "jamais sous le plancher tail-aware");
+    }
+
+    #[test]
+    fn underrun_pressure_is_capped() {
+        // La mémoire d'underrun est bornée : même une longue rafale ne fait pas
+        // grimper la pression sans limite (sinon buffer tenu trop longtemps après).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        for _ in 0..50 {
+            jb.push(&vec![0.1_f32; jb.target_samples + 1]);
+            let t = jb.target_samples;
+            jb.pull(&mut vec![0.0_f32; t]);     // consomme (plein)
+            jb.pull(&mut vec![0.0_f32; t * 4]); // underrun
+        }
+        assert!(
+            jb.underrun_pressure <= UNDERRUN_PRESSURE_MAX + 1e-6,
+            "pression plafonnée: {}",
+            jb.underrun_pressure
+        );
     }
 
     #[test]

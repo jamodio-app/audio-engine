@@ -30,8 +30,16 @@ tail-aware (6–8 ms) en quelques secondes** au lieu de rester coincé. Un under
 ISOLÉ ne bloque plus la récupération ; une cadence soutenue la maintient. Pire cas =
 comportement d'avant (on ne peut pas régresser la protection). **Le self-monitor
 local (`local_mode`) garde son adaptation bornée historique — intouché.** Couvert
-par 4 tests unitaires (récupération au calme, tenue post-underrun, borne par pull,
-non-régression du chemin local).
+par 5 tests unitaires (récupération au calme, tenue post-underrun, borne par pull,
+plafond de pression, non-régression du chemin local).
+
+**Calibration P1 (mesure réelle 0.5.12-1)** : la première pré-release récupérait
+correctement (buffer redescendu de ~17 à ~10 ms de médiane) mais **trop vite sur
+WiFi** — il retombait au plancher puis se faisait cueillir par un pic WiFi → hausse
+des underruns. Récupération rendue plus CONSERVATRICE : fuite de pression ralentie
+(mémoire d'underrun ~2 s au lieu de ~90 ms), drainage plus doux (~4 ms/s), et
+**plafond de pression** (récupération au plus tard ~5,5 s après le dernier underrun).
+Objectif : latence basse sur lien propre SANS regonfler les underruns sur WiFi.
 
 ## [0.5.11] — 2026-08-07
 
