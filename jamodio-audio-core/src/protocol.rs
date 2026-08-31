@@ -793,6 +793,20 @@ pub enum AgentMessage {
         /// la fiabilité statistique (= count élevé = trigger justifié).
         count: usize,
     },
+    /// Emballement de SORTIE détecté : le plugin instrument produit un niveau
+    /// anormalement élevé (ex. auto-oscillation d'un ampli-sim à fort gain). Le
+    /// soft-clip borne déjà la sortie à ~0 dBFS (pas de sur-niveau dangereux),
+    /// mais le résultat reste un bruit plein-échelle désagréable → on coupe le
+    /// plugin (bypass) automatiquement par SÉCURITÉ. Le browser affiche un toast
+    /// et reflète l'état bypass ; l'utilisateur ré-arme le plugin consciemment.
+    /// Distinct de `InstrumentPluginOverload` (celui-ci = surcharge CPU/drops ;
+    /// ici = niveau de sortie anormal, indépendant du CPU).
+    InstrumentPluginRunaway {
+        /// Nom du plugin coupé (injecté dans le template de toast côté browser).
+        name: String,
+        /// Peak pré-clip observé (linéaire, 1.0 = 0 dBFS). Typiquement ≫ 4 (+12 dBFS).
+        peak: f32,
+    },
     /// Sprint v0.4.9 — Alerte d'overload PIPELINE (= saturation globale
     /// agent, distincte d'un plugin lourd). Émis quand `capture_drops_per_sec`
     /// dépasse 100 sur la fenêtre 1 s — = le CPAL callback ne peut plus pousser

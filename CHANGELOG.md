@@ -41,6 +41,24 @@ des underruns. Récupération rendue plus CONSERVATRICE : fuite de pression rale
 **plafond de pression** (récupération au plus tard ~5,5 s après le dernier underrun).
 Objectif : latence basse sur lien propre SANS regonfler les underruns sur WiFi.
 
+### Added — Sécurité : coupe-circuit d'emballement de sortie (protection écoute)
+
+Un plugin instrument peut s'**auto-osciller** (ampli-sim à fort gain nourri par un
+glitch/denormal) et produire un niveau de sortie anormal — vécu en session : « gros
+son » soudain dans le casque avec AmpliTube, persistant, obligeant à tuer l'agent.
+Le soft-clip bornait déjà la sortie à ~0 dBFS (pas de sur-niveau dangereux) mais le
+résultat restait un bruit plein-échelle pénible, et **rien ne coupait la source**.
+
+Ajout d'un **coupe-circuit** : si le peak de sortie pré-clip dépasse **+12 dBFS (×4)**
+sur **plusieurs fenêtres consécutives** (anti faux-positif sur un transitoire fort
+légitime), l'agent **coupe (bypass) le plugin automatiquement** — en réutilisant le
+mécanisme d'auto-bypass existant — et émet un event `instrument-plugin-runaway` →
+toast UI « sortie anormale — plugin coupé par sécurité » avec bouton « Réactiver ».
+Détection dans la boucle perfstats (**hors du chemin audio temps-réel** → zéro risque
+sur le hot-path), pilotée par une fonction PURE testable (6 tests unitaires). Distinct
+de l'overload CPU (`instrument-plugin-overload`) : ici la cause est le **niveau**, pas
+la charge CPU.
+
 ## [0.5.11] — 2026-08-07
 
 Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz natif

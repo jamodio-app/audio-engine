@@ -799,6 +799,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // du compteur quand le self-monitor est recréé à un nouveau start).
         let mut buffer_low_pressure: u32 = 0;
         let mut prev_monitor_underruns: u64 = 0;
+        // Sécurité — nombre de fenêtres perfstats consécutives où la sortie
+        // s'emballe (peak pré-clip ≫ plein-échelle). Exiger PLUSIEURS fenêtres
+        // évite un faux positif sur un transitoire fort légitime.
+        let mut runaway_windows: u32 = 0;
         loop {
             interval.tick().await;
             let pl = perfstats_pipeline.lock().await;
@@ -1023,6 +1027,39 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let overload_msg: Option<AgentMessage> = None;
 
+            // Sécurité — EMBALLEMENT de sortie (niveau anormal), INDÉPENDANT du
+            // CPU (distinct de l'overload S5 ci-dessus). Un plugin instrument peut
+            // s'auto-osciller (ampli-sim fort gain nourri par un glitch/denormal)
+            // → peak pré-clip ≫ plein-échelle. Le soft-clip borne déjà à ~0 dBFS
+            // (pas de sur-niveau dangereux) mais le résultat est un bruit
+            // plein-échelle pénible → on coupe le plugin par SÉCURITÉ (protection
+            // casque), en réutilisant EXACTEMENT l'auto-bypass existant. On exige
+            // PLUSIEURS fenêtres consécutives au-dessus du seuil pour ne pas se
+            // déclencher sur un transitoire fort légitime. Placé APRÈS l'overload :
+            // si l'overload a déjà bypassé ce tick, le flag garde ce bloc muet.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let runaway_msg: Option<AgentMessage> = {
+                let already = pl.plugin_auto_bypass_active.load(Ordering::SeqCst);
+                if runaway_tick(plugin_name.is_some(), output_peak, already, &mut runaway_windows) {
+                    pl.instrument_plugin_bypass.store(true, Ordering::SeqCst);
+                    pl.plugin_auto_bypass_active.store(true, Ordering::SeqCst);
+                    let name = plugin_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::warn!(
+                        target: "jamodio::plugin",
+                        plugin = %name,
+                        peak = output_peak,
+                        "emballement de sortie détecté (niveau anormal) — bypass auto par sécurité"
+                    );
+                    Some(AgentMessage::InstrumentPluginRunaway { name, peak: output_peak })
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let runaway_msg: Option<AgentMessage> = None;
+
             drop(pl);
 
             // Plugin perf : seulement si on a observé ET qu'un plugin est
@@ -1168,6 +1205,15 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // d'overload — protégé par `plugin_auto_bypass_active`.
             let plugin_overload_fired = overload_msg.is_some();
             if let Some(msg) = overload_msg {
+                if perfstats_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+
+            // Sécurité — toast d'emballement de sortie (après le PerfStats, comme
+            // l'overload). Mutuellement exclusif avec l'overload ce tick (même
+            // flag `plugin_auto_bypass_active`).
+            if let Some(msg) = runaway_msg {
                 if perfstats_tx.send(msg).await.is_err() {
                     break;
                 }
@@ -3360,5 +3406,103 @@ async fn handle_message(
         // pipeline) et n'atteignent jamais ce match. Bras défensifs pour
         // l'exhaustivité — no-op si jamais routés ici.
         BrowserMessage::Restart | BrowserMessage::RelaunchNow => vec![],
+    }
+}
+
+/// Sécurité — décision PURE d'emballement de sortie (testable en isolation).
+///
+/// Met à jour le compteur de fenêtres perfstats consécutives où la sortie
+/// s'emballe (peak pré-clip au-dessus du seuil) et retourne `true` s'il faut
+/// couper (bypass) le plugin instrument par sécurité.
+///
+/// - Seuil `RUNAWAY_PEAK_THRESHOLD` = +12 dBFS (×4) : aucun signal musical réel
+///   ne SOUTIENT ça, et le seul amplificateur du chemin est le plugin instrument.
+/// - `RUNAWAY_WINDOWS_TO_TRIP` fenêtres consécutives requises : évite un faux
+///   positif sur un transitoire fort isolé (le soft-clip tient la ligne pendant
+///   la confirmation, donc aucun sur-niveau dangereux n'atteint le casque).
+/// - `already_bypassed` (flag `plugin_auto_bypass_active`) : anti re-déclenchement
+///   — une fois coupé, on ne re-coupe pas tant que l'utilisateur n'a pas réarmé.
+///
+/// Le compteur est remis à zéro dès qu'une fenêtre repasse sous le seuil OU au
+/// déclenchement (repart propre pour le prochain épisode).
+fn runaway_tick(
+    plugin_loaded: bool,
+    peak: f32,
+    already_bypassed: bool,
+    consecutive: &mut u32,
+) -> bool {
+    /// +12 dBFS (×4). CONSTANTE DE CALIBRATION (sécurité, marge large au-dessus
+    /// des transitoires légitimes que le soft-clip gère déjà).
+    const RUNAWAY_PEAK_THRESHOLD: f32 = 4.0;
+    /// Fenêtres perfstats consécutives (~1 s chacune) avant de couper.
+    const RUNAWAY_WINDOWS_TO_TRIP: u32 = 2;
+
+    if plugin_loaded && peak > RUNAWAY_PEAK_THRESHOLD {
+        *consecutive = consecutive.saturating_add(1);
+    } else {
+        *consecutive = 0;
+    }
+    let trip = *consecutive >= RUNAWAY_WINDOWS_TO_TRIP && !already_bypassed;
+    if trip {
+        *consecutive = 0;
+    }
+    trip
+}
+
+#[cfg(test)]
+mod runaway_tests {
+    use super::runaway_tick;
+
+    #[test]
+    fn no_trip_on_single_window() {
+        // Un seul dépassement (transitoire fort) ne coupe PAS.
+        let mut c = 0;
+        assert!(!runaway_tick(true, 9.0, false, &mut c));
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn trips_after_two_consecutive() {
+        // Deux fenêtres consécutives au-dessus du seuil → coupe.
+        let mut c = 0;
+        assert!(!runaway_tick(true, 9.0, false, &mut c));
+        assert!(runaway_tick(true, 9.0, false, &mut c));
+        assert_eq!(c, 0, "compteur remis à zéro au déclenchement");
+    }
+
+    #[test]
+    fn resets_when_back_to_normal() {
+        // Une fenêtre normale intercalée casse la série → pas de coupe.
+        let mut c = 0;
+        assert!(!runaway_tick(true, 9.0, false, &mut c));
+        assert!(!runaway_tick(true, 0.5, false, &mut c)); // retour normal
+        assert_eq!(c, 0);
+        assert!(!runaway_tick(true, 9.0, false, &mut c)); // repart de 1
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn never_trips_without_plugin() {
+        // Sans plugin chargé, aucune coupe (le dry ne peut pas s'emballer).
+        let mut c = 0;
+        assert!(!runaway_tick(false, 9.0, false, &mut c));
+        assert!(!runaway_tick(false, 9.0, false, &mut c));
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn no_retrip_while_already_bypassed() {
+        // Déjà bypassé (flag) → on ne re-coupe pas, même en plein emballement.
+        let mut c = 0;
+        assert!(!runaway_tick(true, 9.0, true, &mut c));
+        assert!(!runaway_tick(true, 9.0, true, &mut c));
+    }
+
+    #[test]
+    fn threshold_boundary_is_strict() {
+        // Pile au seuil (4.0) ne compte pas (> strict) — marge de sécurité.
+        let mut c = 0;
+        assert!(!runaway_tick(true, 4.0, false, &mut c));
+        assert_eq!(c, 0);
     }
 }
