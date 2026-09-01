@@ -59,6 +59,20 @@ sur le hot-path), pilotée par une fonction PURE testable (6 tests unitaires). D
 de l'overload CPU (`instrument-plugin-overload`) : ici la cause est le **niveau**, pas
 la charge CPU.
 
+### Changed — Écoute locale (A-lite) : plancher self-monitor 5 → 3 ms
+
+Le retour casque (self-monitor) passait par un pré-fill de **5 ms** — le plancher
+partagé avec le réseau (`MIN_TARGET_MS`). Mais le signal local n'a **pas de gigue
+réseau** (seulement la petite gigue d'ordonnancement des threads). Ajout d'un plancher
+LOCAL dédié `LOCAL_MIN_TARGET_MS = 3 ms` : le self-monitor descend à **3 ms au calme**
+(**~2 ms gagnés** sur ce que tu entends), tandis que le **plancher réseau reste 5 ms
+(intact)**. L'adaptation bornée (jusqu'à 15 ms sur spike plugin, retour au plancher,
+concealment inaudible) est conservée. Ne touche NI le plugin, NI son thread, NI le
+callback RT, NI le réseau. CONSTANTE DE CALIBRATION (remonter à 4 ms si trop de
+concealments au chant). Aussi : l'affichage « Ton monitoring » côté studio est corrigé
+pour être conforme (vrai monitoring local = buffers in+monitor+out, sans Opus ni jitter
+réseau) — paire web.
+
 ## [0.5.11] — 2026-08-07
 
 Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz natif

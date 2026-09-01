@@ -26,10 +26,13 @@ pub const BACKING_ID: &str = "backing";
 /// Volume/pan pilotés par le browser via `SetVolume`/`SetPan` avec ce producer_id.
 pub const PREVIEW_ID: &str = "preview";
 
-/// Cible jitter buffer du self-monitor (ms). 5 = MIN_TARGET_MS du ring buffer ;
-/// le signal vient du même process que la capture, donc pas de gigue réseau,
-/// on prend le minimum stable.
-const SELF_MONITOR_TARGET_MS: usize = 5;
+/// Cible jitter buffer du self-monitor (ms). A-lite : 3 = `LOCAL_MIN_TARGET_MS`
+/// du ring buffer (plancher local dédié, sous le plancher réseau). Le signal
+/// vient du même process que la capture (pas de gigue réseau, seulement la gigue
+/// d'ordonnancement des hops), donc on prend le minimum local stable → ~2 ms
+/// gagnés sur le retour casque vs l'historique 5 ms. L'adaptation bornée (retour
+/// à ce plancher, concealment sur spikes) reste le filet.
+const SELF_MONITOR_TARGET_MS: usize = 3;
 
 /// Loi de balance stéréo LINÉAIRE (0 dB au centre), source unique partagée par
 /// `mix_into` (le rendu audio) et `stream_rms` (les niveaux VU post-pan). Sans
@@ -336,15 +339,18 @@ impl AudioMixer {
     /// ouvrir le fader « moi » côté UI via `SetSelfMonitorVolume`. Sans ça,
     /// risque de larsen au démarrage si micro ouvert près d'un haut-parleur.
     ///
-    /// Jitter target = `SELF_MONITOR_TARGET_MS` (5 ms) : signal local sans
-    /// gigue réseau, on prend le minimum stable. Latence ear-to-ear self
-    /// résultante ≈ 5.4 ms (capture 2.7 + playback 2.7) + 5 ms target ≈ 10 ms.
+    /// Jitter target = `SELF_MONITOR_TARGET_MS` (A-lite : 3 ms) : signal local
+    /// sans gigue réseau, on prend le minimum LOCAL stable. Latence ear-to-ear
+    /// self résultante ≈ buffers device (in+out) + 3 ms target ≈ ~5-6 ms à 64
+    /// (vs ~7-8 ms avec l'ancien plancher 5 ms). L'adaptation bornée reste le filet.
     pub fn add_local_stream(&mut self) {
         let mut jitter = JitterBuffer::new();
-        jitter.set_target_ms(SELF_MONITOR_TARGET_MS);
+        // A-lite : `set_local_mode` AVANT `set_target_ms` pour que le clamp du
+        // plancher utilise `LOCAL_MIN_TARGET_MS` (3 ms) et non `MIN_TARGET_MS` (5).
         // Chantier C — mode local : concealment des trous (pas de clic sur les
-        // spikes plugin) + adaptation bornée (latence plafonnée, retour 5 ms).
+        // spikes plugin) + adaptation bornée (latence plafonnée, retour au plancher).
         jitter.set_local_mode(true);
+        jitter.set_target_ms(SELF_MONITOR_TARGET_MS);
         self.streams.insert(SELF_MONITOR_ID.to_string(), StreamState {
             jitter,
             kind: StreamKind::Instrument, // self-monitor = instrument (enregistré/duckable)

@@ -130,6 +130,15 @@ const CROSSFADE_SAMPLES: usize = CROSSFADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 /// 15 ms = compromis : absorbe la plupart des spikes plugin tout en restant
 /// jouable à la guitare. Revient à 5 ms dès le calme.
 const LOCAL_MAX_TARGET_MS: usize = 15;
+/// A-lite (2026-08) — plancher au calme du self-monitor local, PLUS BAS que le
+/// plancher réseau `MIN_TARGET_MS` (5 ms) : le signal local n'a pas de gigue
+/// réseau, seulement la gigue d'ordonnancement des 2 hops de threads (petite).
+/// 3 ms = ~2 ms gagnés sur le retour casque vs les 5 ms historiques. L'adaptation
+/// vers `LOCAL_MAX_TARGET_MS` reste le filet sur les spikes plugin, avec retour à
+/// ce plancher au calme ; un underrun devient un fondu de concealment inaudible
+/// (Chantier C), jamais un clic. RÉSEAU intact (le min réseau reste `MIN_TARGET_MS`).
+/// CONSTANTE DE CALIBRATION (remonter à 4 si trop de concealments au chant).
+const LOCAL_MIN_TARGET_MS: usize = 3;
 /// Mode local : hold avant de réduire la cible (plus long que le réseau pour
 /// éviter d'osciller entre deux spikes plugin espacés).
 const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
@@ -516,7 +525,11 @@ impl JitterBuffer {
     /// Repasse en `unprimed` pour que le pull attende le nouveau target
     /// avant de reprendre le playout.
     pub fn set_target_ms(&mut self, target_ms: usize) {
-        let clamped = target_ms.clamp(MIN_TARGET_MS, MAX_TARGET_MS);
+        // A-lite : le self-monitor local peut descendre sous le plancher réseau
+        // (`MIN_TARGET_MS`) jusqu'à `LOCAL_MIN_TARGET_MS`. Appelé APRÈS
+        // `set_local_mode` pour le self-monitor (cf. `add_local_stream`).
+        let min_ms = if self.local_mode { LOCAL_MIN_TARGET_MS } else { MIN_TARGET_MS };
+        let clamped = target_ms.clamp(min_ms, MAX_TARGET_MS);
         // Override manuel (slider UI) ou pin du self-monitor : on fige le
         // plancher sur cette valeur et on COUPE le pilotage par la gigue
         // (`observe_jitter` devient no-op). Le filet réactif reste actif.
@@ -549,7 +562,8 @@ impl JitterBuffer {
     /// `cap` = `LOCAL_MAX_TARGET_MS` en mode self-monitor, sinon `MAX_TARGET_MS`.
     fn recompute_target(&mut self) {
         let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
-        let min_s = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        let min_ms = if self.local_mode { LOCAL_MIN_TARGET_MS } else { MIN_TARGET_MS };
+        let min_s = min_ms * SAMPLE_RATE * CHANNELS / 1000;
         let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
         self.target_samples = (self.floor_samples + self.reactive_extra_samples).clamp(min_s, cap_s);
     }
@@ -1063,6 +1077,21 @@ mod tests {
         assert!(after <= before, "monotone décroissant");
         assert!(before - after <= 4, "descente bornée par pull: {} samples", before - after);
         assert!(after >= floor_samples, "jamais sous le plancher tail-aware");
+    }
+
+    #[test]
+    fn local_mode_floor_below_network_min() {
+        // A-lite : en mode local, le plancher descend à LOCAL_MIN_TARGET_MS (3),
+        // SOUS le plancher réseau MIN_TARGET_MS (5). Le réseau, lui, reste borné à 5.
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(3);
+        assert_eq!(jb.target_ms(), LOCAL_MIN_TARGET_MS, "local : plancher 3 ms");
+        assert_eq!(LOCAL_MIN_TARGET_MS, 3);
+
+        let mut net = JitterBuffer::new(); // réseau (local_mode = false)
+        net.set_target_ms(3);
+        assert_eq!(net.target_ms(), MIN_TARGET_MS, "réseau : plancher reste 5 ms (intact)");
     }
 
     #[test]
