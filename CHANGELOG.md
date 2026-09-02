@@ -73,6 +73,26 @@ concealments au chant). Aussi : l'affichage « Ton monitoring » côté studio e
 pour être conforme (vrai monitoring local = buffers in+monitor+out, sans Opus ni jitter
 réseau) — paire web.
 
+### Changed — Mixer sans verrou global : verrouillage FIN par flux (C2.1)
+
+Après le durcissement priorité, un stall résiduel `recv_path` (~3–4 ms) subsistait : le callback
+de sortie tenait UN SEUL mutex sur TOUS les flux pendant tout `mix_into` → s'il était préempté en
+le tenant, le thread de décodage (`push_samples`) attendait → underruns/craquements. Priorité
+inversée : un thread prioritaire qui attend un lock tenu reste bloqué.
+
+Refonte du verrouillage du mixer (SANS lock-free — verrous standards, robuste, review facile) :
+suppression du `Mutex<AudioMixer>` externe (méthodes `&self`, `Arc<AudioMixer>` partagé). La map
+des flux passe sous `RwLock` (écrite seulement à l'add/remove) ; chaque flux a son `JitterBuffer`
+sous un **Mutex court dédié** ; volume/pan/mix_armed + VU (rms/peak) en **atomiques**. `mix_into`
+clone les `Arc` des flux sous un RwLock LECTURE bref, le relâche, puis pull chaque flux sous le
+verrou COURT de SA cellule — le callback ne tient plus JAMAIS un verrou couvrant tous les flux.
+`push_samples`/`push_self_samples` idem. **Fenêtre de contention décode↔callback : ms → µs.**
+
+Math du mix **inchangée** (VU par tranche, MIX REC armés, DIM, talkback/voix, métronome/backing,
+master, self-monitor, record, hot-swap — identiques). 101 tests mixer existants passent sans
+modif d'assertion + 2 tests de concurrence ajoutés (push + churn add/remove pendant 20 000
+`mix_into`). Cf. `internal-docs/plans/PLAN-C2-SPSC-MIXER-2026-09.md`.
+
 ### Changed — Durcissement de la PRIORITÉ des threads audio (Mac + Windows)
 
 Le thread de **décodage de réception** était moins prioritaire que capture/process/encode

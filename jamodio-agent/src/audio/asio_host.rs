@@ -215,7 +215,7 @@ impl AsioDuplexHost {
         capture_callbacks: Arc<AtomicU64>,
         input_frames: Arc<AtomicU32>,
         capture_feeding: Arc<AtomicBool>,
-        mixer: Arc<Mutex<AudioMixer>>,
+        mixer: Arc<AudioMixer>,
         output_callbacks: Arc<AtomicU64>,
         output_frames: Arc<AtomicU32>,
         // Lot B — index de départ (0-based) de la PAIRE de canaux de sortie ASIO.
@@ -419,7 +419,7 @@ impl AsioDuplexHost {
                     output_frames.store(bufsz as u32, Ordering::Relaxed);
                     out_scratch.clear();
                     out_scratch.resize(bufsz * 2, 0.0);
-                    mixer.lock().mix_into(&mut out_scratch);
+                    mixer.mix_into(&mut out_scratch);
                     // Lot B — le mix stéréo va sur la PAIRE choisie (canaux `ps`, `ps+1`),
                     // zéros sur tous les autres canaux ouverts (nécessaire chaque bloc :
                     // double-buffer ASIO + la paire peut bouger en live). Lu ici = swap

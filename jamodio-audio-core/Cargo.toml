@@ -11,6 +11,7 @@ audiopus = "0.3.0-rc.0"    # Opus encode/decode (safe wrapper around libopus)
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync"] }
 crossbeam-channel = "0.5"  # Lock-free channels (audio thread ↔ network thread)
 ringbuf = "0.4"            # SPSC lock-free ring buffer (jitter management)
+parking_lot = "0.12"       # Verrous fins du mixer (RwLock map + Mutex par flux) — C2.1
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking

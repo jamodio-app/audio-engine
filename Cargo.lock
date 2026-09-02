@@ -2497,6 +2497,7 @@ dependencies = [
  "bytes 1.11.1",
  "crossbeam-channel",
  "getrandom 0.2.17",
+ "parking_lot",
  "ringbuf",
  "serde",
  "serde_json",

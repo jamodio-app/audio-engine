@@ -230,7 +230,7 @@ struct AcquiredAudio {
 /// atomiques (le `cpal::Device` !Send ne traverse pas les threads).
 fn open_output_on_com(
     output_id: Option<String>,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
     // Lot B / CoreAudio — paire de canaux de sortie (partagée, swap live).
@@ -276,7 +276,7 @@ fn open_duplex_on_com(
     input_id: Option<String>,
     output_id: Option<String>,
     build_output: bool,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     sample_tx: Sender<Vec<f32>>,
     capture_drops: Arc<std::sync::atomic::AtomicU64>,
     capture_callbacks: Arc<std::sync::atomic::AtomicU64>,
@@ -662,7 +662,7 @@ pub struct CaptureStartedInfo {
 
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
 pub struct PipelineState {
-    pub mixer: Arc<Mutex<AudioMixer>>,
+    pub mixer: Arc<AudioMixer>,
     /// CPAL streams must be kept alive — dropping them stops audio.
     ///
     /// En mode MIDI (mac/win, plugin instrument INSERT chargé), CPAL reste
@@ -1177,7 +1177,7 @@ impl PluginControl {
 const CHANNELS: usize = 2;
 
 impl PipelineState {
-    pub fn new(mixer: Arc<Mutex<AudioMixer>>) -> Self {
+    pub fn new(mixer: Arc<AudioMixer>) -> Self {
         Self {
             mixer,
             capture_stream: None,
@@ -1495,7 +1495,7 @@ impl PipelineState {
         }
         let handle = RecorderHandle::start(stems)?;
         // Active les tap sites côté mixer en clonant le sender.
-        self.mixer.lock().set_record_tx(Some(handle.tx.clone()));
+        self.mixer.set_record_tx(Some(handle.tx.clone()));
         let armed = handle.armed_specs.clone();
         self.recorder = Some(handle);
         tracing::info!(target: "jamodio::pipeline", stems = armed.len(), "recording started");
@@ -1509,7 +1509,7 @@ impl PipelineState {
     pub fn take_recorder(&mut self) -> Option<RecorderHandle> {
         // Détache le tx du mixer d'abord — les tap sites deviennent no-op
         // immédiatement, plus aucune nouvelle commande n'arrive au thread.
-        self.mixer.lock().set_record_tx(None);
+        self.mixer.set_record_tx(None);
         self.recorder.take()
     }
 
@@ -1698,7 +1698,7 @@ impl PipelineState {
         self.voice_ctrl_tx = None;
         self.voice_active = false;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
-        self.mixer.lock().remove_local_stream();
+        self.mixer.remove_local_stream();
         // Hot-swap d'entrée (session_continues) : la réception des pairs est
         // INDÉPENDANTE du chemin capture (sockets UDP + décodage séparés) → on la
         // garde intacte, sinon le pair qui change son entrée perd tous les autres
@@ -2157,7 +2157,7 @@ impl PipelineState {
         // parallèle de l'encodage Opus → l'utilisateur s'entend dans son
         // casque sans passer par la chaîne browser à 25 ms. Volume initial 0
         // (silencieux) → le browser ouvre le fader via SetSelfMonitorVolume.
-        self.mixer.lock().add_local_stream();
+        self.mixer.add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
         let input_cut_for_encoder = self.input_cut.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2389,7 +2389,7 @@ impl PipelineState {
     /// ré-estimé à cheval sur le trou de ~6 s, produit une distorsion persistante
     /// dans le casque.
     pub fn reset_self_monitor(&self) {
-        self.mixer.lock().reset_local_stream();
+        self.mixer.reset_local_stream();
     }
 
     /// 0.5.4-18 — coupe (`false`) ou rétablit (`true`) l'alimentation de l'encodeur
@@ -2540,7 +2540,7 @@ impl PipelineState {
         // P1 — repart propre : vide les jitter buffers du périmé accumulé pendant
         // le gel de sortie (le décodage a continué de pousser jusqu'à 300 ms) et
         // re-prime à la cible de démarrage. Évite de rejouer le retard accumulé.
-        self.mixer.lock().reset_streams_for_recovery();
+        self.mixer.reset_streams_for_recovery();
         Ok(())
     }
 
@@ -2958,7 +2958,7 @@ fn encoder_thread(
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
     channel_sel: ChannelSel,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
@@ -3304,7 +3304,7 @@ fn process_stage_loop(
     in_rx: Receiver<TimedBlock>,
     out_tx: Sender<TimedBlock>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     input_rms: Arc<std::sync::atomic::AtomicU32>,
     perfstats: PerfHandles,
@@ -3634,7 +3634,7 @@ fn process_stage_loop(
                         let rms = (sum_sq / stereo.len() as f32).sqrt();
                         input_rms
                             .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                        mixer.lock().push_self_samples(&stereo);
+                        mixer.push_self_samples(&stereo);
                     } else {
                         input_rms.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -4042,7 +4042,7 @@ struct DecodeThread {
 /// (cohérent avec le spawn de l'encoder thread) : une erreur OS de création de
 /// thread est propagée au lieu de paniquer.
 fn spawn_decode_thread(
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
 ) -> std::io::Result<DecodeThread> {
@@ -4063,7 +4063,7 @@ fn spawn_decode_thread(
 fn decode_rt_loop(
     rx: Receiver<DecodeMsg>,
     pool_tx: Sender<Vec<u8>>,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
 ) {
@@ -4082,7 +4082,7 @@ fn decode_rt_loop(
                 // supprimer le stream re-créé par la nouvelle génération.
                 if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
                     states.remove(&producer_id);
-                    mixer.lock().remove_stream(&producer_id);
+                    mixer.remove_stream(&producer_id);
                     // Sans ça, un peer disparu laisserait un ppm fantôme dans la
                     // map → PerfStats continuerait à mentionner ce peer mort.
                     net_stats_by_producer.lock().remove(&*producer_id);
@@ -4101,7 +4101,7 @@ fn decode_rt_loop(
                     // Génération plus RÉCENTE que l'état présent → l'ancienne est
                     // supersédée : on retire son stream avant d'en recréer un.
                     Some(_) => {
-                        mixer.lock().remove_stream(&producer_id);
+                        mixer.remove_stream(&producer_id);
                         true
                     }
                     None => true,
@@ -4109,7 +4109,7 @@ fn decode_rt_loop(
                 if needs_create {
                     match DecodeState::new(&producer_id, epoch) {
                         Some(st) => {
-                            mixer.lock().add_stream(&producer_id, kind);
+                            mixer.add_stream(&producer_id, kind);
                             states.insert(producer_id.clone(), st);
                         }
                         None => {
@@ -4129,9 +4129,8 @@ fn decode_rt_loop(
     // Shutdown : nettoie les streams mixer + net_stats restants (Remove non
     // encore traités). Sépare les locks (jamais les deux en même temps).
     {
-        let mut m = mixer.lock();
         for id in states.keys() {
-            m.remove_stream(id);
+            mixer.remove_stream(id);
         }
     }
     {
@@ -4151,7 +4150,7 @@ fn decode_one_packet(
     producer_id: &str,
     recv_instant: std::time::Instant,
     buf: &[u8],
-    mixer: &Arc<Mutex<AudioMixer>>,
+    mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: &Arc<Mutex<Histogram>>,
 ) {
@@ -4191,7 +4190,7 @@ fn decode_one_packet(
     // une fois l'estimateur fiable (warmup).
     if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
         let jitter_tail_ms = st.jitter.jitter_tail_ms();
-        mixer.lock().observe_jitter(producer_id, jitter_tail_ms);
+        mixer.observe_jitter(producer_id, jitter_tail_ms);
     }
     // Détection de perte → PLC
     if let Some(prev) = st.last_seq {
@@ -4204,7 +4203,7 @@ fn decode_one_packet(
                     // d'un buffer interne écrasé au decode suivant (Sprint 3 BUG 7).
                     let plc_owned: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
                     if let Some(plc) = plc_owned {
-                        mixer.lock().push_samples(producer_id, &plc);
+                        mixer.push_samples(producer_id, &plc);
                     }
                 }
             } else if !st.logged_large_jump {
@@ -4220,7 +4219,7 @@ fn decode_one_packet(
     if let Some(pcm) = st.decoder.decode(payload) {
         let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
         recv_path.lock().observe(recv_path_ms);
-        mixer.lock().push_samples(producer_id, pcm);
+        mixer.push_samples(producer_id, pcm);
     }
 }
 

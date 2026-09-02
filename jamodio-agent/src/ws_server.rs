@@ -630,7 +630,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
             let (rms_data, master_mix, master_mix_peak, peer_voice_rms) = {
-                let m = pl.mixer.lock();
+                let m = &pl.mixer;
                 (m.stream_levels(), m.master_mix_rms(), m.master_mix_peak(), m.inbound_voice_rms())
             };
             // input_rms (instrument self post-plugin) alimente le VU d'entrée
@@ -851,7 +851,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // Snapshot mixer stats (underruns + drift_drops cumul + target_ms)
             // + Chantier C : stats du self-monitor (latence courante + underruns).
             let (mixer_stats, monitor_buffer_ms, monitor_underruns) = {
-                let m = pl.mixer.lock();
+                let m = &pl.mixer;
                 let stats = m.stream_perf_stats();
                 let (mt, mu) = m.self_monitor_stats();
                 (stats, mt, mu)
@@ -902,7 +902,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // au passage. Retour : (producer_id, events_window, drains_total).
             let unstable_peers: Vec<(String, usize, u64)> = pl
                 .mixer
-                .lock()
                 .stream_unstable_events(
                     PEER_UNSTABLE_WINDOW,
                     PEER_UNSTABLE_THRESHOLD,
@@ -2500,7 +2499,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_volume(&producer_id, volume);
+            pl.mixer.set_volume(&producer_id, volume);
             vec![]
         }
 
@@ -2508,7 +2507,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_target_ms_all(target_ms as usize);
+            pl.mixer.set_target_ms_all(target_ms as usize);
             tracing::info!(target: "jamodio::ws", target_ms, "SetBuffer");
             vec![]
         }
@@ -2520,7 +2519,7 @@ async fn handle_message(
             // Clamp défensif côté agent (le mixer clampe déjà dans
             // [0, 1.5] mais on filtre les NaN ici). 0 = silence (défaut).
             let v = if volume.is_finite() { volume.max(0.0) } else { 0.0 };
-            pl.mixer.lock().set_self_monitor_volume(v);
+            pl.mixer.set_self_monitor_volume(v);
             tracing::info!(target: "jamodio::ws", volume = v, "SetSelfMonitorVolume");
             vec![]
         }
@@ -2579,10 +2578,8 @@ async fn handle_message(
             // 6,5 ms : la télémétrie d'avant sous-estimait donc la latence.)
             let opus_ms: f32 = 2.5;
 
-            let mixer = pl.mixer.lock();
-            let underruns = mixer.total_underruns();
-            let jitter_target_ms = mixer.mean_target_ms();
-            drop(mixer);
+            let underruns = pl.mixer.total_underruns();
+            let jitter_target_ms = pl.mixer.mean_target_ms();
 
             // Total = input_buf + opus_enc + opus_dec + jitter + output_buf
             // (cf. doc `Stats::total_latency_ms`). Utilise les estimations
@@ -2638,7 +2635,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_master_gain(volume);
+            pl.mixer.set_master_gain(volume);
             vec![]
         }
 
@@ -2646,7 +2643,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_pan(&producer_id, pan);
+            pl.mixer.set_pan(&producer_id, pan);
             vec![]
         }
 
@@ -2655,7 +2652,7 @@ async fn handle_message(
                 return vec![];
             };
             // DIM = ducking des instruments pour laisser passer le talkback.
-            pl.mixer.lock().set_dim(factor);
+            pl.mixer.set_dim(factor);
             vec![]
         }
 
@@ -2665,7 +2662,7 @@ async fn handle_message(
             };
             // Point 4 — snapshot d'armement MIX REC : le mixer ne somme dans le
             // bus enregistré/VU que les sources armées (monitoring inchangé).
-            pl.mixer.lock().set_record_arm(self_armed, &armed_peers);
+            pl.mixer.set_record_arm(self_armed, &armed_peers);
             vec![]
         }
 
@@ -2674,14 +2671,14 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_peer_voice_gain(gain);
+            pl.mixer.set_peer_voice_gain(gain);
             vec![]
         }
         BrowserMessage::SetPeerVoicePan { pan } => {
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().set_peer_voice_pan(pan);
+            pl.mixer.set_peer_voice_pan(pan);
             vec![]
         }
 
@@ -2705,7 +2702,7 @@ async fn handle_message(
                     .map(|n| n as f32 / 48.0)
                     .unwrap_or(DEFAULT_BUF_MS_FALLBACK)
             };
-            let anchor = pl.mixer.lock().output_anchor();
+            let anchor = pl.mixer.output_anchor();
             drop(pl);
             // Stampé au plus près de la réception (même epoch que `anchor.mono_ms`).
             let agent_mono_ms = jamodio_audio_core::sync::clock::mono_now_ms();
@@ -2738,7 +2735,7 @@ async fn handle_message(
                 return vec![];
             };
             use jamodio_audio_core::mixer::reference::{Figure, MetroSound};
-            pl.mixer.lock().set_reference_config(
+            pl.mixer.set_reference_config(
                 enabled,
                 volume,
                 pan,
@@ -2766,7 +2763,6 @@ async fn handle_message(
                 return vec![];
             };
             pl.mixer
-                .lock()
                 .set_reference_grid(anchor_beat_frame, anchor_beat_index);
             vec![]
         }
@@ -2775,7 +2771,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().reference_stop();
+            pl.mixer.reference_stop();
             tracing::debug!(target: "jamodio::ws", "ReferenceStop");
             vec![]
         }
@@ -2785,7 +2781,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_begin(total_frames as usize);
+            pl.mixer.backing_begin(total_frames as usize);
             tracing::debug!(target: "jamodio::ws", total_frames, "ReferenceBackingBegin");
             vec![]
         }
@@ -2803,7 +2799,7 @@ async fn handle_message(
                         let s = i16::from_le_bytes([pair[0], pair[1]]);
                         samples.push(s as f32 / 32768.0);
                     }
-                    pl.mixer.lock().backing_push(&samples);
+                    pl.mixer.backing_push(&samples);
                 }
                 Err(e) => {
                     tracing::warn!(target: "jamodio::ws", error = %e, "ReferenceBackingChunk base64 invalide");
@@ -2816,7 +2812,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_end();
+            pl.mixer.backing_end();
             tracing::debug!(target: "jamodio::ws", "ReferenceBackingEnd");
             vec![]
         }
@@ -2825,7 +2821,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_unload();
+            pl.mixer.backing_unload();
             vec![]
         }
 
@@ -2833,7 +2829,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_play(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.backing_play(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -2841,7 +2837,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_pause();
+            pl.mixer.backing_pause();
             vec![]
         }
 
@@ -2849,7 +2845,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_seek(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.backing_seek(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -2857,7 +2853,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().backing_sync(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.backing_sync(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -2866,7 +2862,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_begin(total_frames as usize);
+            pl.mixer.preview_begin(total_frames as usize);
             tracing::debug!(target: "jamodio::ws", total_frames, "ReferencePreviewBegin");
             vec![]
         }
@@ -2884,7 +2880,7 @@ async fn handle_message(
                         let s = i16::from_le_bytes([pair[0], pair[1]]);
                         samples.push(s as f32 / 32768.0);
                     }
-                    pl.mixer.lock().preview_push(&samples);
+                    pl.mixer.preview_push(&samples);
                 }
                 Err(e) => {
                     tracing::warn!(target: "jamodio::ws", error = %e, "ReferencePreviewChunk base64 invalide");
@@ -2897,7 +2893,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_end();
+            pl.mixer.preview_end();
             tracing::debug!(target: "jamodio::ws", "ReferencePreviewEnd");
             vec![]
         }
@@ -2906,7 +2902,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_unload();
+            pl.mixer.preview_unload();
             vec![]
         }
 
@@ -2914,7 +2910,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_play(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.preview_play(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -2922,7 +2918,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_pause();
+            pl.mixer.preview_pause();
             vec![]
         }
 
@@ -2930,7 +2926,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_seek(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.preview_seek(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -2938,7 +2934,7 @@ async fn handle_message(
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
-            pl.mixer.lock().preview_sync(anchor_backing_frame, anchor_output_frame);
+            pl.mixer.preview_sync(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 

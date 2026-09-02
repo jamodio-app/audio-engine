@@ -2,7 +2,6 @@ use super::output_pair::clamp_output_pair;
 use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig, BufferSize};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -75,7 +74,7 @@ fn scatter_pair<T: Copy>(data: &mut [T], scratch: &[f32], n_out: usize, ps: usiz
 /// cours de route = cold-start muet). Cf. `capture::build_capture_stream`.
 pub fn build_playback_stream(
     device: &Device,
-    mixer: Arc<Mutex<AudioMixer>>,
+    mixer: Arc<AudioMixer>,
     // 0.5.3-4 — liveness : +1 par callback de sortie (cf. watchdog cold-start).
     output_callbacks: Arc<std::sync::atomic::AtomicU64>,
     // 0.5.4-4 — taille réelle du callback de sortie (frames/canal), publiée à
@@ -172,13 +171,13 @@ pub fn build_playback_stream(
                     output_frames.store(frames as u32, Ordering::Relaxed);
                     // Device stéréo : écriture directe zéro-copie (fast-path historique).
                     if n_out == 2 {
-                        mixer.lock().mix_into(data);
+                        mixer.mix_into(data);
                         return;
                     }
                     // Device multicanal : scratch stéréo → paire choisie.
                     scratch.clear();
                     scratch.resize(frames * 2, 0.0);
-                    mixer.lock().mix_into(&mut scratch);
+                    mixer.mix_into(&mut scratch);
                     let ps = clamp_output_pair(output_pair_start.load(Ordering::Relaxed), n_out);
                     scatter_pair(data, &scratch, n_out, ps, |v| v);
                 },
@@ -199,7 +198,7 @@ pub fn build_playback_stream(
                     output_frames.store(frames as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(frames * 2, 0.0);
-                    mixer.lock().mix_into(&mut scratch);
+                    mixer.mix_into(&mut scratch);
                     let ps = clamp_output_pair(output_pair_start.load(Ordering::Relaxed), n_out);
                     scatter_pair(data, &scratch, n_out, ps, |v| (v.clamp(-1.0, 1.0) * 2_147_483_647.0) as i32); // 2^31 - 1
                 },
@@ -220,7 +219,7 @@ pub fn build_playback_stream(
                     output_frames.store(frames as u32, Ordering::Relaxed);
                     scratch.clear();
                     scratch.resize(frames * 2, 0.0);
-                    mixer.lock().mix_into(&mut scratch);
+                    mixer.mix_into(&mut scratch);
                     let ps = clamp_output_pair(output_pair_start.load(Ordering::Relaxed), n_out);
                     scatter_pair(data, &scratch, n_out, ps, |v| (v.clamp(-1.0, 1.0) * 32_767.0) as i16); // 2^15 - 1
                 },

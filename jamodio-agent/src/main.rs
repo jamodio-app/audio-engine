@@ -13,7 +13,6 @@ mod tray_promote;
 mod ws_server;
 
 use jamodio_audio_core::mixer::mixer::AudioMixer;
-use parking_lot::Mutex;
 use pipeline::PipelineState;
 use std::sync::Arc;
 use tauri::{
@@ -532,7 +531,7 @@ fn main() {
             }
 
             // ─── Spawn WS server (audio pipeline) ───────────
-            let mixer = Arc::new(Mutex::new(AudioMixer::new()));
+            let mixer = Arc::new(AudioMixer::new());
             let mut pipeline = PipelineState::new(mixer);
             // Sprint INSERT (S1.3) — lance le scan AU en background dès le
             // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
