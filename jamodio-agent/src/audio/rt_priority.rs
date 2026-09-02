@@ -15,9 +15,11 @@
 //!   le binding `jamodio_au_host::workgroup`. Si indisponible (macOS < 11,
 //!   device sans workgroup, etc.), fallback `pthread_set_qos_class_self_np`
 //!   en `USER_INTERACTIVE` + `thread_policy_set(THREAD_TIME_CONSTRAINT_POLICY)`
-//!   avec un budget aligné sur la frame Opus (2.5 ms à 48k).
-//! - **Windows** : `AvSetMmThreadCharacteristicsW("Pro Audio")` (MMCSS) —
-//!   l'API officielle DAW. Pas de fallback nécessaire (dispo Vista+).
+//!   avec un budget aligné sur la frame Opus (2.5 ms à 48k). Le thread de DÉCODAGE
+//!   reçoit un time-constraint LÉGER (durci 2026-09) au lieu de QoS seul.
+//! - **Windows** : `AvSetMmThreadCharacteristicsW("Pro Audio")` (MMCSS) +
+//!   `AvSetMmThreadPriority(CRITICAL)` (durci 2026-09 — sommet de la plage MMCSS,
+//!   immunise contre la préemption UI/vidéo). L'API officielle DAW, dispo Vista+.
 //! - **Linux/autres** : conserve `thread_priority::Crossplatform(95)` —
 //!   utilisable sur Linux avec `CAP_SYS_NICE`, no-op sinon. Ce n'est pas
 //!   une cible production mais le code reste fonctionnel pour les CI tests.
@@ -263,16 +265,18 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
 /// partagé, alimenté par l'arrivée réseau). Variante « event-driven » de
 /// [`promote_thread_for_audio`] :
 ///
-/// - **macOS** : `QOS_CLASS_USER_INTERACTIVE` **seul** — surtout PAS le workgroup
-///   CoreAudio ni le `THREAD_TIME_CONSTRAINT_POLICY`. Ce thread n'est PAS en
-///   lock-step avec le cycle I/O du device (il décode quand des paquets UDP
-///   arrivent) ; le faire rejoindre le workgroup de sortie le **sur-peuplerait**
-///   et risquerait de dégrader les threads d'émission qui, eux, ont une vraie
-///   deadline I/O. QoS seul = élévation douce au-dessus du normal, sans fausse
-///   promesse de deadline. (Le Mac fonctionne déjà en priorité normale sur ce
-///   chemin → cette promotion ne peut pas régresser, au pire elle aide.)
-/// - **Windows** : MMCSS « Pro Audio » (identique à l'émission). Un seul thread
-///   de décodage → aucun souci de budget MMCSS.
+/// - **macOS** : `THREAD_TIME_CONSTRAINT_POLICY` **léger** (computation 0,3 ms,
+///   cf. `macos_fallback::apply_recv`), avec fallback QoS-seul. **Durcissement
+///   2026-09** : l'ancien « QoS USER_INTERACTIVE seul » était insuffisant — sous
+///   charge navigateur/vidéo, le thread se faisait préempter (pics `recv_path`
+///   5–10 ms → underruns/craquements, mesurés). Le time-constraint l'élève dans la
+///   bande temps-réel (au-dessus des threads UI/vidéo) → immunisé. On NE rejoint
+///   PAS le workgroup CoreAudio de SORTIE (sur-population + pas de deadline I/O sur
+///   ce chemin event-driven) ; le time-constraint dédié (computation faible,
+///   preemptible) donne la priorité sans sur-réserver ni fausse deadline device.
+/// - **Windows** : MMCSS « Pro Audio » + `AvSetMmThreadPriority(CRITICAL)` (durci
+///   2026-09, identique à l'émission). Un seul thread de décodage → pas de souci
+///   de budget MMCSS.
 /// - **Linux/autres** : `thread_priority` best-effort.
 ///
 /// Même garde anti-double-promotion par thread, même contrat de Drop (sur le
@@ -295,15 +299,21 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
 
     #[cfg(target_os = "macos")]
     {
-        match macos_qos::apply() {
+        // Durcissement priorité audio (2026-09) — le décodage passe de « QoS SEUL »
+        // à un `THREAD_TIME_CONSTRAINT_POLICY` léger (cf. `macos_fallback::apply_recv`).
+        // Racine mesurée : en QoS seul, le thread se faisait préempter sous charge
+        // navigateur/vidéo (pics `recv_path` 5–10 ms → underruns). Le time-constraint
+        // l'élève dans la bande temps-réel → immunisé. Fallback QoS-seul si le
+        // time-constraint échoue (mieux que rien).
+        match macos_fallback::apply_recv() {
             Ok(()) => {
                 tracing::info!(
                     target: "jamodio::rt_priority",
-                    method = "macos-qos",
-                    "decode thread promoted via QoS USER_INTERACTIVE (event-driven, no workgroup)"
+                    method = "macos-time-constraint",
+                    "decode thread promoted via QoS + THREAD_TIME_CONSTRAINT_POLICY (light)"
                 );
                 RtPriorityHandle {
-                    method: PromotionMethod::MacOsQos,
+                    method: PromotionMethod::MacOsTimeConstraint,
                     workgroup: None,
                     _not_sync: std::marker::PhantomData,
                 }
@@ -312,9 +322,23 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
                 tracing::warn!(
                     target: "jamodio::rt_priority",
                     error = %e,
-                    "macos QoS promotion failed — decode thread at normal priority"
+                    "macos time-constraint (recv) failed — fallback QoS USER_INTERACTIVE seul"
                 );
-                make_none_handle()
+                match macos_qos::apply() {
+                    Ok(()) => RtPriorityHandle {
+                        method: PromotionMethod::MacOsQos,
+                        workgroup: None,
+                        _not_sync: std::marker::PhantomData,
+                    },
+                    Err(e2) => {
+                        tracing::warn!(
+                            target: "jamodio::rt_priority",
+                            error = %e2,
+                            "macos QoS fallback failed too — decode thread at normal priority"
+                        );
+                        make_none_handle()
+                    }
+                }
             }
         }
     }
@@ -471,7 +495,30 @@ mod macos_fallback {
     /// pour le travail user-facing (cf. `<sys/qos.h>`).
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
+    /// Capture / process / encode : threads en quasi lock-step avec le device
+    /// (cadence buffer / frame Opus 2,5 ms). Réserve ~50 % du budget.
     pub fn apply() -> io::Result<()> {
+        apply_time_constraint(1_200_000.0, 2_000_000.0) // computation 1,2 ms · constraint 2,0 ms
+    }
+
+    /// Décodage de réception (durcissement priorité audio, 2026-09). Le but ici
+    /// n'est PAS de réserver du CPU (le décode Opus est ~30–100 µs) mais de faire
+    /// PASSER le thread dans la **bande temps-réel** du scheduler — au-dessus des
+    /// threads USER_INTERACTIVE/UI du navigateur — pour qu'un rendu vidéo lourd ou
+    /// une tâche tierce ne puisse plus le préempter (racine mesurée des pics
+    /// `recv_path` 5–10 ms → underruns). Computation VOLONTAIREMENT faible (0,3 ms)
+    /// pour ne pas sur-réserver ni affamer les autres threads ; constraint relâchée
+    /// (2,5 ms = une période entière) car le décode n'a pas de deadline I/O dure et
+    /// peut décoder une petite rafale de paquets en file sans être throttlé.
+    pub fn apply_recv() -> io::Result<()> {
+        apply_time_constraint(300_000.0, 2_500_000.0) // computation 0,3 ms · constraint 2,5 ms
+    }
+
+    /// Applique QoS USER_INTERACTIVE + `THREAD_TIME_CONSTRAINT_POLICY` au thread
+    /// courant, avec `computation`/`constraint` (ns) paramétrés selon le profil.
+    /// `period` = 2,5 ms (frame Opus) pour tous. `preemptible = 1` (on accepte la
+    /// préemption si on dépasse → jamais de deadlock système sur un bug).
+    fn apply_time_constraint(computation_ns: f64, constraint_ns: f64) -> io::Result<()> {
         // 1. QoS class — Darwin scheduler hint.
         // SAFETY : appel libc, pas de pointeur invalide possible.
         let qos_status = unsafe {
@@ -491,9 +538,9 @@ mod macos_fallback {
         // Conversion ns → mach absolute time ticks via mach_timebase_info.
         let nanos_to_ticks = mach_ticks_per_nanosecond();
         let policy = ThreadTimeConstraintPolicy {
-            period:      (2_500_000.0 * nanos_to_ticks) as u32, // 2.5 ms
-            computation: (1_200_000.0 * nanos_to_ticks) as u32, // 1.2 ms
-            constraint:  (2_000_000.0 * nanos_to_ticks) as u32, // 2.0 ms
+            period:      (2_500_000.0 * nanos_to_ticks) as u32, // 2.5 ms (frame Opus)
+            computation: (computation_ns * nanos_to_ticks) as u32,
+            constraint:  (constraint_ns * nanos_to_ticks) as u32,
             preemptible: 1, // true — éviter deadlock système en cas de bug
         };
 
@@ -532,15 +579,14 @@ mod macos_fallback {
     }
 }
 
-// ─── macOS : QoS USER_INTERACTIVE seul (threads RT event-driven) ───
+// ─── macOS : QoS USER_INTERACTIVE seul (FALLBACK du décodage) ───
 //
-// Pour le thread de décodage de réception : on l'élève au-dessus de SCHED_OTHER
-// (que Darwin ignore de toute façon) via la QoS la plus haute, SANS lui imposer
-// un `THREAD_TIME_CONSTRAINT_POLICY` (réservé aux threads en lock-step avec le
-// device, cf. `macos_fallback`) et SANS le faire rejoindre le workgroup CoreAudio
-// de sortie (qui modèle une deadline I/O qu'un thread piloté par l'arrivée UDP
-// n'a pas — et le sur-peupler nuirait aux threads d'émission). QoS seul = le bon
-// niveau pour ce profil event-driven.
+// Historiquement le chemin unique du thread de décodage. Depuis le durcissement
+// priorité audio (2026-09), ce n'est plus que le **fallback** si le time-constraint
+// léger (`macos_fallback::apply_recv`) échoue : QoS seul élève au-dessus de
+// SCHED_OTHER sans deadline temps-réel — mieux que rien, mais insuffisant sous forte
+// charge (préemption mesurée). On ne rejoint jamais le workgroup CoreAudio de sortie
+// (sur-population + fausse deadline I/O sur ce chemin event-driven).
 
 #[cfg(target_os = "macos")]
 mod macos_qos {
@@ -572,7 +618,9 @@ mod macos_qos {
 mod windows_mmcss {
     use std::io;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+    use windows_sys::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, AVRT_PRIORITY_CRITICAL,
+    };
 
     /// UTF-16 NUL-terminated literal pour "Pro Audio" (sans dépendre du macro
     /// `w!` qui n'est pas exposé par windows-sys).
@@ -593,6 +641,22 @@ mod windows_mmcss {
         // (= 0) en cas d'échec et set GetLastError.
         if h == 0 as HANDLE {
             return Err(io::Error::last_os_error());
+        }
+        // Durcissement priorité audio (2026-09) — sans ceci, le thread reste au
+        // niveau AVRT_PRIORITY_NORMAL de la tâche « Pro Audio ». On le monte au
+        // SOMMET de la plage MMCSS (CRITICAL) pour l'immuniser contre la préemption
+        // par les threads UI/vidéo du navigateur (racine mesurée des pics
+        // `recv_path`). Non-fatal : si l'appel échoue, le thread reste en Pro Audio
+        // NORMAL (déjà mieux que rien) — on garde le handle.
+        // SAFETY : `h` est un handle MMCSS valide (non-NULL vérifié ci-dessus) ;
+        // AVRT_PRIORITY_CRITICAL est une valeur d'enum documentée.
+        let prio_ok = unsafe { AvSetMmThreadPriority(h, AVRT_PRIORITY_CRITICAL) };
+        if prio_ok == 0 {
+            tracing::debug!(
+                target: "jamodio::rt_priority",
+                error = %io::Error::last_os_error(),
+                "AvSetMmThreadPriority(CRITICAL) échoué — thread en Pro Audio NORMAL"
+            );
         }
         Ok(h)
     }
@@ -625,15 +689,17 @@ mod tests {
     }
 
     /// `promote_thread_for_audio_recv` (variante event-driven du thread de
-    /// décodage) ne doit jamais paniquer et drop-safe. Sur macOS elle ne doit
-    /// PAS rejoindre le workgroup (→ `MacOsQos` ou `None`, jamais `MacOsWorkgroup`).
+    /// décodage) ne doit jamais paniquer et drop-safe. Depuis le durcissement
+    /// 2026-09, macOS vise `MacOsTimeConstraint` (léger), avec fallback `MacOsQos`.
+    /// Elle ne rejoint JAMAIS le workgroup (→ jamais `MacOsWorkgroup`).
     #[test]
     fn promote_recv_then_drop_is_safe() {
         let h = promote_thread_for_audio_recv();
         let m = h.method();
         assert!(matches!(
             m,
-            PromotionMethod::MacOsQos
+            PromotionMethod::MacOsTimeConstraint
+                | PromotionMethod::MacOsQos
                 | PromotionMethod::WindowsMmcss
                 | PromotionMethod::Generic
                 | PromotionMethod::None

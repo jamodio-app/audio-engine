@@ -73,6 +73,28 @@ concealments au chant). Aussi : l'affichage « Ton monitoring » côté studio e
 pour être conforme (vrai monitoring local = buffers in+monitor+out, sans Opus ni jitter
 réseau) — paire web.
 
+### Changed — Durcissement de la PRIORITÉ des threads audio (Mac + Windows)
+
+Le thread de **décodage de réception** était moins prioritaire que capture/process/encode
+et se faisait **préempter sous forte charge machine** (rendu vidéo navigateur, WindowServer,
+apps de fond) → pics `recv_path` 5–10 ms → underruns → craquements sur l'audio reçu des
+peers. Racine mesurée (sessions debug 09/2026), **indépendante du réseau** (gigue réelle
+~0,8 ms). Standard PRO : l'audio ne doit JAMAIS être dégradé par une charge tierce.
+
+Durcissement des DEUX plateformes, à égale rigueur (cf.
+`internal-docs/plans/PLAN-AUDIO-PRIORITY-HARDENING-2026-09.md`) :
+- **macOS** : le décodage passe de « QoS `USER_INTERACTIVE` seul » à un
+  `THREAD_TIME_CONSTRAINT_POLICY` **léger** (computation 0,3 ms, période 2,5 ms) — le fait
+  passer dans la **bande temps-réel** du scheduler (au-dessus des threads UI/vidéo) sans
+  sur-réserver de CPU. Fallback QoS-seul si le time-constraint échoue. On NE rejoint PAS le
+  workgroup CoreAudio de sortie (sur-population + régression historique évitées).
+- **Windows** : ajout de `AvSetMmThreadPriority(AVRT_PRIORITY_CRITICAL)` sur TOUS les threads
+  audio RT (capture/process/encode **et décodage**) — les faisait monter du niveau NORMAL au
+  **sommet** de la tâche MMCSS « Pro Audio ».
+
+Effet visé : `recv_path` borné et underruns d'origine CPU → ~0, même sous charge lourde, sur
+les deux plateformes. Aucune latence ajoutée (priorité, pas buffer).
+
 ## [0.5.11] — 2026-08-07
 
 Release majeure consolidant tout le cycle 0.5.11 : robustesse audio (48 kHz natif
