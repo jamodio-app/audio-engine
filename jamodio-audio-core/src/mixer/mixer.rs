@@ -84,7 +84,7 @@ fn stereo_rms(buf: &[f32]) -> (f32, f32) {
         return (0.0, 0.0);
     }
     let (mut sq_l, mut sq_r) = (0.0f32, 0.0f32);
-    for pair in buf.chunks_exact(2) {
+    for pair in buf.as_chunks::<2>().0 {
         sq_l += pair[0] * pair[0];
         sq_r += pair[1] * pair[1];
     }
@@ -96,7 +96,7 @@ fn stereo_rms(buf: &[f32]) -> (f32, f32) {
 /// master) — capte les transitoires que le RMS lisse.
 fn stereo_peak(buf: &[f32]) -> (f32, f32) {
     let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
-    for pair in buf.chunks_exact(2) {
+    for pair in buf.as_chunks::<2>().0 {
         pk_l = pk_l.max(pair[0].abs());
         pk_r = pk_r.max(pair[1].abs());
     }
@@ -726,7 +726,7 @@ impl AudioMixer {
                 let mut sq_l = 0.0f32;
                 let mut sq_r = 0.0f32;
                 let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
-                for pair in samples.chunks_exact(2) {
+                for pair in samples.as_chunks::<2>().0 {
                     sq_l += pair[0] * pair[0];
                     sq_r += pair[1] * pair[1];
                     pk_l = pk_l.max(pair[0].abs());
