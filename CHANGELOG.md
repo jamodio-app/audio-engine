@@ -5,7 +5,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.5.12] — non publiée
+## [0.5.12] — 2026-09-02
 
 ### Fixed — Jitter buffer de réception : RÉCUPÉRATION (le buffer redescend enfin)
 
@@ -33,7 +33,7 @@ local (`local_mode`) garde son adaptation bornée historique — intouché.** Co
 par 5 tests unitaires (récupération au calme, tenue post-underrun, borne par pull,
 plafond de pression, non-régression du chemin local).
 
-**Calibration P1 (mesure réelle 0.5.12-1)** : la première pré-release récupérait
+**Calibration P1 (mesure réelle)** : la première pré-release récupérait
 correctement (buffer redescendu de ~17 à ~10 ms de médiane) mais **trop vite sur
 WiFi** — il retombait au plancher puis se faisait cueillir par un pic WiFi → hausse
 des underruns. Récupération rendue plus CONSERVATRICE : fuite de pression ralentie
@@ -77,7 +77,7 @@ réseau) — paire web.
 
 Dernier lever pour ZÉRO glitch. Sur lien PROPRE (Ethernet), le plancher tail-aware
 tombe à MIN (5 ms) et underrunne ~2/min sur des micro-à-coups LOCAUX (recv_path 2 ms,
-ordonnancement) que le plancher basé sur la gigue RÉSEAU ne voit pas (mesuré 0.5.12-5).
+ordonnancement) que le plancher basé sur la gigue RÉSEAU ne voit pas (mesuré sur lien Ethernet propre).
 
 Ajout d'un `glitch_floor` PERSISTANT (streams réseau) piloté par les underruns réels :
 grow-fast (+1 ms/underrun, borné 20 ms), shrink-slow (décroissance très lente, ~5 ms
