@@ -86,6 +86,16 @@ pub struct JitterBuffer {
     /// C1 — accumulateur fractionnaire de réduction du filet (samples), pour une
     /// descente lisse à `REACTIVE_RECOVER_SAMPLES_PER_PULL` par pull.
     shrink_accum: f32,
+    /// P0 (2026-09) — plancher PERSISTANT piloté par le TAUX DE GLITCH (réseau).
+    /// Monte à chaque underrun (petit pas), redescend TRÈS lentement au calme
+    /// (grow-fast/shrink-slow). Capte les micro-à-coups LOCAUX que le plancher
+    /// tail-aware (gigue réseau) ne voit pas → convergence vers le plancher
+    /// minimal SANS glitch. `0` = inerte (comportement identique à avant).
+    /// Inactif en `local_mode` (self-monitor a son propre chemin borné).
+    glitch_floor_samples: usize,
+    /// P0 — compteur de pulls calmes consécutifs, pour la décroissance très lente
+    /// de `glitch_floor_samples`.
+    glitch_calm_pulls: u32,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -199,6 +209,22 @@ const UNDERRUN_PRESSURE_MAX: f32 = 4.0;
 /// graduelle, jamais de saut sec. CONSTANTE DE CALIBRATION.
 const REACTIVE_RECOVER_SAMPLES_PER_PULL: f32 = 0.5;
 
+// ── P0 (2026-09) — plancher piloté par le TAUX DE GLITCH (réseau) ───────────
+// Le plancher tail-aware ne couvre que la gigue RÉSEAU. Sur lien propre, il
+// tombe à MIN (5 ms) et underrunne sur des micro-à-coups LOCAUX (recv_path 2 ms,
+// ordonnancement) — mesuré ~2/min sur Ethernet en 0.5.12-5. Le glitch_floor
+// ajoute un headroom PERSISTANT piloté par les underruns réels : grow-fast à
+// chaque glitch, shrink-slow au calme → converge vers le plancher minimal qui
+// tient ZÉRO glitch. Additif (glitch-free ⇒ inerte).
+/// Pas de croissance par underrun.
+const GLITCH_FLOOR_STEP_MS: usize = 1;
+/// Plafond (bien sous MAX 40 ms : headroom suffisant sans exploser la latence).
+const GLITCH_FLOOR_MAX_MS: usize = 20;
+/// Pulls calmes consécutifs avant de décrémenter le plancher d'UN sample. Très
+/// lent : à ~750 pull/s, 500 ⇒ ~5 ms récupérés en ~5 min de calme TOTAL (un
+/// underrun remet le compteur à zéro). CONSTANTE DE CALIBRATION.
+const GLITCH_FLOOR_DECAY_CALM_PULLS: u32 = 500;
+
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
     (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
@@ -241,6 +267,8 @@ impl JitterBuffer {
             rs_scratch: Vec::with_capacity(2048),
             underrun_pressure: 0.0,
             shrink_accum: 0.0,
+            glitch_floor_samples: 0,
+            glitch_calm_pulls: 0,
         }
     }
 
@@ -266,6 +294,8 @@ impl JitterBuffer {
         self.reactive_extra_samples = 0;
         self.underrun_pressure = 0.0;
         self.shrink_accum = 0.0;
+        self.glitch_floor_samples = 0;
+        self.glitch_calm_pulls = 0;
         self.floor_samples = initial;
         self.target_samples = initial;
         self.last_adapt = std::time::Instant::now();
@@ -565,7 +595,10 @@ impl JitterBuffer {
         let min_ms = if self.local_mode { LOCAL_MIN_TARGET_MS } else { MIN_TARGET_MS };
         let min_s = min_ms * SAMPLE_RATE * CHANNELS / 1000;
         let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
-        self.target_samples = (self.floor_samples + self.reactive_extra_samples).clamp(min_s, cap_s);
+        // P0 — `glitch_floor_samples` = headroom persistant piloté par le glitch
+        // (0 en local_mode / glitch-free → identique à avant).
+        self.target_samples = (self.floor_samples + self.glitch_floor_samples + self.reactive_extra_samples)
+            .clamp(min_s, cap_s);
     }
 
     pub fn underruns(&self) -> u64 {
@@ -596,9 +629,20 @@ impl JitterBuffer {
         // gardent MAX_TARGET_MS (40 ms).
         let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
         let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
-        // Borne le filet pour que `floor + extra` ne dépasse jamais le cap :
-        // sinon une accumulation sans effet rendrait la redescente lente.
-        let max_extra = cap_s.saturating_sub(self.floor_samples);
+        // P0 — chaque underrun remonte le plancher PERSISTANT (réseau uniquement),
+        // borné, et casse le calme. Capte les micro-à-coups locaux invisibles au
+        // plancher tail-aware. Le self-monitor local n'est pas concerné.
+        if !self.local_mode {
+            let min_s = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+            let gf_cap = (GLITCH_FLOOR_MAX_MS * SAMPLE_RATE * CHANNELS / 1000)
+                .min(cap_s.saturating_sub(min_s));
+            let step = GLITCH_FLOOR_STEP_MS * SAMPLE_RATE * CHANNELS / 1000;
+            self.glitch_floor_samples = (self.glitch_floor_samples + step).min(gf_cap);
+            self.glitch_calm_pulls = 0;
+        }
+        // Borne le filet pour que `floor + glitch_floor + extra` ne dépasse jamais
+        // le cap : sinon une accumulation sans effet rendrait la redescente lente.
+        let max_extra = cap_s.saturating_sub(self.floor_samples + self.glitch_floor_samples);
         self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
@@ -635,6 +679,17 @@ impl JitterBuffer {
         // Encore des underruns récents → on tient le filet (protection).
         if self.underrun_pressure >= UNDERRUN_PRESSURE_CALM {
             return;
+        }
+        // P0 — calme installé : décroissance TRÈS lente du plancher de glitch
+        // (grow-fast/shrink-slow). Se fait MÊME si le filet réactif est déjà à 0
+        // (c'est justement là qu'on veut relâcher le headroom persistant).
+        if self.glitch_floor_samples > 0 {
+            self.glitch_calm_pulls = self.glitch_calm_pulls.saturating_add(1);
+            if self.glitch_calm_pulls >= GLITCH_FLOOR_DECAY_CALM_PULLS {
+                self.glitch_floor_samples = self.glitch_floor_samples.saturating_sub(1);
+                self.glitch_calm_pulls = 0;
+                self.recompute_target();
+            }
         }
         // Déjà au plancher : rien à drainer, on repart d'un accumulateur propre.
         if self.reactive_extra_samples == 0 {
@@ -974,6 +1029,48 @@ mod tests {
             (ratio - 1.0 / (1.0 + RESAMPLE_MAX_ADJ)).abs() < 0.001,
             "ratio sortie/entrée = {ratio}"
         );
+    }
+
+    // ─── P0 — plancher piloté par le taux de glitch ─────────────────────────
+
+    #[test]
+    fn glitch_floor_stays_zero_without_underrun() {
+        // Additif : sans underrun, le plancher de glitch reste 0 → cible = plancher
+        // tail (comportement STRICTEMENT identique à avant P0).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher tail = 5 ms
+        drive_full_pulls(&mut jb, 240, 3000); // calme, jamais d'underrun
+        assert_eq!(jb.glitch_floor_samples, 0, "aucun glitch → plancher inerte");
+        assert_eq!(jb.target_ms(), 5, "cible = plancher tail (comportement d'avant)");
+    }
+
+    #[test]
+    fn glitch_floor_grows_on_underruns_and_persists_after_reactive_recovery() {
+        // P0 : des underruns montent le plancher PERSISTANT ; après que le filet
+        // réactif (C1) soit drainé au calme, la cible reste AU-DESSUS du plancher
+        // tail — c'est ce qui tue les micro-à-coups locaux (contrairement au pur C1).
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher tail = 5 ms
+        for _ in 0..4 {
+            network_underrun_once(&mut jb);      // +1 ms glitch_floor + filet réactif
+            drive_full_pulls(&mut jb, 240, 2000); // calme : draine le réactif, PAS le glitch_floor
+        }
+        assert!(jb.glitch_floor_samples > 0, "plancher de glitch relevé");
+        assert!(jb.target_ms() > 5, "P0 : cible tenue au-dessus du plancher tail: {} ms", jb.target_ms());
+    }
+
+    #[test]
+    fn glitch_floor_inert_in_local_mode() {
+        // Le self-monitor local (local_mode) garde son chemin borné : le plancher
+        // de glitch reste inerte même sous underrun.
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(3);
+        let three = 3 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![0.1_f32; three]);
+        jb.pull(&mut vec![0.0_f32; three]);
+        jb.pull(&mut vec![0.0_f32; three * 4]); // underrun
+        assert_eq!(jb.glitch_floor_samples, 0, "local : glitch_floor inerte");
     }
 
     #[test]

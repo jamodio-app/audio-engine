@@ -73,6 +73,20 @@ concealments au chant). Aussi : l'affichage « Ton monitoring » côté studio e
 pour être conforme (vrai monitoring local = buffers in+monitor+out, sans Opus ni jitter
 réseau) — paire web.
 
+### Added — Plancher jitter buffer piloté par le TAUX DE GLITCH (P0)
+
+Dernier lever pour ZÉRO glitch. Sur lien PROPRE (Ethernet), le plancher tail-aware
+tombe à MIN (5 ms) et underrunne ~2/min sur des micro-à-coups LOCAUX (recv_path 2 ms,
+ordonnancement) que le plancher basé sur la gigue RÉSEAU ne voit pas (mesuré 0.5.12-5).
+
+Ajout d'un `glitch_floor` PERSISTANT (streams réseau) piloté par les underruns réels :
+grow-fast (+1 ms/underrun, borné 20 ms), shrink-slow (décroissance très lente, ~5 ms
+récupérés en ~5 min de calme TOTAL) → converge vers le plancher MINIMAL qui tient zéro
+glitch, propre à chaque lien. Additif + backstop : glitch-free ⇒ inerte (identique à
+avant). Self-monitor local intouché. Complète C1/P1 (récupération « buffer trop haut ») ;
+P0 = le symétrique « buffer trop bas ». Cf. `internal-docs/plans/PLAN-P0-GLITCH-FLOOR-2026-09.md`.
+3 tests unitaires ; 106 tests audio-core + clippy verts.
+
 ### Changed — Mixer sans verrou global : verrouillage FIN par flux (C2.1)
 
 Après le durcissement priorité, un stall résiduel `recv_path` (~3–4 ms) subsistait : le callback
