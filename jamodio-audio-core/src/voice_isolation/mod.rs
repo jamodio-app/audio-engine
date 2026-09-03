@@ -26,7 +26,7 @@ pub mod isolator;
 pub mod resample;
 pub mod vad;
 
-pub use denoise::Denoiser;
+pub use denoise::{DenoiseParams, Denoiser};
 pub use gate::{GateParams, VoiceGate};
 pub use isolator::{IsolationConfig, VoiceIsolator, VoiceState};
 pub use vad::Vad;

@@ -14,6 +14,39 @@ use ndarray::{ArrayView2, ArrayViewMut2};
 
 use super::IsolationError;
 
+/// Réglages d'exécution de DeepFilterNet. Ce sont des SEUILS DE SNR LOCAL qui
+/// pilotent des commutations FRANCHES à l'intérieur du modèle, trame par trame
+/// (cf. `DfTract::apply_stages`) :
+///   - sous `min_snr_db` → le modèle applique un **masque de zéros** (trame muette) ;
+///   - au-dessus de `max_erb_snr_db` → signal jugé propre, **aucun traitement** ;
+///   - au-dessus de `max_df_snr_db` → 2ᵉ étage (deep filtering) **sauté**.
+///
+/// Ces valeurs sont donc AUDIBLES : trop serrées, le modèle bascule d'un régime à
+/// l'autre au fil des trames (voix hachée, effet « qui respire ») sur une captation
+/// où l'instrument repisse — exactement notre cas.
+///
+/// **Défauts = ceux du binaire officiel `deep-filter`** (`libDF/src/bin/enhance_wav.rs`),
+/// c'est-à-dire la configuration validée à l'oreille sur les vraies prises. ⚠️ Ils
+/// diffèrent des `RuntimeParams::default()` de la bibliothèque (−10 / 30 / 20), bien
+/// plus agressifs en commutation : ne PAS revenir à ces derniers.
+#[derive(Debug, Clone, Copy)]
+pub struct DenoiseParams {
+    /// SNR local sous lequel la trame est mise à zéro (« que du bruit »), en dB.
+    pub min_snr_db: f32,
+    /// SNR local au-dessus duquel le signal est jugé propre (aucun traitement), en dB.
+    pub max_erb_snr_db: f32,
+    /// SNR local au-dessus duquel l'étage DF est sauté, en dB.
+    pub max_df_snr_db: f32,
+    /// Limite d'atténuation du bruit, en dB (100 = réduction totale).
+    pub atten_lim_db: f32,
+}
+
+impl Default for DenoiseParams {
+    fn default() -> Self {
+        Self { min_snr_db: -15.0, max_erb_snr_db: 35.0, max_df_snr_db: 35.0, atten_lim_db: 100.0 }
+    }
+}
+
 pub struct Denoiser {
     model: DfTract,
     hop: usize,
@@ -31,10 +64,18 @@ pub struct Denoiser {
 }
 
 impl Denoiser {
-    /// Charge le modèle embarqué (feature `default-model`). **Erreur explicite** si
-    /// le chargement échoue (zéro fallback silencieux — l'appelant décide).
+    /// Charge le modèle embarqué (feature `default-model`) avec les réglages par
+    /// défaut ([`DenoiseParams`]). **Erreur explicite** si le chargement échoue
+    /// (zéro fallback silencieux — l'appelant décide).
     pub fn new() -> Result<Self, IsolationError> {
-        let rp = RuntimeParams::default();
+        Self::with_params(DenoiseParams::default())
+    }
+
+    /// Idem [`Denoiser::new`] avec des seuils explicites (banc de réglage hors-ligne).
+    pub fn with_params(p: DenoiseParams) -> Result<Self, IsolationError> {
+        let rp = RuntimeParams::default()
+            .with_atten_lim(p.atten_lim_db)
+            .with_thresholds(p.min_snr_db, p.max_erb_snr_db, p.max_df_snr_db);
         let dp = DfParams::default();
         let model = DfTract::new(dp, &rp).map_err(|e| IsolationError::Denoise(e.to_string()))?;
         let hop = model.hop_size;
@@ -58,6 +99,12 @@ impl Denoiser {
 
     pub fn sample_rate(&self) -> usize {
         self.sr
+    }
+
+    /// Latence algorithmique du modèle, en échantillons (retard STFT + look-ahead
+    /// interne). C'est le retard que le denoise ajoute au canal talkback.
+    pub fn latency_samples(&self) -> usize {
+        self.prime_target
     }
 
     /// Débruite `block` **en place**. La sortie est retardée de la latence du
@@ -136,5 +183,20 @@ mod tests {
         d.reset();
         assert!(!d.primed);
         assert!(d.in_ring.is_empty() && d.out_ring.is_empty());
+    }
+
+    #[test]
+    fn seuils_par_defaut_sont_ceux_du_binaire_valide() {
+        // RÉGRESSION (terrain 03/09 « ce n'est pas propre ») : on embarquait les
+        // `RuntimeParams::default()` de la bibliothèque (−10 / 30 / 20), bien plus
+        // agressifs en COMMUTATION D'ÉTAGES que ceux du binaire officiel
+        // `deep-filter` (−15 / 35 / 35) — seuls ces derniers ont été validés à
+        // l'oreille sur les prises réelles. Sur une prise voix+guitare, les seuils
+        // de la lib ne laissaient passer que 67 % du niveau contre 92 %.
+        let p = DenoiseParams::default();
+        assert_eq!(p.min_snr_db, -15.0);
+        assert_eq!(p.max_erb_snr_db, 35.0);
+        assert_eq!(p.max_df_snr_db, 35.0);
+        assert_eq!(p.atten_lim_db, 100.0);
     }
 }
