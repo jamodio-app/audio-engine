@@ -5,6 +5,48 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.13-2] — 2026-09-03 (pré-release)
+
+**Qualité de l'isolation de voix talkback.** La 0.5.13-1 rendait le talkback muet, puis,
+une fois le VAD réparé, une voix hachée (« ça coupe quand il y a la voix »). Trois causes,
+toutes corrigées à la racine et mesurées hors-ligne sur des prises réelles (voix + guitare,
+un seul micro) avec `cargo run --release --example iso_offline`.
+
+### Fixed — VAD Silero muet (talkback silencieux)
+
+Silero v5 exige un **contexte de 64 échantillons** préfixé à chaque trame de 512 (entrée
+réelle = 576). Sans lui, la probabilité de parole restait ~0 sur TOUTE parole → gate
+toujours fermé → talkback muet. Test de non-régression sur parole réelle ajouté.
+
+### Fixed — Denoise : on n'embarquait pas les réglages validés
+
+DeepFilterNet commute des **étages entiers** selon le SNR local estimé, trame par trame :
+sous `min_snr_db` il applique un masque de zéros (trame muette), au-dessus de
+`max_erb_snr_db` il ne traite pas du tout. On utilisait les `RuntimeParams::default()` de
+la bibliothèque (**−10 / 30 / 20**) au lieu de ceux du binaire officiel `deep-filter`
+(**−15 / 35 / 35**), seuls validés à l'oreille : sur une captation où l'instrument repisse,
+le modèle basculait sans arrêt d'un régime à l'autre (voix qui « respire »). Mesure sur
+prise réelle : **67 % du niveau conservé contre 92 %**. Les seuils sont désormais explicites
+(`DenoiseParams`), documentés, et verrouillés par un test.
+
+### Fixed — Gate : le début des mots était rogné (lookahead)
+
+Le VAD ne décide qu'à la **fin** de sa trame de 32 ms, et il lui faut parfois deux trames
+sur une attaque douce. Sans retard, cette décision s'appliquait à des échantillons déjà
+partis. Mesure : **48 attaques de mots sur 150 perdaient plus de 30 ms** (jusqu'à 205 ms).
+La voix nettoyée passe maintenant par une **ligne à retard de 96 ms avant le gate** → 1
+attaque sur 150 encore concernée. S'y ajoute une **hystérésis** (ouverture 0,50 / maintien
+0,35) et une ballistique revue (attaque 5 ms, relâche 150 ms, maintien 400 ms).
+
+⚠️ **Coût explicite : le talkback porte ~96 ms de latence de plus** (canal comm uniquement —
+le monitoring instrument ne traverse JAMAIS cette chaîne). Le seuil d'ouverture reste à 0,50 :
+plus bas, la repisse d'instrument suffit à ouvrir le gate et la règle « je joue, rien ne
+sort » tombe (mesuré). La latence ajoutée est désormais **tracée au démarrage**.
+
+### Changed
+- Le tap voix ne jette plus de blocs **silencieusement** quand le thread voix est en retard :
+  saturation tracée (échantillonnée). Ce thread fait tourner deux réseaux depuis la 0.5.13-1.
+
 ## [0.5.13-1] — 2026-09-03 (pré-release)
 
 **Isolation de voix talkback (BÊTA, opt-in)** : sur le canal talkback, la voix est

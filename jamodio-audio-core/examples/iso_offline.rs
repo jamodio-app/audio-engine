@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use jamodio_audio_core::voice_isolation::gate::{GateParams, VoiceGate};
 use jamodio_audio_core::voice_isolation::resample::Decimator3;
 use jamodio_audio_core::voice_isolation::vad::VAD_FRAME;
-use jamodio_audio_core::voice_isolation::{Denoiser, IsolationConfig, Vad};
+use jamodio_audio_core::voice_isolation::{DenoiseParams, Denoiser, IsolationConfig, Vad};
 
 const SR: usize = 48_000;
 const BLOCK: usize = 480; // 10 ms — taille de bloc de référence
@@ -72,10 +72,14 @@ fn write_wav(path: &str, samples: &[f32]) {
 
 /// Étage 1 — denoise seul, bloc par bloc (streaming, comme en production).
 fn denoise_all(input: &[f32]) -> Vec<f32> {
+    denoise_with(input, DenoiseParams::default())
+}
+
+fn denoise_with(input: &[f32], params: DenoiseParams) -> Vec<f32> {
     // ISO_BLOCK permet de rejouer la chaîne avec la taille de bloc RÉELLE de la
     // capture (souvent 128 éch.), pas seulement un multiple du hop du modèle.
     let blk: usize = std::env::var("ISO_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK);
-    let mut den = Denoiser::new().expect("modèle DeepFilterNet");
+    let mut den = Denoiser::with_params(params).expect("modèle DeepFilterNet");
     let mut out = Vec::with_capacity(input.len());
     for chunk in input.chunks(blk) {
         let mut b = chunk.to_vec();
@@ -88,9 +92,9 @@ fn denoise_all(input: &[f32]) -> Vec<f32> {
 /// Étage 2 — probas VAD sur le signal fourni, une par trame de 512 @16k.
 /// Renvoie (proba, index du DERNIER échantillon 48 k de la trame) : c'est
 /// l'instant où la décision devient disponible en causal.
-fn vad_probs(signal: &[f32], threshold: f32) -> Vec<(f32, usize)> {
+fn vad_probs(signal: &[f32]) -> Vec<(f32, usize)> {
     let mut dec = Decimator3::new(SR as f32);
-    let mut vad = Vad::new(threshold).expect("modèle Silero");
+    let mut vad = Vad::new().expect("modèle Silero");
     let mut acc: VecDeque<f32> = VecDeque::new();
     let mut frame = vec![0.0f32; VAD_FRAME];
     let mut probs = Vec::new();
@@ -123,7 +127,7 @@ fn causal_gains(len: usize, probs: &[(f32, usize)], cfg: &IsolationConfig) -> Ve
         // Décisions devenues disponibles à la fin de ce bloc (comme en production :
         // la boucle `while accum >= VAD_FRAME` tourne AVANT l'application du gate).
         while next < probs.len() && probs[next].1 <= pos + n {
-            speech = probs[next].0 >= cfg.vad_threshold;
+            speech = probs[next].0 >= cfg.vad_open_threshold;
             next += 1;
         }
         gate.process_block(speech, &mut gains[pos..pos + n]);
@@ -141,7 +145,7 @@ fn oracle_gains(len: usize, probs: &[(f32, usize)], cfg: &IsolationConfig, pad_b
     let pad_b = (pad_before_ms / 1000.0 * SR as f32) as usize;
     let pad_a = (pad_after_ms / 1000.0 * SR as f32) as usize;
     for &(p, end) in probs {
-        if p < cfg.vad_threshold {
+        if p < cfg.vad_open_threshold {
             continue;
         }
         // La trame couvre [end - VAD_FRAME_48K, end[.
@@ -238,6 +242,8 @@ fn variant_gains(len: usize, probs: &[(f32, usize)], v: &Variant) -> Vec<f32> {
         let n = BLOCK.min(len - pos);
         while next < probs.len() && probs[next].1 <= pos + n {
             let p = probs[next].0;
+            // Hystérésis : on OUVRE au-dessus de `open_thresh`, on MAINTIENT tant
+            // qu'on reste au-dessus de `close_thresh` (anti-papillotement en mot).
             speech = if speech { p >= v.close_thresh } else { p >= v.open_thresh };
             next += 1;
         }
@@ -320,8 +326,8 @@ fn main() {
 
     let input = read_wav_mono48(inp);
     let denoised = denoise_all(&input);
-    let probs_clean = vad_probs(&denoised, cfg.vad_threshold);
-    let probs_raw = vad_probs(&input, cfg.vad_threshold);
+    let probs_clean = vad_probs(&denoised);
+    let probs_raw = vad_probs(&input);
 
     let causal = causal_gains(denoised.len(), &probs_clean, &cfg);
     let oracle = oracle_gains(denoised.len(), &probs_clean, &cfg, 250.0, 300.0);
@@ -329,8 +335,8 @@ fn main() {
     let chain: Vec<f32> = denoised.iter().zip(&causal).map(|(s, g)| s * g).collect();
     let orac: Vec<f32> = denoised.iter().zip(&oracle).map(|(s, g)| s * g).collect();
 
-    let n_speech = probs_clean.iter().filter(|(p, _)| *p >= cfg.vad_threshold).count();
-    let n_speech_raw = probs_raw.iter().filter(|(p, _)| *p >= cfg.vad_threshold).count();
+    let n_speech = probs_clean.iter().filter(|(p, _)| *p >= cfg.vad_open_threshold).count();
+    let n_speech_raw = probs_raw.iter().filter(|(p, _)| *p >= cfg.vad_open_threshold).count();
     let holes = analyse_holes(&denoised, &causal, &oracle);
 
     println!("── Chaîne d'isolation talkback — diagnostic hors-ligne ──");
@@ -341,7 +347,7 @@ fn main() {
     println!("RMS chaîne (oracle): {:.4} ({:.1} dBFS)", rms(&orac), db(rms(&orac)));
     println!(
         "VAD sur voix NETTOYÉE : {n_speech}/{} trames parole (seuil {:.2}) | sur voix BRUTE : {n_speech_raw}/{}",
-        probs_clean.len(), cfg.vad_threshold, probs_raw.len()
+        probs_clean.len(), cfg.vad_open_threshold, probs_raw.len()
     );
     println!(
         "gate causal vs oracle : {} trous pendant la voix, {:.0} ms cumulés (plus long {:.0} ms), énergie voix perdue {:.2} dB",
@@ -349,7 +355,7 @@ fn main() {
     );
     println!(
         "ballistique actuelle  : attaque {} ms / relâche {} ms / hangover {} ms, seuil VAD {:.2}, latence de décision ≤ {:.0} ms (trame VAD)",
-        cfg.gate.attack_ms, cfg.gate.release_ms, cfg.gate.hangover_ms, cfg.vad_threshold,
+        cfg.gate.attack_ms, cfg.gate.release_ms, cfg.gate.hangover_ms, cfg.vad_open_threshold,
         VAD_FRAME_48K as f32 / SR as f32 * 1000.0
     );
 
@@ -382,13 +388,34 @@ fn main() {
     std::fs::write(format!("{outdir}/{prefix}_trace.csv"), csv).unwrap();
     eprintln!("écrit {outdir}/{prefix}_trace.csv");
 
+    // ── Banc de seuils DENOISE (avant tout gate) ─────────────────────────────
+    // Ces seuils commutent des étages ENTIERS du modèle trame par trame : c'est
+    // la première chose à écouter quand « ça n'est pas propre » AVANT le gate.
+    let denoise_variants = [
+        ("libdefaut", DenoiseParams { min_snr_db: -10.0, max_erb_snr_db: 30.0, max_df_snr_db: 20.0, atten_lim_db: 100.0 }),
+        ("cli", DenoiseParams::default()),
+        ("souple", DenoiseParams { min_snr_db: -30.0, max_erb_snr_db: 35.0, max_df_snr_db: 35.0, atten_lim_db: 100.0 }),
+    ];
+    if std::env::var("ISO_DF_BENCH").is_ok() {
+        println!("\n── Banc de seuils denoise (denoise SEUL, sans gate) ──");
+        for (name, p) in &denoise_variants {
+            let d = denoise_with(&input, *p);
+            println!(
+                "{name:<10} min={:>5} erb={:>4} df={:>4}  RMS={:.4} ({:.1} dBFS, {:.0} % du niveau)",
+                p.min_snr_db, p.max_erb_snr_db, p.max_df_snr_db,
+                rms(&d), db(rms(&d)), rms(&d) / (rms(&input) + 1e-9) * 100.0
+            );
+            write_wav(&format!("{outdir}/{prefix}_denoise_{name}.wav"), &d);
+        }
+    }
+
     // ── Banc de réglage : variantes candidates, chiffrées sur le même fichier ──
     // Vrais débuts acoustiques (référence perceptive) : premier échantillon d'un
     // segment de parole en remontant tant que le signal nettoyé reste au-dessus
     // d'un plancher relatif.
     let mut speech_mask = vec![false; denoised.len()];
     for &(p, end) in &probs_clean {
-        if p >= cfg.vad_threshold {
+        if p >= cfg.vad_open_threshold {
             let start = end.saturating_sub(VAD_FRAME_48K);
             speech_mask[start..end.min(denoised.len())].iter_mut().for_each(|m| *m = true);
         }
@@ -411,14 +438,11 @@ fn main() {
     }
     let variants = [
         Variant { name: "actuel (prod)", lookahead_ms: 0.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 10.0, release_ms: 120.0, hangover_ms: 250.0 },
-        Variant { name: "look 32", lookahead_ms: 32.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 5.0, release_ms: 120.0, hangover_ms: 250.0 },
-        Variant { name: "look 48", lookahead_ms: 48.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 5.0, release_ms: 120.0, hangover_ms: 250.0 },
-        Variant { name: "look 64", lookahead_ms: 64.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 5.0, release_ms: 120.0, hangover_ms: 250.0 },
-        Variant { name: "look 96", lookahead_ms: 96.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 5.0, release_ms: 120.0, hangover_ms: 250.0 },
-        Variant { name: "look 64 + hang 400", lookahead_ms: 64.0, open_thresh: 0.5, close_thresh: 0.5, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
-        Variant { name: "look 64 + hyst 0.5/0.35", lookahead_ms: 64.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
-        Variant { name: "look 96 + hyst 0.5/0.35", lookahead_ms: 96.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
-        Variant { name: "look 64 + ouv 0.35", lookahead_ms: 64.0, open_thresh: 0.35, close_thresh: 0.25, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
+        Variant { name: "look 32 + hyst", lookahead_ms: 32.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
+        Variant { name: "look 48 + hyst", lookahead_ms: 48.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
+        Variant { name: "look 64 + hyst", lookahead_ms: 64.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
+        Variant { name: "look 96 + hyst", lookahead_ms: 96.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
+        Variant { name: "look 128 + hyst", lookahead_ms: 128.0, open_thresh: 0.5, close_thresh: 0.35, attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
     ];
     println!("\n── Banc de réglage ({} onsets détectés) ──", onsets.len());
     println!("{:<28} {:>8} {:>8} {:>8} {:>9} {:>11} {:>9}", "variante", "retard", "médian", "max", ">30ms", "fuite dBFS", "ouvert%");
@@ -432,7 +456,7 @@ fn main() {
         let med = d[d.len() / 2];
         let max = *d.last().unwrap();
         println!("{:<28} {:>6.0}ms {:>6.0}ms {:>6.0}ms {:>6}/{:<2} {:>10.1} {:>8.1}", v.name, mean, med, max, over, d.len(), db(leak), open_pct);
-        if v.name.starts_with("look 64 + hyst") {
+        if v.name == std::env::var("ISO_PICK").unwrap_or_else(|_| "look 64 + hyst".into()) {
             best = Some((v.name.to_string(), g));
         }
     }

@@ -3148,6 +3148,8 @@ fn capture_stage_loop(
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
+    // Blocs voix abandonnés d'affilée faute de place (cf. le `Full` plus bas).
+    let mut voice_drops: u32 = 0;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3178,10 +3180,26 @@ fn capture_stage_loop(
                     let mono = extract_channel_mono(&samples, channels_in, *vch);
                     if !mono.is_empty() {
                         match vtx.try_send(mono) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                voice_drops = 0;
+                            }
                             // Thread voix en retard : on DROP ce bloc voix
-                            // (concealé par le PLC récepteur). Jamais de stall.
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                            // (concealé par le PLC récepteur). Jamais de stall —
+                            // mais JAMAIS silencieux non plus : depuis que ce
+                            // thread fait tourner l'isolation de voix (deux
+                            // réseaux), une saturation durable s'entend, donc
+                            // elle se trace (échantillonnée pour ne pas noyer
+                            // les logs, et remise à zéro dès que ça repasse).
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                voice_drops += 1;
+                                if voice_drops.is_power_of_two() {
+                                    tracing::warn!(
+                                        target: "jamodio::pipeline",
+                                        consecutive_drops = voice_drops,
+                                        "tap voix saturé — blocs talkback abandonnés (thread voix en retard)"
+                                    );
+                                }
+                            }
                             // Thread voix terminé : on cesse de taper.
                             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                 voice_out = None;
@@ -3903,7 +3921,17 @@ fn voice_encode_stage_loop(
     // Fallback (décision Ben) : si les modèles ne chargent pas → talkback en voix
     // BRUTE (jamais coupé), l'UI indiquera « isolation inactive ».
     let mut isolator: Option<VoiceIsolator> = match VoiceIsolator::new(IsolationConfig::default()) {
-        Ok(i) => Some(i),
+        Ok(i) => {
+            // Le coût en latence est ANNONCÉ, pas découvert à l'oreille : denoise
+            // (~30 ms) + lookahead du gate (le retard qui empêche de rogner le
+            // début des mots). Canal talkback uniquement.
+            tracing::info!(
+                target: "jamodio::voice_isolation",
+                added_latency_ms = i.added_latency_ms(),
+                "isolation de voix active sur le talkback"
+            );
+            Some(i)
+        }
         Err(e) => {
             tracing::error!(
                 target: "jamodio::voice_isolation",
