@@ -20,6 +20,21 @@
 //! wrappers `denoise` (DeepFilterNet) et `vad` (Silero), puis le `resample` 48↔16 k
 //! et l'orchestrateur `VoiceIsolator`, arrivent ensuite.
 
+pub mod denoise;
 pub mod gate;
 
+pub use denoise::Denoiser;
 pub use gate::{GateParams, VoiceGate};
+
+/// Erreurs de l'isolation de voix. **Aucun fallback silencieux** : si un modèle
+/// ne charge pas / échoue, l'appelant reçoit une erreur explicite et bascule en
+/// talkback brut en l'indiquant à l'UI (décision Ben, plan §4).
+#[derive(Debug, thiserror::Error)]
+pub enum IsolationError {
+    /// Chargement ou inférence du denoise (DeepFilterNet) en échec.
+    #[error("denoise (DeepFilterNet) indisponible : {0}")]
+    Denoise(String),
+    /// Chargement ou inférence du VAD (Silero) en échec.
+    #[error("VAD (Silero) indisponible : {0}")]
+    Vad(String),
+}
