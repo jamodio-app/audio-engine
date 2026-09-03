@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.13-1] — 2026-09-03 (pré-release)
+
+**Isolation de voix talkback (BÊTA, opt-in)** : sur le canal talkback, la voix est
+isolée et la repisse d'instrument enlevée ; hors parole, le talkback est **coupé**
+(silence total). 100 % **on-device**, pur Rust, **gratuit** (DeepFilterNet + Silero
+VAD, exécutés via `tract`). N'affecte **jamais** le monitoring instrument temps réel.
+
+- Cette pré-release est là pour **tester la fonction** en conditions réelles (idéalement
+  2 machines : l'une joue/parle, l'autre écoute le talkback). L'isolation est **active en
+  permanence** (le bouton on/off et le voyant arrivent ensuite) et ajoute ~30 ms de latence
+  **au talkback uniquement** (canal comm).
+- **Repli sûr** : si les modèles ne chargent pas, le talkback continue en **voix brute**
+  (jamais coupé).
+
+### Ajouté
+- Sous-système `voice_isolation` (`jamodio-audio-core`) : denoise (DeepFilterNet) + VAD
+  (Silero) + gate + resampler, pur Rust via `tract`, embarqué (aucune dépendance native).
+- Champs `stream-levels` : `voiceOnAir` (voyant « à l'antenne ») et `isolationActive`
+  (isolation active / repli), pour l'UI web à venir.
+- `THIRD-PARTY-LICENSES.md` : crédits DeepFilterNet (MIT/Apache-2.0) + Silero VAD (MIT).
+
 ## [0.5.12] — 2026-09-02
 
 ### Fixed — Jitter buffer de réception : RÉCUPÉRATION (le buffer redescend enfin)
