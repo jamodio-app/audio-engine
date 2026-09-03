@@ -20,6 +20,11 @@ name: Lint
 on:
   push:
     branches: [main]
+    # Les pré-releases sont poussées par TAG (voir release.yml), pas sur main :
+    # sans ce déclencheur, leur code ne passait clippy qu'au merge stable sur
+    # main (le trou qui a laissé rougir v0.5.12). On lint donc AUSSI chaque tag
+    # `v*` → toute pré-release voit clippy avant d'être testée puis mergée.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
