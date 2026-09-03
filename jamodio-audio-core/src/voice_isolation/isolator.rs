@@ -4,6 +4,16 @@
 //! Sortie = voix nettoyée quand on parle, **silence total** sinon. Renvoie l'état
 //! « voix active » (pour le voyant de la tranche). Aucun accès réseau, aucun modèle
 //! rechargé au fil de l'eau ; tout est instancié à `new()`.
+//!
+//! **Lookahead (indispensable, pas un confort).** Le VAD ne rend sa décision qu'à la
+//! FIN de sa trame de 32 ms, et il lui faut parfois deux trames pour reconnaître une
+//! attaque douce. Sans retard, cette décision s'appliquerait à des échantillons DÉJÀ
+//! partis : le début de chaque mot sort atténué (mesuré sur prises réelles : 48
+//! attaques sur 150 perdaient plus de 30 ms — c'est le « ça coupe » du terrain).
+//! On retarde donc la voix de [`IsolationConfig::lookahead_ms`] AVANT le gate, si
+//! bien que le gain est appliqué aux échantillons qui ont réellement été analysés.
+//! Ce retard est le prix EXPLICITE de l'attaque propre ; il ne concerne que le canal
+//! talkback, jamais le monitoring instrument.
 
 use std::collections::VecDeque;
 
@@ -17,17 +27,34 @@ use super::IsolationError;
 pub const SAMPLE_RATE: u32 = 48_000;
 
 /// Réglages de l'isolation (poussés depuis l'UI, plan §8).
+///
+/// Les valeurs par défaut sont **mesurées**, pas devinées : banc
+/// `cargo run --release --example iso_offline` sur les prises réelles (voix +
+/// guitare, un seul micro).
 #[derive(Debug, Clone, Copy)]
 pub struct IsolationConfig {
-    /// Seuil de proba VAD au-delà duquel on considère qu'il y a de la parole.
-    pub vad_threshold: f32,
+    /// Proba VAD à partir de laquelle on OUVRE le gate. Ne pas descendre sous 0.5 :
+    /// à 0.35, la repisse d'instrument suffit à ouvrir (mesuré : 6,8 % du temps de
+    /// jeu, fuite à −56 dBFS) et la règle produit « je joue, rien ne sort » tombe.
+    pub vad_open_threshold: f32,
+    /// Proba VAD en dessous de laquelle on referme, une fois OUVERT (hystérésis).
+    /// Plus bas que l'ouverture : évite le papillotement sur les consonnes sourdes.
+    pub vad_close_threshold: f32,
+    /// Retard appliqué à la voix avant le gate (cf. doc de module). 96 ms ⇒ 1 attaque
+    /// de mot sur 150 encore rognée ; 64 ms ⇒ 14 sur 150 ; 0 ⇒ 48 sur 150.
+    pub lookahead_ms: f32,
     /// Ballistique du gate.
     pub gate: GateParams,
 }
 
 impl Default for IsolationConfig {
     fn default() -> Self {
-        Self { vad_threshold: 0.5, gate: GateParams::default() }
+        Self {
+            vad_open_threshold: 0.5,
+            vad_close_threshold: 0.35,
+            lookahead_ms: 96.0,
+            gate: GateParams::default(),
+        }
     }
 }
 
@@ -49,6 +76,13 @@ pub struct VoiceIsolator {
     vad_frame: Vec<f32>,
     /// Gains de gate par-échantillon (préalloué, redimensionné une fois).
     gate_gains: Vec<f32>,
+    /// Ligne à retard du lookahead : la voix nettoyée y transite avant le gate, le
+    /// temps que le VAD se prononce sur elle. Pré-remplie de silence à `new`/`reset`
+    /// ⇒ on en sort toujours exactement autant qu'on y pousse.
+    delay: VecDeque<f32>,
+    /// Seuils VAD (ouverture / maintien) — hystérésis.
+    vad_open: f32,
+    vad_close: f32,
     /// Dernière décision VAD (parole présente).
     speech: bool,
 }
@@ -63,7 +97,8 @@ impl VoiceIsolator {
             SAMPLE_RATE,
             "le denoise doit être en 48 kHz (notre pipeline)"
         );
-        let vad = Vad::new(cfg.vad_threshold)?;
+        let vad = Vad::new()?;
+        let lookahead = (cfg.lookahead_ms / 1000.0 * SAMPLE_RATE as f32).round() as usize;
         Ok(Self {
             denoiser,
             decimator: Decimator3::new(SAMPLE_RATE as f32),
@@ -72,6 +107,9 @@ impl VoiceIsolator {
             vad_accum: VecDeque::with_capacity(VAD_FRAME * 4),
             vad_frame: vec![0.0; VAD_FRAME],
             gate_gains: Vec::new(),
+            delay: VecDeque::from(vec![0.0; lookahead]),
+            vad_open: cfg.vad_open_threshold,
+            vad_close: cfg.vad_close_threshold,
             speech: false,
         })
     }
@@ -89,10 +127,21 @@ impl VoiceIsolator {
             for slot in self.vad_frame.iter_mut() {
                 *slot = self.vad_accum.pop_front().expect("trame complète garantie par la condition");
             }
-            self.speech = self.vad.is_speech(&self.vad_frame)?;
+            let p = self.vad.speech_prob(&self.vad_frame)?;
+            // Hystérésis : seuil d'OUVERTURE haut (la repisse ne doit pas ouvrir),
+            // seuil de MAINTIEN plus bas (une consonne sourde ne doit pas refermer).
+            self.speech = if self.speech { p >= self.vad_close } else { p >= self.vad_open };
         }
 
-        // 3) Gate : gain lissé par-échantillon → silence total hors parole.
+        // 3) Lookahead : la voix nettoyée passe par la ligne à retard, si bien que
+        //    le gate agit sur les échantillons que le VAD vient d'analyser (et non
+        //    sur les suivants, ce qui rognait le début des mots).
+        for s in block.iter_mut() {
+            self.delay.push_back(*s);
+            *s = self.delay.pop_front().expect("ligne pré-remplie ⇒ jamais vide");
+        }
+
+        // 4) Gate : gain lissé par-échantillon → silence total hors parole.
         if self.gate_gains.len() != block.len() {
             self.gate_gains.resize(block.len(), 0.0);
         }
@@ -104,6 +153,14 @@ impl VoiceIsolator {
         Ok(VoiceState { voice_active: self.gate.is_open() })
     }
 
+    /// Latence AJOUTÉE au canal talkback par l'isolation : denoise + lookahead du
+    /// gate, en millisecondes. À logguer au démarrage — ce coût doit être visible,
+    /// jamais découvert à l'oreille. (Canal talkback uniquement : le monitoring
+    /// instrument ne traverse pas cette chaîne.)
+    pub fn added_latency_ms(&self) -> f32 {
+        (self.denoiser.latency_samples() + self.delay.len()) as f32 / SAMPLE_RATE as f32 * 1000.0
+    }
+
     /// Réinitialise toute la chaîne (à (ré)ouverture capture / hot-swap device).
     pub fn reset(&mut self) {
         self.denoiser.reset();
@@ -111,6 +168,11 @@ impl VoiceIsolator {
         self.vad.reset();
         self.gate.reset();
         self.vad_accum.clear();
+        // La ligne à retard se re-remplit de silence (même longueur qu'à la
+        // construction) : le lookahead reste EXACT après un hot-swap de device.
+        let n = self.delay.len();
+        self.delay.clear();
+        self.delay.extend(std::iter::repeat_n(0.0, n));
         self.speech = false;
     }
 }
@@ -171,5 +233,99 @@ mod tests {
         iso.process_block(&mut b).unwrap();
         iso.reset();
         assert!(iso.vad_accum.is_empty() && !iso.speech);
+    }
+
+    /// Parole réelle @48 kHz : la fixture 16 kHz (LibriSpeech, CC-BY) est
+    /// sur-échantillonnée ×3 par interpolation linéaire, précédée de 300 ms de
+    /// silence. Suffisant pour la propriété testée (préservation de l'attaque) —
+    /// la bande utile de la parole est très en dessous de 8 kHz.
+    fn parole_48k() -> Vec<f32> {
+        const RAW: &[u8] = include_bytes!("../../tests/fixtures/speech_16k_mono_i16.raw");
+        let s16: Vec<f32> = RAW
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        let mut out = vec![0.0f32; SAMPLE_RATE as usize * 3 / 10]; // 300 ms de silence
+        for w in s16.windows(2) {
+            for k in 0..3 {
+                out.push(w[0] + (w[1] - w[0]) * (k as f32 / 3.0));
+            }
+        }
+        out
+    }
+
+    fn run_chain(cfg: IsolationConfig, sig: &[f32]) -> Vec<f32> {
+        let mut iso = VoiceIsolator::new(cfg).unwrap();
+        let mut out = Vec::with_capacity(sig.len());
+        for chunk in sig.chunks(HOP) {
+            let mut b = chunk.to_vec();
+            iso.process_block(&mut b).unwrap();
+            out.extend_from_slice(&b);
+        }
+        out
+    }
+
+    /// Gain moyen RÉELLEMENT appliqué par le gate sur les `dur_ms` qui suivent
+    /// l'attaque du premier mot. Référence = la même voix nettoyée SANS gate ;
+    /// `retard` aligne les deux timelines (denoise seul vs denoise + lookahead).
+    fn gain_sur_attaque(sortie: &[f32], reference: &[f32], retard: usize, dur_ms: usize) -> f32 {
+        let seuil = rms(reference) * 0.2;
+        let debut = reference.iter().position(|x| x.abs() > seuil).unwrap_or(0);
+        let fin = (debut + dur_ms * SAMPLE_RATE as usize / 1000).min(reference.len());
+        let e_ref: f32 = reference[debut..fin].iter().map(|x| x * x).sum();
+        let e_out: f32 = sortie[(debut + retard).min(sortie.len())..(fin + retard).min(sortie.len())]
+            .iter()
+            .map(|x| x * x)
+            .sum();
+        (e_out / e_ref.max(1e-12)).sqrt()
+    }
+
+    #[test]
+    fn le_lookahead_preserve_l_attaque_des_mots() {
+        // RÉGRESSION (terrain 03/09 « ça coupe quand il y a la voix ») : sans
+        // lookahead, la décision du VAD s'applique à des échantillons DÉJÀ sortis
+        // → le début de chaque mot part atténué. On mesure le gain effectivement
+        // appliqué sur les 100 premières ms du premier mot, la référence étant la
+        // même voix nettoyée sans gate. Ce test échoue si le retard disparaît.
+        let sig = parole_48k();
+        let cfg = IsolationConfig::default();
+        let avec = run_chain(cfg, &sig);
+        let sans = run_chain(IsolationConfig { lookahead_ms: 0.0, ..cfg }, &sig);
+
+        let mut den = Denoiser::new().unwrap();
+        let mut reference = Vec::with_capacity(sig.len());
+        for chunk in sig.chunks(HOP) {
+            let mut b = chunk.to_vec();
+            den.process_block(&mut b).unwrap();
+            reference.extend_from_slice(&b);
+        }
+        let retard = (cfg.lookahead_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
+        // Fenêtre courte (30 ms) : c'est très exactement la portion de mot que la
+        // latence de décision du VAD fait disparaître.
+        let g_avec = gain_sur_attaque(&avec, &reference, retard, 30);
+        let g_sans = gain_sur_attaque(&sans, &reference, 0, 30);
+        eprintln!("gain attaque : avec lookahead={g_avec:.3}  sans={g_sans:.3}");
+        assert!(
+            g_avec > 0.8,
+            "avec lookahead, l'attaque doit passer quasi intacte (gain={g_avec:.2})"
+        );
+        assert!(
+            g_avec > g_sans * 1.3,
+            "le lookahead doit préserver l'attaque : avec={g_avec:.2} sans={g_sans:.2}"
+        );
+    }
+
+    #[test]
+    fn le_lookahead_retarde_exactement_de_la_consigne() {
+        // Le retard doit être EXACT (et le rester après reset) : c'est lui qui
+        // aligne la décision du VAD sur les échantillons analysés.
+        let cfg = IsolationConfig { lookahead_ms: 10.0, ..IsolationConfig::default() };
+        let mut iso = VoiceIsolator::new(cfg).unwrap();
+        assert_eq!(iso.delay.len(), SAMPLE_RATE as usize / 100, "10 ms @48k = 480 éch.");
+        let mut b = noise(HOP, 0.3);
+        iso.process_block(&mut b).unwrap();
+        iso.reset();
+        assert_eq!(iso.delay.len(), SAMPLE_RATE as usize / 100, "reset conserve la longueur du retard");
+        assert!(iso.delay.iter().all(|&x| x == 0.0), "reset re-remplit de silence");
     }
 }

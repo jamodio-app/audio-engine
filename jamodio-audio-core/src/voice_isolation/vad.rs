@@ -37,7 +37,6 @@ pub struct Vad {
     input_buf: Vec<f32>,
     /// Fréquence (scalaire i64), constante.
     sr: Tensor,
-    threshold: f32,
 }
 
 fn zero_state() -> Tensor {
@@ -45,10 +44,11 @@ fn zero_state() -> Tensor {
 }
 
 impl Vad {
-    /// Charge le modèle embarqué. `threshold` : proba au-delà de laquelle on
-    /// considère qu'il y a de la parole (0.5 par défaut recommandé).
+    /// Charge le modèle embarqué. Le VAD ne rend qu'une **probabilité** : la
+    /// décision (seuils d'ouverture / maintien) appartient à
+    /// [`super::IsolationConfig`], source unique de vérité.
     /// **Erreur explicite** si le chargement échoue (zéro fallback silencieux).
-    pub fn new(threshold: f32) -> Result<Self, IsolationError> {
+    pub fn new() -> Result<Self, IsolationError> {
         let map = |e: TractError| IsolationError::Vad(e.to_string());
         // NB : on ne pose PAS de formes d'entrée fixes. tract analyse alors le
         // graphe avec des dims symboliques (dont le nœud `If` interne du modèle)
@@ -68,7 +68,6 @@ impl Vad {
             context: vec![0.0; VAD_CONTEXT],
             input_buf: vec![0.0; VAD_CONTEXT + VAD_FRAME],
             sr: tensor0(VAD_SR),
-            threshold,
         })
     }
 
@@ -97,11 +96,6 @@ impl Vad {
         Ok(prob)
     }
 
-    /// Décision binaire (proba ≥ seuil).
-    pub fn is_speech(&mut self, frame: &[f32]) -> Result<bool, IsolationError> {
-        Ok(self.speech_prob(frame)? >= self.threshold)
-    }
-
     /// Réinitialise l'état LSTM (à (ré)ouverture capture / hot-swap).
     pub fn reset(&mut self) {
         self.state = zero_state();
@@ -115,13 +109,13 @@ mod tests {
 
     #[test]
     fn charge_le_modele_vad() {
-        let v = Vad::new(0.5).expect("le modèle Silero VAD embarqué doit se charger dans tract");
+        let v = Vad::new().expect("le modèle Silero VAD embarqué doit se charger dans tract");
         assert_eq!(v.frame_len(), 512);
     }
 
     #[test]
     fn silence_faible_proba() {
-        let mut v = Vad::new(0.5).unwrap();
+        let mut v = Vad::new().unwrap();
         let frame = [0.0f32; VAD_FRAME];
         // Sur du silence, la proba de parole doit être basse (et jamais NaN).
         let mut p = 0.0;
@@ -134,7 +128,7 @@ mod tests {
 
     #[test]
     fn reset_remet_etat_a_zero() {
-        let mut v = Vad::new(0.5).unwrap();
+        let mut v = Vad::new().unwrap();
         let frame = [0.1f32; VAD_FRAME];
         v.speech_prob(&frame).unwrap();
         v.reset();
@@ -156,7 +150,7 @@ mod tests {
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
             .collect();
-        let mut v = Vad::new(0.5).unwrap();
+        let mut v = Vad::new().unwrap();
         let (mut maxp, mut speech, mut frames) = (0.0f32, 0usize, 0usize);
         for frame in samples.chunks_exact(VAD_FRAME) {
             let p = v.speech_prob(frame).unwrap();
