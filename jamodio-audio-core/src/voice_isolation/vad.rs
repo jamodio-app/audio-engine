@@ -17,6 +17,10 @@ use super::IsolationError;
 pub const VAD_SR: i64 = 16_000;
 /// Taille de trame VAD en échantillons @16 kHz (32 ms).
 pub const VAD_FRAME: usize = 512;
+/// Silero v5 préfixe à chaque trame un **contexte** = les 64 derniers échantillons
+/// de la trame précédente. L'entrée réelle du modèle vaut donc `64 + 512 = 576`.
+/// (Sans ce contexte, le modèle renvoie une proba ~0 sur toute parole — bug corrigé.)
+const VAD_CONTEXT: usize = 64;
 
 /// Modèle embarqué (variante ifless, compatible tract).
 static MODEL_BYTES: &[u8] = include_bytes!("../../assets/silero_vad_ifless.onnx");
@@ -27,6 +31,10 @@ pub struct Vad {
     plan: Plan,
     /// État LSTM [2, 1, 128], reporté entre trames.
     state: Tensor,
+    /// Contexte = 64 derniers échantillons de la trame précédente (préfixé à l'entrée).
+    context: Vec<f32>,
+    /// Tampon d'entrée préalloué (64 + 512 = 576).
+    input_buf: Vec<f32>,
     /// Fréquence (scalaire i64), constante.
     sr: Tensor,
     threshold: f32,
@@ -54,7 +62,14 @@ impl Vad {
             .map_err(map)?
             .into_runnable()
             .map_err(map)?;
-        Ok(Self { plan, state: zero_state(), sr: tensor0(VAD_SR), threshold })
+        Ok(Self {
+            plan,
+            state: zero_state(),
+            context: vec![0.0; VAD_CONTEXT],
+            input_buf: vec![0.0; VAD_CONTEXT + VAD_FRAME],
+            sr: tensor0(VAD_SR),
+            threshold,
+        })
     }
 
     pub const fn frame_len(&self) -> usize {
@@ -66,14 +81,19 @@ impl Vad {
     pub fn speech_prob(&mut self, frame: &[f32]) -> Result<f32, IsolationError> {
         let map = |e: TractError| IsolationError::Vad(e.to_string());
         debug_assert_eq!(frame.len(), VAD_FRAME, "trame VAD = {VAD_FRAME} éch. @16k");
-        let input = Tensor::from_shape(&[1, VAD_FRAME], frame).map_err(map)?;
+        // Entrée = contexte (64) ++ trame (512) = 576 (préproc. Silero v5, indispensable).
+        self.input_buf[..VAD_CONTEXT].copy_from_slice(&self.context);
+        self.input_buf[VAD_CONTEXT..].copy_from_slice(frame);
+        let input =
+            Tensor::from_shape(&[1, VAD_CONTEXT + VAD_FRAME], &self.input_buf).map_err(map)?;
         let out = self
             .plan
             .run(tvec!(input.into(), self.sr.clone().into(), self.state.clone().into()))
             .map_err(map)?;
         let prob = out[0].as_slice::<f32>().map_err(map)?[0];
-        // Reporte le nouvel état pour la prochaine trame.
+        // Reporte l'état LSTM + le contexte (64 derniers éch. de la trame) pour la suivante.
         self.state = out[1].clone().into_tensor();
+        self.context.copy_from_slice(&frame[VAD_FRAME - VAD_CONTEXT..]);
         Ok(prob)
     }
 
@@ -85,6 +105,7 @@ impl Vad {
     /// Réinitialise l'état LSTM (à (ré)ouverture capture / hot-swap).
     pub fn reset(&mut self) {
         self.state = zero_state();
+        self.context.iter_mut().for_each(|c| *c = 0.0);
     }
 }
 
@@ -122,5 +143,30 @@ mod tests {
         v.reset();
         let b = v.speech_prob(&frame).unwrap();
         assert!((a - b).abs() < 1e-6, "reset doit rendre l'inférence reproductible");
+    }
+
+    #[test]
+    fn detecte_la_parole_reelle_regression_contexte() {
+        // RÉGRESSION : sans le contexte de 64 éch. préfixé (entrée 576), Silero renvoie
+        // ~0 sur TOUTE parole → gate fermé → talkback muet (bug terrain 03/09). Ce test
+        // échoue si le contexte n'est plus appliqué.
+        // Fixture : 1,5 s de parole @16k mono i16 (LibriSpeech dev-clean, CC-BY 4.0).
+        const RAW: &[u8] = include_bytes!("../../tests/fixtures/speech_16k_mono_i16.raw");
+        let samples: Vec<f32> = RAW
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        let mut v = Vad::new(0.5).unwrap();
+        let (mut maxp, mut speech, mut frames) = (0.0f32, 0usize, 0usize);
+        for frame in samples.chunks_exact(VAD_FRAME) {
+            let p = v.speech_prob(frame).unwrap();
+            maxp = maxp.max(p);
+            if p >= 0.5 {
+                speech += 1;
+            }
+            frames += 1;
+        }
+        assert!(maxp > 0.9, "le VAD doit détecter la parole (max proba={maxp} — contexte manquant ?)");
+        assert!(speech > frames / 4, "assez de trames de parole ({speech}/{frames})");
     }
 }

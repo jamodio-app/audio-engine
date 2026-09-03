@@ -56,3 +56,6 @@ srtp = { version = "0.7", default-features = false, features = ["bytes", "log", 
 [target.'cfg(windows)'.dependencies]
 webrtc-srtp = "0.17"
 bytes = "1"
+
+[dev-dependencies]
+hound = "3"                # lecture/écriture WAV pour l'exemple de diagnostic iso_offline
