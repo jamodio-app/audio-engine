@@ -43,9 +43,20 @@ le monitoring instrument ne traverse JAMAIS cette chaîne). Le seuil d'ouverture
 plus bas, la repisse d'instrument suffit à ouvrir le gate et la règle « je joue, rien ne
 sort » tombe (mesuré). La latence ajoutée est désormais **tracée au démarrage**.
 
+### Fixed — Le début du talkback n'est plus perdu à l'activation
+
+Le tap voix était greffé **avant** que les modèles d'isolation soient chargés (~260 ms) : la
+capture poussait déjà des blocs, la file débordait, et la **première demi-seconde de talkback
+partait en silence** (constaté dans les logs terrain grâce à la trace ci-dessous). Le thread
+voix signale désormais qu'il est **prêt à consommer** — modèles chargés et rodés — et le tap
+n'est greffé qu'à ce moment. Si le thread meurt avant d'être prêt, l'activation échoue avec une
+erreur explicite au lieu d'un talkback muet.
+
 ### Changed
 - Le tap voix ne jette plus de blocs **silencieusement** quand le thread voix est en retard :
   saturation tracée (échantillonnée). Ce thread fait tourner deux réseaux depuis la 0.5.13-1.
+- `VoiceIsolator::new` fait un **tour de rodage** : `tract` alloue ses tampons à la première
+  inférence, ce coût ne doit pas tomber sur le premier bloc de voix réel.
 
 ## [0.5.13-1] — 2026-09-03 (pré-release)
 

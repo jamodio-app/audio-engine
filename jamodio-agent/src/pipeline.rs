@@ -2317,6 +2317,9 @@ impl PipelineState {
             .as_deref()
             .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
         // 6. Spawn du thread d'encodage voix (RT). Termine seul au drop de voice_tx.
+        //    Il signale sur `ready_tx` quand il est PRÊT À CONSOMMER (encodeur créé,
+        //    modèles d'isolation chargés) — cf. étape 7.
+        let (ready_tx, ready_rx) = bounded::<()>(1);
         std::thread::Builder::new()
             .name("voice-encode".into())
             .spawn(move || {
@@ -2330,10 +2333,32 @@ impl PipelineState {
                     voice_on_air,
                     isolation_active,
                     output_device_name,
+                    ready_tx,
                 );
             })
             .map_err(|e| format!("spawn voice-encode: {}", e))?;
-        // 7. Greffe le tap sur le capture_stage en cours.
+        // 7. Attend que le thread voix soit prêt AVANT de greffer le tap. Sans ça,
+        //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
+        //    mesurés) : la file de 32 blocs déborde et la PREMIÈRE DEMI-SECONDE de
+        //    talkback part en silence (constaté en logs terrain, « tap voix saturé »).
+        match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(()) => {}
+            // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
+            // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("voice encode thread failed to start".to_string());
+            }
+            // Machine très lente : on greffe quand même (comportement d'avant), mais
+            // on le DIT — le début du talkback peut être tronqué.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    "thread voix toujours pas prêt après 10 s — greffe du tap quand même, \
+                     le début du talkback peut être tronqué"
+                );
+            }
+        }
+        // 8. Greffe le tap sur le capture_stage en cours.
         voice_ctrl_tx
             .try_send(VoiceControl::Add {
                 channel_index: channel_index as usize,
@@ -3884,6 +3909,10 @@ fn voice_encode_stage_loop(
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
+    // Signale à `start_voice_capture` que ce thread est prêt à consommer (encodeur
+    // créé, modèles d'isolation chargés) → il ne greffe le tap qu'à ce moment.
+    // Droppé sans envoi si le thread abandonne : l'appelant voit `Disconnected`.
+    ready_tx: Sender<()>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -3943,6 +3972,10 @@ fn voice_encode_stage_loop(
     };
     // Indicateur : l'isolation tourne-t-elle ? (sinon repli en voix brute → UI.)
     isolation_active.store(isolator.is_some(), std::sync::atomic::Ordering::Relaxed);
+
+    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
+    let _ = ready_tx.send(());
+    drop(ready_tx);
 
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
