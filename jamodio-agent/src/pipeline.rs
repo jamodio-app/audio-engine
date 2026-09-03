@@ -797,6 +797,10 @@ pub struct PipelineState {
     /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
     /// flag `voice_active` ci-dessus qui indique juste que le tap voix est monté.)
     pub voice_on_air: Arc<std::sync::atomic::AtomicBool>,
+    /// Isolation de voix (Lot 2) : `true` si l'isolation TOURNE ; `false` si repli
+    /// en voix brute (modèle KO). Diffusé → indicateur « isolation active/inactive »
+    /// sur la tranche voix (décision Ben : dégradation visible, pas silencieuse).
+    pub isolation_active: Arc<std::sync::atomic::AtomicBool>,
     /// Nb de canaux physiques + sample rate natif de la capture courante,
     /// mémorisés au `start_capture`. Permettent de greffer la voix (validation
     /// du canal demandé + config resampler voix) SANS redémarrer la capture
@@ -1215,6 +1219,7 @@ impl PipelineState {
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            isolation_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
@@ -2306,6 +2311,7 @@ impl PipelineState {
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
         let voice_on_air = self.voice_on_air.clone();
+        let isolation_active = self.isolation_active.clone();
         let output_device_name = self
             .output_device_id
             .as_deref()
@@ -2322,6 +2328,7 @@ impl PipelineState {
                     voice_gain,
                     voice_rms,
                     voice_on_air,
+                    isolation_active,
                     output_device_name,
                 );
             })
@@ -3857,6 +3864,7 @@ fn voice_encode_stage_loop(
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<std::sync::atomic::AtomicU32>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
+    isolation_active: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3905,6 +3913,8 @@ fn voice_encode_stage_loop(
             None
         }
     };
+    // Indicateur : l'isolation tourne-t-elle ? (sinon repli en voix brute → UI.)
+    isolation_active.store(isolator.is_some(), std::sync::atomic::Ordering::Relaxed);
 
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -3937,6 +3947,7 @@ fn voice_encode_stage_loop(
                     );
                     isolator = None;
                     voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+                    isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -3991,6 +4002,7 @@ fn voice_encode_stage_loop(
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
     voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+    isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
 }
 

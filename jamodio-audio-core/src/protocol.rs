@@ -699,6 +699,14 @@ pub enum AgentMessage {
         input_rms: Option<f32>,
         #[serde(rename = "midiActive", skip_serializing_if = "Option::is_none")]
         midi_active: Option<bool>,
+        /// Isolation de voix (Lot 2) : `true` quand le gate est ouvert (on parle) →
+        /// voyant « à l'antenne » de la tranche voix. Absent hors capture voix.
+        #[serde(rename = "voiceOnAir", skip_serializing_if = "Option::is_none")]
+        voice_on_air: Option<bool>,
+        /// Isolation de voix (Lot 2) : `true` si l'isolation TOURNE, `false` si repli
+        /// en voix brute (modèle KO) → indicateur « isolation active/inactive ».
+        #[serde(rename = "isolationActive", skip_serializing_if = "Option::is_none")]
+        isolation_active: Option<bool>,
     },
     /// Réponse à `GetLogsArchive`. Contient les logs agent concaténés en
     /// plain text (UTF-8), avec entêtes par fichier `====== agent.log.YYYY-MM-DD ======`.

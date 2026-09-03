@@ -626,6 +626,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             return;
         }
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        // Isolation de voix (Lot 2) — dernier état poussé, pour forcer un push sur
+        // TRANSITION même en idle (sinon le voyant/indicateur resterait figé après
+        // la dernière transition, comme le faisait l'ancien gate).
+        let mut last_voice_on_air = false;
+        let mut last_isolation_active = false;
         loop {
             interval.tick().await;
             let pl = levels_pipeline.lock().await;
@@ -654,6 +659,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
             let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
+            // Isolation de voix : état « à l'antenne » (gate) + isolation active/repli.
+            let voice_on_air = pl.voice_on_air.load(std::sync::atomic::Ordering::Relaxed);
+            let isolation_active = pl.isolation_active.load(std::sync::atomic::Ordering::Relaxed);
             drop(pl);
             // Push si on a soit des niveaux peers, soit un signal LOCAL (instrument
             // RMS > 0, MIDI actif, OU talkback voix RMS > 0). En idle complet, on
@@ -663,7 +671,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // push. Sans lui, parler SEUL — pas de peer, instrument silencieux —
             // n'émettait aucun StreamLevels et le VU talkback restait figé.
             let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0 || peer_voice_rms > 0.0;
-            if !rms_data.is_empty() || has_self_signal {
+            // Force un push si l'isolation/le voyant a CHANGÉ d'état, même sans autre
+            // signal (sinon le voyant resterait figé après la dernière transition).
+            let iso_changed =
+                voice_on_air != last_voice_on_air || isolation_active != last_isolation_active;
+            last_voice_on_air = voice_on_air;
+            last_isolation_active = isolation_active;
+            if !rms_data.is_empty() || has_self_signal || iso_changed {
                 let mut levels: Vec<StreamLevel> = rms_data
                     .into_iter()
                     .map(|(producer_id, rms, rms_l, rms_r, peak_l, peak_r)| StreamLevel {
@@ -728,6 +742,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     levels,
                     input_rms: Some(input_rms),
                     midi_active: Some(midi_active),
+                    voice_on_air: Some(voice_on_air),
+                    isolation_active: Some(isolation_active),
                 };
                 if levels_tx.send(msg).await.is_err() {
                     break;
