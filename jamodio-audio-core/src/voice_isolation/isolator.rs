@@ -53,7 +53,12 @@ impl Default for IsolationConfig {
             vad_open_threshold: 0.5,
             vad_close_threshold: 0.35,
             lookahead_ms: 96.0,
-            gate: GateParams::default(),
+            // Ballistique mesurée pour la PAROLE : attaque courte (le lookahead a
+            // déjà pré-ouvert), relâche douce, et un maintien de 400 ms car les
+            // silences inter-phrases relevés sur les prises réelles montent
+            // jusque-là — en dessous, le gate referme entre deux phrases et il
+            // faut le rouvrir à chaque fois.
+            gate: GateParams { attack_ms: 5.0, release_ms: 150.0, hangover_ms: 400.0 },
         }
     }
 }
@@ -302,15 +307,18 @@ mod tests {
         let retard = (cfg.lookahead_ms / 1000.0 * SAMPLE_RATE as f32) as usize;
         // Fenêtre courte (30 ms) : c'est très exactement la portion de mot que la
         // latence de décision du VAD fait disparaître.
-        let g_avec = gain_sur_attaque(&avec, &reference, retard, 30);
-        let g_sans = gain_sur_attaque(&sans, &reference, 0, 30);
-        eprintln!("gain attaque : avec lookahead={g_avec:.3}  sans={g_sans:.3}");
+        // Fenêtre de 20 ms : très exactement la portion de mot que la latence de
+        // décision du VAD fait disparaître. (Sur les 10 premières ms, la chaîne
+        // sans lookahead ne sort RIEN du tout.)
+        let g_avec = gain_sur_attaque(&avec, &reference, retard, 20);
+        let g_sans = gain_sur_attaque(&sans, &reference, 0, 20);
+        eprintln!("gain sur l'attaque : avec lookahead={g_avec:.3}  sans={g_sans:.3}");
         assert!(
-            g_avec > 0.8,
+            g_avec > 0.9,
             "avec lookahead, l'attaque doit passer quasi intacte (gain={g_avec:.2})"
         );
         assert!(
-            g_avec > g_sans * 1.3,
+            g_avec > g_sans * 1.8,
             "le lookahead doit préserver l'attaque : avec={g_avec:.2} sans={g_sans:.2}"
         );
     }

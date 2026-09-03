@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use jamodio_audio_core::voice_isolation::gate::{GateParams, VoiceGate};
 use jamodio_audio_core::voice_isolation::resample::Decimator3;
 use jamodio_audio_core::voice_isolation::vad::VAD_FRAME;
-use jamodio_audio_core::voice_isolation::{DenoiseParams, Denoiser, IsolationConfig, Vad};
+use jamodio_audio_core::voice_isolation::{DenoiseParams, Denoiser, IsolationConfig, Vad, VoiceIsolator};
 
 const SR: usize = 48_000;
 const BLOCK: usize = 480; // 10 ms — taille de bloc de référence
@@ -460,6 +460,46 @@ fn main() {
             best = Some((v.name.to_string(), g));
         }
     }
+    // ── Parité banc ↔ production ────────────────────────────────────────────
+    // Le banc ne vaut que s'il décrit VRAIMENT ce que fait `VoiceIsolator`. On
+    // rejoue donc la vraie chaîne et on compare à la variante qui reproduit ses
+    // réglages par défaut.
+    {
+        let mut iso = VoiceIsolator::new(cfg).expect("modèles chargés");
+        let mut reel = Vec::with_capacity(input.len());
+        for chunk in input.chunks(BLOCK) {
+            let mut b = chunk.to_vec();
+            iso.process_block(&mut b).expect("process");
+            reel.extend_from_slice(&b);
+        }
+        let defaut = Variant {
+            name: "défauts production",
+            lookahead_ms: cfg.lookahead_ms,
+            open_thresh: cfg.vad_open_threshold,
+            close_thresh: cfg.vad_close_threshold,
+            attack_ms: cfg.gate.attack_ms,
+            release_ms: cfg.gate.release_ms,
+            hangover_ms: cfg.gate.hangover_ms,
+        };
+        let g = variant_gains(denoised.len(), &probs_clean, &defaut);
+        let simule: Vec<f32> = denoised.iter().zip(&g).map(|(s, gg)| s * gg).collect();
+        // La production RETARDE l'audio avant le gate ; le banc, lui, AVANCE les
+        // gains (strictement équivalent, au décalage près) → on aligne de
+        // `lookahead` avant de comparer.
+        let l = (cfg.lookahead_ms / 1000.0 * SR as f32) as usize;
+        let n = reel.len().saturating_sub(l).min(simule.len());
+        let ecart = reel[l..l + n]
+            .iter()
+            .zip(&simule[..n])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "\nparité banc ↔ VoiceIsolator (réglages par défaut) : écart max {ecart:.6} ({:.1} dBFS) — latence ajoutée {:.0} ms",
+            db(ecart),
+            iso.added_latency_ms()
+        );
+    }
+
     if let Some((name, g)) = best {
         let fixed: Vec<f32> = denoised.iter().zip(&g).map(|(s, gg)| s * gg).collect();
         eprintln!("variante écrite pour écoute : {name}");
