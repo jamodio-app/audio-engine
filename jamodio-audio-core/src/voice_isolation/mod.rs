@@ -22,9 +22,11 @@
 
 pub mod denoise;
 pub mod gate;
+pub mod vad;
 
 pub use denoise::Denoiser;
 pub use gate::{GateParams, VoiceGate};
+pub use vad::Vad;
 
 /// Erreurs de l'isolation de voix. **Aucun fallback silencieux** : si un modèle
 /// ne charge pas / échoue, l'appelant reçoit une erreur explicite et bascule en
