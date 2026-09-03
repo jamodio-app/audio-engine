@@ -22,10 +22,13 @@
 
 pub mod denoise;
 pub mod gate;
+pub mod isolator;
+pub mod resample;
 pub mod vad;
 
 pub use denoise::Denoiser;
 pub use gate::{GateParams, VoiceGate};
+pub use isolator::{IsolationConfig, VoiceIsolator, VoiceState};
 pub use vad::Vad;
 
 /// Erreurs de l'isolation de voix. **Aucun fallback silencieux** : si un modèle
