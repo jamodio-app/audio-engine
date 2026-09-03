@@ -17,6 +17,7 @@ use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, Plugi
 use crate::audio::midi::CapturedMidiEvent;
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
+use jamodio_audio_core::voice_isolation::{IsolationConfig, VoiceIsolator};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 use jamodio_audio_core::sync::jitter::JitterEstimator;
 #[cfg(target_os = "macos")]
@@ -792,6 +793,10 @@ pub struct PipelineState {
     /// `voice`) → alimente le VU talkback côté browser en mode agent voix (sinon
     /// plat : pas d'analyser navigateur). `0.0` hors voix active.
     pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    /// Isolation de voix (Lot 2) : état LIVE « à l'antenne » (gate ouvert) diffusé
+    /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
+    /// flag `voice_active` ci-dessus qui indique juste que le tap voix est monté.)
+    pub voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     /// Nb de canaux physiques + sample rate natif de la capture courante,
     /// mémorisés au `start_capture`. Permettent de greffer la voix (validation
     /// du canal demandé + config resampler voix) SANS redémarrer la capture
@@ -1209,6 +1214,7 @@ impl PipelineState {
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
@@ -2299,6 +2305,7 @@ impl PipelineState {
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
+        let voice_on_air = self.voice_on_air.clone();
         let output_device_name = self
             .output_device_id
             .as_deref()
@@ -2314,6 +2321,7 @@ impl PipelineState {
                     payload_type,
                     voice_gain,
                     voice_rms,
+                    voice_on_air,
                     output_device_name,
                 );
             })
@@ -3848,6 +3856,7 @@ fn voice_encode_stage_loop(
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3881,6 +3890,22 @@ fn voice_encode_stage_loop(
     let attack_coeff = 1.0 - (-1.0f32 / (0.015 * 48000.0)).exp();
     let release_coeff = 1.0 - (-1.0f32 / (0.080 * 48000.0)).exp();
 
+    // Isolation de voix talkback (Lot 2) : denoise (DeepFilterNet) + VAD (Silero) +
+    // gate, pur Rust (tract). Chargée UNE fois au démarrage du thread voix.
+    // Fallback (décision Ben) : si les modèles ne chargent pas → talkback en voix
+    // BRUTE (jamais coupé), l'UI indiquera « isolation inactive ».
+    let mut isolator: Option<VoiceIsolator> = match VoiceIsolator::new(IsolationConfig::default()) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::voice_isolation",
+                error = %e,
+                "isolation de voix indisponible — talkback en voix brute"
+            );
+            None
+        }
+    };
+
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(raw) => raw,
@@ -3890,9 +3915,30 @@ fn voice_encode_stage_loop(
 
         // 1. Bloc mono déjà @ 48 kHz (capture 48 k natif garanti — R2). Aucun
         //    resampling : le tap voix arrive au bon rate directement.
-        let mono48: Vec<f32> = raw;
+        let mut mono48: Vec<f32> = raw;
         if mono48.is_empty() {
             continue;
+        }
+
+        // 1-bis. Isolation de voix (AVANT le gain mute) : enlève la repisse
+        //        d'instrument et coupe hors parole. En cas d'erreur d'inférence,
+        //        on désactive l'isolation pour le reste de la session (voix brute)
+        //        sans JAMAIS couper le talkback — dégradation visible, pas silencieuse.
+        if let Some(iso) = isolator.as_mut() {
+            match iso.process_block(&mut mono48) {
+                Ok(state) => {
+                    voice_on_air.store(state.voice_active, std::sync::atomic::Ordering::Relaxed)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "jamodio::voice_isolation",
+                        error = %e,
+                        "erreur d'inférence isolation — bascule en voix brute"
+                    );
+                    isolator = None;
+                    voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
 
         // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
@@ -3944,6 +3990,7 @@ fn voice_encode_stage_loop(
     }
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
 }
 
