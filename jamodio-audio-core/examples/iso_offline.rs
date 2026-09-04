@@ -388,6 +388,44 @@ fn main() {
     std::fs::write(format!("{outdir}/{prefix}_trace.csv"), csv).unwrap();
     eprintln!("écrit {outdir}/{prefix}_trace.csv");
 
+    // ── Écrêtage : que rend le denoise selon le NIVEAU d'entrée ? ────────────
+    // Terrain 03/09 : `WARN df::tract: Possible clipping detected (2.619)`, soit
+    // +8,4 dB au-dessus du plein échelle, sur un simple micro-casque. On rejoue la
+    // même voix à différents niveaux d'entrée pour voir d'où vient le dépassement.
+    if std::env::var("ISO_PEAK_SWEEP").is_ok() {
+        let pic_in = input.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        println!("\n── Écrêtage en sortie de denoise selon le niveau d'entrée ──");
+        println!("pic du fichier source : {:.3} ({:.1} dBFS)", pic_in, db(pic_in));
+        println!("{:<12} {:>10} {:>10} {:>9} {:>12} {:>15}", "entrée", "pic in", "pic out", "gain", "éch. > 1.0", "fidélité/réf");
+        // Référence : la même voix traitée DANS la plage (−6 dBFS), remise à l'échelle.
+        let ref_k = 10f32.powf(-6.0 / 20.0) / pic_in.max(1e-9);
+        let ref_in: Vec<f32> = input.iter().map(|x| x * ref_k).collect();
+        let ref_out = denoise_with(&ref_in, DenoiseParams::default());
+        for cible_db in [-18.0f32, -12.0, -6.0, -3.0, -1.0, 0.0, 6.0, 8.4] {
+            let cible = 10f32.powf(cible_db / 20.0);
+            let k = cible / pic_in.max(1e-9);
+            let mis: Vec<f32> = input.iter().map(|x| x * k).collect();
+            let out = denoise_with(&mis, DenoiseParams::default());
+            let pic_out = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let n_clip = out.iter().filter(|x| x.abs() > 1.0).count();
+            // Écart au traitement « dans la plage » (les deux ramenés au même niveau).
+            let n = out.len().min(ref_out.len());
+            let renorm = 10f32.powf(-6.0 / 20.0) / cible;
+            let err: f32 = out[..n]
+                .iter()
+                .zip(&ref_out[..n])
+                .map(|(a, b)| (a * renorm - b).powi(2))
+                .sum::<f32>()
+                / n as f32;
+            let sig: f32 = ref_out[..n].iter().map(|x| x * x).sum::<f32>() / n as f32;
+            println!(
+                "{:>6.1} dBFS {:>10.3} {:>10.3} {:>8.1} dB {:>12} {:>12.1} dB",
+                cible_db, cible, pic_out, db(pic_out) - db(cible), n_clip,
+                10.0 * (sig / err.max(1e-20)).log10()
+            );
+        }
+    }
+
     // ── Banc de seuils DENOISE (avant tout gate) ─────────────────────────────
     // Ces seuils commutent des étages ENTIERS du modèle trame par trame : c'est
     // la première chose à écouter quand « ça n'est pas propre » AVANT le gate.

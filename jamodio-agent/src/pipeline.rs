@@ -6,6 +6,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
+use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
@@ -3973,6 +3974,17 @@ fn voice_encode_stage_loop(
     // Indicateur : l'isolation tourne-t-elle ? (sinon repli en voix brute → UI.)
     isolation_active.store(isolator.is_some(), std::sync::atomic::Ordering::Relaxed);
 
+    // Limiteur de crête AVANT Opus — actif aussi en repli voix brute, car c'est
+    // l'ENTRÉE qui dépasse : un micro-casque ou un micro interne, dont l'utilisateur
+    // ne règle aucun gain matériel, peut être amplifié par l'OS bien au-delà du plein
+    // échelle (mesuré en session : crêtes à +8,4 dB, que l'encodeur tronquait).
+    let mut limiter = PeakLimiter::new(
+        jamodio_audio_core::voice_isolation::isolator::SAMPLE_RATE as f32,
+        limiter::DEFAULT_CEILING,
+        limiter::DEFAULT_LOOKAHEAD_MS,
+    );
+    let mut last_limiter_report = std::time::Instant::now();
+
     // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
     let _ = ready_tx.send(());
     drop(ready_tx);
@@ -4010,6 +4022,23 @@ fn voice_encode_stage_loop(
                     voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
                     isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
+            }
+        }
+
+        // 1-ter. Limiteur de crête : borne ce qui part dans Opus sans aplatir la
+        //        forme d'onde (réduction de gain anticipée). Sous le plafond, le
+        //        signal n'est pas touché.
+        limiter.process_block(&mut mono48);
+        if last_limiter_report.elapsed() >= std::time::Duration::from_secs(5) {
+            last_limiter_report = std::time::Instant::now();
+            let reduction_db = limiter.take_max_reduction_db();
+            if reduction_db > 1.0 {
+                tracing::warn!(
+                    target: "jamodio::voice_isolation",
+                    reduction_db,
+                    "entrée talkback au-dessus du plein échelle — limiteur en action \
+                     (micro sans réglage de gain matériel ?)"
+                );
             }
         }
 

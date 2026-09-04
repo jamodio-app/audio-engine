@@ -43,6 +43,24 @@ le monitoring instrument ne traverse JAMAIS cette chaîne). Le seuil d'ouverture
 plus bas, la repisse d'instrument suffit à ouvrir le gate et la règle « je joue, rien ne
 sort » tombe (mesuré). La latence ajoutée est désormais **tracée au démarrage**.
 
+### Fixed — L'entrée talkback ne sature plus l'encodeur (limiteur de crête)
+
+Les logs terrain montraient `Possible clipping detected (2.619)` — **409 fois sur une journée,
+dont 193 au-dessus de 2,0**. Vérification faite dans la source de DeepFilterNet : cette valeur
+est le pic du signal **d'ENTRÉE**, pas de sortie. Autrement dit la capture livrait des crêtes à
+**+8,4 dB au-dessus du plein échelle**, avec un simple micro-casque. C'est normal et attendu :
+CoreAudio (comme WASAPI/ASIO en flottant) livre des `f32` qui ne sont pas bornés à ±1.0, et un
+micro-casque ou interne — sans aucun réglage de gain matériel — peut être amplifié par le pilote
+ou l'OS. Ces échantillons partaient tels quels dans Opus, qui les tronquait.
+
+Mesuré au passage sur prise réelle : le denoise, lui, n'ajoute que **0,1 à 0,3 dB** — il n'est
+pour rien dans le dépassement.
+
+Un **limiteur de crête à lookahead** (3 ms, plafond −1 dBFS) est désormais placé juste avant
+l'encodeur, **y compris en repli voix brute** puisque c'est l'entrée qui déborde. Sous le
+plafond, le gain vaut exactement 1.0 : le signal n'est pas touché (ce n'est pas un compresseur).
+La réduction appliquée est tracée — l'UI l'affichera.
+
 ### Fixed — Le début du talkback n'est plus perdu à l'activation
 
 Le tap voix était greffé **avant** que les modèles d'isolation soient chargés (~260 ms) : la
