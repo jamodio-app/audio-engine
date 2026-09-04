@@ -7,6 +7,14 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.5.13-4] — 2026-09-04 (pré-release)
 
+### Fixed — La fenêtre Licences figeait l'agent sur Windows
+
+Elle s'ouvrait vide et l'agent devait être tué (End Task). Cause : la fenêtre était construite
+depuis le thread d'une commande Tauri, alors qu'une webview **doit** être créée sur le thread
+principal — macOS le tolérait, Windows non. La création est désormais postée sur la boucle
+d'événements, et la page réessaie brièvement si le pont Tauri n'est pas encore prêt plutôt que de
+rester muette.
+
 ### Ajouté — S'entendre sans envoyer (tranche instrument en PRIVÉ)
 
 Remontée d'un utilisateur : impossible de s'accorder sans que tout le studio l'entende. En effet,

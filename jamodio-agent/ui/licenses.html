@@ -44,13 +44,22 @@
     // qui s'affiche est exactement ce qui est livré. textContent, jamais innerHTML.
     (async () => {
       const el = document.getElementById('lic-text');
-      const invoke = window.__TAURI__?.core?.invoke;
-      if (!invoke) { el.textContent = 'Licences indisponibles (pont Tauri absent).'; return; }
-      try {
-        el.textContent = await invoke('get_third_party_licenses');
-      } catch (err) {
-        el.textContent = 'Impossible de lire les licences : ' + String(err);
+      // Le pont Tauri peut n'être pas encore injecté au tout premier rendu de la
+      // fenêtre : on réessaie brièvement plutôt que de laisser un écran vide
+      // sans explication (une fenêtre muette ressemble à un plantage).
+      for (let i = 0; i < 40; i++) {
+        const invoke = window.__TAURI__?.core?.invoke;
+        if (invoke) {
+          try {
+            el.textContent = await invoke('get_third_party_licenses');
+          } catch (err) {
+            el.textContent = 'Impossible de lire les licences : ' + String(err);
+          }
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 50));
       }
+      el.textContent = 'Licences indisponibles : le pont Tauri n\'a pas répondu.';
     })();
   </script>
 </body>

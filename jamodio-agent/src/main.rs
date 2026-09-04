@@ -76,25 +76,42 @@ fn get_third_party_licenses() -> &'static str {
 #[tauri::command]
 fn open_licenses_window(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager as _;
-    if let Some(win) = app.get_webview_window("licenses") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        return win.set_focus().map_err(|e| e.to_string());
-    }
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        "licenses",
-        tauri::WebviewUrl::App("licenses.html".into()),
-    )
-    .title("Licences — Jamodio Audio Engine")
-    .inner_size(600.0, 640.0)
-    .min_inner_size(420.0, 340.0)
-    .resizable(true)
-    // Contrairement à la fenêtre principale, elle ne doit PAS rester au-dessus de
-    // tout : on la lit, on la ferme.
-    .always_on_top(false)
-    .build()
-    .map(|_| ())
+    let handle = app.clone();
+    // ⚠️ La création d'une webview DOIT se faire sur le THREAD PRINCIPAL.
+    // Une commande Tauri s'exécute sur un thread du runtime async : construire
+    // la fenêtre depuis là fige WebView2 sur Windows — fenêtre ouverte mais
+    // vide, et agent bloqué au point de devoir le tuer (constaté en test le
+    // 04/09/2026). macOS tolérait, Windows non. On poste donc la création sur
+    // le thread de la boucle d'événements, et la commande rend la main tout de
+    // suite (les erreurs de construction sont tracées, pas silencieuses).
+    app.run_on_main_thread(move || {
+        if let Some(win) = handle.get_webview_window("licenses") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+        let built = tauri::WebviewWindowBuilder::new(
+            &handle,
+            "licenses",
+            tauri::WebviewUrl::App("licenses.html".into()),
+        )
+        .title("Licences — Jamodio Audio Engine")
+        .inner_size(600.0, 640.0)
+        .min_inner_size(420.0, 340.0)
+        .resizable(true)
+        // Contrairement à la fenêtre principale, elle ne reste pas au-dessus de
+        // tout : on la lit, on la ferme.
+        .always_on_top(false)
+        .build();
+        if let Err(e) = built {
+            tracing::error!(
+                target: "jamodio::ui",
+                error = %e,
+                "ouverture de la fenêtre Licences impossible"
+            );
+        }
+    })
     .map_err(|e| e.to_string())
 }
 
