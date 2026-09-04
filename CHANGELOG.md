@@ -7,6 +7,19 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.5.13-3] — 2026-09-04 (pré-release)
 
+### Changed — Fenêtre de l'Audio Engine
+
+- **Licences** : ouvre désormais une **vraie fenêtre**, redimensionnable et défilante, au lieu
+  d'un panneau écrasé dans une fenêtre de 300×380. La liste des composants tiers grandira avec
+  le produit (plugins d'effets open-source à venir).
+- **« Démarrer avec l'ordinateur »** passe à un **interrupteur au style Jamodio**, comme dans
+  l'app web (la case native reste dessous : focus clavier et accessibilité intacts).
+- Seconde signature de marque : **« Music creates connections. »** sous « Your studio. Anywhere. ».
+- **Installeur Windows en FRANÇAIS et en ANGLAIS** (un MSI par langue). L'app web sert
+  automatiquement celui qui correspond à la langue de l'interface — un utilisateur qui lit
+  Jamodio en anglais ne tombe plus sur un assistant d'installation en français. Le nom de
+  fichier stable historique reste le français : les liens en circulation gardent leur sens.
+
 ### Ajouté — Micro talkback SÉPARÉ de l'interface instrument
 
 Le talkback pouvait seulement être un CANAL du flux instrument : impossible de parler avec une

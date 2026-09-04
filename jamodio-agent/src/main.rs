@@ -69,6 +69,35 @@ fn get_third_party_licenses() -> &'static str {
     include_str!("../../THIRD-PARTY-LICENSES.md")
 }
 
+/// Ouvre la fenêtre « Licences » — une VRAIE fenêtre, pas un panneau dans la
+/// fenêtre principale (300×380, non redimensionnable) où le texte serait illisible.
+/// Elle défile et s'agrandit : la liste des composants tiers grandira avec le
+/// produit. Idempotent : si elle est déjà ouverte, on la remet au premier plan.
+#[tauri::command]
+fn open_licenses_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager as _;
+    if let Some(win) = app.get_webview_window("licenses") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        return win.set_focus().map_err(|e| e.to_string());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "licenses",
+        tauri::WebviewUrl::App("licenses.html".into()),
+    )
+    .title("Licences — Jamodio Audio Engine")
+    .inner_size(600.0, 640.0)
+    .min_inner_size(420.0, 340.0)
+    .resizable(true)
+    // Contrairement à la fenêtre principale, elle ne doit PAS rester au-dessus de
+    // tout : on la lit, on la ferme.
+    .always_on_top(false)
+    .build()
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 /// État courant de l'autostart (lu depuis l'OS : plist LaunchAgent sur macOS,
 /// clé Run du registre sur Windows). Alimente la case à cocher de la fenêtre
 /// agent à l'ouverture. `false` en cas d'erreur de lecture (fail-safe visuel).
@@ -397,6 +426,7 @@ fn main() {
             get_log_dir,
             get_version,
             get_third_party_licenses,
+            open_licenses_window,
             get_autostart,
             set_autostart,
             quit_app

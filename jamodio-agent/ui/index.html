@@ -23,6 +23,7 @@
       <div class="badge" id="status">IDLE</div>
     </div>
     <div class="tagline">YOUR STUDIO. <span class="tagline-accent">ANYWHERE.</span></div>
+    <div class="tagline tagline-jam">MUSIC CREATES <span class="tagline-accent">CONNECTIONS.</span></div>
     <div class="info">
       <div class="row">
         <span class="label">Device</span>
@@ -52,7 +53,11 @@
     <div class="settings">
       <label class="row setting" for="autostart-toggle" title="Lance automatiquement l'Audio Engine à l'ouverture de session de votre ordinateur. Décochez pour ne le démarrer que manuellement (ou depuis jamodio.com).">
         <span class="label">Démarrer avec l'ordinateur</span>
-        <input type="checkbox" id="autostart-toggle" class="toggle">
+        <!-- Interrupteur au style de l'app web : la case à cocher native reste
+             (accessibilité + clavier + le JS lit toujours `.checked`), c'est le
+             <span> frère qui porte l'apparence. -->
+        <input type="checkbox" id="autostart-toggle" class="toggle-input">
+        <span class="switch" aria-hidden="true"></span>
       </label>
     </div>
     <div class="actions">
@@ -63,13 +68,6 @@
       <!-- Filet quit OS-agnostic : indispensable sur Windows quand l'icône
            tray est rangée dans l'overflow (cf. tray_promote.rs). -->
       <button id="quit-app" type="button" title="Ferme l'Audio Engine (les studios ouverts seront prévenus)">Quitter l'agent</button>
-    </div>
-    <div class="licenses-panel hidden" id="licenses-panel" role="dialog" aria-modal="true" aria-label="Licences des composants tiers">
-      <div class="licenses-head">
-        <span>Licences des composants tiers</span>
-        <button id="close-licenses" type="button" aria-label="Fermer">✕</button>
-      </div>
-      <pre id="licenses-text">Chargement…</pre>
     </div>
     <div class="ws-status" id="ws-status">ws://localhost:9876 — en attente</div>
     <div class="version" id="version">—</div>
@@ -127,26 +125,19 @@
     }
 
     // ─── Bouton "Licences" ─────────────────────────────────────
-    // Le texte vient du binaire (include_str! de THIRD-PARTY-LICENSES.md) : ce
-    // qui est affiché est exactement ce qui est livré, pas une copie qui dérive.
+    // Ouvre une FENÊTRE dédiée (licenses.html) : la fenêtre principale fait
+    // 300×380 et ne se redimensionne pas — un panneau y serait illisible, et la
+    // liste des composants tiers grandira avec le produit.
     const licBtn = $('show-licenses');
-    const licPanel = $('licenses-panel');
-    const licText = $('licenses-text');
-    if (licBtn && licPanel && licText) {
+    if (licBtn) {
       licBtn.addEventListener('click', async () => {
-        licPanel.classList.remove('hidden');
         try {
-          const txt = await tauriInvoke('get_third_party_licenses');
-          // textContent (pas innerHTML) : le contenu ne doit jamais être
-          // interprété comme du HTML.
-          licText.textContent = txt || 'Licences indisponibles dans cette fenêtre.';
+          await tauriInvoke('open_licenses_window');
         } catch (err) {
-          licText.textContent = 'Impossible de lire les licences : ' + String(err);
+          licBtn.textContent = '✗ Échec';
+          licBtn.title = String(err);
+          setTimeout(() => { licBtn.textContent = 'Licences'; }, 2500);
         }
-      });
-      $('close-licenses')?.addEventListener('click', () => licPanel.classList.add('hidden'));
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') licPanel.classList.add('hidden');
       });
     }
 

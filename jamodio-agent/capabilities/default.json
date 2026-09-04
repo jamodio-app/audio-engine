@@ -1,7 +1,10 @@
 {
   "identifier": "default",
   "description": "Default permissions for Jamodio Audio Engine",
-  "windows": ["main"],
+  "windows": [
+    "main",
+    "licenses"
+  ],
   "permissions": [
     "core:default",
     "autostart:allow-enable",

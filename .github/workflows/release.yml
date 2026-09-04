@@ -178,7 +178,8 @@ jobs:
 
             **Téléchargements** (liens permanents, toujours la dernière version) :
             - macOS Apple Silicon (M1+) : [Jamodio-Audio-Engine-macOS-AppleSilicon.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg)
-            - Windows : [Jamodio-Audio-Engine-Windows.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.msi)
+            - Windows (installeur en français) : [Jamodio-Audio-Engine-Windows.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.msi)
+            - Windows (English installer) : [Jamodio-Audio-Engine-Windows-en.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows-en.msi)
           releaseDraft: true      # chaque matrix complète le draft
           # Tag semver de pré-release (contient un '-', ex. v0.5.0-rc.1) →
           # publié en pre-release GitHub, donc JAMAIS marqué "latest". L'updater
@@ -231,8 +232,15 @@ jobs:
               *aarch64*.dmg)
                 cp -v "$f" 'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg'
                 ;;
-              *.msi)
+              # Deux MSI depuis 0.5.13-3 : l'installeur existe en français et en
+              # anglais (WiX produit un fichier par langue). Le nom stable
+              # historique reste le FRANÇAIS — les liens déjà en circulation ne
+              # doivent pas changer de sens — et l'anglais prend un nom dédié.
+              *fr-FR*.msi)
                 cp -v "$f" 'Jamodio-Audio-Engine-Windows.msi'
+                ;;
+              *en-US*.msi)
+                cp -v "$f" 'Jamodio-Audio-Engine-Windows-en.msi'
                 ;;
             esac
           done
@@ -244,7 +252,8 @@ jobs:
           # les deux. Le delete séparé (|| true) rend l'étape rejouable sans échec.
           for stable in \
             'Jamodio-Audio-Engine-macOS-AppleSilicon.dmg' \
-            'Jamodio-Audio-Engine-Windows.msi'; do
+            'Jamodio-Audio-Engine-Windows.msi' \
+            'Jamodio-Audio-Engine-Windows-en.msi'; do
             if [ -f "$stable" ]; then
               gh release delete-asset "$TAG" "$stable" -R "$REPO" --yes 2>/dev/null || true
               gh release upload "$TAG" "$stable" -R "$REPO"

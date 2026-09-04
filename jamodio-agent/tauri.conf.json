@@ -67,7 +67,7 @@
         "type": "embedBootstrapper"
       },
       "wix": {
-        "language": "fr-FR",
+        "language": ["fr-FR", "en-US"],
         "bannerPath": "icons/wix/banner.bmp",
         "dialogImagePath": "icons/wix/dialog.bmp"
       }
