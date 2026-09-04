@@ -255,10 +255,9 @@ mod tests {
     /// la bande utile de la parole est très en dessous de 8 kHz.
     fn parole_48k() -> Vec<f32> {
         const RAW: &[u8] = include_bytes!("../../tests/fixtures/speech_16k_mono_i16.raw");
-        let s16: Vec<f32> = RAW
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-            .collect();
+        let (paires, _reste) = RAW.as_chunks::<2>();
+        let s16: Vec<f32> =
+            paires.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32768.0).collect();
         let mut out = vec![0.0f32; SAMPLE_RATE as usize * 3 / 10]; // 300 ms de silence
         for w in s16.windows(2) {
             for k in 0..3 {

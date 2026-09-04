@@ -146,13 +146,13 @@ mod tests {
         // échoue si le contexte n'est plus appliqué.
         // Fixture : 1,5 s de parole @16k mono i16 (LibriSpeech dev-clean, CC-BY 4.0).
         const RAW: &[u8] = include_bytes!("../../tests/fixtures/speech_16k_mono_i16.raw");
-        let samples: Vec<f32> = RAW
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-            .collect();
+        let (paires, _reste) = RAW.as_chunks::<2>();
+        let samples: Vec<f32> =
+            paires.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32768.0).collect();
         let mut v = Vad::new().unwrap();
         let (mut maxp, mut speech, mut frames) = (0.0f32, 0usize, 0usize);
-        for frame in samples.chunks_exact(VAD_FRAME) {
+        let (trames, _reste) = samples.as_chunks::<VAD_FRAME>();
+        for frame in trames {
             let p = v.speech_prob(frame).unwrap();
             maxp = maxp.max(p);
             if p >= 0.5 {
