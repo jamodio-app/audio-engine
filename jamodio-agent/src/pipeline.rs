@@ -1515,9 +1515,6 @@ impl PipelineState {
             .map_err(|e| format!("{e}"))
     }
 
-    /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF
-    /// browser). Le flag est lu sans lock dans l'encoder_thread à chaque
-    /// frame capturée — coût Relaxed négligeable face à une frame 2.5ms.
     /// Bascule la tranche instrument en PRIVÉ. On continue de S'ENTENDRE ; les
     /// autres musiciens n'entendent plus rien, et la tranche sort du FICHIER
     /// (partagé — décision Ben) via le mixer.
@@ -1528,6 +1525,11 @@ impl PipelineState {
         tracing::info!(target: "jamodio::pipeline", private, "instrument private updated");
     }
 
+    /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF
+    /// browser, agents antérieurs au mode PRIVÉ). Le flag est lu sans lock dans
+    /// l'encoder_thread à chaque frame capturée — coût Relaxed négligeable face
+    /// à une frame 2.5 ms. ⚠️ Coupe AUSSI le self-monitor (il est en aval) :
+    /// c'est précisément ce que `set_instrument_private` ne fait pas.
     pub fn set_input_cut(&mut self, cut: bool) {
         self.input_cut.store(cut, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "jamodio::pipeline", cut, "input_cut updated");
@@ -2356,6 +2358,15 @@ impl PipelineState {
             }
         }
         self.voice_capture = None;
+        // À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
+        // active : l'ancienne est démontée et la nouvelle pas encore branchée.
+        // Sans ce passage à false, un échec en cours de route (micro débranché
+        // entre l'affichage de la liste et le clic) laisserait l'agent convaincu
+        // qu'un talkback tourne — la fenêtre afficherait un micro pour un flux
+        // inexistant, et le prochain démarrage prendrait la branche « idempotence »
+        // sur un état fantôme.
+        self.voice_active = false;
+        self.voice_device_label = None;
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2383,8 +2394,10 @@ impl PipelineState {
             .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
         // 6. Spawn du thread d'encodage voix (RT). Termine seul au drop de voice_tx.
         //    Il signale sur `ready_tx` quand il est PRÊT À CONSOMMER (encodeur créé,
-        //    modèles d'isolation chargés) — cf. étape 7.
-        let (ready_tx, ready_rx) = bounded::<()>(1);
+        //    modèles d'isolation chargés) — cf. étape 7. Canal ONESHOT TOKIO (et
+        //    non crossbeam) : l'attente doit être `await`, pas bloquante — on tient
+        //    le mutex pipeline et on tourne sur un worker du runtime.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("voice-encode".into())
             .spawn(move || {
@@ -2406,16 +2419,17 @@ impl PipelineState {
         //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
         //    mesurés) : la file de 32 blocs déborde et la PREMIÈRE DEMI-SECONDE de
         //    talkback part en silence (constaté en logs terrain, « tap voix saturé »).
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(()) => {}
+        match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
+            Ok(Ok(())) => {}
             // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
             // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Ok(Err(_)) => {
+                self.voice_active = false;
                 return Err("voice encode thread failed to start".to_string());
             }
             // Machine très lente : on greffe quand même (comportement d'avant), mais
             // on le DIT — le début du talkback peut être tronqué.
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(_) => {
                 tracing::warn!(
                     target: "jamodio::pipeline",
                     "thread voix toujours pas prêt après 10 s — greffe du tap quand même, \
@@ -2428,11 +2442,19 @@ impl PipelineState {
         //    isolation, limiteur, Opus et RTP sont identiques dans les deux cas.
         let voice_source = match voice_device_id.as_ref() {
             Some(id) => {
-                let (info, handle) = crate::audio::voice_capture::spawn_voice_capture(
-                    id.clone(),
-                    channel_index as usize,
-                    voice_tx,
-                )?;
+                // Ouverture du périphérique : elle ATTEND la réponse du pilote
+                // (jusqu'à 10 s dans le pire cas). On la sort du worker tokio,
+                // sinon une carte lente à répondre gèlerait le runtime — et le
+                // navigateur, dont le watchdog est à 3 s, déclarerait l'agent
+                // perdu alors qu'il va très bien.
+                let id_owned = id.clone();
+                let ch = channel_index as usize;
+                let opened = tokio::task::spawn_blocking(move || {
+                    crate::audio::voice_capture::spawn_voice_capture(id_owned, ch, voice_tx)
+                })
+                .await
+                .map_err(|e| format!("ouverture du micro talkback interrompue : {e}"))?;
+                let (info, handle) = opened?;
                 self.voice_capture = Some(handle);
                 // Nom lisible = la part « nom » de l'id `{host}:{index}:{nom}`.
                 self.voice_device_label =
@@ -4059,8 +4081,10 @@ fn voice_encode_stage_loop(
     output_device_name: Option<String>,
     // Signale à `start_voice_capture` que ce thread est prêt à consommer (encodeur
     // créé, modèles d'isolation chargés) → il ne greffe le tap qu'à ce moment.
-    // Droppé sans envoi si le thread abandonne : l'appelant voit `Disconnected`.
-    ready_tx: Sender<()>,
+    // Droppé sans envoi si le thread abandonne : l'appelant voit le canal fermé.
+    // Oneshot TOKIO : l'appelant attend en `await`, il ne doit pas bloquer un
+    // worker du runtime pendant le chargement des modèles.
+    ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -4133,8 +4157,8 @@ fn voice_encode_stage_loop(
     let mut last_limiter_report = std::time::Instant::now();
 
     // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
+    // `send` consomme le Sender — le canal se ferme donc de lui-même ensuite.
     let _ = ready_tx.send(());
-    drop(ready_tx);
 
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -4205,7 +4229,9 @@ fn voice_encode_stage_loop(
         }
 
         // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
-        //    (L=R). On mesure au passage le RMS POST-gain (VU talkback).
+        //    (L=R). Le niveau du VU, lui, a été relevé en ENTRÉE (étape 1-bis) :
+        //    il doit refléter ce que le micro capte, pas ce que le filtre laisse
+        //    passer.
         let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
         for &s in mono48.iter() {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };

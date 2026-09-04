@@ -60,7 +60,16 @@ pub struct Denoiser {
     enh_hop: Vec<f32>,
     /// Coussin de sortie à atteindre avant de commencer à émettre (= latence algo).
     prime_target: usize,
+    /// Plus grand bloc reçu jusqu'ici. Le coussin doit le couvrir : un pilote qui
+    /// délivre des blocs plus GROS que la latence du modèle (buffer de 2048
+    /// frames, vu sur certaines cartes) viderait l'anneau de sortie à chaque tour
+    /// et on comblerait en silence — un trou périodique, inaudible à l'analyse et
+    /// invisible dans les logs.
+    max_block: usize,
     primed: bool,
+    /// Nombre d'échantillons comblés par du silence faute de sortie disponible.
+    /// Doit rester à 0 ; sinon c'est une dégradation, et elle se DIT.
+    underruns: u64,
 }
 
 impl Denoiser {
@@ -84,7 +93,7 @@ impl Denoiser {
         let latency = (model.fft_size - model.hop_size) + model.lookahead * model.hop_size;
         // Coussin ≥ latence et ≥ 1 hop → jamais de sous-alimentation en régime.
         let prime_target = latency.max(hop);
-        Ok(Self {
+        let mut den = Self {
             model,
             hop,
             sr,
@@ -93,8 +102,22 @@ impl Denoiser {
             in_hop: vec![0.0; hop],
             enh_hop: vec![0.0; hop],
             prime_target,
+            max_block: 0,
             primed: false,
-        })
+            underruns: 0,
+        };
+        // RODAGE : `tract` alloue ses tampons à la première inférence. Payé ici,
+        // à la construction, plutôt que sur le premier bloc de voix réel — au
+        // moment précis où la capture commence à pousser.
+        //
+        // Fait DANS le constructeur (et non chez l'appelant) pour que TOUT
+        // `Denoiser` naisse dans le MÊME état interne : sans quoi une instance
+        // rodée et une instance fraîche ne rendent pas exactement le même signal,
+        // et le banc de diagnostic ne décrirait plus la production.
+        let mut rodage = vec![0.0f32; hop * 3];
+        den.process_block(&mut rodage)?;
+        den.reset();
+        Ok(den)
     }
 
     pub fn sample_rate(&self) -> usize {
@@ -111,6 +134,7 @@ impl Denoiser {
     /// modèle (silence pendant l'amorçage initial).
     pub fn process_block(&mut self, block: &mut [f32]) -> Result<(), IsolationError> {
         // 1) Empile l'entrée, traite tous les hops complets disponibles.
+        self.max_block = self.max_block.max(block.len());
         self.in_ring.extend(block.iter().copied());
         while self.in_ring.len() >= self.hop {
             for slot in self.in_hop.iter_mut() {
@@ -127,14 +151,38 @@ impl Denoiser {
         }
 
         // 2) Amorçage : tant que le coussin n'est pas constitué, on émet du silence
-        //    (c'est la latence). Ensuite, on émet la voix débruitée.
-        if !self.primed && self.out_ring.len() >= self.prime_target {
+        //    (c'est la latence). Le coussin doit couvrir À LA FOIS la latence du
+        //    modèle ET la taille du plus gros bloc reçu, sinon chaque bloc plus
+        //    grand que le coussin sortirait à moitié vide.
+        let cushion = self.prime_target.max(self.max_block);
+        if !self.primed && self.out_ring.len() >= cushion {
             self.primed = true;
         }
         if self.primed {
+            let mut missing = 0usize;
             for slot in block.iter_mut() {
-                // `unwrap_or(0.0)` : au pire du silence, jamais de bruit résiduel.
-                *slot = self.out_ring.pop_front().unwrap_or(0.0);
+                match self.out_ring.pop_front() {
+                    Some(v) => *slot = v,
+                    // Au pire du silence, jamais de bruit résiduel — mais on le
+                    // COMPTE : un trou silencieux non signalé est indiagnostiquable.
+                    None => {
+                        *slot = 0.0;
+                        missing += 1;
+                    }
+                }
+            }
+            if missing > 0 {
+                self.underruns = self.underruns.saturating_add(missing as u64);
+                if self.underruns.is_power_of_two() {
+                    tracing::warn!(
+                        target: "jamodio::voice_isolation",
+                        missing,
+                        total = self.underruns,
+                        block = block.len(),
+                        cushion,
+                        "denoise sous-alimenté — silence comblé (coussin trop court ?)"
+                    );
+                }
             }
         } else {
             block.fill(0.0);
@@ -148,6 +196,17 @@ impl Denoiser {
         self.in_ring.clear();
         self.out_ring.clear();
         self.primed = false;
+        // La taille de bloc se RÉAPPREND : après un hot-swap de device, celle de
+        // l'ancien pilote ne doit pas dimensionner le coussin du nouveau. C'est
+        // aussi ce qui empêche le bloc de rodage de `VoiceIsolator::new` (plus
+        // gros qu'un bloc réel) d'ajouter 2 ms de latence à tout le canal.
+        self.max_block = 0;
+    }
+
+    /// Échantillons comblés par du silence faute de sortie disponible (doit
+    /// rester à 0). Exposé pour les tests et le diagnostic.
+    pub fn underruns(&self) -> u64 {
+        self.underruns
     }
 }
 
@@ -198,5 +257,27 @@ mod tests {
         assert_eq!(p.max_erb_snr_db, 35.0);
         assert_eq!(p.max_df_snr_db, 35.0);
         assert_eq!(p.atten_lim_db, 100.0);
+    }
+
+    #[test]
+    fn gros_blocs_ne_creusent_pas_de_trous() {
+        // RÉGRESSION (revue 04/09) : avec un pilote qui délivre des blocs PLUS
+        // GROS que la latence du modèle (2048 frames, vu sur certaines cartes),
+        // un coussin figé sur la seule latence se vidait à chaque tour et on
+        // comblait en silence — un trou périodique, muet dans les logs.
+        let mut d = Denoiser::new().unwrap();
+        // Signal continu : tout zéro en sortie APRÈS amorçage signalerait un trou.
+        let bloc: Vec<f32> = (0..2048)
+            .map(|i| (i as f32 * 0.01).sin() * 0.3)
+            .collect();
+        for _ in 0..12 {
+            let mut b = bloc.clone();
+            d.process_block(&mut b).unwrap();
+        }
+        assert_eq!(
+            d.underruns(),
+            0,
+            "aucun échantillon ne doit être comblé par du silence sur des blocs de 2048"
+        );
     }
 }

@@ -271,8 +271,12 @@ pub fn build_voice_capture_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
+                    // 1/2^15 (et non 1/i16::MAX) : même convention que la capture
+                    // instrument — sinon un échantillon pleine échelle négatif
+                    // sortirait légèrement au-delà de -1.0.
+                    const SCALE: f32 = 1.0 / 32_768.0;
                     scratch.clear();
-                    scratch.extend(data.iter().map(|s| *s as f32 / i16::MAX as f32));
+                    scratch.extend(data.iter().map(|s| *s as f32 * SCALE));
                     converter.feed(&scratch, &mut send);
                 },
                 err_fn,
@@ -284,8 +288,9 @@ pub fn build_voice_capture_stream(
             device.build_input_stream(
                 &config,
                 move |data: &[i32], _| {
+                    const SCALE: f32 = 1.0 / 2_147_483_648.0; // 1 / 2^31
                     scratch.clear();
-                    scratch.extend(data.iter().map(|s| *s as f32 / i32::MAX as f32));
+                    scratch.extend(data.iter().map(|s| *s as f32 * SCALE));
                     converter.feed(&scratch, &mut send);
                 },
                 err_fn,

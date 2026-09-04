@@ -2465,10 +2465,13 @@ async fn handle_message(
         }
 
         BrowserMessage::SetInstrumentPrivate { private } => {
-            // Toggle d'interface (LIVE ⇄ PRIVÉ) : idempotent, sans réouverture de
-            // driver. Try-lock comme les autres toggles du hot-path — si l'agent
-            // est en contention, l'utilisateur rebasculera.
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+            // On ATTEND le lock. Ce n'est pas un toggle de confort : la promesse
+            // est « les autres ne m'entendent plus ». Un try-lock abandonnerait la
+            // commande en cas de contention (un pair qui rejoint, un reset ASIO…)
+            // pendant que l'interface, elle, afficherait déjà PRIVÉ — l'utilisateur
+            // s'accorderait en croyant être seul à s'entendre. Action utilisateur
+            // rare : la fiabilité prime sur la latence, comme pour StartVoiceCapture.
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
                 return vec![AgentMessage::error("agent overloaded")];
             };
             pl.set_instrument_private(private);
@@ -2661,7 +2664,11 @@ async fn handle_message(
         }
 
         BrowserMessage::SetInputCut { cut } => {
-            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+            // Même raison que SetInstrumentPrivate : couper son entrée est une
+            // promesse faite aux autres, pas un réglage de confort. Perdre la
+            // commande sur contention laisserait le signal partir alors que
+            // l'interface affiche « ENTRÉE OFF ».
+            let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
                 return vec![];
             };
             pl.set_input_cut(cut);

@@ -5,6 +5,36 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.13-5] — 2026-09-04 (pré-release)
+
+### Fixed — Revue de code du chantier talkback (7 défauts corrigés)
+
+Revue menée avant merge sur l'ensemble du chantier (isolation de voix, micro dédié, mode privé).
+Trois défauts touchaient la promesse la plus sensible du produit : « les autres ne m'entendent
+plus ».
+
+- **PRIVÉ pouvait être perdu** : la commande utilisait un verrou opportuniste et était abandonnée
+  en cas de contention (un pair qui rejoint, un reset ASIO…) — l'interface affichait PRIVÉ pendant
+  que le son continuait de partir. La commande attend désormais le verrou, comme toute action dont
+  la promesse est faite aux autres. Idem pour « ENTRÉE OFF », qui portait la même faiblesse.
+- **État fantôme du talkback** : si l'ouverture du micro dédié échouait (casque débranché entre
+  l'affichage de la liste et le clic), l'agent restait convaincu qu'un talkback tournait — la
+  fenêtre affichait un micro pour un flux inexistant.
+- **Attente bloquante sous le verrou** : l'activation du talkback bloquait un worker du runtime
+  jusqu'à 10 s dans le pire cas. Au-delà de 3 s, le navigateur déclare l'agent perdu alors qu'il
+  va parfaitement bien. L'attente est maintenant asynchrone et l'ouverture du périphérique sort du
+  runtime.
+- **Trous silencieux dans le denoise** : avec un pilote délivrant des blocs plus gros que la
+  latence du modèle (buffer de 2048 frames), l'anneau de sortie se vidait à chaque tour et on
+  comblait en silence — un trou périodique, sans le moindre log. Le coussin s'adapte à la taille
+  de bloc réelle, et tout comblement est désormais compté et tracé.
+- Deux commentaires devenus faux (documentation d'`ENTRÉE OFF` rattachée à la mauvaise fonction,
+  mesure du VU décrite comme post-gain) et une normalisation i16/i32 divergente du reste du code.
+
+Le rodage des modèles passe dans le constructeur du denoise : tout exemplaire naît dans le même
+état, si bien que le banc de diagnostic hors-ligne reproduit la production **au bit près**
+(écart max mesuré sur 55 s de prise réelle : 0,000000).
+
 ## [0.5.13-4] — 2026-09-04 (pré-release)
 
 ### Fixed — La fenêtre Licences figeait l'agent sur Windows

@@ -117,14 +117,12 @@ impl VoiceIsolator {
             vad_close: cfg.vad_close_threshold,
             speech: false,
         };
-        // Rodage : `tract` alloue ses tampons à la PREMIÈRE inférence. Sans ce tour
-        // à blanc, ce coût tomberait sur le premier bloc de voix réel, au moment
-        // précis où la capture commence à pousser. On force donc une passe complète
-        // (assez de silence pour déclencher denoise ET VAD) avant de rendre la main,
-        // puis on remet l'état à zéro.
-        let mut rodage = vec![0.0f32; VAD_FRAME * 3];
-        iso.process_block(&mut rodage)?;
-        iso.reset();
+        // Rodage du VAD (le denoise se rode lui-même, dans son constructeur) :
+        // première inférence = allocation des tampons `tract`, à payer ici et non
+        // sur le premier bloc de voix réel.
+        let silence = vec![0.0f32; VAD_FRAME];
+        iso.vad.speech_prob(&silence)?;
+        iso.vad.reset();
         Ok(iso)
     }
 

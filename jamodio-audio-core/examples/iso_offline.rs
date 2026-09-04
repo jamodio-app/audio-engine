@@ -531,6 +531,21 @@ fn main() {
             .zip(&simule[..n])
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
+        // Où se situe l'écart ? Le rodage des modèles (VoiceIsolator::new) laisse
+        // l'état interne de DeepFilterNet légèrement différent d'une instance
+        // fraîche : la divergence doit être un TRANSITOIRE de début, pas un écart
+        // permanent — sinon le banc ne décrirait pas la production.
+        let apres = SR * 2;
+        let ecart_regime = if n > apres {
+            reel[l + apres..l + n]
+                .iter()
+                .zip(&simule[apres..n])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        } else {
+            f32::NAN
+        };
+        println!("   (écart après 2 s d'établissement : {:.6} = {:.1} dBFS)", ecart_regime, db(ecart_regime));
         println!(
             "\nparité banc ↔ VoiceIsolator (réglages par défaut) : écart max {ecart:.6} ({:.1} dBFS) — latence ajoutée {:.0} ms",
             db(ecart),
