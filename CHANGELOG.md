@@ -5,6 +5,36 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.13-3] — 2026-09-04 (pré-release)
+
+### Ajouté — Micro talkback SÉPARÉ de l'interface instrument
+
+Le talkback pouvait seulement être un CANAL du flux instrument : impossible de parler avec une
+interface à une seule entrée (basse branchée = aucun canal libre), et choisir un autre micro
+faisait sortir la voix de l'agent — donc sans Filtre antibruit et avec une latence non maîtrisée.
+
+L'agent sait désormais ouvrir un **flux d'entrée dédié** sur le micro de son choix (micro-casque,
+micro interne, seconde carte). Dans les Paramètres, la liste des micros talkback devient **unique** :
+on choisit un micro, l'agent décide du mécanisme (tap sur le flux instrument si c'est la même
+interface, flux dédié sinon). L'interface instrument n'y figure qu'une fois.
+
+- **Rééchantillonnage du canal voix** quand le micro tourne à 44,1 ou 16 kHz — cas courant des
+  micros-casques. Exception ASSUMÉE et limitée au talkback : le chemin instrument garde R2
+  (48 kHz natif, aucun resampler). Coût mesuré < 4 ms, annoncé dans les Paramètres.
+- Ids de micro voix **préfixés par leur host** (`wasapi:2:Casque USB`) : sans ça, l'index d'une
+  énumération ASIO et celui d'une énumération WASAPI désigneraient deux matériels différents sous
+  le même id. Les ids instrument ne changent pas — aucun réglage instrument n'est perdu.
+- Le flux voix est tenu par un thread propriétaire : lâcher la poignée arrête le flux et **relâche
+  le périphérique**.
+- Rétro-compatible : `start-voice-capture` sans `voiceDeviceId` = comportement historique, prouvé
+  par un test sur le message legacy.
+
+⚠️ **Windows** : le canal voix passera par WASAPI pendant que l'instrument reste en ASIO (un
+pilote ASIO est exclusif). À valider sur machine Windows avant diffusion.
+
+⚠️ **Bêta** : les testeurs qui avaient choisi un micro « navigateur » devront le re-sélectionner
+une fois (l'ancien identifiant ne désigne plus rien).
+
 ## [0.5.13-2] — 2026-09-03 (pré-release)
 
 **Qualité de l'isolation de voix talkback.** La 0.5.13-1 rendait le talkback muet, puis,
