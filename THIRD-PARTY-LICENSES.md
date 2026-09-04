@@ -1,23 +1,24 @@
 # Licences des composants tiers — Jamodio Audio Engine
 
 Jamodio embarque des composants open-source. Leurs licences (MIT / Apache-2.0)
-imposent d'inclure le copyright et le texte de licence : les voici. La fonction
-d'**isolation de voix (talkback)** est fournie par les deux composants suivants,
-exécutés **100 % en local sur votre machine** (aucune donnée envoyée à un serveur).
+imposent d'inclure le copyright et le texte de licence : les voici. Le
+**Filtre antibruit** du talkback est fourni par les deux composants suivants,
+exécutés **100 % en local sur votre machine** (aucune donnée envoyée à un serveur,
+aucun abonnement). Modèles exécutés via `tract` (moteur ONNX pur Rust).
 
-> NB : cette page de crédits sera aussi accessible depuis l'agent (« À propos →
-> Licences ») et le site web. Modèles exécutés via `tract` (moteur ONNX pur Rust).
+> Ce texte est accessible depuis la fenêtre de l'Audio Engine (bouton
+> « Licences ») — il y est lu directement dans ce fichier, embarqué au build.
 
 ---
 
-## DeepFilterNet (isolation de voix — débruitage)
+## DeepFilterNet (Filtre antibruit — débruitage)
 
 - Projet : https://github.com/Rikorose/DeepFilterNet
 - Copyright © Hendrik Schröter et contributeurs DeepFilterNet.
 - Licence : **au choix, MIT OU Apache-2.0**. Poids du modèle inclus sous la même
   licence. Entraîné sur le corpus DNS-Challenge (données de licences permissives).
 
-## Silero VAD (isolation de voix — détection de parole)
+## Silero VAD (Filtre antibruit — détection de parole)
 
 - Projet : https://github.com/snakers4/silero-vad
 - Copyright © Silero Team.

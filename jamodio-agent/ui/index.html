@@ -57,9 +57,19 @@
     </div>
     <div class="actions">
       <button id="export-logs" type="button">Exporter les logs</button>
+      <!-- Obligation d'attribution MIT / Apache-2.0 des composants du Filtre
+           antibruit : le texte doit être fourni AVEC le logiciel. -->
+      <button id="show-licenses" type="button" title="Licences des composants open-source embarqués (Filtre antibruit)">Licences</button>
       <!-- Filet quit OS-agnostic : indispensable sur Windows quand l'icône
            tray est rangée dans l'overflow (cf. tray_promote.rs). -->
       <button id="quit-app" type="button" title="Ferme l'Audio Engine (les studios ouverts seront prévenus)">Quitter l'agent</button>
+    </div>
+    <div class="licenses-panel hidden" id="licenses-panel" role="dialog" aria-modal="true" aria-label="Licences des composants tiers">
+      <div class="licenses-head">
+        <span>Licences des composants tiers</span>
+        <button id="close-licenses" type="button" aria-label="Fermer">✕</button>
+      </div>
+      <pre id="licenses-text">Chargement…</pre>
     </div>
     <div class="ws-status" id="ws-status">ws://localhost:9876 — en attente</div>
     <div class="version" id="version">—</div>
@@ -113,6 +123,30 @@
           exportBtn.title = String(err);
           setTimeout(() => { exportBtn.textContent = 'Exporter les logs'; }, 2500);
         }
+      });
+    }
+
+    // ─── Bouton "Licences" ─────────────────────────────────────
+    // Le texte vient du binaire (include_str! de THIRD-PARTY-LICENSES.md) : ce
+    // qui est affiché est exactement ce qui est livré, pas une copie qui dérive.
+    const licBtn = $('show-licenses');
+    const licPanel = $('licenses-panel');
+    const licText = $('licenses-text');
+    if (licBtn && licPanel && licText) {
+      licBtn.addEventListener('click', async () => {
+        licPanel.classList.remove('hidden');
+        try {
+          const txt = await tauriInvoke('get_third_party_licenses');
+          // textContent (pas innerHTML) : le contenu ne doit jamais être
+          // interprété comme du HTML.
+          licText.textContent = txt || 'Licences indisponibles dans cette fenêtre.';
+        } catch (err) {
+          licText.textContent = 'Impossible de lire les licences : ' + String(err);
+        }
+      });
+      $('close-licenses')?.addEventListener('click', () => licPanel.classList.add('hidden'));
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') licPanel.classList.add('hidden');
       });
     }
 

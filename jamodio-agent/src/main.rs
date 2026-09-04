@@ -57,6 +57,18 @@ fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Texte des licences tierces, EMBARQUÉ AU BUILD depuis `THIRD-PARTY-LICENSES.md`.
+///
+/// Les licences MIT / Apache-2.0 de DeepFilterNet et Silero VAD (le Filtre
+/// antibruit du talkback) imposent de fournir le copyright et le texte de licence
+/// AVEC le logiciel : cet écran est cette obligation, pas un bonus. `include_str!`
+/// plutôt qu'une copie dans l'HTML pour qu'il n'y ait qu'UNE source de vérité —
+/// impossible que le fichier du dépôt et ce qui est livré divergent.
+#[tauri::command]
+fn get_third_party_licenses() -> &'static str {
+    include_str!("../../THIRD-PARTY-LICENSES.md")
+}
+
 /// État courant de l'autostart (lu depuis l'OS : plist LaunchAgent sur macOS,
 /// clé Run du registre sur Windows). Alimente la case à cocher de la fenêtre
 /// agent à l'ouverture. `false` en cas d'erreur de lecture (fail-safe visuel).
@@ -384,6 +396,7 @@ fn main() {
             open_log_dir,
             get_log_dir,
             get_version,
+            get_third_party_licenses,
             get_autostart,
             set_autostart,
             quit_app
