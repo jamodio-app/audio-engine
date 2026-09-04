@@ -789,6 +789,11 @@ pub struct PipelineState {
     /// qui n'a pas d'équivalent ici puisque le flux part en PlainTransport
     /// piloté par CPAL).
     pub input_cut: Arc<std::sync::atomic::AtomicBool>,
+    /// Tranche instrument en **PRIVÉ** : je m'entends (accordage, réglages), les
+    /// autres non. Distinct d'`input_cut`, qui met l'entrée à zéro AVANT le
+    /// self-monitor et coupe donc aussi ce qu'on entend. Appliqué à l'entrée de
+    /// l'étage d'ENVOI uniquement — le monitoring, en amont, n'est pas touché.
+    pub instrument_private: Arc<std::sync::atomic::AtomicBool>,
     /// Talkback via l'agent (Lot 2, v0.5.7). `Some` pendant une capture
     /// instrument active : canal de commande du tap voix vers le
     /// `capture_stage`. Le tap extrait un canal mono du buffer multicanal BRUT
@@ -1237,6 +1242,7 @@ impl PipelineState {
             midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             recorder: None,
             input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instrument_private: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             voice_ctrl_tx: None,
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
@@ -1512,6 +1518,16 @@ impl PipelineState {
     /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF
     /// browser). Le flag est lu sans lock dans l'encoder_thread à chaque
     /// frame capturée — coût Relaxed négligeable face à une frame 2.5ms.
+    /// Bascule la tranche instrument en PRIVÉ. On continue de S'ENTENDRE ; les
+    /// autres musiciens n'entendent plus rien, et la tranche sort du FICHIER
+    /// (partagé — décision Ben) via le mixer.
+    pub fn set_instrument_private(&mut self, private: bool) {
+        self.instrument_private
+            .store(private, std::sync::atomic::Ordering::Relaxed);
+        self.mixer.set_self_private(private);
+        tracing::info!(target: "jamodio::pipeline", private, "instrument private updated");
+    }
+
     pub fn set_input_cut(&mut self, cut: bool) {
         self.input_cut.store(cut, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "jamodio::pipeline", cut, "input_cut updated");
@@ -2112,6 +2128,9 @@ impl PipelineState {
         // (ceinture+bretelles) ; ce reset est le filet racine côté agent.
         if !session_continues {
             self.set_input_cut(false);
+            // Même raison pour le mode PRIVÉ : sans reset il survivrait d'une
+            // session à l'autre, et on rejoindrait un studio sans être entendu.
+            self.set_instrument_private(false);
         }
         // Canal de commande du tap voix (capacité 4 : Add/Remove sont rares,
         // pilotés par les toggles UI). Poll é par `capture_stage_loop`.
@@ -2194,6 +2213,7 @@ impl PipelineState {
         self.mixer.add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
         let input_cut_for_encoder = self.input_cut.clone();
+        let instrument_private_for_encoder = self.instrument_private.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_host_for_encoder = self.plugin_host.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2227,6 +2247,7 @@ impl PipelineState {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, effective_sel, mixer_for_encoder, input_cut_for_encoder,
+                    instrument_private_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
@@ -3113,6 +3134,7 @@ fn encoder_thread(
     channel_sel: ChannelSel,
     mixer: Arc<AudioMixer>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
+    instrument_private: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
@@ -3213,6 +3235,7 @@ fn encoder_thread(
                 stop_enc,
                 ssrc,
                 payload_type,
+                instrument_private,
                 perfstats_enc,
                 out_name_enc,
             );
@@ -3844,12 +3867,17 @@ fn process_stage_loop(
 // Coût observé : ~50-100 µs par frame (Opus encode est constant). Spike
 // rarissime (Opus interne).
 
+#[allow(clippy::too_many_arguments)]
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
     sender: Arc<RtpSender>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     ssrc: u32,
     payload_type: u8,
+    // Tranche en PRIVÉ : on n'envoie plus rien aux autres. Appliqué ICI et nulle
+    // part ailleurs — le self-monitor est en amont, donc l'utilisateur continue
+    // de s'entendre (c'est tout l'objet du mode privé).
+    instrument_private: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
 ) {
@@ -3881,7 +3909,14 @@ fn encode_stage_loop(
             break;
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok((t_block_start, stereo)) => {
+            Ok((t_block_start, mut stereo)) => {
+                // PRIVÉ : on continue d'ÉMETTRE, mais du silence. Suspendre
+                // l'émission viderait le buffer de gigue des pairs et
+                // déclencherait leur concealment (artefacts) ; du silence les
+                // laisse en régime établi.
+                if instrument_private.load(std::sync::atomic::Ordering::Relaxed) {
+                    stereo.fill(0.0);
+                }
                 // v0.4.8 — timer "traitement pur" du encode_stage : depuis le
                 // pop ringbuf jusqu'au try_send RTP final. NB : `block_elapsed_ms`
                 // (pipeline_latency end-to-end) reste mesuré depuis t_block_start.

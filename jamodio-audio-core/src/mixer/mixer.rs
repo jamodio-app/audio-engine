@@ -253,6 +253,15 @@ pub struct AudioMixer {
     /// lu en concurrence par décodage + callback (lecteurs multiples, zéro
     /// contention entre eux).
     record_tx: RwLock<Option<Sender<RecordCmd>>>,
+    /// Tranche instrument en **PRIVÉ** : je m'entends, les autres non. Le
+    /// monitoring continue (c'est tout l'intérêt : s'accorder sans déranger),
+    /// mais rien de ce qui est privé ne doit finir dans le FICHIER — celui-ci est
+    /// partagé avec les autres musiciens (décision Ben, 04/09).
+    self_private: AtomicBool,
+    /// Armement RECORD demandé par l'utilisateur pour sa propre tranche. Mémorisé
+    /// à part car l'armement EFFECTIF vaut `utilisateur && !privé` : sortir du
+    /// mode privé doit rendre l'armement tel que l'utilisateur l'avait laissé.
+    self_armed_user: AtomicBool,
     /// Gate rapide (lock-free) miroir de `record_tx.is_some()` — testé en 1er sur
     /// le hot path pour court-circuiter le lookup/clone hors enregistrement.
     record_active: AtomicBool,
@@ -308,6 +317,8 @@ impl AudioMixer {
             scratch: Mutex::new(MixScratch::new()),
             default_target_ms: AtomicUsize::new(NO_DEFAULT_TARGET),
             record_tx: RwLock::new(None),
+            self_private: AtomicBool::new(false),
+            self_armed_user: AtomicBool::new(false),
             record_active: AtomicBool::new(false),
             master_gain: AtomicF32::new(1.0),
             dim_factor: AtomicF32::new(1.0),
@@ -377,14 +388,28 @@ impl AudioMixer {
     /// dans `armed_peers`. Tous les autres instruments passent à `mix_armed =
     /// false`. N'affecte JAMAIS le monitoring/MASTER (`output`).
     pub fn set_record_arm(&self, self_armed: bool, armed_peers: &[String]) {
+        self.self_armed_user.store(self_armed, Ordering::Relaxed);
+        let effective_self = self_armed && !self.self_private.load(Ordering::Relaxed);
         let map = self.streams.read();
         for (id, cell) in map.iter() {
             let armed = if id == SELF_MONITOR_ID {
-                self_armed
+                effective_self
             } else {
                 armed_peers.iter().any(|p| p == id)
             };
             cell.mix_armed.store(armed, Ordering::Relaxed);
+        }
+    }
+
+    /// Bascule la tranche instrument en PRIVÉ (ou non). Le MONITORING n'est pas
+    /// touché — on continue de s'entendre. En revanche la tranche sort du
+    /// fichier : ni stem self, ni bus MIX. Sortir du privé restaure l'armement
+    /// tel que l'utilisateur l'avait laissé.
+    pub fn set_self_private(&self, private: bool) {
+        self.self_private.store(private, Ordering::Relaxed);
+        let effective_self = self.self_armed_user.load(Ordering::Relaxed) && !private;
+        if let Some(cell) = self.streams.read().get(SELF_MONITOR_ID) {
+            cell.mix_armed.store(effective_self, Ordering::Relaxed);
         }
     }
 
@@ -493,7 +518,12 @@ impl AudioMixer {
         // Fait APRÈS push_samples pour ne pas dépendre de l'existence du
         // stream self-monitor : on enregistre l'instrument même si le user
         // a coupé son monitor browser (mode agent typique selfMuteGain=0).
-        if self.record_active.load(Ordering::Relaxed) && !samples.is_empty() {
+        // En PRIVÉ, la tranche ne part pas aux autres : elle ne doit pas non plus
+        // atterrir dans le fichier, qui est partagé (décision Ben).
+        if self.record_active.load(Ordering::Relaxed)
+            && !samples.is_empty()
+            && !self.self_private.load(Ordering::Relaxed)
+        {
             self.record_send(RecordCmd::PushSelf(samples.to_vec()));
         }
     }
@@ -1527,6 +1557,94 @@ mod tests {
         m.mix_into(&mut out);
         let (_, _, xl2, _) = m.master_mix_rms();
         assert!(xl2 > 0.1, "self armé → MIX présent, got {xl2}");
+    }
+
+    // ─── Tranche instrument en PRIVÉ (s'entendre sans envoyer) ────────────────
+
+    /// En PRIVÉ, on continue de S'ENTENDRE (c'est tout l'intérêt : s'accorder
+    /// sans déranger) mais la tranche ne doit PAS finir dans le fichier, qui est
+    /// partagé avec les autres musiciens.
+    #[test]
+    fn prive_monitore_mais_n_enregistre_pas() {
+        use crate::record::RecordCmd;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let m = AudioMixer::new();
+        m.set_record_tx(Some(tx));
+        m.add_local_stream();
+        m.set_self_monitor_volume(1.0);
+        m.set_record_arm(true, &[]);
+        m.set_self_private(true);
+
+        let ones = vec![1.0f32; 4_800];
+        m.push_self_samples(&ones);
+
+        // Monitoring : le signal est bien dans le MASTER (on s'entend).
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        let (master_l, _, mix_l, _) = m.master_mix_rms();
+        assert!(master_l > 0.1, "en privé on doit continuer à s'entendre (master={master_l})");
+        // Fichier : ni stem self, ni bus MIX.
+        assert!(mix_l < 1e-4, "en privé, la tranche sort du bus MIX (mix={mix_l})");
+        let mut stems = 0usize;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, RecordCmd::PushSelf(_)) {
+                stems += 1;
+            }
+        }
+        assert_eq!(stems, 0, "en privé, aucun stem self ne doit être enregistré");
+    }
+
+    /// Sortir du privé rend l'armement RECORD tel que l'utilisateur l'avait
+    /// laissé — on ne le lui a pas silencieusement désarmé au passage.
+    #[test]
+    fn sortir_du_prive_restaure_l_armement_utilisateur() {
+        use crate::record::RecordCmd;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let m = AudioMixer::new();
+        m.set_record_tx(Some(tx));
+        m.add_local_stream();
+        m.set_self_monitor_volume(1.0);
+        m.set_record_arm(true, &[]);   // l'utilisateur a armé sa tranche
+        m.set_self_private(true);
+        m.set_self_private(false);     // … puis repasse en LIVE
+
+        let ones = vec![1.0f32; 4_800];
+        m.push_self_samples(&ones);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        let (_, _, mix_l, _) = m.master_mix_rms();
+        assert!(mix_l > 0.1, "de retour en LIVE, la tranche armée réintègre le MIX (mix={mix_l})");
+        let mut stems = 0usize;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, RecordCmd::PushSelf(_)) {
+                stems += 1;
+            }
+        }
+        assert!(stems > 0, "de retour en LIVE, le stem self est de nouveau enregistré");
+    }
+
+    /// Un armement demandé PENDANT le privé ne réactive pas l'enregistrement en
+    /// douce : il ne prend effet qu'au retour en LIVE.
+    #[test]
+    fn armer_pendant_le_prive_reste_sans_effet_jusqu_au_retour() {
+        let m = AudioMixer::new();
+        m.add_local_stream();
+        m.set_self_monitor_volume(1.0);
+        m.set_self_private(true);
+        m.set_record_arm(true, &[]);
+
+        let ones = vec![1.0f32; 4_800];
+        m.push_self_samples(&ones);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        let (_, _, mix_l, _) = m.master_mix_rms();
+        assert!(mix_l < 1e-4, "armer en privé ne doit rien enregistrer (mix={mix_l})");
+
+        m.set_self_private(false);
+        m.push_self_samples(&ones);
+        m.mix_into(&mut out);
+        let (_, _, mix_l2, _) = m.master_mix_rms();
+        assert!(mix_l2 > 0.1, "l'armement prend effet au retour en LIVE (mix={mix_l2})");
     }
 
     // ─── C2.1 — concurrence : push (décode) pendant mix_into (callback) ────────

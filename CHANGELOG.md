@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.5.13-4] — 2026-09-04 (pré-release)
+
+### Ajouté — S'entendre sans envoyer (tranche instrument en PRIVÉ)
+
+Remontée d'un utilisateur : impossible de s'accorder sans que tout le studio l'entende. En effet,
+« ENTRÉE OFF » mettait les échantillons à zéro **avant** le self-monitor : il coupait d'un seul
+geste ce qu'on envoie ET ce qu'on entend.
+
+La tranche instrument a désormais deux états, dans le même vocabulaire que le talkback :
+**LIVE** (les autres m'entendent) et **PRIVÉ** (je m'entends, eux non).
+
+- Le silence n'est appliqué qu'à l'entrée de **l'étage d'ENVOI**. Le monitoring, en amont, n'est
+  pas touché — aucune latence ajoutée, aucun changement de structure du chemin temps réel.
+- On émet du **silence** plutôt que de suspendre l'émission : couper le flux viderait le buffer de
+  gigue des pairs et déclencherait leurs artefacts de concealment.
+- **Une tranche en PRIVÉ n'est pas enregistrée** — ni stem, ni bus MIX (décision Ben : le fichier
+  est partagé avec les autres musiciens). Sortir du privé restaure l'armement RECORD tel que
+  l'utilisateur l'avait laissé, et un armement demandé pendant le privé ne prend effet qu'au
+  retour en LIVE. Les trois cas sont couverts par des tests.
+- Le mode PRIVÉ est remis à zéro à chaque entrée en studio : on ne rejoint jamais une session sans
+  être entendu à cause d'un réglage hérité de la précédente.
+
 ## [0.5.13-3] — 2026-09-04 (pré-release)
 
 ### Fixed — Le VU du talkback ne bougeait plus quand on parlait

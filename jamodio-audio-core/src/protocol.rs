@@ -118,6 +118,15 @@ pub enum BrowserMessage {
     /// `capture_stage` en cours. La voix a sa PROPRE destination SFU
     /// (ssrc/port/SRTP distincts). Réponse browser : `LocalPort` avec
     /// `producer_id = "voice"`.
+    /// Tranche instrument en **PRIVÉ** : je m'entends (accordage, réglages), les
+    /// autres musiciens n'entendent plus rien, et la tranche sort du fichier
+    /// d'enregistrement — qui est partagé (décision Ben, 04/09/2026).
+    ///
+    /// À ne pas confondre avec `SetInputCut`, qui met l'entrée à zéro AVANT le
+    /// self-monitor : celui-ci coupe aussi ce qu'on ENTEND.
+    SetInstrumentPrivate {
+        private: bool,
+    },
     StartVoiceCapture {
         ssrc: u32,
         #[serde(rename = "sfuIp")]

@@ -2464,6 +2464,17 @@ async fn handle_message(
             }
         }
 
+        BrowserMessage::SetInstrumentPrivate { private } => {
+            // Toggle d'interface (LIVE ⇄ PRIVÉ) : idempotent, sans réouverture de
+            // driver. Try-lock comme les autres toggles du hot-path — si l'agent
+            // est en contention, l'utilisateur rebasculera.
+            let Some(mut pl) = try_lock_pipeline(pipeline).await else {
+                return vec![AgentMessage::error("agent overloaded")];
+            };
+            pl.set_instrument_private(private);
+            vec![]
+        }
+
         BrowserMessage::StopVoiceCapture => {
             // Toggle talkback OFF / device-canal changé. Fiabilité > vitesse
             // (une voix restée ouverte est pire qu'une courte attente) → wait.
