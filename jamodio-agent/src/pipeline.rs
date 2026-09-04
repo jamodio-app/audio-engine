@@ -802,10 +802,16 @@ pub struct PipelineState {
     /// par-sample par `voice_encode_stage_loop` (fondu anti-clic). Pilote
     /// l'auto-mute talkback dont la DÉCISION reste côté browser.
     pub voice_gain: Arc<std::sync::atomic::AtomicU32>,
-    /// RMS (bits f32) du producteur voix POST-gain, mesuré par
-    /// `voice_encode_stage_loop` et diffusé dans `stream-levels` (producteur
-    /// `voice`) → alimente le VU talkback côté browser en mode agent voix (sinon
-    /// plat : pas d'analyser navigateur). `0.0` hors voix active.
+    /// RMS (bits f32) du niveau d'ENTRÉE du micro talkback, mesuré par
+    /// `voice_encode_stage_loop` AVANT le filtre antibruit, et diffusé dans
+    /// `stream-levels` (producteur `voice`) → alimente le VU de la tranche côté
+    /// browser (pas d'analyser navigateur en mode agent voix). `0.0` hors voix
+    /// active.
+    ///
+    /// Mesuré en ENTRÉE et non en sortie : un vumètre branché après le filtre ne
+    /// bouge que quand le gate s'ouvre, si bien qu'on ne peut plus vérifier que
+    /// son micro capte quelque chose. Ce qui PART réellement est indiqué par le
+    /// voyant « à l'antenne » (`voice_on_air`), pas par le vumètre.
     pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
     /// Isolation de voix (Lot 2) : état LIVE « à l'antenne » (gate ouvert) diffusé
     /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
@@ -4109,7 +4115,22 @@ fn voice_encode_stage_loop(
             continue;
         }
 
-        // 1-bis. Isolation de voix (AVANT le gain mute) : enlève la repisse
+        // 1-bis. NIVEAU D'ENTRÉE du micro talkback, mesuré AVANT le filtre.
+        //        C'est lui qui alimente le VU de la tranche : un vumètre branché
+        //        APRÈS le filtre ne bouge que quand le gate s'ouvre — l'utilisateur
+        //        ne peut alors plus vérifier que son micro capte quoi que ce soit
+        //        (constaté au test terrain 04/09 : « ça ne module pas quand je
+        //        parle »). Le VU montre donc l'entrée ; c'est le voyant « à
+        //        l'antenne » qui dit ce qui PART réellement.
+        {
+            let n = mono48.len();
+            if n > 0 {
+                let sum_sq: f32 = mono48.iter().map(|s| s * s).sum();
+                voice_rms.store((sum_sq / n as f32).sqrt().to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 1-ter. Isolation de voix (AVANT le gain mute) : enlève la repisse
         //        d'instrument et coupe hors parole. En cas d'erreur d'inférence,
         //        on désactive l'isolation pour le reste de la session (voix brute)
         //        sans JAMAIS couper le talkback — dégradation visible, pas silencieuse.
@@ -4131,7 +4152,7 @@ fn voice_encode_stage_loop(
             }
         }
 
-        // 1-ter. Limiteur de crête : borne ce qui part dans Opus sans aplatir la
+        // 1-quater. Limiteur de crête : borne ce qui part dans Opus sans aplatir la
         //        forme d'onde (réduction de gain anticipée). Sous le plafond, le
         //        signal n'est pas touché.
         limiter.process_block(&mut mono48);
@@ -4151,13 +4172,10 @@ fn voice_encode_stage_loop(
         // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
         //    (L=R). On mesure au passage le RMS POST-gain (VU talkback).
         let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
-        let mut sum_sq = 0.0f32;
         for &s in mono48.iter() {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
             cur_gain += (target - cur_gain) * coeff;
-            let g = s * cur_gain;
-            sum_sq += g * g;
-            acc.push(g);
+            acc.push(s * cur_gain);
             if acc.len() == frame_size {
                 for (i, &m) in acc.iter().enumerate() {
                     stereo_frame[i * 2] = m;
@@ -4188,12 +4206,7 @@ fn voice_encode_stage_loop(
                 acc.clear();
             }
         }
-        // RMS post-gain du bloc → VU talkback (mono). Bits f32, comme input_rms.
-        let n = mono48.len();
-        if n > 0 {
-            let rms = (sum_sq / n as f32).sqrt();
-            voice_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        }
+        // (Le niveau du VU est mesuré en ENTRÉE, cf. étape 1-bis.)
     }
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);

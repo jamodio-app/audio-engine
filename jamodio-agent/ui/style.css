@@ -68,7 +68,9 @@ body {
   font-size: 8px;
   letter-spacing: 0.22em;
   color: var(--muted);
-  text-align: center;
+  /* Alignées à GAUCHE, sous la marque : centrées, elles flottaient sans point
+     d'accroche entre le logo (à gauche) et le badge d'état (à droite). */
+  text-align: left;
   opacity: 0.85;
   margin-top: -4px;
   text-transform: uppercase;
@@ -77,7 +79,8 @@ body {
 .tagline-accent { color: var(--accent); }
 /* Seconde signature de marque. Même couleur et même opacité que la première :
    deux lignes de la même voix, pas une principale et une secondaire. */
-.tagline-jam { margin-top: 2px; }
+/* Seconde signature : collée à la première (deux lignes d'un même bloc). */
+.tagline-jam { margin-top: 0; }
 
 /* ─── Status badge ─── */
 .badge {

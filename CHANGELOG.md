@@ -7,6 +7,13 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.5.13-3] — 2026-09-04 (pré-release)
 
+### Fixed — Le VU du talkback ne bougeait plus quand on parlait
+
+Le vumètre de la tranche talkback mesurait la SORTIE du filtre antibruit : il ne bougeait donc
+que lorsque le gate s'ouvrait, et il devenait impossible de vérifier que son micro capte quoi que
+ce soit (constaté au test terrain : « ça ne module pas quand je parle »). Le vumètre mesure
+désormais l'ENTRÉE du micro ; ce qui PART réellement reste indiqué par le voyant « à l'antenne ».
+
 ### Fixed — Télémétrie de la fenêtre : trois chiffres disaient autre chose que leur libellé
 
 - **« Gigue réseau »** affichait en réalité la **marge anti-gigue** que l'agent oppose au réseau,
@@ -32,7 +39,8 @@ instrument.
 - **« Démarrer avec l'ordinateur »** passe à un **interrupteur au style Jamodio**, comme dans
   l'app web (la case native reste dessous : focus clavier et accessibilité intacts).
 - Seconde signature de marque : **« Music creates connections. »** sous « Your studio. Anywhere. »,
-  dans la même couleur que la première. Fenêtre agrandie (320×470) pour que la version reste
+  dans la même couleur que la première, alignée à gauche sous la marque et collée à elle.
+  Fenêtre agrandie (320×470) pour que la version reste
   visible en bas, et les boutons passent à la ligne au lieu d'être rognés.
 - **Installeur Windows en FRANÇAIS et en ANGLAIS** (un MSI par langue). L'app web sert
   automatiquement celui qui correspond à la langue de l'interface — un utilisateur qui lit
