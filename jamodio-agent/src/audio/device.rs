@@ -81,6 +81,102 @@ fn parse_id(id: &str) -> Option<(usize, &str)> {
     Some((idx, name))
 }
 
+/// Id d'un périphérique du canal **VOIX** : `"{host}:{index}:{name}"`.
+///
+/// # Pourquoi un préfixe (chantier micro talkback séparé, 09/2026)
+///
+/// L'index d'un id `{idx}:{name}` est relatif à l'énumération d'UN host. Sur
+/// Windows, la liste voix vient de WASAPI alors que la liste instrument vient
+/// d'ASIO : sans préfixe, **deux périphériques physiquement différents
+/// porteraient le même id**. Le préfixe rend l'id auto-descriptif et permet de
+/// REFUSER explicitement un id qui n'appartient pas au host voix courant.
+///
+/// Les ids instrument restent **non préfixés** → les réglages déjà persistés
+/// côté navigateur gardent exactement leur sens (aucune migration).
+fn make_voice_id(host: super::host::HostKind, index: usize, name: &str) -> String {
+    format!("{}:{}:{}", host.wire_name(), index, name)
+}
+
+/// Parse un id voix `"{host}:{index}:{name}"`. **Aucune tolérance** : un id
+/// instrument (non préfixé) ou un préfixe inconnu renvoie `None` — c'est une
+/// erreur explicite, jamais un repli sur un périphérique voisin.
+fn parse_voice_id(id: &str) -> Option<(super::host::HostKind, usize, &str)> {
+    use super::host::HostKind;
+    let (host_str, rest) = id.split_once(':')?;
+    let host = match host_str {
+        "asio" => HostKind::Asio,
+        "wasapi" => HostKind::Wasapi,
+        "coreaudio" => HostKind::CoreAudio,
+        _ => return None,
+    };
+    let (idx_str, name) = rest.split_once(':')?;
+    let idx = idx_str.parse::<usize>().ok()?;
+    Some((host, idx, name))
+}
+
+/// Périphériques d'entrée disponibles pour le **talkback**, énumérés sur le host
+/// voix (cf. [`super::host::voice_kind`]).
+///
+/// Volontairement énuméré **en ligne**, PAS via `com_exec` : ce thread STA
+/// persistant est réservé à ASIO (mono-client, `CoCreateInstance`). Le host voix
+/// est WASAPI/CoreAudio, il n'a rien à y faire — et l'y envoyer mélangerait deux
+/// apartments COM sans raison. Corollaire : l'énumération voix reste possible
+/// **pendant** qu'un stream ASIO est ouvert, contrairement à `list_inputs`.
+pub fn list_voice_inputs() -> Vec<AudioDevice> {
+    let host = super::host::voice();
+    let host_kind = super::host::voice_kind();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    let Ok(devices) = host.input_devices() else { return vec![] };
+    devices
+        .enumerate()
+        .filter_map(|(idx, d)| {
+            let name = d.name().ok()?;
+            let cfg = d.default_input_config().ok();
+            Some(AudioDevice {
+                id: make_voice_id(host_kind, idx, &name),
+                is_default: Some(&name) == default_name.as_ref(),
+                channels: cfg.as_ref().map(|c| c.channels()).unwrap_or(0),
+                // Peut légitimement valoir 44 100 ou 16 000 (micro-casque, micro
+                // interne) : le chemin voix rééchantillonne, contrairement au
+                // chemin instrument où R2 impose 48 kHz natif.
+                native_sample_rate: cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0),
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Résolution stricte d'un périphérique voix. Même doctrine que
+/// [`get_input_device`] : **pas de fuzzy match, pas de repli sur le défaut**.
+/// Refuse aussi un id dont le host ne correspond pas au host voix courant.
+pub fn get_voice_input_device(id: &str) -> Option<cpal::Device> {
+    let (host_kind, idx, expected_name) = parse_voice_id(id)?;
+    if host_kind != super::host::voice_kind() {
+        tracing::warn!(
+            target: "jamodio::devices",
+            kind = "voice-input",
+            requested_id = %id,
+            "id voix d'un autre host que le host voix courant → refus"
+        );
+        return None;
+    }
+    let host = super::host::voice();
+    let dev = host.input_devices().ok()?.nth(idx)?;
+    let actual_name = dev.name().ok()?;
+    if actual_name == expected_name {
+        Some(dev)
+    } else {
+        tracing::warn!(
+            target: "jamodio::devices",
+            kind = "voice-input",
+            requested_id = %id,
+            actual_name = %actual_name,
+            "id voix résolu vers un device de nom différent (hot-plug ?) → refus"
+        );
+        None
+    }
+}
+
 // Énumération ASIO : voir `super::com_exec` pour le « pourquoi » (asio-sys
 // charge les drivers via CoCreateInstance sans initialiser COM → l'énumération
 // DOIT tourner sur un thread STA). On passe par le thread COM-STA persistant
@@ -481,5 +577,36 @@ mod tests {
         set_asio_stream_active(false);
         *INPUT_CACHE.lock().unwrap() = None;
         *OUTPUT_CACHE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn id_voix_aller_retour() {
+        use super::super::host::HostKind;
+        let id = make_voice_id(HostKind::Wasapi, 2, "Casque USB");
+        assert_eq!(id, "wasapi:2:Casque USB");
+        let (host, idx, name) = parse_voice_id(&id).expect("id voix valide");
+        assert_eq!((host, idx, name), (HostKind::Wasapi, 2, "Casque USB"));
+    }
+
+    #[test]
+    fn id_voix_accepte_un_nom_contenant_des_deux_points() {
+        // Les noms de devices en contiennent (« Scarlett 2i2: Entrée 1 ») : seuls
+        // les DEUX premiers `:` sont des séparateurs, le reste appartient au nom.
+        use super::super::host::HostKind;
+        let (host, idx, name) =
+            parse_voice_id("coreaudio:0:Scarlett 2i2: Entrée 1").expect("id voix valide");
+        assert_eq!((host, idx, name), (HostKind::CoreAudio, 0, "Scarlett 2i2: Entrée 1"));
+    }
+
+    #[test]
+    fn id_voix_refuse_un_id_instrument_ou_malforme() {
+        // Doctrine device id strict : on refuse, on ne devine pas. Un id
+        // instrument (non préfixé) n'est PAS un id voix valide — sinon l'index
+        // d'une énumération ASIO serait lu comme un index WASAPI.
+        assert!(parse_voice_id("2:Casque USB").is_none(), "id instrument refusé");
+        assert!(parse_voice_id("jack:2:Casque").is_none(), "host inconnu refusé");
+        assert!(parse_voice_id("wasapi:x:Casque").is_none(), "index non numérique refusé");
+        assert!(parse_voice_id("wasapi:2").is_none(), "nom manquant refusé");
+        assert!(parse_voice_id("").is_none());
     }
 }

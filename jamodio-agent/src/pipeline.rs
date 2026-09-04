@@ -681,6 +681,11 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// Flux d'entrée DÉDIÉ au talkback (micro-casque, micro interne), quand
+    /// l'utilisateur a choisi un micro autre qu'un canal de l'interface
+    /// instrument. `None` = talkback pris sur le flux instrument (historique).
+    /// Lâcher la poignée arrête le flux et relâche le périphérique.
+    voice_capture: Option<crate::audio::voice_capture::VoiceCaptureHandle>,
     /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
     /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
     /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
@@ -1192,6 +1197,7 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            voice_capture: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
             capture_sample_tx: None,
@@ -2266,6 +2272,10 @@ impl PipelineState {
     /// Idempotent : si une voix tournait déjà (changement de canal sans stop),
     /// l'ancien tap est retiré d'abord. Retourne `(local_port, agent_srtp)` que
     /// le browser relaie au SFU (`connect-plain-transport` du flux voix).
+    // 8 paramètres : ils viennent tous du message wire `StartVoiceCapture` (ssrc,
+    // destination SFU, canal, clés SRTP, micro dédié). Les regrouper en struct
+    // n'ajouterait qu'une indirection entre le protocole et la pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_voice_capture(
         &mut self,
         ssrc: u32,
@@ -2274,24 +2284,41 @@ impl PipelineState {
         payload_type: u8,
         channel_index: u8,
         sfu_srtp: SrtpParameters,
+        // Micro DÉDIÉ au talkback (id voix préfixé par son host). `None` =
+        // comportement historique : le talkback est un canal du flux instrument.
+        voice_device_id: Option<String>,
     ) -> Result<(u16, SrtpParameters), String> {
-        // 1. Capture instrument requise (le tap se greffe sur son capture_stage).
-        let Some(voice_ctrl_tx) = self.voice_ctrl_tx.clone() else {
+        // 1. Sur quoi prend-on la voix ?
+        //    - micro dédié → flux d'entrée PROPRE, indépendant de l'instrument
+        //      (c'est tout l'intérêt : une interface à une seule entrée n'a aucun
+        //      canal libre pour parler) ;
+        //    - sinon → tap greffé sur le capture_stage instrument, qui doit donc
+        //      tourner (comportement historique, inchangé).
+        let voice_ctrl_tx = self.voice_ctrl_tx.clone();
+        if voice_device_id.is_none() && voice_ctrl_tx.is_none() {
             return Err("no active capture — start voice after instrument capture".into());
-        };
-        // 2. Validation stricte du canal contre la géométrie courante.
-        let channels_in = self.capture_channels_in;
-        if u16::from(channel_index) >= channels_in {
-            return Err(format!(
-                "voice channel {} out of range (device has {} channels)",
-                channel_index, channels_in
-            ));
         }
-        // 3. Idempotence : retire l'ancien tap si présent (son thread termine
-        //    seul quand capture_stage drop l'out_tx associé).
+        // 2. Validation stricte du canal. Avec un micro dédié, la géométrie n'est
+        //    connue qu'à l'ouverture du flux → c'est `build_voice_capture_stream`
+        //    qui refuse explicitement un canal hors bornes.
+        if voice_device_id.is_none() {
+            let channels_in = self.capture_channels_in;
+            if u16::from(channel_index) >= channels_in {
+                return Err(format!(
+                    "voice channel {} out of range (device has {} channels)",
+                    channel_index, channels_in
+                ));
+            }
+        }
+        // 3. Idempotence : retire l'ancien tap ET/OU ferme l'ancien flux dédié
+        //    (changement de micro). Le drop de la poignée relâche le périphérique
+        //    AVANT qu'on en ouvre un autre.
         if self.voice_active {
-            let _ = voice_ctrl_tx.try_send(VoiceControl::Remove);
+            if let Some(tx) = voice_ctrl_tx.as_ref() {
+                let _ = tx.try_send(VoiceControl::Remove);
+            }
         }
+        self.voice_capture = None;
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2359,17 +2386,53 @@ impl PipelineState {
                 );
             }
         }
-        // 8. Greffe le tap sur le capture_stage en cours.
-        voice_ctrl_tx
-            .try_send(VoiceControl::Add {
-                channel_index: channel_index as usize,
-                out_tx: voice_tx,
-            })
-            .map_err(|e| format!("voice tap attach failed: {}", e))?;
+        // 8. Branche la SOURCE : micro dédié (flux propre) ou tap sur le flux
+        //    instrument. L'étage voix, lui, ne sait pas d'où viennent ses blocs —
+        //    isolation, limiteur, Opus et RTP sont identiques dans les deux cas.
+        let voice_source = match voice_device_id.as_ref() {
+            Some(id) => {
+                let (info, handle) = crate::audio::voice_capture::spawn_voice_capture(
+                    id.clone(),
+                    channel_index as usize,
+                    voice_tx,
+                )?;
+                self.voice_capture = Some(handle);
+                tracing::info!(
+                    target: "jamodio::voice_capture",
+                    device = %id,
+                    channels = info.channels,
+                    sample_rate = info.sample_rate,
+                    "micro talkback dédié ouvert"
+                );
+                if info.resampling {
+                    // Le rééchantillonnage est une EXCEPTION assumée du canal voix
+                    // (R2 reste intact côté instrument) : il se trace, il ne se subit pas.
+                    tracing::info!(
+                        target: "jamodio::voice_capture",
+                        device_sample_rate = info.sample_rate,
+                        added_latency_ms = info.added_latency_ms,
+                        "micro talkback hors 48 kHz — rééchantillonnage du canal voix"
+                    );
+                }
+                format!("micro dédié {id}")
+            }
+            None => {
+                let tx = voice_ctrl_tx
+                    .as_ref()
+                    .expect("garde étape 1 : tap requis sans micro dédié");
+                tx.try_send(VoiceControl::Add {
+                    channel_index: channel_index as usize,
+                    out_tx: voice_tx,
+                })
+                .map_err(|e| format!("voice tap attach failed: {}", e))?;
+                "canal du flux instrument".to_string()
+            }
+        };
         self.voice_active = true;
         tracing::info!(
             target: "jamodio::pipeline",
             ssrc, channel_index, local_port,
+            source = %voice_source,
             sfu = format!("{}:{}", sfu_ip, sfu_port),
             "voice capture started (talkback via agent)"
         );
@@ -2386,6 +2449,9 @@ impl PipelineState {
         if let Some(tx) = self.voice_ctrl_tx.as_ref() {
             let _ = tx.try_send(VoiceControl::Remove);
         }
+        // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
+        // périphérique (sinon le casque resterait tenu par l'agent).
+        self.voice_capture = None;
         self.voice_active = false;
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }

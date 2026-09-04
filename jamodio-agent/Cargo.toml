@@ -12,6 +12,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 jamodio-audio-core = { path = "../jamodio-audio-core" }
 cpal = "0.15"
+# Rééchantillonnage du canal VOIX uniquement (micro-casque en 44,1/16 kHz).
+# Le chemin INSTRUMENT reste en 48 kHz natif obligatoire (garde R2) — aucun
+# resampler n'y est autorisé. Déjà présent dans l'arbre via DeepFilterNet.
+rubato = "0.14"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 # socket2 : bind du serveur WS avec SO_REUSEADDR (tokio ne le pose pas sur

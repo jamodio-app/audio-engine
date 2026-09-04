@@ -2592,6 +2592,7 @@ dependencies = [
  "objc2",
  "opener",
  "parking_lot",
+ "rubato",
  "serde",
  "serde_json",
  "socket2 0.5.10",

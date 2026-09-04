@@ -2262,7 +2262,11 @@ async fn handle_message(
             let inputs = device::list_inputs();
             let outputs = device::list_outputs();
             let audio_host = Some(crate::audio::host::kind().wire_name().to_string());
-            vec![AgentMessage::Devices { inputs, outputs, audio_host }]
+            // Micros utilisables pour le talkback : énumérés sur le host VOIX
+            // (WASAPI sur Windows, où `inputs` vient d'ASIO). Liste séparée, ids
+            // préfixés → aucune ambiguïté possible entre les deux.
+            let voice_inputs = Some(device::list_voice_inputs());
+            vec![AgentMessage::Devices { inputs, outputs, audio_host, voice_inputs }]
         }
 
         BrowserMessage::SelectDevices { input_id, output_id } => {
@@ -2425,10 +2429,11 @@ async fn handle_message(
         }
 
         // ─── Talkback (Lot 2, v0.5.7) — 2e producteur voix via l'agent ───
-        BrowserMessage::StartVoiceCapture { ssrc, sfu_ip, sfu_port, payload_type: _, channel_index, srtp_parameters } => {
+        BrowserMessage::StartVoiceCapture { ssrc, sfu_ip, sfu_port, payload_type: _, channel_index, srtp_parameters, voice_device_id } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc, channel_index,
+                voice_device = voice_device_id.as_deref().unwrap_or("(canal de l'instrument)"),
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 "StartVoiceCapture"
             );
@@ -2443,7 +2448,10 @@ async fn handle_message(
             let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
                 return vec![AgentMessage::error_keyed("agent overloaded", "voice")];
             };
-            match pl.start_voice_capture(ssrc, sfu_ip, sfu_port, 111, channel_index, srtp_parameters).await {
+            match pl
+                .start_voice_capture(ssrc, sfu_ip, sfu_port, 111, channel_index, srtp_parameters, voice_device_id)
+                .await
+            {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id: "voice".into(),
                     port: local_port,

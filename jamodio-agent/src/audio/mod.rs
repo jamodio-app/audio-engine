@@ -11,6 +11,7 @@ pub mod com_exec;
 pub mod device;
 pub mod host;
 pub mod capture;
+pub mod voice_capture;
 pub mod output_pair;
 pub mod playback;
 pub mod midi;

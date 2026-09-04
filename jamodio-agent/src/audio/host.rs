@@ -78,6 +78,42 @@ pub fn active() -> cpal::Host {
     }
 }
 
+/// Host du canal **VOIX** (talkback) — distinct de l'host instrument.
+///
+/// # Pourquoi un second host (chantier micro talkback séparé, 09/2026)
+///
+/// Le talkback doit pouvoir venir d'un micro-casque ou du micro interne, pas
+/// seulement d'un canal de l'interface instrument. Or sur Windows un pilote
+/// **ASIO est exclusif** : il ne peut pas servir un second périphérique. La voix
+/// passe donc par **WASAPI partagé** pendant que l'instrument reste en ASIO.
+///
+/// **Ce n'est PAS un renoncement à la doctrine ASIO** : celle-ci protège la
+/// latence du chemin INSTRUMENT (garde R1 de `start_capture`, intacte). Le canal
+/// voix porte de la parole et déjà ~130 ms d'isolation — les ~20-30 ms de WASAPI
+/// n'y changent rien de perceptible, alors que refuser WASAPI laisserait sans
+/// talkback tout musicien Windows équipé d'une interface à une seule entrée.
+/// Décision validée par Ben le 04/09/2026.
+///
+/// macOS : même host que l'instrument (CoreAudio sait ouvrir deux périphériques
+/// distincts dans le même processus).
+pub fn voice_kind() -> HostKind {
+    #[cfg(target_os = "windows")]
+    {
+        HostKind::Wasapi
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        kind()
+    }
+}
+
+/// Host CPAL du canal voix (cf. [`voice_kind`]).
+pub fn voice() -> cpal::Host {
+    // `default_host()` = WASAPI sur Windows, CoreAudio sur macOS : dans les deux
+    // cas exactement ce que veut le canal voix.
+    cpal::default_host()
+}
+
 #[cfg(target_os = "windows")]
 fn probe() -> HostKind {
     use cpal::traits::HostTrait;
@@ -134,5 +170,16 @@ mod tests {
     #[test]
     fn kind_is_stable_across_calls() {
         assert_eq!(kind(), kind());
+    }
+
+    #[test]
+    fn voice_kind_est_wasapi_sur_windows_sinon_comme_l_instrument() {
+        // Le canal voix ne peut pas partager le pilote ASIO (exclusif) : sur
+        // Windows il est WASAPI, quoi qu'utilise l'instrument. Ailleurs, rien à
+        // séparer — c'est le même host.
+        #[cfg(target_os = "windows")]
+        assert_eq!(voice_kind(), HostKind::Wasapi);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(voice_kind(), kind());
     }
 }

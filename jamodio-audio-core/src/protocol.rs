@@ -136,6 +136,13 @@ pub enum BrowserMessage {
         /// `plain-transport-created` côté browser).
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
+        /// Périphérique DÉDIÉ au talkback (id voix `"{host}:{index}:{nom}"`,
+        /// cf. `device::list_voice_inputs`). **Absent = comportement historique** :
+        /// le talkback est un canal du flux instrument. Présent = l'agent ouvre un
+        /// second flux d'entrée sur ce micro (micro-casque, micro interne), ce qui
+        /// permet de parler même avec une interface à une seule entrée.
+        #[serde(rename = "voiceDeviceId", skip_serializing_if = "Option::is_none")]
+        voice_device_id: Option<String>,
     },
     /// Retire le producteur voix (toggle talkback OFF, ou device/canal changé).
     /// No-op si aucune voix active. NE touche PAS à la capture instrument.
@@ -550,6 +557,15 @@ pub enum AgentMessage {
         /// Optionnel pour rétro-compat (vieux agents ne l'envoient pas).
         #[serde(rename = "audioHost", skip_serializing_if = "Option::is_none")]
         audio_host: Option<String>,
+        /// Micros utilisables pour le **talkback** (chantier micro séparé, 09/2026).
+        /// Énumérés sur le host VOIX — sur Windows c'est WASAPI, alors que
+        /// `inputs` vient d'ASIO : les deux listes ne sont donc PAS interchangeables,
+        /// d'où des ids voix préfixés par leur host (`"wasapi:2:Casque"`).
+        /// Un micro-casque peut légitimement y apparaître en 44,1 ou 16 kHz : le
+        /// chemin voix rééchantillonne (le chemin instrument, lui, garde R2).
+        /// Optionnel : les agents antérieurs ne l'envoient pas.
+        #[serde(rename = "voiceInputs", skip_serializing_if = "Option::is_none")]
+        voice_inputs: Option<Vec<AudioDevice>>,
     },
     Status {
         state: AgentState,
@@ -1418,5 +1434,54 @@ mod tests {
         assert!(json.contains(r#""pingId":7"#));
         assert!(json.contains(r#""anchorEmergeMonoMs":460"#));
         assert!(json.contains(r#""outMs":1.33"#));
+    }
+}
+
+#[cfg(test)]
+mod voice_device_compat_tests {
+    use super::*;
+
+    /// Rétro-compatibilité : un `start-voice-capture` SANS `voiceDeviceId` (tout
+    /// browser déployé avant le chantier micro séparé) doit continuer à parser et
+    /// signifier « talkback sur un canal du flux instrument ».
+    #[test]
+    fn start_voice_capture_sans_device_reste_valide() {
+        let json = r#"{
+            "type": "start-voice-capture",
+            "ssrc": 42,
+            "sfuIp": "1.2.3.4",
+            "sfuPort": 5000,
+            "payloadType": 111,
+            "channelIndex": 1,
+            "srtpParameters": { "cryptoSuite": "AEAD_AES_256_GCM", "keyBase64": "AAAA" }
+        }"#;
+        match serde_json::from_str::<BrowserMessage>(json).expect("message legacy parsable") {
+            BrowserMessage::StartVoiceCapture { channel_index, voice_device_id, .. } => {
+                assert_eq!(channel_index, 1);
+                assert!(voice_device_id.is_none(), "absent = canal du flux instrument");
+            }
+            other => panic!("variant inattendu : {other:?}"),
+        }
+    }
+
+    /// Et avec un micro dédié, l'id traverse tel quel (pas de normalisation).
+    #[test]
+    fn start_voice_capture_avec_micro_dedie() {
+        let json = r#"{
+            "type": "start-voice-capture",
+            "ssrc": 42,
+            "sfuIp": "1.2.3.4",
+            "sfuPort": 5000,
+            "payloadType": 111,
+            "channelIndex": 0,
+            "voiceDeviceId": "wasapi:2:Casque USB",
+            "srtpParameters": { "cryptoSuite": "AEAD_AES_256_GCM", "keyBase64": "AAAA" }
+        }"#;
+        match serde_json::from_str::<BrowserMessage>(json).expect("message parsable") {
+            BrowserMessage::StartVoiceCapture { voice_device_id, .. } => {
+                assert_eq!(voice_device_id.as_deref(), Some("wasapi:2:Casque USB"));
+            }
+            other => panic!("variant inattendu : {other:?}"),
+        }
     }
 }
