@@ -7,6 +7,23 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [0.5.13-3] — 2026-09-04 (pré-release)
 
+### Fixed — Télémétrie de la fenêtre : trois chiffres disaient autre chose que leur libellé
+
+- **« Gigue réseau »** affichait en réalité la **marge anti-gigue** que l'agent oppose au réseau,
+  pas la gigue mesurée. Renommé « Marge anti-gigue » — le chiffre était juste, le mot était faux.
+- **« Musiciens reçus »** comptait les **flux**, pas les musiciens : depuis que la voix des pairs
+  passe par l'agent, un partenaire qui parle en apporte deux et s'affichait donc en double. On
+  compte désormais les flux instrument (nouveau champ `musicians`).
+- **« Buffer carte »** pouvait afficher une **estimation de repli** (10 ms) quand le pilote ne
+  publie pas sa taille, sans distinguer mesure et supposition. Affiche maintenant « auto » dans
+  ce cas : un chiffre inventé est pire qu'une absence de chiffre.
+
+### Ajouté — Le micro du talkback est affiché dans la fenêtre
+
+La fenêtre montrait l'interface de l'instrument mais rien sur la voix. Nouvelle ligne
+« Talkback » : le micro dédié, ou « canal de l'interface » quand la voix est prise sur le flux
+instrument.
+
 ### Changed — Fenêtre de l'Audio Engine
 
 - **Licences** : ouvre désormais une **vraie fenêtre**, redimensionnable et défilante, au lieu
@@ -14,7 +31,9 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   le produit (plugins d'effets open-source à venir).
 - **« Démarrer avec l'ordinateur »** passe à un **interrupteur au style Jamodio**, comme dans
   l'app web (la case native reste dessous : focus clavier et accessibilité intacts).
-- Seconde signature de marque : **« Music creates connections. »** sous « Your studio. Anywhere. ».
+- Seconde signature de marque : **« Music creates connections. »** sous « Your studio. Anywhere. »,
+  dans la même couleur que la première. Fenêtre agrandie (320×470) pour que la version reste
+  visible en bas, et les boutons passent à la ligne au lieu d'être rognés.
 - **Installeur Windows en FRANÇAIS et en ANGLAIS** (un MSI par langue). L'app web sert
   automatiquement celui qui correspond à la langue de l'interface — un utilisateur qui lit
   Jamodio en anglais ne tombe plus sur un assistant d'installation en français. Le nom de

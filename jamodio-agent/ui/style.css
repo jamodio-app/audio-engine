@@ -75,8 +75,9 @@ body {
 }
 
 .tagline-accent { color: var(--accent); }
-/* Seconde signature de marque, côté « jam » : plus discrète que la première. */
-.tagline-jam { margin-top: 2px; opacity: 0.6; }
+/* Seconde signature de marque. Même couleur et même opacité que la première :
+   deux lignes de la même voix, pas une principale et une secondaire. */
+.tagline-jam { margin-top: 2px; }
 
 /* ─── Status badge ─── */
 .badge {
@@ -191,6 +192,8 @@ body {
 .actions {
   display: flex;
   justify-content: center;
+  flex-wrap: wrap;      /* 3 boutons : ils passent à la ligne au lieu d'être rognés */
+  gap: 6px;
 }
 
 .actions button {

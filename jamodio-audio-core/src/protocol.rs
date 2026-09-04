@@ -621,6 +621,17 @@ pub enum AgentMessage {
         #[serde(rename = "totalLatencyMs")]
         total_latency_ms: f32,
         streams: usize,
+        /// Nombre de MUSICIENS reçus (flux instrument uniquement). Distinct de
+        /// `streams` : depuis que la voix des pairs passe par l'agent, un
+        /// partenaire qui parle apporte DEUX flux — les compter afficherait deux
+        /// musiciens pour une personne. Absent sur les agents antérieurs.
+        #[serde(rename = "musicians", skip_serializing_if = "Option::is_none")]
+        musicians: Option<usize>,
+        /// Micro utilisé par le talkback (nom lisible), ou « canal de l'interface »
+        /// quand la voix est prise sur le flux instrument. Absent si le talkback
+        /// n'est pas actif.
+        #[serde(rename = "voiceDevice", skip_serializing_if = "Option::is_none")]
+        voice_device: Option<String>,
         underruns: u64,
     },
     Vu {

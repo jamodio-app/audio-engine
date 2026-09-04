@@ -2630,6 +2630,8 @@ async fn handle_message(
                     jitter_target_ms,
                     total_latency_ms,
                     streams: stream_count,
+                    musicians: Some(pl.musician_count()),
+                    voice_device: pl.voice_source_label(),
                     underruns,
                 },
             ]

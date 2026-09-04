@@ -686,6 +686,9 @@ pub struct PipelineState {
     /// instrument. `None` = talkback pris sur le flux instrument (historique).
     /// Lâcher la poignée arrête le flux et relâche le périphérique.
     voice_capture: Option<crate::audio::voice_capture::VoiceCaptureHandle>,
+    /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
+    /// est prise sur un canal de l'interface instrument.
+    voice_device_label: Option<String>,
     /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
     /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
     /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
@@ -727,6 +730,11 @@ pub struct PipelineState {
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// Type de chaque flux reçu (instrument / voix). Depuis que la voix des
+    /// pairs transite aussi par l'agent, compter les flux ne compte PLUS les
+    /// musiciens : un partenaire qui parle en apporte deux. Cette carte permet
+    /// de distinguer les deux dans la télémétrie.
+    recv_kinds: HashMap<String, StreamKind>,
     /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
     /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
     /// `None` = pas de stream reçu en cours.
@@ -1198,6 +1206,7 @@ impl PipelineState {
             capture_stream: None,
             playback_stream: None,
             voice_capture: None,
+            voice_device_label: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
             capture_sample_tx: None,
@@ -1208,6 +1217,7 @@ impl PipelineState {
             com_recycle_pending: false,
             encoder_stop: None,
             recv_stops: HashMap::new(),
+            recv_kinds: HashMap::new(),
             decode_thread: None,
             recv_epoch: 0,
             input_device_id: None,
@@ -2397,6 +2407,9 @@ impl PipelineState {
                     voice_tx,
                 )?;
                 self.voice_capture = Some(handle);
+                // Nom lisible = la part « nom » de l'id `{host}:{index}:{nom}`.
+                self.voice_device_label =
+                    Some(id.splitn(3, ':').nth(2).unwrap_or(id.as_str()).to_string());
                 tracing::info!(
                     target: "jamodio::voice_capture",
                     device = %id,
@@ -2425,6 +2438,7 @@ impl PipelineState {
                     out_tx: voice_tx,
                 })
                 .map_err(|e| format!("voice tap attach failed: {}", e))?;
+                self.voice_device_label = None;
                 "canal du flux instrument".to_string()
             }
         };
@@ -2437,6 +2451,29 @@ impl PipelineState {
             "voice capture started (talkback via agent)"
         );
         Ok((local_port, agent_srtp))
+    }
+
+    /// Nombre de MUSICIENS dont on reçoit l'audio — c'est-à-dire de flux
+    /// INSTRUMENT. La voix des pairs arrive dans des flux séparés : les compter
+    /// afficherait deux « musiciens » pour un partenaire qui parle.
+    pub fn musician_count(&self) -> usize {
+        self.recv_kinds
+            .values()
+            .filter(|k| matches!(k, StreamKind::Instrument))
+            .count()
+    }
+
+    /// Micro utilisé par le talkback, pour l'affichage : le périphérique dédié
+    /// s'il y en a un, sinon le canal de l'interface instrument. `None` quand le
+    /// talkback n'est pas actif.
+    pub fn voice_source_label(&self) -> Option<String> {
+        if !self.voice_active {
+            return None;
+        }
+        Some(match self.voice_device_label.as_deref() {
+            Some(name) => name.to_string(),
+            None => "canal de l'interface".to_string(),
+        })
     }
 
     /// Talkback (Lot 2) — retire le producteur voix. No-op si aucune voix active.
@@ -2452,6 +2489,7 @@ impl PipelineState {
         // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
         // périphérique (sinon le casque resterait tenu par l'agent).
         self.voice_capture = None;
+        self.voice_device_label = None;
         self.voice_active = false;
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
@@ -2770,6 +2808,7 @@ impl PipelineState {
         // Stop signal pour la tâche I/O de ce pair.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.recv_stops.insert(producer_id.clone(), stop_tx);
+        self.recv_kinds.insert(producer_id.clone(), media_tag);
 
         // Spawn la tâche I/O async (recv UDP + horodatage + punch + idle-timeout).
         // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
@@ -2817,6 +2856,7 @@ impl PipelineState {
         // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
         // thread de décodage qui retire l'état + le stream mixer + net_stats,
         // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
+        self.recv_kinds.remove(producer_id);
         if let Some(stop) = self.recv_stops.remove(producer_id) {
             let _ = stop.send(());
         }

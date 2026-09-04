@@ -11,8 +11,8 @@
     "windows": [
       {
         "title": "Jamodio Audio Engine",
-        "width": 300,
-        "height": 380,
+        "width": 320,
+        "height": 470,
         "resizable": false,
         "visible": false,
         "decorations": true,

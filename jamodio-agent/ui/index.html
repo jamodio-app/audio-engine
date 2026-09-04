@@ -29,12 +29,16 @@
         <span class="label">Device</span>
         <span class="value" id="device">—</span>
       </div>
+      <div class="row" title="Micro utilisé pour parler aux autres musiciens (talkback). « Canal de l'interface » = la voix est prise sur une entrée de ton interface instrument ; sinon c'est un micro à part, ouvert par l'agent.">
+        <span class="label">Talkback</span>
+        <span class="value" id="voice-device">—</span>
+      </div>
       <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
         <span class="label">Latence locale</span>
         <span class="value" id="latency">—</span>
       </div>
-      <div class="row" title="Buffer de gigue : marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. « — » quand tu es seul (aucun flux reçu).">
-        <span class="label">Gigue réseau</span>
+      <div class="row" title="Marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. Ce n'est PAS la gigue mesurée du réseau, c'est la marge que l'agent lui oppose — elle s'adapte à la qualité du lien. « — » quand tu es seul.">
+        <span class="label">Marge anti-gigue</span>
         <span class="value" id="jitter">—</span>
       </div>
       <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
@@ -45,7 +49,7 @@
         <span class="label">Musiciens reçus</span>
         <span class="value" id="streams">0</span>
       </div>
-      <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard) depuis le démarrage. Doit rester proche de 0.">
+      <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard), comptées depuis le début de la session en cours. Doit rester proche de 0.">
         <span class="label">Coupures</span>
         <span class="value" id="underruns">0</span>
       </div>
@@ -225,23 +229,34 @@
               $('device').textContent = name;
               $('device').title = msg.device;
             }
-            $('streams').textContent = msg.streams || 0;
+            // `musicians` = flux INSTRUMENT (un partenaire qui parle envoie deux
+            // flux) ; repli sur `streams` pour un agent antérieur.
+            $('streams').textContent = (msg.musicians ?? msg.streams) || 0;
+            $('voice-device').textContent = msg.voiceDevice || '—';
+            $('voice-device').title = msg.voiceDevice || '';
             $('underruns').textContent = msg.underruns || 0;
             // Stats latence : on utilise les valeurs pré-calculées par l'agent
             // (totalLatencyMs / jitterTargetMs / bufferMs) — sans recombinaison
             // côté UI (les champs capture/playback exposés séparément contiennent
             // déjà bufferMs, ne pas les additionner ici).
-            const bufMs = msg.bufferMs || 0;
+            // Buffer carte : on n'affiche que la valeur RÉELLEMENT mesurée
+            // (`inputBufferMs`). Absente = le pilote a choisi sa taille sans
+            // l'exposer → on le dit, plutôt que d'afficher l'estimation de repli
+            // que porte `bufferMs`, qui serait un chiffre inventé.
+            const bufMs = msg.inputBufferMs;
             const totalMs = msg.totalLatencyMs || 0;
             const jitterMs = msg.jitterTargetMs || 0;
             if (totalMs > 0) {
               $('latency').textContent = totalMs.toFixed(1) + 'ms';
-              $('buffer').textContent = bufMs.toFixed(1) + 'ms';
+              $('buffer').textContent = (typeof bufMs === 'number')
+                ? bufMs.toFixed(1) + 'ms'
+                : 'auto';
               $('jitter').textContent = jitterMs > 0 ? jitterMs.toFixed(1) + 'ms' : '—';
             } else {
               $('latency').textContent = '—';
               $('buffer').textContent = '—';
               $('jitter').textContent = '—';
+              $('voice-device').textContent = '—';
             }
             break;
           }
