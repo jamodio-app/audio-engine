@@ -11,8 +11,11 @@
 //! - Windows : `%APPDATA%/Jamodio/logs/agent.log.YYYY-MM-DD`
 //! - Linux   : `~/.local/state/jamodio/agent.log.YYYY-MM-DD`
 //!
-//! Le filtre par défaut est `info,jamodio_agent=debug,jamodio_audio_core=debug` ;
-//! override possible via la variable d'environnement `RUST_LOG`.
+//! Le filtre par défaut (`DEFAULT_DIRECTIVES`) met NOS crates et NOS cibles
+//! `jamodio::*` en `debug`, et tout le reste en `info` ; override possible via la
+//! variable d'environnement `RUST_LOG`. Le MÊME filtre s'applique à stderr et au
+//! fichier : un fichier plus bavard que la console ne sert personne (cf. la note
+//! sur le bruit tiers ci-dessous).
 //!
 //! Le `WorkerGuard` retourné DOIT rester vivant pendant toute la durée de
 //! l'exécution — sinon le worker async du file appender s'arrête et plus
@@ -28,6 +31,30 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// après encoding base64 (~+33 %) côté browser.
 pub const DEFAULT_LOG_ARCHIVE_DAYS: u32 = 3;
 pub const DEFAULT_LOG_ARCHIVE_BYTES: u64 = 5_000_000;
+
+/// Filtre par défaut, appliqué À LA FOIS à stderr et au fichier.
+///
+/// # Pourquoi le fichier n'est plus en `debug` global (05/09/2026)
+///
+/// Il l'était, et ça a fini par détruire notre capacité de diagnostic : depuis
+/// l'arrivée du filtre antibruit, `tract` (le moteur d'inférence) journalise en
+/// `debug` À CHAQUE TRAME de voix — mesuré sur un rapport de bug réel : **124
+/// lignes par seconde**, soit 99,4 % d'un export de 9 Mo. Le plafond de l'export
+/// était atteint par du bruit tiers, et les lignes Jamodio de l'incident qu'on
+/// cherchait avaient été évincées. Un log qui chasse l'information qu'il est
+/// censé porter ne vaut rien.
+///
+/// `info` global suffit à museler tract (son bavardage est en `debug`) sans
+/// perdre ce que les crates tierces disent d'important. `jamodio` (sans suffixe)
+/// couvre les cibles explicites `jamodio::pipeline`, `jamodio::mixer`… que les
+/// directives par nom de crate ne matchent pas.
+const DEFAULT_DIRECTIVES: &str = "info,jamodio=debug,jamodio_agent=debug,jamodio_audio_core=debug,jamodio_au_host=debug,jamodio_vst3_host=debug";
+
+/// Construit le filtre : `RUST_LOG` s'il est posé (choix explicite du
+/// développeur, jamais contredit), sinon `DEFAULT_DIRECTIVES`.
+fn build_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_DIRECTIVES))
+}
 
 /// Nombre de fichiers journaliers `agent.log.*` conservés sur disque.
 /// `rolling::daily` ne purge jamais : sans ça les fichiers s'accumulent
@@ -68,17 +95,13 @@ pub fn init() -> WorkerGuard {
     let file_appender = rolling::daily(&dir, "agent.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,jamodio_agent=debug,jamodio_audio_core=debug")
-    });
-
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(true)
         .with_level(true)
         .with_ansi(true)
         .compact()
-        .with_filter(env_filter);
+        .with_filter(build_filter());
 
     // Fichier : pas d'ANSI, niveaux + targets explicites pour faciliter le grep.
     let file_layer = tracing_subscriber::fmt::layer()
@@ -86,7 +109,7 @@ pub fn init() -> WorkerGuard {
         .with_target(true)
         .with_level(true)
         .with_ansi(false)
-        .with_filter(EnvFilter::new("debug"));
+        .with_filter(build_filter());
 
     tracing_subscriber::registry()
         .with(stderr_layer)
@@ -226,4 +249,91 @@ pub fn collect_recent_logs(max_days: u32, max_bytes: u64) -> (String, Vec<String
     sections.reverse();
     files.reverse();
     (sections.concat(), files, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// Writer de test : capture ce que le subscriber écrirait DANS LE FICHIER.
+    /// On teste le filtre par son effet observable (des lignes écrites ou non),
+    /// pas par la forme de la chaîne de directives — c'est l'effet qui protège
+    /// l'export support.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Émet un jeu d'événements représentatif sous le filtre par défaut et rend
+    /// ce qui a été écrit.
+    fn sortie_sous_filtre_par_defaut() -> String {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(DEFAULT_DIRECTIVES))
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            // Bruit tiers : le moteur d'inférence du filtre antibruit.
+            tracing::debug!(target: "tract_core::plan", "BRUIT_PLAN");
+            tracing::debug!(target: "tract_core::optim::change_axes", "BRUIT_AXES");
+            tracing::debug!(target: "tract_pulse::model", "BRUIT_PULSE");
+            // Tiers utile.
+            tracing::info!(target: "tract_onnx::model", "TIERS_INFO");
+            tracing::warn!(target: "cpal::host::wasapi", "TIERS_WARN");
+            // Nos cibles explicites + nos crates.
+            tracing::debug!(target: "jamodio::pipeline", "NOTRE_PIPELINE");
+            tracing::debug!(target: "jamodio::perfstats", "NOTRE_PERFSTATS");
+            tracing::debug!(target: "jamodio::voice_capture", "NOTRE_VOIX");
+            tracing::debug!(target: "jamodio_audio_core::mixer", "NOTRE_CORE");
+        });
+        let bytes = cap.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Régression réelle (05/09/2026) : `tract` journalisait en `debug` à chaque
+    /// trame de voix — 124 lignes/s, 99,4 % d'un export support de 9 Mo, et les
+    /// lignes Jamodio de l'incident cherché avaient été évincées par le plafond.
+    #[test]
+    fn le_bavardage_tiers_en_debug_n_atteint_plus_les_logs() {
+        let out = sortie_sous_filtre_par_defaut();
+        for marqueur in ["BRUIT_PLAN", "BRUIT_AXES", "BRUIT_PULSE"] {
+            assert!(!out.contains(marqueur), "{marqueur} ne doit pas être journalisé");
+        }
+    }
+
+    /// …sans museler ce que les crates tierces disent d'important.
+    #[test]
+    fn le_tiers_reste_audible_a_partir_de_info() {
+        let out = sortie_sous_filtre_par_defaut();
+        assert!(out.contains("TIERS_INFO"));
+        assert!(out.contains("TIERS_WARN"));
+    }
+
+    /// Nos crates ET nos cibles explicites `jamodio::*` gardent le niveau debug :
+    /// c'est le contenu utile de l'export support.
+    #[test]
+    fn nos_cibles_restent_en_debug() {
+        let out = sortie_sous_filtre_par_defaut();
+        for marqueur in ["NOTRE_PIPELINE", "NOTRE_PERFSTATS", "NOTRE_VOIX", "NOTRE_CORE"] {
+            assert!(out.contains(marqueur), "{marqueur} doit rester journalisé");
+        }
+    }
 }
