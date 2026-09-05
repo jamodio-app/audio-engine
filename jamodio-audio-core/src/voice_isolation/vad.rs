@@ -49,6 +49,13 @@ impl Vad {
     /// [`super::IsolationConfig`], source unique de vérité.
     /// **Erreur explicite** si le chargement échoue (zéro fallback silencieux).
     pub fn new() -> Result<Self, IsolationError> {
+        // Même garde que le débruiteur : le VAD passe par le même moteur d'inférence,
+        // donc par le même AMX absent en machine virtuelle (cf. `macos_virtualise`).
+        if crate::voice_isolation::macos_virtualise() {
+            return Err(IsolationError::Vad(
+                crate::voice_isolation::VM_NON_SUPPORTEE.to_string(),
+            ));
+        }
         let map = |e: TractError| IsolationError::Vad(e.to_string());
         // NB : on ne pose PAS de formes d'entrée fixes. tract analyse alors le
         // graphe avec des dims symboliques (dont le nœud `If` interne du modèle)

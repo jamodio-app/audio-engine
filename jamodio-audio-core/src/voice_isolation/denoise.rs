@@ -82,6 +82,16 @@ impl Denoiser {
 
     /// Idem [`Denoiser::new`] avec des seuils explicites (banc de réglage hors-ligne).
     pub fn with_params(p: DenoiseParams) -> Result<Self, IsolationError> {
+        // Garde AVANT tout chargement de modèle : sur macOS virtualisé, la première
+        // inférence ne renvoie pas une erreur, elle TUE le processus (AMX absent en
+        // VM — cf. `macos_virtualise`). Une erreur explicite ici fait basculer
+        // l'appelant en voix brute, avec la raison affichée ; sans elle, l'agent
+        // disparaîtrait au premier mot prononcé.
+        if crate::voice_isolation::macos_virtualise() {
+            return Err(IsolationError::Denoise(
+                crate::voice_isolation::VM_NON_SUPPORTEE.to_string(),
+            ));
+        }
         let rp = RuntimeParams::default()
             .with_atten_lim(p.atten_lim_db)
             .with_thresholds(p.min_snr_db, p.max_erb_snr_db, p.max_df_snr_db);
