@@ -420,6 +420,13 @@ impl AudioMixer {
             .store(if gain.is_finite() { gain.clamp(0.0, 1.5) } else { 1.0 });
     }
 
+    /// Valeur courante du master gain. Lecture seule, sans verrou — pendant du
+    /// setter, et le moyen d'ASSERTER qu'une commande d'état latché a bien été
+    /// appliquée (cf. tests du serveur WS).
+    pub fn master_gain(&self) -> f32 {
+        self.master_gain.load()
+    }
+
     /// Lot C — gain du BUS voix (talkback pairs). Le web envoie le gain EFFECTIF
     /// (valeur du fader, ou 0.0 pour le mute « M »). Clamp [0.0, 1.5] (NaN → 1.0).
     pub fn set_peer_voice_gain(&self, gain: f32) {

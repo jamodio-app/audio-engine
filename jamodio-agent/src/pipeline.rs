@@ -2615,16 +2615,6 @@ impl PipelineState {
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
 
-    /// Talkback (Lot 2) — pose le gain CIBLE du producteur voix (auto-mute /
-    /// toggle manuel). Lissé par-sample côté `voice_encode_stage` (anti-clic).
-    /// Idempotent et sûr même sans voix active (l'atomique est simplement écrit).
-    pub fn set_voice_gain(&self, gain: f32) {
-        self.voice_gain.store(
-            gain.clamp(0.0, 1.0).to_bits(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
     /// Lu par le superviseur de liveness (`audio_liveness_supervisor`).
     pub fn has_active_capture_stream(&self) -> bool {

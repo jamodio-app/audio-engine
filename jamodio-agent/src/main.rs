@@ -571,7 +571,10 @@ fn main() {
 
             // ─── Spawn WS server (audio pipeline) ───────────
             let mixer = Arc::new(AudioMixer::new());
-            let mut pipeline = PipelineState::new(mixer);
+            // Le mixer est AUSSI donné au serveur WS, à côté du pipeline : les
+            // commandes d'état latché l'atteignent alors sans passer par le mutex
+            // pipeline, donc sans pouvoir être perdues sur contention.
+            let mut pipeline = PipelineState::new(mixer.clone());
             // Sprint INSERT (S1.3) — lance le scan AU en background dès le
             // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
             // pas le menu FX avant plusieurs secondes → cache prêt à temps.
@@ -582,8 +585,11 @@ fn main() {
             // d'avoir à configurer manuellement l'IAC Driver pour utiliser
             // les plugins instruments sans clavier USB physique.
             pipeline.spawn_virtual_midi();
+            // Cloné AVANT l'enveloppe Mutex : le serveur WS écrit le gain voix
+            // sans jamais prendre le verrou pipeline (cf. `WsServerHandle`).
+            let voice_gain = pipeline.voice_gain.clone();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
-            let ws_handle = WsServerHandle::new(pipeline);
+            let ws_handle = WsServerHandle::new(pipeline, mixer, voice_gain);
             // Injecte le AppHandle pour que le message browser `Restart`
             // (bouton « Relancer mon agent ») puisse déclencher check_for_update
             // + app.restart() depuis la receive loop WS.

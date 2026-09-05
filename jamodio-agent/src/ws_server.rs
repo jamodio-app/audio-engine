@@ -13,7 +13,7 @@ use jamodio_audio_core::protocol::{
 };
 use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
@@ -142,6 +142,23 @@ pub struct UpdateProgressEvent {
 #[derive(Clone)]
 pub struct WsServerHandle {
     pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
+    /// Le MIXER, atteignable SANS le mutex pipeline.
+    ///
+    /// `AudioMixer` gère sa propre synchronisation interne et vit dans un `Arc`
+    /// partagé avec les callbacks audio : le mutex pipeline ne le protégeait pas,
+    /// on ne le prenait que pour atteindre le champ `pl.mixer`. Résultat, une
+    /// vingtaine de commandes d'ÉTAT LATCHÉ (volumes, pan, armement, grille du
+    /// métronome, transport du backing) passaient par `try_lock_pipeline` et
+    /// étaient ABANDONNÉES en silence sur contention — un fader resté ouvert dans
+    /// l'UI pendant que le son est coupé, un backing qui ne démarre pas. On payait
+    /// une perte de commande pour un verrou dont on n'avait pas besoin.
+    mixer: Arc<jamodio_audio_core::mixer::mixer::AudioMixer>,
+    /// Gain d'ÉMISSION du talkback, pour la même raison que `mixer` : c'est un
+    /// simple atomique partagé avec le thread d'encodage voix, que le mutex
+    /// pipeline ne protégeait pas. Perdre un `SetVoiceGain` est le pire cas de
+    /// la famille : le micro reste ouvert alors que l'utilisateur vient de se
+    /// couper. Ce n'est pas une commande qu'on a le droit d'abandonner.
+    voice_gain: Arc<AtomicU32>,
     /// True quand une WS browser EXTERNE est connectée et tient le slot.
     /// Sert au monitoring (pas à la décision d'admission). Cf. `active_client_killer`.
     client_active: Arc<AtomicBool>,
@@ -168,11 +185,17 @@ pub struct WsServerHandle {
 }
 
 impl WsServerHandle {
-    pub fn new(pipeline: Arc<tokio::sync::Mutex<PipelineState>>) -> Self {
+    pub fn new(
+        pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
+        mixer: Arc<jamodio_audio_core::mixer::mixer::AudioMixer>,
+        voice_gain: Arc<AtomicU32>,
+    ) -> Self {
         let (shutdown_tx, _rx) = broadcast::channel::<&'static str>(4);
         let (update_progress_tx, _prx) = broadcast::channel::<UpdateProgressEvent>(16);
         Self {
             pipeline,
+            mixer,
+            voice_gain,
             client_active: Arc::new(AtomicBool::new(false)),
             active_client_killer: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_tx,
@@ -469,7 +492,8 @@ async fn handle_one_message(
         return true;
     }
 
-    let responses = handle_message(browser_msg, &handle.pipeline).await;
+    let responses =
+        handle_message(browser_msg, &handle.pipeline, &handle.mixer, &handle.voice_gain).await;
     for resp in responses {
         if out_tx.send(resp).await.is_err() {
             return false;
@@ -2266,9 +2290,15 @@ async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>)
     Err(last_err)
 }
 
+/// `mixer` est passé À CÔTÉ de `pipeline`, et pas atteint à travers lui : c'est
+/// ce qui permet aux commandes d'état latché (volumes, pan, armement, grille du
+/// métronome, transport du backing) de ne JAMAIS être perdues sur contention du
+/// mutex pipeline. Cf. le champ `WsServerHandle::mixer`.
 async fn handle_message(
     msg: BrowserMessage,
     pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+    mixer: &Arc<jamodio_audio_core::mixer::mixer::AudioMixer>,
+    voice_gain: &Arc<AtomicU32>,
 ) -> Vec<AgentMessage> {
     match msg {
         BrowserMessage::HelloAck { protocol_version, session_id } => {
@@ -2516,13 +2546,14 @@ async fn handle_message(
         }
 
         BrowserMessage::SetVoiceGain { gain } => {
-            // Hot-path idempotent (l'auto-mute le pilote à ~10 Hz) : try-lock,
-            // skip OK si contention (la prochaine cible rattrapera). L'atomique
-            // clampe/écrit sans toucher au thread RT voix.
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.set_voice_gain(gain);
+            // Le commentaire d'origine justifiait le skip par « l'auto-mute le
+            // pilote à ~10 Hz, la prochaine cible rattrapera ». L'auto-mute
+            // n'existe plus : c'est aujourd'hui l'utilisateur qui coupe ou rouvre
+            // SON micro, une fois. Rien ne rattrape rien, et la valeur perdue
+            // laisse le micro dans l'état inverse de ce qui est affiché.
+            // L'écriture est un simple atomique, elle n'a jamais eu besoin du
+            // mutex pipeline.
+            voice_gain.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             vec![]
         }
 
@@ -2561,30 +2592,21 @@ async fn handle_message(
         }
 
         BrowserMessage::SetVolume { producer_id, volume } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_volume(&producer_id, volume);
+            mixer.set_volume(&producer_id, volume);
             vec![]
         }
 
         BrowserMessage::SetBuffer { target_ms } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_target_ms_all(target_ms as usize);
+            mixer.set_target_ms_all(target_ms as usize);
             tracing::info!(target: "jamodio::ws", target_ms, "SetBuffer");
             vec![]
         }
 
         BrowserMessage::SetSelfMonitorVolume { volume } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             // Clamp défensif côté agent (le mixer clampe déjà dans
             // [0, 1.5] mais on filtre les NaN ici). 0 = silence (défaut).
             let v = if volume.is_finite() { volume.max(0.0) } else { 0.0 };
-            pl.mixer.set_self_monitor_volume(v);
+            mixer.set_self_monitor_volume(v);
             tracing::info!(target: "jamodio::ws", volume = v, "SetSelfMonitorVolume");
             vec![]
         }
@@ -2706,53 +2728,35 @@ async fn handle_message(
         }
 
         BrowserMessage::SetMasterVolume { volume } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_master_gain(volume);
+            mixer.set_master_gain(volume);
             vec![]
         }
 
         BrowserMessage::SetPan { producer_id, pan } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_pan(&producer_id, pan);
+            mixer.set_pan(&producer_id, pan);
             vec![]
         }
 
         BrowserMessage::SetDim { factor } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             // DIM = ducking des instruments pour laisser passer le talkback.
-            pl.mixer.set_dim(factor);
+            mixer.set_dim(factor);
             vec![]
         }
 
         BrowserMessage::SetRecordArm { self_armed, armed_peers } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             // Point 4 — snapshot d'armement MIX REC : le mixer ne somme dans le
             // bus enregistré/VU que les sources armées (monitoring inchangé).
-            pl.mixer.set_record_arm(self_armed, &armed_peers);
+            mixer.set_record_arm(self_armed, &armed_peers);
             vec![]
         }
 
         // Lot C — bus voix des pairs (talkback via l'agent). Tranche unique.
         BrowserMessage::SetPeerVoiceGain { gain } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_peer_voice_gain(gain);
+            mixer.set_peer_voice_gain(gain);
             vec![]
         }
         BrowserMessage::SetPeerVoicePan { pan } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.set_peer_voice_pan(pan);
+            mixer.set_peer_voice_pan(pan);
             vec![]
         }
 
@@ -2805,11 +2809,8 @@ async fn handle_message(
             anchor_beat_frame,
             anchor_beat_index,
         } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             use jamodio_audio_core::mixer::reference::{Figure, MetroSound};
-            pl.mixer.set_reference_config(
+            mixer.set_reference_config(
                 enabled,
                 volume,
                 pan,
@@ -2833,37 +2834,25 @@ async fn handle_message(
         }
 
         BrowserMessage::ReferenceGrid { anchor_beat_frame, anchor_beat_index } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer
+            mixer
                 .set_reference_grid(anchor_beat_frame, anchor_beat_index);
             vec![]
         }
 
         BrowserMessage::ReferenceStop => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.reference_stop();
+            mixer.reference_stop();
             tracing::debug!(target: "jamodio::ws", "ReferenceStop");
             vec![]
         }
 
         // ─── Option B / B4 — backing track via l'agent ────────────────────
         BrowserMessage::ReferenceBackingBegin { total_frames } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_begin(total_frames as usize);
+            mixer.backing_begin(total_frames as usize);
             tracing::debug!(target: "jamodio::ws", total_frames, "ReferenceBackingBegin");
             vec![]
         }
 
         BrowserMessage::ReferenceBackingChunk { data_b64 } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             // base64 → PCM int16 LE → f32 (stéréo entrelacé).
             let b64 = base64::engine::general_purpose::STANDARD;
             match b64.decode(data_b64.as_bytes()) {
@@ -2873,7 +2862,7 @@ async fn handle_message(
                         let s = i16::from_le_bytes(*pair);
                         samples.push(s as f32 / 32768.0);
                     }
-                    pl.mixer.backing_push(&samples);
+                    mixer.backing_push(&samples);
                 }
                 Err(e) => {
                     tracing::warn!(target: "jamodio::ws", error = %e, "ReferenceBackingChunk base64 invalide");
@@ -2883,68 +2872,44 @@ async fn handle_message(
         }
 
         BrowserMessage::ReferenceBackingEnd => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_end();
+            mixer.backing_end();
             tracing::debug!(target: "jamodio::ws", "ReferenceBackingEnd");
             vec![]
         }
 
         BrowserMessage::ReferenceBackingUnload => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_unload();
+            mixer.backing_unload();
             vec![]
         }
 
         BrowserMessage::ReferenceBackingPlay { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_play(anchor_backing_frame, anchor_output_frame);
+            mixer.backing_play(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
         BrowserMessage::ReferenceBackingPause => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_pause();
+            mixer.backing_pause();
             vec![]
         }
 
         BrowserMessage::ReferenceBackingSeek { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_seek(anchor_backing_frame, anchor_output_frame);
+            mixer.backing_seek(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
         BrowserMessage::ReferenceBackingSync { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.backing_sync(anchor_backing_frame, anchor_output_frame);
+            mixer.backing_sync(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
         // ─── Lot D — aperçu de fichier Library via l'agent (buffer séparé) ─────
         BrowserMessage::ReferencePreviewBegin { total_frames } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_begin(total_frames as usize);
+            mixer.preview_begin(total_frames as usize);
             tracing::debug!(target: "jamodio::ws", total_frames, "ReferencePreviewBegin");
             vec![]
         }
 
         BrowserMessage::ReferencePreviewChunk { data_b64 } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
             // base64 → PCM int16 LE → f32 (stéréo entrelacé).
             let b64 = base64::engine::general_purpose::STANDARD;
             match b64.decode(data_b64.as_bytes()) {
@@ -2954,7 +2919,7 @@ async fn handle_message(
                         let s = i16::from_le_bytes(*pair);
                         samples.push(s as f32 / 32768.0);
                     }
-                    pl.mixer.preview_push(&samples);
+                    mixer.preview_push(&samples);
                 }
                 Err(e) => {
                     tracing::warn!(target: "jamodio::ws", error = %e, "ReferencePreviewChunk base64 invalide");
@@ -2964,51 +2929,33 @@ async fn handle_message(
         }
 
         BrowserMessage::ReferencePreviewEnd => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_end();
+            mixer.preview_end();
             tracing::debug!(target: "jamodio::ws", "ReferencePreviewEnd");
             vec![]
         }
 
         BrowserMessage::ReferencePreviewUnload => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_unload();
+            mixer.preview_unload();
             vec![]
         }
 
         BrowserMessage::ReferencePreviewPlay { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_play(anchor_backing_frame, anchor_output_frame);
+            mixer.preview_play(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
         BrowserMessage::ReferencePreviewPause => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_pause();
+            mixer.preview_pause();
             vec![]
         }
 
         BrowserMessage::ReferencePreviewSeek { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_seek(anchor_backing_frame, anchor_output_frame);
+            mixer.preview_seek(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
         BrowserMessage::ReferencePreviewSync { anchor_backing_frame, anchor_output_frame } => {
-            let Some(pl) = try_lock_pipeline(pipeline).await else {
-                return vec![];
-            };
-            pl.mixer.preview_sync(anchor_backing_frame, anchor_output_frame);
+            mixer.preview_sync(anchor_backing_frame, anchor_output_frame);
             vec![]
         }
 
@@ -3574,5 +3521,85 @@ mod runaway_tests {
         let mut c = 0;
         assert!(!runaway_tick(true, 4.0, false, &mut c));
         assert_eq!(c, 0);
+    }
+}
+
+/// Les commandes d'ÉTAT LATCHÉ ne doivent JAMAIS être perdues sur contention.
+///
+/// Avant ce lot, une vingtaine d'entre elles passaient par `try_lock_pipeline` et
+/// faisaient `return vec![]` au bout de 200 ms — sans erreur au browser, sans
+/// retry. L'UI montrait un fader ouvert pendant que le son était coupé ; un
+/// `SetVoiceGain` perdu laissait le micro à l'inverse de ce que l'utilisateur
+/// venait de demander. Elles n'ont jamais eu besoin de ce verrou : le mixer est
+/// un `Arc` à synchronisation interne, le gain voix un simple atomique.
+#[cfg(test)]
+mod etat_latche_tests {
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+
+    /// Monte un jeu (pipeline, mixer, gain voix) tel que le serveur WS le détient.
+    fn harnais() -> (
+        Arc<tokio::sync::Mutex<PipelineState>>,
+        Arc<AudioMixer>,
+        Arc<AtomicU32>,
+    ) {
+        let mixer = Arc::new(AudioMixer::new());
+        let pipeline = PipelineState::new(mixer.clone());
+        let voice_gain = pipeline.voice_gain.clone();
+        (
+            Arc::new(tokio::sync::Mutex::new(pipeline)),
+            mixer,
+            voice_gain,
+        )
+    }
+
+    #[tokio::test]
+    async fn le_volume_master_passe_alors_que_le_pipeline_est_verrouille() {
+        let (pipeline, mixer, voice_gain) = harnais();
+        // Contention MAXIMALE : le mutex est tenu pour toute la durée de l'appel.
+        let _tenu = pipeline.lock().await;
+        handle_message(
+            BrowserMessage::SetMasterVolume { volume: 0.25 },
+            &pipeline,
+            &mixer,
+            &voice_gain,
+        )
+        .await;
+        assert!((mixer.master_gain() - 0.25).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn couper_son_micro_passe_alors_que_le_pipeline_est_verrouille() {
+        let (pipeline, mixer, voice_gain) = harnais();
+        let _tenu = pipeline.lock().await;
+        handle_message(
+            BrowserMessage::SetVoiceGain { gain: 0.0 },
+            &pipeline,
+            &mixer,
+            &voice_gain,
+        )
+        .await;
+        assert_eq!(f32::from_bits(voice_gain.load(Ordering::Relaxed)), 0.0);
+    }
+
+    /// Et sans attendre : si la commande partait quand même dans `try_lock`, elle
+    /// mettrait 200 ms (le timeout) avant d'abandonner.
+    #[tokio::test]
+    async fn ces_commandes_n_attendent_plus_le_verrou() {
+        let (pipeline, mixer, voice_gain) = harnais();
+        let _tenu = pipeline.lock().await;
+        let t0 = std::time::Instant::now();
+        handle_message(
+            BrowserMessage::SetMasterVolume { volume: 0.5 },
+            &pipeline,
+            &mixer,
+            &voice_gain,
+        )
+        .await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(50),
+            "la commande a attendu le verrou ({:?})",
+            t0.elapsed()
+        );
     }
 }
