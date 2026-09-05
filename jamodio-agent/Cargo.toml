@@ -87,6 +87,10 @@ windows-sys = { version = "0.59", features = [
     # ASIO). Cf. audio/power_events.rs. Les constantes PBT_*/DEVICE_NOTIFY_CALLBACK
     # vivent dans Win32_UI_WindowsAndMessaging.
     "Win32_System_Power",
+    # PowerSettingRegisterNotification(GUID_CONSOLE_DISPLAY_STATE) : la VEILLE
+    # MODERNE (S0ix) ne délivre AUCUN PBT_APMRESUME* — seul l'état de l'écran
+    # signale ces transitions. Le GUID vit dans SystemServices.
+    "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
