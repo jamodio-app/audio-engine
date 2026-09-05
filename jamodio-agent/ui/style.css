@@ -130,6 +130,32 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
   color: var(--text2);
+  /* Un nom d'interface + son canal dépasse souvent la largeur de la fenêtre.
+     On laisse le NAVIGATEUR couper au pixel près (et seulement s'il le faut)
+     plutôt que d'amputer la chaîne à un nombre de caractères arbitraire : le
+     texte complet reste dans l'infobulle de la ligne. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+/* La colonne de gauche ne doit pas être compressée par une valeur longue. */
+.label { flex: 0 0 auto; }
+.row .value { flex: 1 1 auto; margin-left: 10px; }
+
+/* Rappel affiché tant qu'aucune session n'est en cours : sans lui, une fenêtre
+   pleine de « — » laisse croire à une panne alors que l'agent attend simplement
+   qu'on entre dans un studio. */
+.info-hint {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text2);
+  opacity: 0.75;
+  margin-top: 10px;
+  text-align: center;
 }
 
 .settings {

@@ -698,6 +698,11 @@ pub struct PipelineState {
     /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
     /// est prise sur un canal de l'interface instrument.
     voice_device_label: Option<String>,
+    /// Sélection de canal(aux) de l'INSTRUMENT, telle que demandée au démarrage
+    /// de la capture. Sert uniquement à l'affichage : la fenêtre nomme le canal
+    /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
+    /// d'un seul côté laissait croire à deux réglages de nature différente.
+    capture_channels_label: Option<String>,
     /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
     /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
     /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
@@ -1240,6 +1245,7 @@ impl PipelineState {
             playback_stream: None,
             voice_capture: None,
             voice_device_label: None,
+            capture_channels_label: None,
             voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
@@ -2298,6 +2304,15 @@ impl PipelineState {
         //    Stream de sortie ouvert/réutilisé en 1. via prepare_audio_for_session.)
 
         self.state = AgentState::Capturing;
+        // Libellé d'affichage de la source instrument : le canal (ou la paire)
+        // réellement demandé. Posé ICI, quand la capture a abouti — pas à
+        // l'entrée de la fonction : un échec en cours de route laisserait sinon
+        // la fenêtre nommer un canal qui ne capte rien.
+        self.capture_channels_label = match (channel_index, stereo_start) {
+            (Some(i), _) => Some(format!("canal {}", u16::from(i) + 1)),
+            (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
+            (None, None) => Some("canaux 1-2".to_string()),
+        };
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -2536,6 +2551,22 @@ impl PipelineState {
             .values()
             .filter(|k| matches!(k, StreamKind::Instrument))
             .count()
+    }
+
+    /// Interface instrument + canal(aux) captés, pour l'affichage. `None` quand
+    /// aucune capture ne tourne — la fenêtre montre alors « — », pas un réglage
+    /// qui n'a pas cours.
+    pub fn instrument_source_label(&self) -> Option<String> {
+        if !matches!(self.state, AgentState::Capturing) {
+            return None;
+        }
+        let name = self
+            .selected_input_id()
+            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()))?;
+        Some(match self.capture_channels_label.as_deref() {
+            Some(ch) => format!("{name} — {ch}"),
+            None => name,
+        })
     }
 
     /// Micro utilisé par le talkback, pour l'affichage : le périphérique dédié

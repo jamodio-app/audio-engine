@@ -2601,10 +2601,13 @@ async fn handle_message(
             };
             let is_capturing = matches!(pl.state, AgentState::Capturing);
             let stream_count = pl.recv_stops.len();
-            // L'UI agent affiche le nom lisible (pas l'id complet `{idx}:{name}`).
-            // On extrait la part nom de l'id sélectionné.
-            let device_name = pl.selected_input_id().and_then(|id| {
-                id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id))
+            // L'UI agent affiche le nom lisible (pas l'id complet `{idx}:{name}`),
+            // suivi du canal capté QUAND une capture tourne — même forme que la
+            // ligne Talkback, pour qu'on ne croie pas à deux réglages de nature
+            // différente. Hors capture, le nom seul (le canal n'a pas cours).
+            let device_name = pl.instrument_source_label().or_else(|| {
+                pl.selected_input_id()
+                    .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id)))
             });
 
             // Real latency from CPAL buffer: samples / 48000 * 1000.
