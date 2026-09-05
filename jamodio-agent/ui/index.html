@@ -29,7 +29,7 @@
         <span class="label">Instrument</span>
         <span class="value" id="device">—</span>
       </div>
-      <div class="row" title="Micro utilisé pour parler aux autres musiciens (talkback). « Canal de l'interface » = la voix est prise sur une entrée de ton interface instrument ; sinon c'est un micro à part, ouvert par l'agent.">
+      <div class="row" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent.">
         <span class="label">Talkback</span>
         <span class="value" id="voice-device">—</span>
       </div>
@@ -235,7 +235,12 @@
             // `musicians` = flux INSTRUMENT (un partenaire qui parle envoie deux
             // flux) ; repli sur `streams` pour un agent antérieur.
             $('streams').textContent = (msg.musicians ?? msg.streams) || 0;
-            $('voice-device').textContent = msg.voiceDevice || '—';
+            // Même troncature que la ligne Instrument : le nom du micro peut
+            // porter l'interface ET le canal (« Scarlett 18i20 — canal 3 »), et
+            // la fenêtre fait 300 px. Le nom complet reste dans l'infobulle.
+            $('voice-device').textContent = msg.voiceDevice
+              ? (msg.voiceDevice.length > 22 ? msg.voiceDevice.substring(0, 22) + '…' : msg.voiceDevice)
+              : '—';
             $('voice-device').title = msg.voiceDevice || '';
             $('underruns').textContent = msg.underruns || 0;
             // Stats latence : on utilise les valeurs pré-calculées par l'agent

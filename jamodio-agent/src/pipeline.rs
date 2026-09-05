@@ -689,6 +689,11 @@ pub struct PipelineState {
     /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
     /// est prise sur un canal de l'interface instrument.
     voice_device_label: Option<String>,
+    /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
+    /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
+    /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
+    /// l'interface » qui ne disait ni lequel ni laquelle.
+    voice_channel_index: Option<u8>,
     /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
     /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
     /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
@@ -1218,6 +1223,7 @@ impl PipelineState {
             playback_stream: None,
             voice_capture: None,
             voice_device_label: None,
+            voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
             capture_sample_tx: None,
@@ -2367,6 +2373,7 @@ impl PipelineState {
         // sur un état fantôme.
         self.voice_active = false;
         self.voice_device_label = None;
+        self.voice_channel_index = None;
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2488,6 +2495,7 @@ impl PipelineState {
                 })
                 .map_err(|e| format!("voice tap attach failed: {}", e))?;
                 self.voice_device_label = None;
+                self.voice_channel_index = Some(channel_index);
                 "canal du flux instrument".to_string()
             }
         };
@@ -2519,9 +2527,23 @@ impl PipelineState {
         if !self.voice_active {
             return None;
         }
-        Some(match self.voice_device_label.as_deref() {
-            Some(name) => name.to_string(),
-            None => "canal de l'interface".to_string(),
+        if let Some(name) = self.voice_device_label.as_deref() {
+            return Some(name.to_string());
+        }
+        // Voix prélevée sur un canal du flux instrument. On NOMME l'interface et
+        // le canal : l'agent les connaît, et « canal de l'interface » laissait
+        // croire à une autre source que celle affichée juste au-dessus.
+        // Le nom est relu à CHAQUE appel (jamais figé au démarrage du talkback)
+        // pour ne pas afficher l'ancienne interface après un changement d'entrée.
+        let iface = self
+            .selected_input_id()
+            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()));
+        Some(match (iface, self.voice_channel_index) {
+            (Some(name), Some(ch)) => format!("{} — canal {}", name, u16::from(ch) + 1),
+            (Some(name), None) => name,
+            // Pas d'entrée sélectionnée alors qu'une voix est active : état
+            // incohérent, on le dit au lieu d'inventer un nom.
+            (None, _) => "source inconnue".to_string(),
         })
     }
 
@@ -2539,6 +2561,7 @@ impl PipelineState {
         // périphérique (sinon le casque resterait tenu par l'agent).
         self.voice_capture = None;
         self.voice_device_label = None;
+        self.voice_channel_index = None;
         self.voice_active = false;
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
