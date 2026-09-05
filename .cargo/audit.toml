@@ -1,0 +1,65 @@
+# ══════════════════════════════════════════════════════════════════════════
+# cargo-audit — exceptions ASSUMÉES, pas ignorées.
+#
+# Règle : une entrée ici doit dire POURQUOI l'avis ne nous expose pas, et CE QUI
+# invaliderait ce raisonnement. Sans ça, une exception devient un oubli.
+# À relire à chaque montée de version majeure des dépendances concernées.
+# ══════════════════════════════════════════════════════════════════════════
+[advisories]
+ignore = [
+    # ── RUSTSEC-2026-0217 — tract-nnef 0.21.4 : dépassement d'entier dans le
+    #    parseur de tenseurs NNEF → lecture hors bornes AU CHARGEMENT D'UN MODÈLE.
+    #
+    #    Exposition chez nous : NULLE. Les deux seuls modèles chargés sont
+    #    EMBARQUÉS DANS LE BINAIRE (DeepFilterNet via la feature `default-model`,
+    #    Silero via `include_bytes!`). Aucun chemin de code ne charge un modèle
+    #    fourni par l'utilisateur ou téléchargé — vérifié le 04/09/2026.
+    #
+    #    Pourquoi pas de correctif : l'avis est corrigé en tract 0.21.16, mais
+    #    cette version a changé de version d'`ndarray`, et DeepFilterNet (épinglé
+    #    au rev d375b2d) ne compile plus contre elle (types `Axis` incompatibles).
+    #    La montée devra donc se faire AVEC une montée de DeepFilterNet.
+    #
+    #    ⚠️ CETTE EXCEPTION SAUTE le jour où l'agent charge un modèle fourni de
+    #    l'extérieur (import de plugin d'effet neuronal, modèle téléchargé…).
+    "RUSTSEC-2026-0217",
+
+    # ── RUSTSEC-2026-0195 / RUSTSEC-2026-0194 — quick-xml < 0.41 : épuisement
+    #    mémoire et coût quadratique sur du XML hostile.
+    #
+    #    Exposition : NULLE. quick-xml arrive par `plist` ← `tauri`, qui lit les
+    #    plists de NOTRE application (Info.plist, préférences). Aucun XML d'origine
+    #    externe n'est parsé par l'agent.
+    #    Correctif : dépend d'une montée de tauri/plist — hors de notre contrôle.
+    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",
+
+    # ── RUSTSEC-2024-0006 — shlex 0.1.1 : problèmes de l'API `quote`.
+    #    Exposition : NULLE au runtime. shlex vient de `bindgen`, une dépendance
+    #    de BUILD (génération de bindings FFI) : elle ne finit pas dans le binaire
+    #    distribué.
+    "RUSTSEC-2024-0006",
+
+    # ── RUSTSEC-2026-0097 — rand 0.7.3 : unsoundness avec un logger personnalisé.
+    #    Exposition : NULLE au runtime. rand 0.7 arrive par
+    #    `phf_generator` ← `phf_codegen` ← [build-dependencies] de `selectors`
+    #    ← kuchikiki ← tauri-utils ← tauri-build : dépendance de BUILD, absente
+    #    du binaire distribué. Aucune utilisation directe de `rand` dans notre code.
+    "RUSTSEC-2026-0097",
+
+    # ── RUSTSEC-2024-0429 — glib 0.18.5 : unsoundness d'itérateurs.
+    #    Exposition : NULLE. glib fait partie de la pile GTK que tauri tire pour
+    #    la cible LINUX. Jamodio ne distribue que macOS et Windows (cf. matrice
+    #    de `release.yml`) : ce code n'est jamais compilé ni livré.
+    #    ⚠️ Cette exception saute si Linux devient une cible.
+    "RUSTSEC-2024-0429",
+
+    # ── RUSTSEC-2026-0221 — event-listener 5.4.1 : `!Send` traversant une
+    #    frontière de thread.
+    #    Exposition : NULLE. Chemin : event-listener ← zbus ← tauri-plugin-single-instance,
+    #    c'est-à-dire la pile D-Bus, **Linux uniquement**. Vérifié : la crate
+    #    n'apparaît PAS dans l'arbre de la cible macOS (`cargo tree -i event-listener`
+    #    ne renvoie rien ; il faut `--target all` pour la voir).
+    #    ⚠️ Cette exception saute si Linux devient une cible.
+    "RUSTSEC-2026-0221",
+]

@@ -1,0 +1,47 @@
+# Garde-fou d'approvisionnement : failles connues + licences des dépendances.
+#
+# RAISON D'ÊTRE : l'agent embarque ~700 crates transitives, dont un dépôt git
+# épinglé (DeepFilterNet) et des modèles d'IA. Deux risques qu'aucun test ne
+# couvre : une faille publiée dans une dépendance qu'on ne touche plus, et une
+# licence incompatible qui arrive par une dépendance transitive.
+#
+# Le déclencheur PLANIFIÉ est le cœur du dispositif : une faille apparaît APRÈS
+# le merge, sans que personne ne pousse quoi que ce soit.
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  schedule:
+    # Tous les lundis 6h UTC — un avis publié dans la semaine est vu au plus tard 7 jours après.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Failles connues (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH relatif
+      # (workaround dev Mac) ; inutile ici et source d'échecs.
+      - run: rm -f .cargo/config.toml
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Licences et sources (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rm -f .cargo/config.toml
+      - uses: EmbarkStudios/cargo-deny-action@e2f4ede4a4e60ea15ff31bc0647485d80c66cfba # v2.0.4
+        with:
+          command: check licenses sources bans
