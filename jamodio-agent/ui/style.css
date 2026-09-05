@@ -154,9 +154,14 @@ body {
   line-height: 1.4;
   color: var(--text2);
   opacity: 0.75;
-  margin-top: 10px;
+  margin-top: 8px;
   text-align: center;
 }
+
+/* La fenêtre est à taille FIXE et non redimensionnable : un élément masqué doit
+   l'être vraiment, sinon il continue d'occuper sa hauteur et pousse le numéro de
+   version hors du cadre (constaté le 05/09). */
+[hidden] { display: none !important; }
 
 .settings {
   display: flex;

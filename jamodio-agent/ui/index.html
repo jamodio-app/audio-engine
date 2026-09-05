@@ -29,6 +29,10 @@
         <span class="label">Instrument</span>
         <span class="value" id="device">—</span>
       </div>
+      <!-- Lignes qui n'ont de sens QU'EN SESSION : masquées hors session, où
+           elles n'affichaient que des « — » (du bruit, et six lignes de hauteur
+           qui poussaient le numéro de version hors de la fenêtre). -->
+      <div id="live-metrics" hidden>
       <div class="row" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent.">
         <span class="label">Talkback</span>
         <span class="value" id="voice-device">—</span>
@@ -53,8 +57,9 @@
         <span class="label">Coupures</span>
         <span class="value" id="underruns">0</span>
       </div>
-      <!-- Sans cette phrase, une fenêtre pleine de « — » se lit comme une panne
-           alors que l'agent attend simplement une session. -->
+      </div>
+      <!-- Ce qui les remplace hors session : sans cette phrase, une fenêtre pleine
+           de « — » se lit comme une panne alors que l'agent attend simplement. -->
       <div class="info-hint" id="info-hint">Les mesures apparaissent quand tu entres dans un studio.</div>
     </div>
     <div class="settings">
@@ -209,7 +214,11 @@
             const active = msg.state === 'capturing';
             $('status').textContent = active ? 'ACTIF' : 'IDLE';
             $('status').classList.toggle('active', active);
-            $('info-hint').style.display = active ? 'none' : '';
+            // Les mesures et la phrase qui les remplace s'échangent : la hauteur
+            // de la fenêtre ne bouge pas vers le bas (le numéro de version doit
+            // rester visible — fenêtre à taille fixe, non redimensionnable).
+            $('live-metrics').hidden = !active;
+            $('info-hint').hidden = active;
             if (!active) {
               $('buffer').textContent = '—';
               $('latency').textContent = '—';
@@ -277,6 +286,10 @@
         $('ws-status').classList.remove('ok');
         $('status').textContent = 'IDLE';
         $('status').classList.remove('active');
+        // Même bascule qu'au repos : sans elle, une WS coupée en pleine session
+        // laisserait les mesures figées à leur dernière valeur, donc fausses.
+        $('live-metrics').hidden = true;
+        $('info-hint').hidden = false;
         $('device').textContent = '—';
         $('buffer').textContent = '—';
         $('latency').textContent = '—';
