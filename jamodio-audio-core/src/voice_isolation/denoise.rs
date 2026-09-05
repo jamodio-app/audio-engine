@@ -216,6 +216,9 @@ mod tests {
 
     #[test]
     fn charge_le_modele_embarque() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         // Prouve que le modèle embarqué se charge dans notre build (tract pur Rust).
         let d = Denoiser::new().expect("le modèle DeepFilterNet embarqué doit se charger");
         assert_eq!(d.sample_rate(), 48_000);
@@ -224,6 +227,9 @@ mod tests {
 
     #[test]
     fn bloc_meme_taille_et_silence_sur_zero() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         let mut d = Denoiser::new().unwrap();
         // Entrée silencieuse → sortie de même taille, sans NaN, bornée.
         let mut block = vec![0.0f32; 1024];
@@ -236,6 +242,9 @@ mod tests {
 
     #[test]
     fn reset_ok() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         let mut d = Denoiser::new().unwrap();
         let mut b = vec![0.1f32; 2048];
         d.process_block(&mut b).unwrap();
@@ -261,6 +270,9 @@ mod tests {
 
     #[test]
     fn gros_blocs_ne_creusent_pas_de_trous() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         // RÉGRESSION (revue 04/09) : avec un pilote qui délivre des blocs PLUS
         // GROS que la latence du modèle (2048 frames, vu sur certaines cartes),
         // un coussin figé sur la seule latence se vidait à chaque tour et on

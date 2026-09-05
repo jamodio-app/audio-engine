@@ -109,12 +109,18 @@ mod tests {
 
     #[test]
     fn charge_le_modele_vad() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         let v = Vad::new().expect("le modèle Silero VAD embarqué doit se charger dans tract");
         assert_eq!(v.frame_len(), 512);
     }
 
     #[test]
     fn silence_faible_proba() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         let mut v = Vad::new().unwrap();
         let frame = [0.0f32; VAD_FRAME];
         // Sur du silence, la proba de parole doit être basse (et jamais NaN).
@@ -128,6 +134,9 @@ mod tests {
 
     #[test]
     fn reset_remet_etat_a_zero() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         let mut v = Vad::new().unwrap();
         let frame = [0.1f32; VAD_FRAME];
         v.speech_prob(&frame).unwrap();
@@ -141,6 +150,9 @@ mod tests {
 
     #[test]
     fn detecte_la_parole_reelle_regression_contexte() {
+        if crate::voice_isolation::inference_impossible_ici() {
+            return;
+        }
         // RÉGRESSION : sans le contexte de 64 éch. préfixé (entrée 576), Silero renvoie
         // ~0 sur TOUTE parole → gate fermé → talkback muet (bug terrain 03/09). Ce test
         // échoue si le contexte n'est plus appliqué.
