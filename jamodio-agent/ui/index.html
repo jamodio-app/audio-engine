@@ -129,14 +129,17 @@
     }
 
     // ─── Bouton "Licences" ─────────────────────────────────────
-    // Ouvre une FENÊTRE dédiée (licenses.html) : la fenêtre principale fait
-    // 300×380 et ne se redimensionne pas — un panneau y serait illisible, et la
-    // liste des composants tiers grandira avec le produit.
+    // Écrit le texte embarqué dans un fichier et laisse l'OS l'ouvrir. Une
+    // seconde webview figeait l'agent sur Windows (cf. open_licenses côté Rust) ;
+    // le lecteur de texte du système, lui, défile et se ferme toujours.
     const licBtn = $('show-licenses');
     if (licBtn) {
       licBtn.addEventListener('click', async () => {
         try {
-          await tauriInvoke('open_licenses_window');
+          const path = await tauriInvoke('open_licenses');
+          licBtn.textContent = '✓ Ouvert';
+          licBtn.title = path || '';
+          setTimeout(() => { licBtn.textContent = 'Licences'; }, 2500);
         } catch (err) {
           licBtn.textContent = '✗ Échec';
           licBtn.title = String(err);

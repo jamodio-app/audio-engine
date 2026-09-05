@@ -69,50 +69,29 @@ fn get_third_party_licenses() -> &'static str {
     include_str!("../../THIRD-PARTY-LICENSES.md")
 }
 
-/// Ouvre la fenêtre « Licences » — une VRAIE fenêtre, pas un panneau dans la
-/// fenêtre principale (300×380, non redimensionnable) où le texte serait illisible.
-/// Elle défile et s'agrandit : la liste des composants tiers grandira avec le
-/// produit. Idempotent : si elle est déjà ouverte, on la remet au premier plan.
+/// Ouvre les licences tierces dans le lecteur de texte du système.
+///
+/// # Pourquoi PAS une fenêtre de l'app (décision 04/09/2026)
+///
+/// Deux tentatives d'ouvrir une seconde webview ont figé l'agent sur Windows —
+/// fenêtre blanche, impossible à fermer, obligé de tuer le process — y compris
+/// en construisant la fenêtre sur le thread principal (le correctif habituel de
+/// ce symptôme). Faute de pouvoir reproduire hors Windows, on ARRÊTE de deviner :
+/// on écrit le texte dans un fichier et on laisse l'OS l'ouvrir. Aucune webview,
+/// donc aucun moyen de figer l'agent — et l'obligation d'attribution (MIT /
+/// Apache-2.0) est remplie, hors ligne, dans une fenêtre qui défile.
+///
+/// Le fichier est réécrit à chaque ouverture depuis le texte EMBARQUÉ au build :
+/// il ne peut pas dater d'une version précédente.
 #[tauri::command]
-fn open_licenses_window(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager as _;
-    let handle = app.clone();
-    // ⚠️ La création d'une webview DOIT se faire sur le THREAD PRINCIPAL.
-    // Une commande Tauri s'exécute sur un thread du runtime async : construire
-    // la fenêtre depuis là fige WebView2 sur Windows — fenêtre ouverte mais
-    // vide, et agent bloqué au point de devoir le tuer (constaté en test le
-    // 04/09/2026). macOS tolérait, Windows non. On poste donc la création sur
-    // le thread de la boucle d'événements, et la commande rend la main tout de
-    // suite (les erreurs de construction sont tracées, pas silencieuses).
-    app.run_on_main_thread(move || {
-        if let Some(win) = handle.get_webview_window("licenses") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-            return;
-        }
-        let built = tauri::WebviewWindowBuilder::new(
-            &handle,
-            "licenses",
-            tauri::WebviewUrl::App("licenses.html".into()),
-        )
-        .title("Licences — Jamodio Audio Engine")
-        .inner_size(600.0, 640.0)
-        .min_inner_size(420.0, 340.0)
-        .resizable(true)
-        // Contrairement à la fenêtre principale, elle ne reste pas au-dessus de
-        // tout : on la lit, on la ferme.
-        .always_on_top(false)
-        .build();
-        if let Err(e) = built {
-            tracing::error!(
-                target: "jamodio::ui",
-                error = %e,
-                "ouverture de la fenêtre Licences impossible"
-            );
-        }
-    })
-    .map_err(|e| e.to_string())
+fn open_licenses() -> Result<String, String> {
+    let dir = logging::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("dossier inaccessible : {e}"))?;
+    let path = dir.join("Jamodio - Licences des composants tiers.txt");
+    std::fs::write(&path, get_third_party_licenses())
+        .map_err(|e| format!("écriture impossible : {e}"))?;
+    opener::open(&path).map_err(|e| format!("ouverture impossible : {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// État courant de l'autostart (lu depuis l'OS : plist LaunchAgent sur macOS,
@@ -443,7 +422,7 @@ fn main() {
             get_log_dir,
             get_version,
             get_third_party_licenses,
-            open_licenses_window,
+            open_licenses,
             get_autostart,
             set_autostart,
             quit_app

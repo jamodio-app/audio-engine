@@ -2,8 +2,7 @@
   "identifier": "default",
   "description": "Default permissions for Jamodio Audio Engine",
   "windows": [
-    "main",
-    "licenses"
+    "main"
   ],
   "permissions": [
     "core:default",
