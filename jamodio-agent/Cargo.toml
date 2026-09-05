@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.5.13-7"
+version = "0.5.13-8"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
