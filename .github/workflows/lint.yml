@@ -119,7 +119,10 @@ jobs:
         shell: bash
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
-        # TEMPORAIRE (05/09) — un seul thread + backtrace pour NOMMER le test qui
-        # tue le binaire audio-core en SIGILL sur le runner macOS. À retirer une
-        # fois la cause identifiée.
-        run: RUST_BACKTRACE=1 cargo test --workspace --target ${{ matrix.target }} -- --test-threads=1
+        # TEMPORAIRE (05/09) — test NOMMÉ : voice_isolation::denoise::tests::
+        # bloc_meme_taille_et_silence_sur_zero, soit la 1re inférence DeepFilterNet.
+        # On DISCRIMINE maintenant la cause : `TRACT_CPU_AARCH64_KIND=generic` force
+        # le moteur d'inférence à ses noyaux génériques au lieu de ceux qu'il choisit
+        # pour « Apple Silicon » (une seule catégorie chez lui, toutes générations
+        # confondues). Si le crash disparaît → c'est la sélection de noyaux.
+        run: TRACT_CPU_AARCH64_KIND=generic RUST_BACKTRACE=1 cargo test --workspace --target ${{ matrix.target }} -- --test-threads=1
