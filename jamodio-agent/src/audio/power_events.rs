@@ -100,7 +100,9 @@ impl Default for ResumeSignal {
 /// Valeurs de `GUID_CONSOLE_DISPLAY_STATE` (ABI Windows, figée). Déclarées ici —
 /// hors du module `win` — pour que la décision de réveil reste testable sur toutes
 /// les plateformes : c'est de la logique pure, pas de l'appel système.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const DISPLAY_OFF: u32 = 0;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const DISPLAY_ON: u32 = 1;
 /// L'écran se tamise. Le contrôleur audio n'est PAS endormi pour autant.
 /// Jamais testé explicitement par `is_display_wake` (qui n'accepte que `OFF → ON`)
@@ -109,6 +111,7 @@ pub(crate) const DISPLAY_ON: u32 = 1;
 #[allow(dead_code)]
 pub(crate) const DISPLAY_DIMMED: u32 = 2;
 /// Sentinelle : aucun état reçu encore.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const DISPLAY_UNKNOWN: u32 = u32::MAX;
 
 /// Un changement d'état d'écran constitue-t-il un RÉVEIL à traiter ?
@@ -119,6 +122,9 @@ pub(crate) const DISPLAY_UNKNOWN: u32 = u32::MAX;
 ///     à chaque démarrage de l'agent ;
 ///   - `DIMMED → ON` : l'écran s'est seulement tamisé, rien ne s'est endormi côté
 ///     audio. Le compter provoquerait des coupures en pleine session.
+// Consommé par le seul chemin Windows ; la logique reste multi-plateforme pour
+// rester testable partout — `allow` CIBLÉ, jamais posé sur le module entier.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn is_display_wake(prev: u32, new: u32) -> bool {
     prev == DISPLAY_OFF && new == DISPLAY_ON
 }

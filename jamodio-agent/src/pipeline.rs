@@ -274,6 +274,10 @@ fn open_output_on_com(
 /// Tous les drops internes (échec build/play) ont lieu DANS la closure, donc sur
 /// le thread COM-STA (fermeture ASIO sur l'apartment créateur — contrat `SendStream`).
 #[allow(clippy::too_many_arguments)]
+// `callback_health` n'est lu que par la branche ASIO (Windows) : hors Windows le
+// paramètre est légitimement inutilisé. `allow` CIBLÉ plutôt qu'un `_` en préfixe,
+// qui masquerait un vrai oubli le jour où la branche Cpal l'utiliserait aussi.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn open_duplex_on_com(
     input_id: Option<String>,
     output_id: Option<String>,

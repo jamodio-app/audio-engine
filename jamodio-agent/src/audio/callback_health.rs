@@ -89,6 +89,10 @@ impl CallbackHealth {
     /// - `late_us` : seuil au-delà duquel l'intervalle compte comme un retard
     ///   (cf. [`late_threshold_us`] — strictement supérieur au budget pour ne pas
     ///   compter la gigue normale du driver).
+    // Consommé par le seul chemin Windows (callback ASIO) ; la LOGIQUE reste
+    // multi-plateforme pour rester testable partout — d'où l'`allow` ciblé, et
+    // surtout pas un `allow` posé sur le module entier.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn record_block(
         &self,
         gap_us: Option<u64>,
@@ -152,6 +156,9 @@ pub fn block_budget_us(frames: u32, sample_rate: u32) -> u64 {
 /// arrivé avant que le précédent n'ait fini d'être joué — rien n'a manqué à la
 /// sortie. Au-delà, une période entière est passée sans être servie : c'est
 /// audible.
+// Consommé par le seul chemin Windows ; la logique reste multi-plateforme pour
+// rester testable partout — `allow` CIBLÉ, jamais posé sur le module entier.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn late_threshold_us(budget_us: u64) -> u64 {
     budget_us * 2
 }
