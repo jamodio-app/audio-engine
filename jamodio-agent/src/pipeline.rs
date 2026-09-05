@@ -3195,8 +3195,22 @@ fn encoder_thread(
                 out_name_cap,
                 voice_ctrl_rx,
             );
-        })
-        .expect("spawn audio-capture thread");
+        });
+    // Un panic ici tuerait le thread encodeur SANS tuer le process : la capture
+    // continuerait de tourner, plus rien ne serait encodé, et l'utilisateur
+    // verrait un agent « vivant » et muet (revue 04/09). On échoue donc à voix
+    // haute, et proprement.
+    let h_cap = match h_cap {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-capture",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            return;
+        }
+    };
 
     // ─── Process stage ────────────────────────────────────
     let stop_proc = stop_flag.clone();
@@ -3241,8 +3255,22 @@ fn encoder_thread(
                 midi_active_proc,
                 midi_last_note_on_ms_proc,
             );
-        })
-        .expect("spawn audio-process thread");
+        });
+    let h_proc = match h_proc {
+        Ok(h) => h,
+        Err(e) => {
+            // La capture tourne déjà : on la démonte avant de sortir, sinon son
+            // thread et le driver resteraient tenus par un pipeline mort.
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-process",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = h_cap.join();
+            return;
+        }
+    };
 
     // ─── Encode stage ─────────────────────────────────────
     let stop_enc = stop_flag.clone();
@@ -3261,8 +3289,21 @@ fn encoder_thread(
                 perfstats_enc,
                 out_name_enc,
             );
-        })
-        .expect("spawn audio-encode thread");
+        });
+    let h_enc = match h_enc {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-encode",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = h_cap.join();
+            let _ = h_proc.join();
+            return;
+        }
+    };
 
     // ─── Attente stop + drainage cascade ──────────────────
     //
