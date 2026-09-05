@@ -873,6 +873,33 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 (stats, mt, mu)
             };
 
+            // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
+            // Deux causes possibles, désormais chiffrées séparément : blocs servis
+            // en RETARD par le driver/l'OS (`late_blocks`) vs blocs dont NOTRE
+            // traitement a débordé (`over_budget_blocks`). On draine à chaque
+            // fenêtre (reset des compteurs), mais on ne journalise QUE si la fenêtre
+            // est dégradée : une session saine n'ajoute aucune ligne, et chaque
+            // ligne présente désigne une seconde réellement déchirée à l'oreille.
+            {
+                let cbh = pl.perfstats.callback_health.drain();
+                if !cbh.is_clean() {
+                    let frames = pl.perfstats.output_frames.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "jamodio::audio",
+                        late_blocks = cbh.late_blocks,
+                        over_budget_blocks = cbh.over_budget_blocks,
+                        blocks = cbh.blocks,
+                        worst_gap_us = cbh.worst_gap_us,
+                        worst_work_us = cbh.worst_work_us,
+                        budget_us = crate::audio::callback_health::block_budget_us(frames, 48_000),
+                        buffer_frames = frames,
+                        // Le snapshot perfstats de la MÊME seconde porte déjà
+                        // plugin_name / pipeline_p99 / drops : on ne duplique pas.
+                        "CRAQUEMENT : blocs audio en retard et/ou hors budget sur la dernière seconde"
+                    );
+                }
+            }
+
             // ── Adaptive buffer : backoff auto 64 → 128 sous charge soutenue ────
             // À la cible basse (64), si des drops capture OU des underruns
             // self-monitor PERSISTENT (leaky bucket → ~ESCALATE_AT s de charge

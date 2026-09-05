@@ -290,14 +290,18 @@ fn open_duplex_on_com(
     // multicanal (partagée, swap live). Lue par le callback playback (branche Cpal)
     // ET par le callback ASIO. Inerte sur un device ≤ 2 sorties.
     output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
+    // Diagnostic des craquements — alimenté par le callback ASIO (cf.
+    // `audio::callback_health`). Inerte sur la branche Cpal.
+    callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
 
-        // --- Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`) : remplace les 2
-        //     streams cpal par un objet duplex robuste (1 ASIOInit, priming, snap de
-        //     taille, 1 create(in+out), 1 start, tous formats). ---
+        // --- Host ASIO single-owner : remplace les 2 streams cpal par un objet duplex
+        //     robuste (1 ASIOInit, priming, snap de taille, 1 create(in+out), 1 start,
+        //     tous formats). Actif dès que l'hôte audio est ASIO (`asio_host_enabled`)
+        //     — plus d'opt-in par variable d'environnement depuis l'ASIO-only Windows. ---
         #[cfg(target_os = "windows")]
         if asio_host_enabled() {
             let resolved_id = input_id
@@ -324,6 +328,7 @@ fn open_duplex_on_com(
                 output_callbacks,
                 output_frames,
                 output_pair_start,
+                callback_health,
                 &reset_signal,
             )
             .map_err(CaptureStartError::Other)?;
@@ -1017,6 +1022,13 @@ pub struct PerfHandles {
     /// ne pas crier au loup sur les transitoires inaudibles (batterie/piano).
     pub output_clip_samples: Arc<std::sync::atomic::AtomicU64>,
     pub output_total_samples: Arc<std::sync::atomic::AtomicU64>,
+    /// Diagnostic des CRAQUEMENTS — blocs audio servis en RETARD par le driver/l'OS
+    /// ou dont NOTRE traitement a dépassé le budget du bloc. Alimenté depuis le
+    /// callback temps-réel (atomiques seuls), drainé à 1 Hz par `perfstats_task`
+    /// qui ne journalise QUE les fenêtres dégradées — une session saine n'ajoute
+    /// donc aucune ligne. Cf. `audio::callback_health`. Aujourd'hui seul l'hôte
+    /// ASIO l'alimente ; reste à zéro ailleurs (⇒ fenêtre propre ⇒ silence).
+    pub callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
 }
 
 impl PerfHandles {
@@ -1043,6 +1055,7 @@ impl PerfHandles {
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
         }
     }
 }
@@ -1974,6 +1987,7 @@ impl PipelineState {
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
             self.output_pair_start.clone(),
+            self.perfstats.callback_health.clone(),
             self.reset_signal.clone(),
         )?;
         let (channels_in, native_sr, input_buf, in_name, resolved_input_id, output_name, output_fallback) = match built {
@@ -2692,6 +2706,7 @@ impl PipelineState {
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
             self.output_pair_start.clone(),
+            self.perfstats.callback_health.clone(),
             self.reset_signal.clone(),
         )?;
 
@@ -3395,8 +3410,13 @@ fn capture_stage_loop(
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
-    // Blocs voix abandonnés d'affilée faute de place (cf. le `Full` plus bas).
+    // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
+    // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
+    // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
+    // et c'est elle qui domine en pratique.
     let mut voice_drops: u32 = 0;
+    // Fenêtre d'échantillonnage de la trace de saturation voix. Voir `Full`.
+    let mut voice_drops_last_warn: Option<std::time::Instant> = None;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3427,24 +3447,39 @@ fn capture_stage_loop(
                     let mono = extract_channel_mono(&samples, channels_in, *vch);
                     if !mono.is_empty() {
                         match vtx.try_send(mono) {
-                            Ok(()) => {
-                                voice_drops = 0;
-                            }
+                            Ok(()) => {}
                             // Thread voix en retard : on DROP ce bloc voix
                             // (concealé par le PLC récepteur). Jamais de stall —
                             // mais JAMAIS silencieux non plus : depuis que ce
                             // thread fait tourner l'isolation de voix (deux
                             // réseaux), une saturation durable s'entend, donc
-                            // elle se trace (échantillonnée pour ne pas noyer
-                            // les logs, et remise à zéro dès que ça repasse).
+                            // elle se trace.
+                            //
+                            // Échantillonnage par le TEMPS (≤ 1 ligne/s), pas par
+                            // un compteur de drops consécutifs : ce dernier était
+                            // remis à zéro au premier bloc passé, si bien qu'une
+                            // saturation INTERMITTENTE (drop, ok, drop, ok…) ne
+                            // dépassait jamais 1-2 et traçait donc à CHAQUE drop —
+                            // 4352 lignes en 25 min mesurées le 05/09, l'exact
+                            // contraire du but recherché, et de quoi évincer le
+                            // diagnostic utile de l'export support (cap 5 Mo).
+                            // On journalise donc au plus une fois par seconde, en
+                            // rapportant le nombre RÉEL de blocs perdus depuis la
+                            // dernière trace.
                             Err(crossbeam_channel::TrySendError::Full(_)) => {
                                 voice_drops += 1;
-                                if voice_drops.is_power_of_two() {
+                                const VOICE_WARN_EVERY: std::time::Duration =
+                                    std::time::Duration::from_secs(1);
+                                let due = voice_drops_last_warn
+                                    .is_none_or(|t| t.elapsed() >= VOICE_WARN_EVERY);
+                                if due {
                                     tracing::warn!(
                                         target: "jamodio::pipeline",
-                                        consecutive_drops = voice_drops,
+                                        dropped_blocks = voice_drops,
                                         "tap voix saturé — blocs talkback abandonnés (thread voix en retard)"
                                     );
+                                    voice_drops = 0;
+                                    voice_drops_last_warn = Some(std::time::Instant::now());
                                 }
                             }
                             // Thread voix terminé : on cesse de taper.
