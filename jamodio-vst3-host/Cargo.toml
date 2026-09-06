@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-vst3-host"
-version = "0.5.13-9"
+version = "0.5.13-10"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
