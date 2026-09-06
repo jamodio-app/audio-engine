@@ -5,12 +5,15 @@ pub mod asio_host;
 /// P2.0 — spike de faisabilité host ASIO duplex (Windows only, opt-in env var).
 #[cfg(target_os = "windows")]
 pub mod asio_probe;
+/// Diagnostic des craquements : blocs audio en retard ou hors budget (cf. module).
+pub mod callback_health;
 pub mod buffer_policy;
 pub mod buffer_size;
 pub mod com_exec;
 pub mod device;
 pub mod host;
 pub mod capture;
+pub mod voice_capture;
 pub mod output_pair;
 pub mod playback;
 pub mod midi;

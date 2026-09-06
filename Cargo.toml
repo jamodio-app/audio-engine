@@ -6,3 +6,46 @@ members = [
   "jamodio-au-host",
   "jamodio-vst3-host",
 ]
+
+# ── Isolation de voix (Lot 2) : les crates `tract` exécutent des passes de
+# génération de code coûteuses qui PANIQUENT sous le profil dev (opt-level 0 +
+# debug-assertions + overflow-checks) — tract réemballe ça en `Err("running pass
+# codegen")` au chargement du modèle. On compile donc UNIQUEMENT ces dépendances
+# comme en release (opt + sans checks) ; NOTRE code reste en debug rapide à itérer.
+# (Uniquement des dépendances tierces — n'affecte pas la sémantique de notre code.)
+[profile.dev.package.tract-core]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-data]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-linalg]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-nnef]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-hir]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-onnx]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-onnx-opl]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-pulse]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+[profile.dev.package.tract-pulse-opl]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

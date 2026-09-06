@@ -57,6 +57,43 @@ fn get_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Texte des licences tierces, EMBARQUÉ AU BUILD depuis `THIRD-PARTY-LICENSES.md`.
+///
+/// Les licences MIT / Apache-2.0 de DeepFilterNet et Silero VAD (le Filtre
+/// antibruit du talkback) imposent de fournir le copyright et le texte de licence
+/// AVEC le logiciel : cet écran est cette obligation, pas un bonus. `include_str!`
+/// plutôt qu'une copie dans l'HTML pour qu'il n'y ait qu'UNE source de vérité —
+/// impossible que le fichier du dépôt et ce qui est livré divergent.
+#[tauri::command]
+fn get_third_party_licenses() -> &'static str {
+    include_str!("../../THIRD-PARTY-LICENSES.md")
+}
+
+/// Ouvre les licences tierces dans le lecteur de texte du système.
+///
+/// # Pourquoi PAS une fenêtre de l'app (décision 04/09/2026)
+///
+/// Deux tentatives d'ouvrir une seconde webview ont figé l'agent sur Windows —
+/// fenêtre blanche, impossible à fermer, obligé de tuer le process — y compris
+/// en construisant la fenêtre sur le thread principal (le correctif habituel de
+/// ce symptôme). Faute de pouvoir reproduire hors Windows, on ARRÊTE de deviner :
+/// on écrit le texte dans un fichier et on laisse l'OS l'ouvrir. Aucune webview,
+/// donc aucun moyen de figer l'agent — et l'obligation d'attribution (MIT /
+/// Apache-2.0) est remplie, hors ligne, dans une fenêtre qui défile.
+///
+/// Le fichier est réécrit à chaque ouverture depuis le texte EMBARQUÉ au build :
+/// il ne peut pas dater d'une version précédente.
+#[tauri::command]
+fn open_licenses() -> Result<String, String> {
+    let dir = logging::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("dossier inaccessible : {e}"))?;
+    let path = dir.join("Jamodio - Licences des composants tiers.txt");
+    std::fs::write(&path, get_third_party_licenses())
+        .map_err(|e| format!("écriture impossible : {e}"))?;
+    opener::open(&path).map_err(|e| format!("ouverture impossible : {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// État courant de l'autostart (lu depuis l'OS : plist LaunchAgent sur macOS,
 /// clé Run du registre sur Windows). Alimente la case à cocher de la fenêtre
 /// agent à l'ouverture. `false` en cas d'erreur de lecture (fail-safe visuel).
@@ -384,6 +421,8 @@ fn main() {
             open_log_dir,
             get_log_dir,
             get_version,
+            get_third_party_licenses,
+            open_licenses,
             get_autostart,
             set_autostart,
             quit_app
@@ -532,7 +571,10 @@ fn main() {
 
             // ─── Spawn WS server (audio pipeline) ───────────
             let mixer = Arc::new(AudioMixer::new());
-            let mut pipeline = PipelineState::new(mixer);
+            // Le mixer est AUSSI donné au serveur WS, à côté du pipeline : les
+            // commandes d'état latché l'atteignent alors sans passer par le mutex
+            // pipeline, donc sans pouvoir être perdues sur contention.
+            let mut pipeline = PipelineState::new(mixer.clone());
             // Sprint INSERT (S1.3) — lance le scan AU en background dès le
             // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
             // pas le menu FX avant plusieurs secondes → cache prêt à temps.
@@ -543,8 +585,11 @@ fn main() {
             // d'avoir à configurer manuellement l'IAC Driver pour utiliser
             // les plugins instruments sans clavier USB physique.
             pipeline.spawn_virtual_midi();
+            // Cloné AVANT l'enveloppe Mutex : le serveur WS écrit le gain voix
+            // sans jamais prendre le verrou pipeline (cf. `WsServerHandle`).
+            let voice_gain = pipeline.voice_gain.clone();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
-            let ws_handle = WsServerHandle::new(pipeline);
+            let ws_handle = WsServerHandle::new(pipeline, mixer, voice_gain);
             // Injecte le AppHandle pour que le message browser `Restart`
             // (bouton « Relancer mon agent ») puisse déclencher check_for_update
             // + app.restart() depuis la receive loop WS.

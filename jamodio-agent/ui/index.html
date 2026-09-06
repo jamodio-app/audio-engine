@@ -23,40 +23,62 @@
       <div class="badge" id="status">IDLE</div>
     </div>
     <div class="tagline">YOUR STUDIO. <span class="tagline-accent">ANYWHERE.</span></div>
+    <div class="tagline tagline-jam">MUSIC CREATES <span class="tagline-accent">CONNECTIONS.</span></div>
     <div class="info">
-      <div class="row">
-        <span class="label">Device</span>
+      <!-- ENTRÉES : ce que l'agent écoute. Toujours visible — c'est une CONFIGURATION,
+           elle a un sens même hors session (≠ les mesures, qui n'existent qu'en session). -->
+      <div class="section-title">Entrées</div>
+      <div class="row stacked" title="Interface audio qui capte ton instrument, et canal (ou paire) réellement capté.">
+        <span class="label">Instrument</span>
         <span class="value" id="device">—</span>
       </div>
-      <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
-        <span class="label">Latence locale</span>
-        <span class="value" id="latency">—</span>
+      <div class="row stacked" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent. « — » tant que le talkback n'a pas démarré.">
+        <span class="label">Talkback</span>
+        <span class="value pending" id="voice-device">défini à l'entrée en studio</span>
       </div>
-      <div class="row" title="Buffer de gigue : marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. « — » quand tu es seul (aucun flux reçu).">
-        <span class="label">Gigue réseau</span>
-        <span class="value" id="jitter">—</span>
+
+      <div class="section-title">Statistiques</div>
+      <!-- Mesures : elles n'existent QUE pendant une session. Hors session, la phrase
+           ci-dessous les remplace — une colonne de « — » se lit comme une panne. -->
+      <div id="live-metrics" hidden>
+        <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
+          <span class="label">Latence locale</span>
+          <span class="value" id="latency">—</span>
+        </div>
+        <div class="row" title="Marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. Ce n'est PAS la gigue mesurée du réseau, c'est la marge que l'agent lui oppose — elle s'adapte à la qualité du lien. « — » quand tu es seul.">
+          <span class="label">Marge anti-gigue</span>
+          <span class="value" id="jitter">—</span>
+        </div>
+        <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
+          <span class="label">Buffer carte</span>
+          <span class="value" id="buffer">—</span>
+        </div>
+        <div class="row" title="Nombre de musiciens dont tu reçois l'audio. 0 = tu es seul dans le studio.">
+          <span class="label">Musiciens reçus</span>
+          <span class="value" id="streams">0</span>
+        </div>
+        <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard), comptées depuis le début de la session en cours. Doit rester proche de 0.">
+          <span class="label">Coupures</span>
+          <span class="value" id="underruns">0</span>
+        </div>
       </div>
-      <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
-        <span class="label">Buffer carte</span>
-        <span class="value" id="buffer">—</span>
-      </div>
-      <div class="row" title="Nombre de musiciens dont tu reçois l'audio. 0 = tu es seul dans le studio.">
-        <span class="label">Musiciens reçus</span>
-        <span class="value" id="streams">0</span>
-      </div>
-      <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard) depuis le démarrage. Doit rester proche de 0.">
-        <span class="label">Coupures</span>
-        <span class="value" id="underruns">0</span>
-      </div>
+      <div class="info-hint" id="info-hint">Elles apparaissent quand tu entres dans un studio.</div>
     </div>
     <div class="settings">
       <label class="row setting" for="autostart-toggle" title="Lance automatiquement l'Audio Engine à l'ouverture de session de votre ordinateur. Décochez pour ne le démarrer que manuellement (ou depuis jamodio.com).">
         <span class="label">Démarrer avec l'ordinateur</span>
-        <input type="checkbox" id="autostart-toggle" class="toggle">
+        <!-- Interrupteur au style de l'app web : la case à cocher native reste
+             (accessibilité + clavier + le JS lit toujours `.checked`), c'est le
+             <span> frère qui porte l'apparence. -->
+        <input type="checkbox" id="autostart-toggle" class="toggle-input">
+        <span class="switch" aria-hidden="true"></span>
       </label>
     </div>
     <div class="actions">
       <button id="export-logs" type="button">Exporter les logs</button>
+      <!-- Obligation d'attribution MIT / Apache-2.0 des composants du Filtre
+           antibruit : le texte doit être fourni AVEC le logiciel. -->
+      <button id="show-licenses" type="button" title="Licences des composants open-source embarqués (Filtre antibruit)">Licences</button>
       <!-- Filet quit OS-agnostic : indispensable sur Windows quand l'icône
            tray est rangée dans l'overflow (cf. tray_promote.rs). -->
       <button id="quit-app" type="button" title="Ferme l'Audio Engine (les studios ouverts seront prévenus)">Quitter l'agent</button>
@@ -112,6 +134,38 @@
           exportBtn.textContent = '✗ Échec';
           exportBtn.title = String(err);
           setTimeout(() => { exportBtn.textContent = 'Exporter les logs'; }, 2500);
+        }
+      });
+    }
+
+    // Le micro talkback n'est connu de l'agent qu'au démarrage du talkback : le
+    // choix vit dans les Paramètres audio du studio, et rien ne le transmet avant.
+    // Un « — » laissait croire à un réglage manquant ou à une panne ; on DIT ce
+    // qu'on attend au lieu de laisser un vide à interpréter.
+    const TALKBACK_EN_ATTENTE = 'défini à l\'entrée en studio';
+    function afficheTalkback(nom) {
+      const el = $('voice-device');
+      el.textContent = nom || TALKBACK_EN_ATTENTE;
+      el.title = nom || '';
+      el.classList.toggle('pending', !nom);
+    }
+
+    // ─── Bouton "Licences" ─────────────────────────────────────
+    // Écrit le texte embarqué dans un fichier et laisse l'OS l'ouvrir. Une
+    // seconde webview figeait l'agent sur Windows (cf. open_licenses côté Rust) ;
+    // le lecteur de texte du système, lui, défile et se ferme toujours.
+    const licBtn = $('show-licenses');
+    if (licBtn) {
+      licBtn.addEventListener('click', async () => {
+        try {
+          const path = await tauriInvoke('open_licenses');
+          licBtn.textContent = '✓ Ouvert';
+          licBtn.title = path || '';
+          setTimeout(() => { licBtn.textContent = 'Licences'; }, 2500);
+        } catch (err) {
+          licBtn.textContent = '✗ Échec';
+          licBtn.title = String(err);
+          setTimeout(() => { licBtn.textContent = 'Licences'; }, 2500);
         }
       });
     }
@@ -174,6 +228,11 @@
             const active = msg.state === 'capturing';
             $('status').textContent = active ? 'ACTIF' : 'IDLE';
             $('status').classList.toggle('active', active);
+            // Les mesures et la phrase qui les remplace s'échangent : la hauteur
+            // de la fenêtre ne bouge pas vers le bas (le numéro de version doit
+            // rester visible — fenêtre à taille fixe, non redimensionnable).
+            $('live-metrics').hidden = !active;
+            $('info-hint').hidden = active;
             if (!active) {
               $('buffer').textContent = '—';
               $('latency').textContent = '—';
@@ -187,36 +246,47 @@
           case 'devices':
             if (msg.inputs && msg.inputs.length > 0) {
               const def = msg.inputs.find(d => d.isDefault) || msg.inputs[0];
-              const name = def.name.length > 22 ? def.name.substring(0, 22) + '…' : def.name;
-              $('device').textContent = name;
+              $('device').textContent = def.name;
               $('device').title = def.name;
             }
             break;
 
           case 'stats': {
             // Device name
+            // Plus de troncature en JS : la coupure se fait en CSS, au pixel et
+            // seulement si nécessaire (cf. `.value` dans style.css). Le texte
+            // complet reste dans l'infobulle.
             if (msg.device) {
-              const name = msg.device.length > 22 ? msg.device.substring(0, 22) + '…' : msg.device;
-              $('device').textContent = name;
+              $('device').textContent = msg.device;
               $('device').title = msg.device;
             }
-            $('streams').textContent = msg.streams || 0;
+            // `musicians` = flux INSTRUMENT (un partenaire qui parle envoie deux
+            // flux) ; repli sur `streams` pour un agent antérieur.
+            $('streams').textContent = (msg.musicians ?? msg.streams) || 0;
+            afficheTalkback(msg.voiceDevice);
             $('underruns').textContent = msg.underruns || 0;
             // Stats latence : on utilise les valeurs pré-calculées par l'agent
             // (totalLatencyMs / jitterTargetMs / bufferMs) — sans recombinaison
             // côté UI (les champs capture/playback exposés séparément contiennent
             // déjà bufferMs, ne pas les additionner ici).
-            const bufMs = msg.bufferMs || 0;
+            // Buffer carte : on n'affiche que la valeur RÉELLEMENT mesurée
+            // (`inputBufferMs`). Absente = le pilote a choisi sa taille sans
+            // l'exposer → on le dit, plutôt que d'afficher l'estimation de repli
+            // que porte `bufferMs`, qui serait un chiffre inventé.
+            const bufMs = msg.inputBufferMs;
             const totalMs = msg.totalLatencyMs || 0;
             const jitterMs = msg.jitterTargetMs || 0;
             if (totalMs > 0) {
               $('latency').textContent = totalMs.toFixed(1) + 'ms';
-              $('buffer').textContent = bufMs.toFixed(1) + 'ms';
+              $('buffer').textContent = (typeof bufMs === 'number')
+                ? bufMs.toFixed(1) + 'ms'
+                : 'auto';
               $('jitter').textContent = jitterMs > 0 ? jitterMs.toFixed(1) + 'ms' : '—';
             } else {
               $('latency').textContent = '—';
               $('buffer').textContent = '—';
               $('jitter').textContent = '—';
+              afficheTalkback(null);
             }
             break;
           }
@@ -229,6 +299,11 @@
         $('ws-status').classList.remove('ok');
         $('status').textContent = 'IDLE';
         $('status').classList.remove('active');
+        // Même bascule qu'au repos : sans elle, une WS coupée en pleine session
+        // laisserait les mesures figées à leur dernière valeur, donc fausses.
+        $('live-metrics').hidden = true;
+        $('info-hint').hidden = false;
+        afficheTalkback(null);
         $('device').textContent = '—';
         $('buffer').textContent = '—';
         $('latency').textContent = '—';

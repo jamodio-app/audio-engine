@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.5.12"
+version = "0.6.0"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -20,6 +20,18 @@ getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûr
 zeroize = "1"              # Efface les clés SRTP décodées de la mémoire au drop
 tracing = "0.1"            # Logging structuré (façade) — init côté binaire jamodio-agent
 thiserror = "1"            # Dérive Error proprement (utilisé par plugin_host)
+
+# ── Isolation de voix talkback (Lot 2) — 100 % pur Rust via tract, ZÉRO dép native ML.
+# DeepFilterNet : le crate publié (0.2.5) est périmé (sans inférence) → dépendance GIT
+# épinglée à un REV FIXE (jamais HEAD). Le crate demande tract ^0.21.4 mais tract a cassé
+# son API dans un patch 0.21.x (`symbol_table`) → PIN STRICT =0.21.4 des sous-crates tract.
+# (Durcissement prod possible : vendoring du crate — cf. PLAN-LOT2 §3.1.)
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d", features = ["tract"] }
+tract-core = "=0.21.4"
+tract-onnx = "=0.21.4"     # aussi utilisé pour le VAD Silero (variante ifless)
+tract-hir = "=0.21.4"
+tract-pulse = "=0.21.4"
+ndarray = "=0.15.6"        # version attendue par deep_filter
 
 # SRTP — chiffrement+auth du flux RTP agent ↔ SFU (AEAD AES-256-GCM).
 # Stratégie par plateforme :
@@ -44,3 +56,6 @@ srtp = { version = "0.7", default-features = false, features = ["bytes", "log", 
 [target.'cfg(windows)'.dependencies]
 webrtc-srtp = "0.17"
 bytes = "1"
+
+[dev-dependencies]
+hound = "3"                # lecture/écriture WAV pour l'exemple de diagnostic iso_offline

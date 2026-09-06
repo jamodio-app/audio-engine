@@ -1,0 +1,68 @@
+# ══════════════════════════════════════════════════════════════════════════
+# cargo-deny — garde-fou d'approvisionnement (dépendances Rust)
+#
+# Trois questions auxquelles ce fichier répond automatiquement, à chaque CI :
+#   1. une dépendance a-t-elle une FAILLE connue (base RustSec) ?
+#   2. une dépendance arrive-t-elle avec une LICENCE incompatible avec un
+#      produit propriétaire ? (le sujet du chantier isolation de voix : on
+#      embarque des modèles et des crates, leur licence nous engage)
+#   3. le code vient-il d'une SOURCE attendue (crates.io, ou un dépôt git
+#      explicitement autorisé et épinglé) ?
+#
+# `cargo deny check` échoue si l'une des trois répond mal. Cf. .github/workflows/supply-chain.yml
+# ══════════════════════════════════════════════════════════════════════════
+
+[advisories]
+# ⚠️ Les AVIS DE SÉCURITÉ ne sont PAS traités ici mais par `cargo audit`, dont
+# les exceptions (avec justification) vivent dans `.cargo/audit.toml`. Une seule
+# liste d'exceptions, à un seul endroit : deux listes finiraient par diverger.
+# La CI lance donc `cargo deny check licenses sources bans` — pas `advisories`.
+yanked = "warn"
+
+[licenses]
+# Licences permissives compatibles avec un produit propriétaire distribué.
+# Rien de copyleft fort (GPL/AGPL) : leur absence de cette liste = échec CI,
+# ce qui est exactement le garde-fou voulu.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",       # copyleft FAIBLE (par fichier) : compatible tant qu'on ne
+                     # modifie pas les fichiers de la dépendance
+    "OpenSSL",
+    # webpki-root-certs : jeu de certificats racine (données, pas du code).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# Nos propres crates déclarent `LicenseRef-Jamodio-Proprietary` (produit
+# propriétaire) et ne sont pas publiées : elles n'ont pas à passer la grille
+# destinée aux dépendances TIERCES.
+[licenses.private]
+ignore = true
+
+[bans]
+# Deux versions de la même crate = binaire plus gros et risque de divergence.
+# En avertissement : sur un arbre de cette taille, c'est fréquent et rarement
+# critique — mais ça doit se voir.
+multiple-versions = "warn"
+wildcards = "deny"
+# Nos crates se référencent entre elles par `path` (workspace) et DeepFilterNet
+# par `git` + rev épinglé : ce ne sont pas des jokers de version au sens du
+# risque visé (une dépendance publique non bornée).
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# DeepFilterNet est épinglé sur un REV fixe (cf. jamodio-audio-core/Cargo.toml) :
+# le crate publié 0.2.5 est périmé et ne contient pas l'inférence.
+allow-git = ["https://github.com/Rikorose/DeepFilterNet"]

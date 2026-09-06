@@ -6,6 +6,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
+use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
@@ -17,6 +18,7 @@ use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, Plugi
 use crate::audio::midi::CapturedMidiEvent;
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
+use jamodio_audio_core::voice_isolation::{IsolationConfig, VoiceIsolator};
 use jamodio_audio_core::sync::drift::DriftEstimator;
 use jamodio_audio_core::sync::jitter::JitterEstimator;
 #[cfg(target_os = "macos")]
@@ -272,6 +274,10 @@ fn open_output_on_com(
 /// Tous les drops internes (échec build/play) ont lieu DANS la closure, donc sur
 /// le thread COM-STA (fermeture ASIO sur l'apartment créateur — contrat `SendStream`).
 #[allow(clippy::too_many_arguments)]
+// `callback_health` n'est lu que par la branche ASIO (Windows) : hors Windows le
+// paramètre est légitimement inutilisé. `allow` CIBLÉ plutôt qu'un `_` en préfixe,
+// qui masquerait un vrai oubli le jour où la branche Cpal l'utiliserait aussi.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn open_duplex_on_com(
     input_id: Option<String>,
     output_id: Option<String>,
@@ -288,14 +294,18 @@ fn open_duplex_on_com(
     // multicanal (partagée, swap live). Lue par le callback playback (branche Cpal)
     // ET par le callback ASIO. Inerte sur un device ≤ 2 sorties.
     output_pair_start: Arc<std::sync::atomic::AtomicUsize>,
+    // Diagnostic des craquements — alimenté par le callback ASIO (cf.
+    // `audio::callback_health`). Inerte sur la branche Cpal.
+    callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
     reset_signal: crate::audio::asio_reset::ResetSignal,
 ) -> Result<BuiltDuplex, CaptureStartError> {
     crate::audio::com_exec::run(move || -> Result<BuiltDuplex, CaptureStartError> {
         use cpal::traits::{DeviceTrait, StreamTrait};
 
-        // --- Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`) : remplace les 2
-        //     streams cpal par un objet duplex robuste (1 ASIOInit, priming, snap de
-        //     taille, 1 create(in+out), 1 start, tous formats). ---
+        // --- Host ASIO single-owner : remplace les 2 streams cpal par un objet duplex
+        //     robuste (1 ASIOInit, priming, snap de taille, 1 create(in+out), 1 start,
+        //     tous formats). Actif dès que l'hôte audio est ASIO (`asio_host_enabled`)
+        //     — plus d'opt-in par variable d'environnement depuis l'ASIO-only Windows. ---
         #[cfg(target_os = "windows")]
         if asio_host_enabled() {
             let resolved_id = input_id
@@ -322,6 +332,7 @@ fn open_duplex_on_com(
                 output_callbacks,
                 output_frames,
                 output_pair_start,
+                callback_health,
                 &reset_signal,
             )
             .map_err(CaptureStartError::Other)?;
@@ -679,6 +690,24 @@ pub struct PipelineState {
     /// le drain + Chantier C fade ne suffisait pas en pratique.
     capture_stream: Option<SendStream>,
     playback_stream: Option<SendStream>,
+    /// Flux d'entrée DÉDIÉ au talkback (micro-casque, micro interne), quand
+    /// l'utilisateur a choisi un micro autre qu'un canal de l'interface
+    /// instrument. `None` = talkback pris sur le flux instrument (historique).
+    /// Lâcher la poignée arrête le flux et relâche le périphérique.
+    voice_capture: Option<crate::audio::voice_capture::VoiceCaptureHandle>,
+    /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
+    /// est prise sur un canal de l'interface instrument.
+    voice_device_label: Option<String>,
+    /// Sélection de canal(aux) de l'INSTRUMENT, telle que demandée au démarrage
+    /// de la capture. Sert uniquement à l'affichage : la fenêtre nomme le canal
+    /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
+    /// d'un seul côté laissait croire à deux réglages de nature différente.
+    capture_channels_label: Option<String>,
+    /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
+    /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
+    /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
+    /// l'interface » qui ne disait ni lequel ni laquelle.
+    voice_channel_index: Option<u8>,
     /// Host ASIO single-owner (opt-in `JAMODIO_ASIO_HOST=1`). Quand `Some`, il
     /// remplace `capture_stream` + `playback_stream` (un seul objet duplex robuste).
     /// `None` hors ASIO/Windows ou chemin cpal → comportement historique inchangé.
@@ -720,6 +749,11 @@ pub struct PipelineState {
     encoder_stop: Option<Sender<()>>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// Type de chaque flux reçu (instrument / voix). Depuis que la voix des
+    /// pairs transite aussi par l'agent, compter les flux ne compte PLUS les
+    /// musiciens : un partenaire qui parle en apporte deux. Cette carte permet
+    /// de distinguer les deux dans la télémétrie.
+    recv_kinds: HashMap<String, StreamKind>,
     /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
     /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
     /// `None` = pas de stream reçu en cours.
@@ -774,6 +808,11 @@ pub struct PipelineState {
     /// qui n'a pas d'équivalent ici puisque le flux part en PlainTransport
     /// piloté par CPAL).
     pub input_cut: Arc<std::sync::atomic::AtomicBool>,
+    /// Tranche instrument en **PRIVÉ** : je m'entends (accordage, réglages), les
+    /// autres non. Distinct d'`input_cut`, qui met l'entrée à zéro AVANT le
+    /// self-monitor et coupe donc aussi ce qu'on entend. Appliqué à l'entrée de
+    /// l'étage d'ENVOI uniquement — le monitoring, en amont, n'est pas touché.
+    pub instrument_private: Arc<std::sync::atomic::AtomicBool>,
     /// Talkback via l'agent (Lot 2, v0.5.7). `Some` pendant une capture
     /// instrument active : canal de commande du tap voix vers le
     /// `capture_stage`. Le tap extrait un canal mono du buffer multicanal BRUT
@@ -787,11 +826,25 @@ pub struct PipelineState {
     /// par-sample par `voice_encode_stage_loop` (fondu anti-clic). Pilote
     /// l'auto-mute talkback dont la DÉCISION reste côté browser.
     pub voice_gain: Arc<std::sync::atomic::AtomicU32>,
-    /// RMS (bits f32) du producteur voix POST-gain, mesuré par
-    /// `voice_encode_stage_loop` et diffusé dans `stream-levels` (producteur
-    /// `voice`) → alimente le VU talkback côté browser en mode agent voix (sinon
-    /// plat : pas d'analyser navigateur). `0.0` hors voix active.
+    /// RMS (bits f32) du niveau d'ENTRÉE du micro talkback, mesuré par
+    /// `voice_encode_stage_loop` AVANT le filtre antibruit, et diffusé dans
+    /// `stream-levels` (producteur `voice`) → alimente le VU de la tranche côté
+    /// browser (pas d'analyser navigateur en mode agent voix). `0.0` hors voix
+    /// active.
+    ///
+    /// Mesuré en ENTRÉE et non en sortie : un vumètre branché après le filtre ne
+    /// bouge que quand le gate s'ouvre, si bien qu'on ne peut plus vérifier que
+    /// son micro capte quelque chose. Ce qui PART réellement est indiqué par le
+    /// voyant « à l'antenne » (`voice_on_air`), pas par le vumètre.
     pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    /// Isolation de voix (Lot 2) : état LIVE « à l'antenne » (gate ouvert) diffusé
+    /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
+    /// flag `voice_active` ci-dessus qui indique juste que le tap voix est monté.)
+    pub voice_on_air: Arc<std::sync::atomic::AtomicBool>,
+    /// Isolation de voix (Lot 2) : `true` si l'isolation TOURNE ; `false` si repli
+    /// en voix brute (modèle KO). Diffusé → indicateur « isolation active/inactive »
+    /// sur la tranche voix (décision Ben : dégradation visible, pas silencieuse).
+    pub isolation_active: Arc<std::sync::atomic::AtomicBool>,
     /// Nb de canaux physiques + sample rate natif de la capture courante,
     /// mémorisés au `start_capture`. Permettent de greffer la voix (validation
     /// du canal demandé + config resampler voix) SANS redémarrer la capture
@@ -978,6 +1031,13 @@ pub struct PerfHandles {
     /// ne pas crier au loup sur les transitoires inaudibles (batterie/piano).
     pub output_clip_samples: Arc<std::sync::atomic::AtomicU64>,
     pub output_total_samples: Arc<std::sync::atomic::AtomicU64>,
+    /// Diagnostic des CRAQUEMENTS — blocs audio servis en RETARD par le driver/l'OS
+    /// ou dont NOTRE traitement a dépassé le budget du bloc. Alimenté depuis le
+    /// callback temps-réel (atomiques seuls), drainé à 1 Hz par `perfstats_task`
+    /// qui ne journalise QUE les fenêtres dégradées — une session saine n'ajoute
+    /// donc aucune ligne. Cf. `audio::callback_health`. Aujourd'hui seul l'hôte
+    /// ASIO l'alimente ; reste à zéro ailleurs (⇒ fenêtre propre ⇒ silence).
+    pub callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
 }
 
 impl PerfHandles {
@@ -1004,6 +1064,7 @@ impl PerfHandles {
             output_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
         }
     }
 }
@@ -1182,6 +1243,10 @@ impl PipelineState {
             mixer,
             capture_stream: None,
             playback_stream: None,
+            voice_capture: None,
+            voice_device_label: None,
+            capture_channels_label: None,
+            voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
             capture_sample_tx: None,
@@ -1192,6 +1257,7 @@ impl PipelineState {
             com_recycle_pending: false,
             encoder_stop: None,
             recv_stops: HashMap::new(),
+            recv_kinds: HashMap::new(),
             decode_thread: None,
             recv_epoch: 0,
             input_device_id: None,
@@ -1205,10 +1271,13 @@ impl PipelineState {
             midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             recorder: None,
             input_cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instrument_private: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             voice_ctrl_tx: None,
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            isolation_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
@@ -1475,9 +1544,21 @@ impl PipelineState {
             .map_err(|e| format!("{e}"))
     }
 
+    /// Bascule la tranche instrument en PRIVÉ. On continue de S'ENTENDRE ; les
+    /// autres musiciens n'entendent plus rien, et la tranche sort du FICHIER
+    /// (partagé — décision Ben) via le mixer.
+    pub fn set_instrument_private(&mut self, private: bool) {
+        self.instrument_private
+            .store(private, std::sync::atomic::Ordering::Relaxed);
+        self.mixer.set_self_private(private);
+        tracing::info!(target: "jamodio::pipeline", private, "instrument private updated");
+    }
+
     /// Active/désactive le mute hardware côté capture (bouton ENTRÉE OFF
-    /// browser). Le flag est lu sans lock dans l'encoder_thread à chaque
-    /// frame capturée — coût Relaxed négligeable face à une frame 2.5ms.
+    /// browser, agents antérieurs au mode PRIVÉ). Le flag est lu sans lock dans
+    /// l'encoder_thread à chaque frame capturée — coût Relaxed négligeable face
+    /// à une frame 2.5 ms. ⚠️ Coupe AUSSI le self-monitor (il est en aval) :
+    /// c'est précisément ce que `set_instrument_private` ne fait pas.
     pub fn set_input_cut(&mut self, cut: bool) {
         self.input_cut.store(cut, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(target: "jamodio::pipeline", cut, "input_cut updated");
@@ -1916,6 +1997,7 @@ impl PipelineState {
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
             self.output_pair_start.clone(),
+            self.perfstats.callback_health.clone(),
             self.reset_signal.clone(),
         )?;
         let (channels_in, native_sr, input_buf, in_name, resolved_input_id, output_name, output_fallback) = match built {
@@ -2078,6 +2160,9 @@ impl PipelineState {
         // (ceinture+bretelles) ; ce reset est le filet racine côté agent.
         if !session_continues {
             self.set_input_cut(false);
+            // Même raison pour le mode PRIVÉ : sans reset il survivrait d'une
+            // session à l'autre, et on rejoindrait un studio sans être entendu.
+            self.set_instrument_private(false);
         }
         // Canal de commande du tap voix (capacité 4 : Add/Remove sont rares,
         // pilotés par les toggles UI). Poll é par `capture_stage_loop`.
@@ -2160,6 +2245,7 @@ impl PipelineState {
         self.mixer.add_local_stream();
         let mixer_for_encoder = self.mixer.clone();
         let input_cut_for_encoder = self.input_cut.clone();
+        let instrument_private_for_encoder = self.instrument_private.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let plugin_host_for_encoder = self.plugin_host.clone();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2193,6 +2279,7 @@ impl PipelineState {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
                     channels_in, effective_sel, mixer_for_encoder, input_cut_for_encoder,
+                    instrument_private_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host_for_encoder,
                     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_handle_for_encoder,
@@ -2217,6 +2304,15 @@ impl PipelineState {
         //    Stream de sortie ouvert/réutilisé en 1. via prepare_audio_for_session.)
 
         self.state = AgentState::Capturing;
+        // Libellé d'affichage de la source instrument : le canal (ou la paire)
+        // réellement demandé. Posé ICI, quand la capture a abouti — pas à
+        // l'entrée de la fonction : un échec en cours de route laisserait sinon
+        // la fenêtre nommer un canal qui ne capte rien.
+        self.capture_channels_label = match (channel_index, stereo_start) {
+            (Some(i), _) => Some(format!("canal {}", u16::from(i) + 1)),
+            (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
+            (None, None) => Some("canaux 1-2".to_string()),
+        };
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -2254,6 +2350,10 @@ impl PipelineState {
     /// Idempotent : si une voix tournait déjà (changement de canal sans stop),
     /// l'ancien tap est retiré d'abord. Retourne `(local_port, agent_srtp)` que
     /// le browser relaie au SFU (`connect-plain-transport` du flux voix).
+    // 8 paramètres : ils viennent tous du message wire `StartVoiceCapture` (ssrc,
+    // destination SFU, canal, clés SRTP, micro dédié). Les regrouper en struct
+    // n'ajouterait qu'une indirection entre le protocole et la pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_voice_capture(
         &mut self,
         ssrc: u32,
@@ -2262,24 +2362,51 @@ impl PipelineState {
         payload_type: u8,
         channel_index: u8,
         sfu_srtp: SrtpParameters,
+        // Micro DÉDIÉ au talkback (id voix préfixé par son host). `None` =
+        // comportement historique : le talkback est un canal du flux instrument.
+        voice_device_id: Option<String>,
     ) -> Result<(u16, SrtpParameters), String> {
-        // 1. Capture instrument requise (le tap se greffe sur son capture_stage).
-        let Some(voice_ctrl_tx) = self.voice_ctrl_tx.clone() else {
+        // 1. Sur quoi prend-on la voix ?
+        //    - micro dédié → flux d'entrée PROPRE, indépendant de l'instrument
+        //      (c'est tout l'intérêt : une interface à une seule entrée n'a aucun
+        //      canal libre pour parler) ;
+        //    - sinon → tap greffé sur le capture_stage instrument, qui doit donc
+        //      tourner (comportement historique, inchangé).
+        let voice_ctrl_tx = self.voice_ctrl_tx.clone();
+        if voice_device_id.is_none() && voice_ctrl_tx.is_none() {
             return Err("no active capture — start voice after instrument capture".into());
-        };
-        // 2. Validation stricte du canal contre la géométrie courante.
-        let channels_in = self.capture_channels_in;
-        if u16::from(channel_index) >= channels_in {
-            return Err(format!(
-                "voice channel {} out of range (device has {} channels)",
-                channel_index, channels_in
-            ));
         }
-        // 3. Idempotence : retire l'ancien tap si présent (son thread termine
-        //    seul quand capture_stage drop l'out_tx associé).
+        // 2. Validation stricte du canal. Avec un micro dédié, la géométrie n'est
+        //    connue qu'à l'ouverture du flux → c'est `build_voice_capture_stream`
+        //    qui refuse explicitement un canal hors bornes.
+        if voice_device_id.is_none() {
+            let channels_in = self.capture_channels_in;
+            if u16::from(channel_index) >= channels_in {
+                return Err(format!(
+                    "voice channel {} out of range (device has {} channels)",
+                    channel_index, channels_in
+                ));
+            }
+        }
+        // 3. Idempotence : retire l'ancien tap ET/OU ferme l'ancien flux dédié
+        //    (changement de micro). Le drop de la poignée relâche le périphérique
+        //    AVANT qu'on en ouvre un autre.
         if self.voice_active {
-            let _ = voice_ctrl_tx.try_send(VoiceControl::Remove);
+            if let Some(tx) = voice_ctrl_tx.as_ref() {
+                let _ = tx.try_send(VoiceControl::Remove);
+            }
         }
+        self.voice_capture = None;
+        // À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
+        // active : l'ancienne est démontée et la nouvelle pas encore branchée.
+        // Sans ce passage à false, un échec en cours de route (micro débranché
+        // entre l'affichage de la liste et le clic) laisserait l'agent convaincu
+        // qu'un talkback tourne — la fenêtre afficherait un micro pour un flux
+        // inexistant, et le prochain démarrage prendrait la branche « idempotence »
+        // sur un état fantôme.
+        self.voice_active = false;
+        self.voice_device_label = None;
+        self.voice_channel_index = None;
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2299,11 +2426,18 @@ impl PipelineState {
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
+        let voice_on_air = self.voice_on_air.clone();
+        let isolation_active = self.isolation_active.clone();
         let output_device_name = self
             .output_device_id
             .as_deref()
             .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
         // 6. Spawn du thread d'encodage voix (RT). Termine seul au drop de voice_tx.
+        //    Il signale sur `ready_tx` quand il est PRÊT À CONSOMMER (encodeur créé,
+        //    modèles d'isolation chargés) — cf. étape 7. Canal ONESHOT TOKIO (et
+        //    non crossbeam) : l'attente doit être `await`, pas bloquante — on tient
+        //    le mutex pipeline et on tourne sur un worker du runtime.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("voice-encode".into())
             .spawn(move || {
@@ -2314,25 +2448,152 @@ impl PipelineState {
                     payload_type,
                     voice_gain,
                     voice_rms,
+                    voice_on_air,
+                    isolation_active,
                     output_device_name,
+                    ready_tx,
                 );
             })
             .map_err(|e| format!("spawn voice-encode: {}", e))?;
-        // 7. Greffe le tap sur le capture_stage en cours.
-        voice_ctrl_tx
-            .try_send(VoiceControl::Add {
-                channel_index: channel_index as usize,
-                out_tx: voice_tx,
-            })
-            .map_err(|e| format!("voice tap attach failed: {}", e))?;
+        // 7. Attend que le thread voix soit prêt AVANT de greffer le tap. Sans ça,
+        //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
+        //    mesurés) : la file de 32 blocs déborde et la PREMIÈRE DEMI-SECONDE de
+        //    talkback part en silence (constaté en logs terrain, « tap voix saturé »).
+        match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
+            Ok(Ok(())) => {}
+            // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
+            // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
+            Ok(Err(_)) => {
+                self.voice_active = false;
+                return Err("voice encode thread failed to start".to_string());
+            }
+            // Machine très lente : on greffe quand même (comportement d'avant), mais
+            // on le DIT — le début du talkback peut être tronqué.
+            Err(_) => {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    "thread voix toujours pas prêt après 10 s — greffe du tap quand même, \
+                     le début du talkback peut être tronqué"
+                );
+            }
+        }
+        // 8. Branche la SOURCE : micro dédié (flux propre) ou tap sur le flux
+        //    instrument. L'étage voix, lui, ne sait pas d'où viennent ses blocs —
+        //    isolation, limiteur, Opus et RTP sont identiques dans les deux cas.
+        let voice_source = match voice_device_id.as_ref() {
+            Some(id) => {
+                // Ouverture du périphérique : elle ATTEND la réponse du pilote
+                // (jusqu'à 10 s dans le pire cas). On la sort du worker tokio,
+                // sinon une carte lente à répondre gèlerait le runtime — et le
+                // navigateur, dont le watchdog est à 3 s, déclarerait l'agent
+                // perdu alors qu'il va très bien.
+                let id_owned = id.clone();
+                let ch = channel_index as usize;
+                let opened = tokio::task::spawn_blocking(move || {
+                    crate::audio::voice_capture::spawn_voice_capture(id_owned, ch, voice_tx)
+                })
+                .await
+                .map_err(|e| format!("ouverture du micro talkback interrompue : {e}"))?;
+                let (info, handle) = opened?;
+                self.voice_capture = Some(handle);
+                // Nom lisible = la part « nom » de l'id `{host}:{index}:{nom}`.
+                self.voice_device_label =
+                    Some(id.splitn(3, ':').nth(2).unwrap_or(id.as_str()).to_string());
+                tracing::info!(
+                    target: "jamodio::voice_capture",
+                    device = %id,
+                    channels = info.channels,
+                    sample_rate = info.sample_rate,
+                    "micro talkback dédié ouvert"
+                );
+                if info.resampling {
+                    // Le rééchantillonnage est une EXCEPTION assumée du canal voix
+                    // (R2 reste intact côté instrument) : il se trace, il ne se subit pas.
+                    tracing::info!(
+                        target: "jamodio::voice_capture",
+                        device_sample_rate = info.sample_rate,
+                        added_latency_ms = info.added_latency_ms,
+                        "micro talkback hors 48 kHz — rééchantillonnage du canal voix"
+                    );
+                }
+                format!("micro dédié {id}")
+            }
+            None => {
+                let tx = voice_ctrl_tx
+                    .as_ref()
+                    .expect("garde étape 1 : tap requis sans micro dédié");
+                tx.try_send(VoiceControl::Add {
+                    channel_index: channel_index as usize,
+                    out_tx: voice_tx,
+                })
+                .map_err(|e| format!("voice tap attach failed: {}", e))?;
+                self.voice_device_label = None;
+                self.voice_channel_index = Some(channel_index);
+                "canal du flux instrument".to_string()
+            }
+        };
         self.voice_active = true;
         tracing::info!(
             target: "jamodio::pipeline",
             ssrc, channel_index, local_port,
+            source = %voice_source,
             sfu = format!("{}:{}", sfu_ip, sfu_port),
             "voice capture started (talkback via agent)"
         );
         Ok((local_port, agent_srtp))
+    }
+
+    /// Nombre de MUSICIENS dont on reçoit l'audio — c'est-à-dire de flux
+    /// INSTRUMENT. La voix des pairs arrive dans des flux séparés : les compter
+    /// afficherait deux « musiciens » pour un partenaire qui parle.
+    pub fn musician_count(&self) -> usize {
+        self.recv_kinds
+            .values()
+            .filter(|k| matches!(k, StreamKind::Instrument))
+            .count()
+    }
+
+    /// Interface instrument + canal(aux) captés, pour l'affichage. `None` quand
+    /// aucune capture ne tourne — la fenêtre montre alors « — », pas un réglage
+    /// qui n'a pas cours.
+    pub fn instrument_source_label(&self) -> Option<String> {
+        if !matches!(self.state, AgentState::Capturing) {
+            return None;
+        }
+        let name = self
+            .selected_input_id()
+            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()))?;
+        Some(match self.capture_channels_label.as_deref() {
+            Some(ch) => format!("{name} — {ch}"),
+            None => name,
+        })
+    }
+
+    /// Micro utilisé par le talkback, pour l'affichage : le périphérique dédié
+    /// s'il y en a un, sinon le canal de l'interface instrument. `None` quand le
+    /// talkback n'est pas actif.
+    pub fn voice_source_label(&self) -> Option<String> {
+        if !self.voice_active {
+            return None;
+        }
+        if let Some(name) = self.voice_device_label.as_deref() {
+            return Some(name.to_string());
+        }
+        // Voix prélevée sur un canal du flux instrument. On NOMME l'interface et
+        // le canal : l'agent les connaît, et « canal de l'interface » laissait
+        // croire à une autre source que celle affichée juste au-dessus.
+        // Le nom est relu à CHAQUE appel (jamais figé au démarrage du talkback)
+        // pour ne pas afficher l'ancienne interface après un changement d'entrée.
+        let iface = self
+            .selected_input_id()
+            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()));
+        Some(match (iface, self.voice_channel_index) {
+            (Some(name), Some(ch)) => format!("{} — canal {}", name, u16::from(ch) + 1),
+            (Some(name), None) => name,
+            // Pas d'entrée sélectionnée alors qu'une voix est active : état
+            // incohérent, on le dit au lieu d'inventer un nom.
+            (None, _) => "source inconnue".to_string(),
+        })
     }
 
     /// Talkback (Lot 2) — retire le producteur voix. No-op si aucune voix active.
@@ -2345,18 +2606,13 @@ impl PipelineState {
         if let Some(tx) = self.voice_ctrl_tx.as_ref() {
             let _ = tx.try_send(VoiceControl::Remove);
         }
+        // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
+        // périphérique (sinon le casque resterait tenu par l'agent).
+        self.voice_capture = None;
+        self.voice_device_label = None;
+        self.voice_channel_index = None;
         self.voice_active = false;
         tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
-    }
-
-    /// Talkback (Lot 2) — pose le gain CIBLE du producteur voix (auto-mute /
-    /// toggle manuel). Lissé par-sample côté `voice_encode_stage` (anti-clic).
-    /// Idempotent et sûr même sans voix active (l'atomique est simplement écrit).
-    pub fn set_voice_gain(&self, gain: f32) {
-        self.voice_gain.store(
-            gain.clamp(0.0, 1.0).to_bits(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
 
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
@@ -2475,6 +2731,7 @@ impl PipelineState {
             self.perfstats.output_frames.clone(),
             self.perfstats.capture_feeding.clone(),
             self.output_pair_start.clone(),
+            self.perfstats.callback_health.clone(),
             self.reset_signal.clone(),
         )?;
 
@@ -2663,6 +2920,7 @@ impl PipelineState {
         // Stop signal pour la tâche I/O de ce pair.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         self.recv_stops.insert(producer_id.clone(), stop_tx);
+        self.recv_kinds.insert(producer_id.clone(), media_tag);
 
         // Spawn la tâche I/O async (recv UDP + horodatage + punch + idle-timeout).
         // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
@@ -2710,6 +2968,7 @@ impl PipelineState {
         // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
         // thread de décodage qui retire l'état + le stream mixer + net_stats,
         // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
+        self.recv_kinds.remove(producer_id);
         if let Some(stop) = self.recv_stops.remove(producer_id) {
             let _ = stop.send(());
         }
@@ -2960,6 +3219,7 @@ fn encoder_thread(
     channel_sel: ChannelSel,
     mixer: Arc<AudioMixer>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
+    instrument_private: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
@@ -2998,8 +3258,22 @@ fn encoder_thread(
                 out_name_cap,
                 voice_ctrl_rx,
             );
-        })
-        .expect("spawn audio-capture thread");
+        });
+    // Un panic ici tuerait le thread encodeur SANS tuer le process : la capture
+    // continuerait de tourner, plus rien ne serait encodé, et l'utilisateur
+    // verrait un agent « vivant » et muet (revue 04/09). On échoue donc à voix
+    // haute, et proprement.
+    let h_cap = match h_cap {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-capture",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            return;
+        }
+    };
 
     // ─── Process stage ────────────────────────────────────
     let stop_proc = stop_flag.clone();
@@ -3044,8 +3318,22 @@ fn encoder_thread(
                 midi_active_proc,
                 midi_last_note_on_ms_proc,
             );
-        })
-        .expect("spawn audio-process thread");
+        });
+    let h_proc = match h_proc {
+        Ok(h) => h,
+        Err(e) => {
+            // La capture tourne déjà : on la démonte avant de sortir, sinon son
+            // thread et le driver resteraient tenus par un pipeline mort.
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-process",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = h_cap.join();
+            return;
+        }
+    };
 
     // ─── Encode stage ─────────────────────────────────────
     let stop_enc = stop_flag.clone();
@@ -3060,11 +3348,25 @@ fn encoder_thread(
                 stop_enc,
                 ssrc,
                 payload_type,
+                instrument_private,
                 perfstats_enc,
                 out_name_enc,
             );
-        })
-        .expect("spawn audio-encode thread");
+        });
+    let h_enc = match h_enc {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::pipeline",
+                error = %e, stage = "audio-encode",
+                "impossible de démarrer un étage du pipeline — capture abandonnée"
+            );
+            stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = h_cap.join();
+            let _ = h_proc.join();
+            return;
+        }
+    };
 
     // ─── Attente stop + drainage cascade ──────────────────
     //
@@ -3133,6 +3435,13 @@ fn capture_stage_loop(
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
+    // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
+    // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
+    // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
+    // et c'est elle qui domine en pratique.
+    let mut voice_drops: u32 = 0;
+    // Fenêtre d'échantillonnage de la trace de saturation voix. Voir `Full`.
+    let mut voice_drops_last_warn: Option<std::time::Instant> = None;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3165,8 +3474,39 @@ fn capture_stage_loop(
                         match vtx.try_send(mono) {
                             Ok(()) => {}
                             // Thread voix en retard : on DROP ce bloc voix
-                            // (concealé par le PLC récepteur). Jamais de stall.
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {}
+                            // (concealé par le PLC récepteur). Jamais de stall —
+                            // mais JAMAIS silencieux non plus : depuis que ce
+                            // thread fait tourner l'isolation de voix (deux
+                            // réseaux), une saturation durable s'entend, donc
+                            // elle se trace.
+                            //
+                            // Échantillonnage par le TEMPS (≤ 1 ligne/s), pas par
+                            // un compteur de drops consécutifs : ce dernier était
+                            // remis à zéro au premier bloc passé, si bien qu'une
+                            // saturation INTERMITTENTE (drop, ok, drop, ok…) ne
+                            // dépassait jamais 1-2 et traçait donc à CHAQUE drop —
+                            // 4352 lignes en 25 min mesurées le 05/09, l'exact
+                            // contraire du but recherché, et de quoi évincer le
+                            // diagnostic utile de l'export support (cap 5 Mo).
+                            // On journalise donc au plus une fois par seconde, en
+                            // rapportant le nombre RÉEL de blocs perdus depuis la
+                            // dernière trace.
+                            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                voice_drops += 1;
+                                const VOICE_WARN_EVERY: std::time::Duration =
+                                    std::time::Duration::from_secs(1);
+                                let due = voice_drops_last_warn
+                                    .is_none_or(|t| t.elapsed() >= VOICE_WARN_EVERY);
+                                if due {
+                                    tracing::warn!(
+                                        target: "jamodio::pipeline",
+                                        dropped_blocks = voice_drops,
+                                        "tap voix saturé — blocs talkback abandonnés (thread voix en retard)"
+                                    );
+                                    voice_drops = 0;
+                                    voice_drops_last_warn = Some(std::time::Instant::now());
+                                }
+                            }
                             // Thread voix terminé : on cesse de taper.
                             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                 voice_out = None;
@@ -3673,12 +4013,17 @@ fn process_stage_loop(
 // Coût observé : ~50-100 µs par frame (Opus encode est constant). Spike
 // rarissime (Opus interne).
 
+#[allow(clippy::too_many_arguments)]
 fn encode_stage_loop(
     in_rx: Receiver<TimedBlock>,
     sender: Arc<RtpSender>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
     ssrc: u32,
     payload_type: u8,
+    // Tranche en PRIVÉ : on n'envoie plus rien aux autres. Appliqué ICI et nulle
+    // part ailleurs — le self-monitor est en amont, donc l'utilisateur continue
+    // de s'entendre (c'est tout l'objet du mode privé).
+    instrument_private: Arc<std::sync::atomic::AtomicBool>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
 ) {
@@ -3710,7 +4055,14 @@ fn encode_stage_loop(
             break;
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok((t_block_start, stereo)) => {
+            Ok((t_block_start, mut stereo)) => {
+                // PRIVÉ : on continue d'ÉMETTRE, mais du silence. Suspendre
+                // l'émission viderait le buffer de gigue des pairs et
+                // déclencherait leur concealment (artefacts) ; du silence les
+                // laisse en régime établi.
+                if instrument_private.load(std::sync::atomic::Ordering::Relaxed) {
+                    stereo.fill(0.0);
+                }
                 // v0.4.8 — timer "traitement pur" du encode_stage : depuis le
                 // pop ringbuf jusqu'au try_send RTP final. NB : `block_elapsed_ms`
                 // (pipeline_latency end-to-end) reste mesuré depuis t_block_start.
@@ -3848,7 +4200,15 @@ fn voice_encode_stage_loop(
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    voice_on_air: Arc<std::sync::atomic::AtomicBool>,
+    isolation_active: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
+    // Signale à `start_voice_capture` que ce thread est prêt à consommer (encodeur
+    // créé, modèles d'isolation chargés) → il ne greffe le tap qu'à ce moment.
+    // Droppé sans envoi si le thread abandonne : l'appelant voit le canal fermé.
+    // Oneshot TOKIO : l'appelant attend en `await`, il ne doit pas bloquer un
+    // worker du runtime pendant le chargement des modèles.
+    ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -3881,6 +4241,49 @@ fn voice_encode_stage_loop(
     let attack_coeff = 1.0 - (-1.0f32 / (0.015 * 48000.0)).exp();
     let release_coeff = 1.0 - (-1.0f32 / (0.080 * 48000.0)).exp();
 
+    // Isolation de voix talkback (Lot 2) : denoise (DeepFilterNet) + VAD (Silero) +
+    // gate, pur Rust (tract). Chargée UNE fois au démarrage du thread voix.
+    // Fallback (décision Ben) : si les modèles ne chargent pas → talkback en voix
+    // BRUTE (jamais coupé), l'UI indiquera « isolation inactive ».
+    let mut isolator: Option<VoiceIsolator> = match VoiceIsolator::new(IsolationConfig::default()) {
+        Ok(i) => {
+            // Le coût en latence est ANNONCÉ, pas découvert à l'oreille : denoise
+            // (~30 ms) + lookahead du gate (le retard qui empêche de rogner le
+            // début des mots). Canal talkback uniquement.
+            tracing::info!(
+                target: "jamodio::voice_isolation",
+                added_latency_ms = i.added_latency_ms(),
+                "isolation de voix active sur le talkback"
+            );
+            Some(i)
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "jamodio::voice_isolation",
+                error = %e,
+                "isolation de voix indisponible — talkback en voix brute"
+            );
+            None
+        }
+    };
+    // Indicateur : l'isolation tourne-t-elle ? (sinon repli en voix brute → UI.)
+    isolation_active.store(isolator.is_some(), std::sync::atomic::Ordering::Relaxed);
+
+    // Limiteur de crête AVANT Opus — actif aussi en repli voix brute, car c'est
+    // l'ENTRÉE qui dépasse : un micro-casque ou un micro interne, dont l'utilisateur
+    // ne règle aucun gain matériel, peut être amplifié par l'OS bien au-delà du plein
+    // échelle (mesuré en session : crêtes à +8,4 dB, que l'encodeur tronquait).
+    let mut limiter = PeakLimiter::new(
+        jamodio_audio_core::voice_isolation::isolator::SAMPLE_RATE as f32,
+        limiter::DEFAULT_CEILING,
+        limiter::DEFAULT_LOOKAHEAD_MS,
+    );
+    let mut last_limiter_report = std::time::Instant::now();
+
+    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
+    // `send` consomme le Sender — le canal se ferme donc de lui-même ensuite.
+    let _ = ready_tx.send(());
+
     loop {
         let raw = match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(raw) => raw,
@@ -3890,21 +4293,74 @@ fn voice_encode_stage_loop(
 
         // 1. Bloc mono déjà @ 48 kHz (capture 48 k natif garanti — R2). Aucun
         //    resampling : le tap voix arrive au bon rate directement.
-        let mono48: Vec<f32> = raw;
+        let mut mono48: Vec<f32> = raw;
         if mono48.is_empty() {
             continue;
         }
 
+        // 1-bis. NIVEAU D'ENTRÉE du micro talkback, mesuré AVANT le filtre.
+        //        C'est lui qui alimente le VU de la tranche : un vumètre branché
+        //        APRÈS le filtre ne bouge que quand le gate s'ouvre — l'utilisateur
+        //        ne peut alors plus vérifier que son micro capte quoi que ce soit
+        //        (constaté au test terrain 04/09 : « ça ne module pas quand je
+        //        parle »). Le VU montre donc l'entrée ; c'est le voyant « à
+        //        l'antenne » qui dit ce qui PART réellement.
+        {
+            let n = mono48.len();
+            if n > 0 {
+                let sum_sq: f32 = mono48.iter().map(|s| s * s).sum();
+                voice_rms.store((sum_sq / n as f32).sqrt().to_bits(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 1-ter. Isolation de voix (AVANT le gain mute) : enlève la repisse
+        //        d'instrument et coupe hors parole. En cas d'erreur d'inférence,
+        //        on désactive l'isolation pour le reste de la session (voix brute)
+        //        sans JAMAIS couper le talkback — dégradation visible, pas silencieuse.
+        if let Some(iso) = isolator.as_mut() {
+            match iso.process_block(&mut mono48) {
+                Ok(state) => {
+                    voice_on_air.store(state.voice_active, std::sync::atomic::Ordering::Relaxed)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "jamodio::voice_isolation",
+                        error = %e,
+                        "erreur d'inférence isolation — bascule en voix brute"
+                    );
+                    isolator = None;
+                    voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+                    isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        // 1-quater. Limiteur de crête : borne ce qui part dans Opus sans aplatir la
+        //        forme d'onde (réduction de gain anticipée). Sous le plafond, le
+        //        signal n'est pas touché.
+        limiter.process_block(&mut mono48);
+        if last_limiter_report.elapsed() >= std::time::Duration::from_secs(5) {
+            last_limiter_report = std::time::Instant::now();
+            let reduction_db = limiter.take_max_reduction_db();
+            if reduction_db > 1.0 {
+                tracing::warn!(
+                    target: "jamodio::voice_isolation",
+                    reduction_db,
+                    "entrée talkback au-dessus du plein échelle — limiteur en action \
+                     (micro sans réglage de gain matériel ?)"
+                );
+            }
+        }
+
         // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
-        //    (L=R). On mesure au passage le RMS POST-gain (VU talkback).
+        //    (L=R). Le niveau du VU, lui, a été relevé en ENTRÉE (étape 1-bis) :
+        //    il doit refléter ce que le micro capte, pas ce que le filtre laisse
+        //    passer.
         let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
-        let mut sum_sq = 0.0f32;
         for &s in mono48.iter() {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
             cur_gain += (target - cur_gain) * coeff;
-            let g = s * cur_gain;
-            sum_sq += g * g;
-            acc.push(g);
+            acc.push(s * cur_gain);
             if acc.len() == frame_size {
                 for (i, &m) in acc.iter().enumerate() {
                     stereo_frame[i * 2] = m;
@@ -3935,15 +4391,12 @@ fn voice_encode_stage_loop(
                 acc.clear();
             }
         }
-        // RMS post-gain du bloc → VU talkback (mono). Bits f32, comme input_rms.
-        let n = mono48.len();
-        if n > 0 {
-            let rms = (sum_sq / n as f32).sqrt();
-            voice_rms.store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        }
+        // (Le niveau du VU est mesuré en ENTRÉE, cf. étape 1-bis.)
     }
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+    isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
 }
 

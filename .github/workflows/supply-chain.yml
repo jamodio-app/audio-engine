@@ -1,0 +1,65 @@
+# Garde-fou d'approvisionnement : failles connues + licences des dépendances.
+#
+# RAISON D'ÊTRE : l'agent embarque ~700 crates transitives, dont un dépôt git
+# épinglé (DeepFilterNet) et des modèles d'IA. Deux risques qu'aucun test ne
+# couvre : une faille publiée dans une dépendance qu'on ne touche plus, et une
+# licence incompatible qui arrive par une dépendance transitive.
+#
+# Le déclencheur PLANIFIÉ est le cœur du dispositif : une faille apparaît APRÈS
+# le merge, sans que personne ne pousse quoi que ce soit.
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  schedule:
+    # Tous les lundis 6h UTC — un avis publié dans la semaine est vu au plus tard 7 jours après.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Failles connues (RustSec)
+    runs-on: ubuntu-latest
+    # L'action publie son rapport sous forme de « check run » : sans
+    # `checks: write` elle échoue APRÈS l'analyse (« Resource not accessible by
+    # integration ») — le garde-fou passait alors au rouge sans qu'aucune faille
+    # ne soit en cause. `contents: read` suffit pour le reste (le
+    # `contents: write` global sert au job de release, pas ici).
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH relatif
+      # (workaround dev Mac) ; inutile ici et source d'échecs.
+      - run: rm -f .cargo/config.toml
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Licences et sources (cargo-deny)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rm -f .cargo/config.toml
+      # L'action tourne dans SON image, avec SON cargo. La v2.0.4 embarquait
+      # Rust 1.83, incapable de lire un `Cargo.toml` en edition 2024 — dès qu'une
+      # dépendance transitive y est passée (dlopen2_derive), `cargo metadata`
+      # échouait et le garde-fou virait au rouge pour une raison qui n'avait rien
+      # à voir avec une licence. `rust-version: stable` fait mettre l'image à jour
+      # avant l'analyse : la même cause ne pourra pas se représenter à la
+      # prochaine édition.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: stable
+          command: check licenses sources bans

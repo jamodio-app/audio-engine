@@ -107,3 +107,16 @@ jobs:
           # que CMake 4.x refuse sans cette policy de compat — cf. release.yml.
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      # La CI compilait et lintait, mais ne lançait JAMAIS la suite de tests :
+      # elle n'était exécutée qu'à la main, sur le Mac du développeur, donc jamais
+      # sur Windows — alors que des modules entiers sont `#[cfg(windows)]` et ont
+      # leurs propres tests. Première exécution Windows le 05/09/2026 : verte.
+      # On le verrouille ici avant que ça ne redevienne faux.
+      # Les tests qui ouvrent un périphérique réel sont `#[ignore]` : rien ici ne
+      # dépend d'une carte son.
+      - name: Tests (workspace)
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: cargo test --workspace --target ${{ matrix.target }}

@@ -5,6 +5,68 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.0] — 2026-09-06
+
+Une version dominée par un sujet : **le talkback**. Il devient utilisable comme
+un vrai canal de parole, et non plus comme un micro qu'on ouvre en croisant les
+doigts. S'y ajoutent un correctif de fond sur la veille Windows et une série de
+défauts silencieux corrigés.
+
+### Ajouté
+
+- **Filtre antibruit sur le talkback.** La voix est isolée du reste — instrument,
+  ampli, clavier, bruit de pièce — avant d'être envoyée. Jouer sans parler n'envoie
+  plus rien. Traitement 100 % local, aucun envoi vers un service tiers.
+  Repli sûr : si les modèles ne chargent pas, le talkback continue en **voix brute**
+  et le studio l'affiche — jamais de dégradation muette.
+- **Micro talkback séparé de l'interface instrument.** Un micro-casque, le micro
+  interne, une seconde carte : le talkback ouvre son propre flux. Indispensable
+  quand l'interface n'a pas d'entrée libre. Rééchantillonnage automatique des micros
+  qui ne tournent pas à 48 kHz (44,1 / 16 kHz).
+- **LIVE / PRIVÉ sur la tranche instrument.** S'entendre sans que les autres
+  entendent — pour s'accorder, chercher un son, se chauffer. Une tranche en PRIVÉ
+  n'est pas enregistrée non plus.
+- **Voyant « à l'antenne »** sur la tranche talkback : on voit quand sa voix part.
+- **Le micro et le canal captés** s'affichent dans la fenêtre de l'agent, côté
+  instrument comme côté talkback.
+- **Installeur Windows en français et en anglais**, servi selon la langue de l'app.
+- **Bouton Licences** : la liste des composants tiers s'ouvre dans le lecteur de
+  texte du système.
+
+### Corrigé
+
+- **La veille moderne de Windows (S0ix) laissait l'audio cassé au réveil.** Le
+  système ne signale pas ce type de veille comme un réveil : l'agent ne
+  réinitialisait donc rien et le pilote ressortait dégradé — il fallait relancer.
+  L'état de l'écran sert maintenant de signal, et l'audio revient seul.
+- **Des commandes pouvaient être perdues sans erreur.** Une trentaine d'entre
+  elles — volumes, panoramiques, armement d'enregistrement, grille du métronome,
+  transport du backing, et **le mute du micro** — étaient abandonnées en silence
+  quand l'agent était sollicité. Elles ne peuvent plus l'être.
+- **Le talkback partait saturé.** Un micro-casque dépasse facilement le plein
+  échelle : un limiteur de crête protège désormais l'encodeur.
+- **Le début des mots était rogné**, et le début du talkback perdu à son activation.
+- **Le VU du talkback ne bougeait plus** quand on parlait.
+- **Trois chiffres de la fenêtre disaient autre chose que leur libellé** : la marge
+  anti-gigue était présentée comme la gigue réseau, les flux étaient comptés comme
+  des musiciens, et le buffer carte pouvait afficher une estimation de repli.
+- **Les logs étaient inexploitables.** Le moteur d'inférence écrivait 124 lignes par
+  seconde et remplissait 99 % de l'export support : les lignes utiles étaient
+  évincées, et un rapport de bug ne prouvait plus rien. Le bruit tiers est écarté.
+- **La fenêtre Licences figeait l'agent sur Windows** (il fallait le tuer).
+- Le talkback pouvait rester dans un état fantôme après l'échec d'ouverture d'un
+  micro, et le débruiteur créait des trous silencieux avec certains pilotes.
+
+### Sécurité et outillage
+
+- **Garde-fou d'approvisionnement** : failles connues (RustSec) et licences des
+  dépendances vérifiées à chaque livraison et chaque semaine.
+- **La suite de tests tourne enfin en intégration continue**, sur macOS et sur
+  Windows. Elle n'était jusqu'ici exécutée qu'à la main.
+- Sur macOS **virtualisé**, le filtre antibruit est refusé avec un message explicite
+  au lieu de faire tomber l'agent (le moteur d'inférence y utilise une instruction
+  indisponible en machine virtuelle).
+
 ## [0.5.12] — 2026-09-02
 
 ### Fixed — Jitter buffer de réception : RÉCUPÉRATION (le buffer redescend enfin)

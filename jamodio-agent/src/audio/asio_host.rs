@@ -24,6 +24,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::audio::asio_reset::ResetSignal;
+use crate::audio::callback_health::{block_budget_us, late_threshold_us, CallbackHealth};
 use crate::audio::output_pair::clamp_output_pair;
 use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
@@ -223,6 +224,9 @@ impl AsioDuplexHost {
         // lu à chaque bloc dans le callback → changement de paire = swap LIVE sans
         // réouverture driver.
         output_pair_start: Arc<AtomicUsize>,
+        // Diagnostic des craquements : compteurs de blocs en retard / hors budget,
+        // alimentés par le callback (atomiques seuls). Cf. `audio::callback_health`.
+        callback_health: Arc<CallbackHealth>,
         reset_signal: &ResetSignal,
     ) -> Result<Self, String> {
         // 1) UNE instance Asio, UN load_driver (1 ASIOInit).
@@ -359,13 +363,28 @@ impl AsioDuplexHost {
             let output_frames = output_frames.clone();
             let output_pair_start = output_pair_start.clone();
             let mut out_scratch: Vec<f32> = Vec::new();
+            // Diagnostic craquements : budget d'un bloc et seuil de retard, calculés
+            // UNE fois ici (aucune division dans le callback). `native_sr` est le rate
+            // déclaré ; la garde 48k/ASIO-only le vérifie en amont.
+            let callback_health = callback_health.clone();
+            let budget_us = block_budget_us(buffer_size, native_sr);
+            let late_us = late_threshold_us(budget_us);
+            // Horodatage du bloc précédent — état PRIVÉ du closure (appelé seulement
+            // depuis le thread du driver), donc ni atomique ni verrou.
+            let mut prev_cb: Option<Instant> = None;
             driver.add_callback(move |info| {
+                let cb_start = Instant::now();
                 let idx = info.buffer_index as usize;
                 if idx > 1 {
                     return; // double-buffer ASIO : 0 ou 1
                 }
                 let guard = streams.lock();
                 let Some(st) = guard.as_ref() else { return };
+                // Intervalle depuis le bloc précédent = retard imputable au driver/OS.
+                // Mesuré AVANT le traitement pour ne pas y mêler notre propre coût.
+                let gap_us = prev_cb
+                    .map(|prev| cb_start.saturating_duration_since(prev).as_micros() as u64);
+                prev_cb = Some(cb_start);
 
                 // --- ENTRÉE : dé-entrelacé natif → f32 entrelacé → sample_tx ---
                 if let Some(inp) = st.input.as_ref() {
@@ -447,6 +466,13 @@ impl AsioDuplexHost {
                             unsafe { out_fmt.write(base, f, v) };
                         }
                     }
+                }
+
+                // Diagnostic craquements : durée de traitement de CE bloc. Deux
+                // atomiques + un `fetch_max` — rien qui puisse bloquer le thread RT.
+                if budget_us > 0 {
+                    let work_us = cb_start.elapsed().as_micros() as u64;
+                    callback_health.record_block(gap_us, work_us, budget_us, late_us);
                 }
             })
         };
