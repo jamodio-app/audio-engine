@@ -34,7 +34,7 @@
       </div>
       <div class="row stacked" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent. « — » tant que le talkback n'a pas démarré.">
         <span class="label">Talkback</span>
-        <span class="value" id="voice-device">—</span>
+        <span class="value pending" id="voice-device">défini à l'entrée en studio</span>
       </div>
 
       <div class="section-title">Statistiques</div>
@@ -136,6 +136,18 @@
           setTimeout(() => { exportBtn.textContent = 'Exporter les logs'; }, 2500);
         }
       });
+    }
+
+    // Le micro talkback n'est connu de l'agent qu'au démarrage du talkback : le
+    // choix vit dans les Paramètres audio du studio, et rien ne le transmet avant.
+    // Un « — » laissait croire à un réglage manquant ou à une panne ; on DIT ce
+    // qu'on attend au lieu de laisser un vide à interpréter.
+    const TALKBACK_EN_ATTENTE = 'défini à l\'entrée en studio';
+    function afficheTalkback(nom) {
+      const el = $('voice-device');
+      el.textContent = nom || TALKBACK_EN_ATTENTE;
+      el.title = nom || '';
+      el.classList.toggle('pending', !nom);
     }
 
     // ─── Bouton "Licences" ─────────────────────────────────────
@@ -251,8 +263,7 @@
             // `musicians` = flux INSTRUMENT (un partenaire qui parle envoie deux
             // flux) ; repli sur `streams` pour un agent antérieur.
             $('streams').textContent = (msg.musicians ?? msg.streams) || 0;
-            $('voice-device').textContent = msg.voiceDevice || '—';
-            $('voice-device').title = msg.voiceDevice || '';
+            afficheTalkback(msg.voiceDevice);
             $('underruns').textContent = msg.underruns || 0;
             // Stats latence : on utilise les valeurs pré-calculées par l'agent
             // (totalLatencyMs / jitterTargetMs / bufferMs) — sans recombinaison
@@ -275,7 +286,7 @@
               $('latency').textContent = '—';
               $('buffer').textContent = '—';
               $('jitter').textContent = '—';
-              $('voice-device').textContent = '—';
+              afficheTalkback(null);
             }
             break;
           }
@@ -292,6 +303,7 @@
         // laisserait les mesures figées à leur dernière valeur, donc fausses.
         $('live-metrics').hidden = true;
         $('info-hint').hidden = false;
+        afficheTalkback(null);
         $('device').textContent = '—';
         $('buffer').textContent = '—';
         $('latency').textContent = '—';

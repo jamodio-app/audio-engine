@@ -150,6 +150,14 @@ body {
   margin-bottom: 6px;
 }
 .row.stacked .label { display: block; }
+/* Valeur EN ATTENTE (pas encore connue) : elle se distingue d'une vraie valeur,
+   sinon on lirait « défini à l'entrée en studio » comme un nom de périphérique. */
+.value.pending {
+  font-style: italic;
+  opacity: 0.5;
+  font-size: 11px;
+}
+
 .row.stacked .value {
   display: block;
   margin-left: 0;
