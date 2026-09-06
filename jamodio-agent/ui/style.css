@@ -126,6 +126,38 @@ body {
   color: var(--muted);
 }
 
+/* Titre de section : sépare la CONFIGURATION (ce que l'agent écoute) des MESURES
+   (ce qu'il constate). Deux natures d'information qui ne se lisent pas pareil. */
+.section-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text2);
+  opacity: 0.55;
+  margin: 2px 0 6px;
+}
+.section-title + .row,
+.section-title + .row + .row { margin-bottom: 2px; }
+.info > .section-title:not(:first-child) { margin-top: 12px; }
+
+/* Lignes ENTRÉES : le nom d'une interface + son canal ne tient pas sur une demi-
+   largeur. Libellé au-dessus, valeur en dessous sur TOUTE la largeur — deux fois
+   plus de texte lisible sans agrandir la fenêtre. */
+.row.stacked {
+  display: block;
+  margin-bottom: 6px;
+}
+.row.stacked .label { display: block; }
+.row.stacked .value {
+  display: block;
+  margin-left: 0;
+  text-align: left;
+  font-size: 13px;
+  color: var(--text);
+}
+
 .value {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;

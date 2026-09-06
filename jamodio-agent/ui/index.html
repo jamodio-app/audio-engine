@@ -25,42 +25,44 @@
     <div class="tagline">YOUR STUDIO. <span class="tagline-accent">ANYWHERE.</span></div>
     <div class="tagline tagline-jam">MUSIC CREATES <span class="tagline-accent">CONNECTIONS.</span></div>
     <div class="info">
-      <div class="row" title="Interface audio qui capte ton instrument. La ligne Talkback juste en dessous indique, elle, le micro utilisé pour parler aux autres.">
+      <!-- ENTRÉES : ce que l'agent écoute. Toujours visible — c'est une CONFIGURATION,
+           elle a un sens même hors session (≠ les mesures, qui n'existent qu'en session). -->
+      <div class="section-title">Entrées</div>
+      <div class="row stacked" title="Interface audio qui capte ton instrument, et canal (ou paire) réellement capté.">
         <span class="label">Instrument</span>
         <span class="value" id="device">—</span>
       </div>
-      <!-- Lignes qui n'ont de sens QU'EN SESSION : masquées hors session, où
-           elles n'affichaient que des « — » (du bruit, et six lignes de hauteur
-           qui poussaient le numéro de version hors de la fenêtre). -->
-      <div id="live-metrics" hidden>
-      <div class="row" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent.">
+      <div class="row stacked" title="Micro utilisé pour parler aux autres musiciens (talkback). Un nom suivi d'un numéro de canal = la voix est prise sur une entrée de ton interface instrument ; un nom seul = un micro à part, ouvert par l'agent. « — » tant que le talkback n'a pas démarré.">
         <span class="label">Talkback</span>
         <span class="value" id="voice-device">—</span>
       </div>
-      <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
-        <span class="label">Latence locale</span>
-        <span class="value" id="latency">—</span>
+
+      <div class="section-title">Statistiques</div>
+      <!-- Mesures : elles n'existent QUE pendant une session. Hors session, la phrase
+           ci-dessous les remplace — une colonne de « — » se lit comme une panne. -->
+      <div id="live-metrics" hidden>
+        <div class="row" title="Latence audio LOCALE de l'agent : ta carte → encodage → décodage → buffer de gigue → ta carte. N'inclut PAS le réseau. La latence réelle avec un partenaire (réseau compris) s'affiche dans le studio, sur ta tranche.">
+          <span class="label">Latence locale</span>
+          <span class="value" id="latency">—</span>
+        </div>
+        <div class="row" title="Marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. Ce n'est PAS la gigue mesurée du réseau, c'est la marge que l'agent lui oppose — elle s'adapte à la qualité du lien. « — » quand tu es seul.">
+          <span class="label">Marge anti-gigue</span>
+          <span class="value" id="jitter">—</span>
+        </div>
+        <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
+          <span class="label">Buffer carte</span>
+          <span class="value" id="buffer">—</span>
+        </div>
+        <div class="row" title="Nombre de musiciens dont tu reçois l'audio. 0 = tu es seul dans le studio.">
+          <span class="label">Musiciens reçus</span>
+          <span class="value" id="streams">0</span>
+        </div>
+        <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard), comptées depuis le début de la session en cours. Doit rester proche de 0.">
+          <span class="label">Coupures</span>
+          <span class="value" id="underruns">0</span>
+        </div>
       </div>
-      <div class="row" title="Marge ajoutée pour absorber l'irrégularité d'arrivée des paquets des autres musiciens. Ce n'est PAS la gigue mesurée du réseau, c'est la marge que l'agent lui oppose — elle s'adapte à la qualité du lien. « — » quand tu es seul.">
-        <span class="label">Marge anti-gigue</span>
-        <span class="value" id="jitter">—</span>
-      </div>
-      <div class="row" title="Taille du buffer matériel de ta carte son (CPAL). Plus c'est petit, plus la latence locale est faible.">
-        <span class="label">Buffer carte</span>
-        <span class="value" id="buffer">—</span>
-      </div>
-      <div class="row" title="Nombre de musiciens dont tu reçois l'audio. 0 = tu es seul dans le studio.">
-        <span class="label">Musiciens reçus</span>
-        <span class="value" id="streams">0</span>
-      </div>
-      <div class="row" title="Coupures dans l'audio reçu des autres musiciens (paquets arrivés trop tard), comptées depuis le début de la session en cours. Doit rester proche de 0.">
-        <span class="label">Coupures</span>
-        <span class="value" id="underruns">0</span>
-      </div>
-      </div>
-      <!-- Ce qui les remplace hors session : sans cette phrase, une fenêtre pleine
-           de « — » se lit comme une panne alors que l'agent attend simplement. -->
-      <div class="info-hint" id="info-hint">Les mesures apparaissent quand tu entres dans un studio.</div>
+      <div class="info-hint" id="info-hint">Elles apparaissent quand tu entres dans un studio.</div>
     </div>
     <div class="settings">
       <label class="row setting" for="autostart-toggle" title="Lance automatiquement l'Audio Engine à l'ouverture de session de votre ordinateur. Décochez pour ne le démarrer que manuellement (ou depuis jamodio.com).">
