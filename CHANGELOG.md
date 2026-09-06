@@ -5,227 +5,67 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.5.13-5] — 2026-09-04 (pré-release)
+## [0.6.0] — 2026-09-06
 
-### Fixed — Revue de code du chantier talkback (7 défauts corrigés)
-
-Revue menée avant merge sur l'ensemble du chantier (isolation de voix, micro dédié, mode privé).
-Trois défauts touchaient la promesse la plus sensible du produit : « les autres ne m'entendent
-plus ».
-
-- **PRIVÉ pouvait être perdu** : la commande utilisait un verrou opportuniste et était abandonnée
-  en cas de contention (un pair qui rejoint, un reset ASIO…) — l'interface affichait PRIVÉ pendant
-  que le son continuait de partir. La commande attend désormais le verrou, comme toute action dont
-  la promesse est faite aux autres. Idem pour « ENTRÉE OFF », qui portait la même faiblesse.
-- **État fantôme du talkback** : si l'ouverture du micro dédié échouait (casque débranché entre
-  l'affichage de la liste et le clic), l'agent restait convaincu qu'un talkback tournait — la
-  fenêtre affichait un micro pour un flux inexistant.
-- **Attente bloquante sous le verrou** : l'activation du talkback bloquait un worker du runtime
-  jusqu'à 10 s dans le pire cas. Au-delà de 3 s, le navigateur déclare l'agent perdu alors qu'il
-  va parfaitement bien. L'attente est maintenant asynchrone et l'ouverture du périphérique sort du
-  runtime.
-- **Trous silencieux dans le denoise** : avec un pilote délivrant des blocs plus gros que la
-  latence du modèle (buffer de 2048 frames), l'anneau de sortie se vidait à chaque tour et on
-  comblait en silence — un trou périodique, sans le moindre log. Le coussin s'adapte à la taille
-  de bloc réelle, et tout comblement est désormais compté et tracé.
-- Deux commentaires devenus faux (documentation d'`ENTRÉE OFF` rattachée à la mauvaise fonction,
-  mesure du VU décrite comme post-gain) et une normalisation i16/i32 divergente du reste du code.
-
-Le rodage des modèles passe dans le constructeur du denoise : tout exemplaire naît dans le même
-état, si bien que le banc de diagnostic hors-ligne reproduit la production **au bit près**
-(écart max mesuré sur 55 s de prise réelle : 0,000000).
-
-## [0.5.13-4] — 2026-09-04 (pré-release)
-
-### Fixed — La fenêtre Licences figeait l'agent sur Windows
-
-Elle s'ouvrait vide et l'agent devait être tué (End Task). Cause : la fenêtre était construite
-depuis le thread d'une commande Tauri, alors qu'une webview **doit** être créée sur le thread
-principal — macOS le tolérait, Windows non. La création est désormais postée sur la boucle
-d'événements, et la page réessaie brièvement si le pont Tauri n'est pas encore prêt plutôt que de
-rester muette.
-
-### Ajouté — S'entendre sans envoyer (tranche instrument en PRIVÉ)
-
-Remontée d'un utilisateur : impossible de s'accorder sans que tout le studio l'entende. En effet,
-« ENTRÉE OFF » mettait les échantillons à zéro **avant** le self-monitor : il coupait d'un seul
-geste ce qu'on envoie ET ce qu'on entend.
-
-La tranche instrument a désormais deux états, dans le même vocabulaire que le talkback :
-**LIVE** (les autres m'entendent) et **PRIVÉ** (je m'entends, eux non).
-
-- Le silence n'est appliqué qu'à l'entrée de **l'étage d'ENVOI**. Le monitoring, en amont, n'est
-  pas touché — aucune latence ajoutée, aucun changement de structure du chemin temps réel.
-- On émet du **silence** plutôt que de suspendre l'émission : couper le flux viderait le buffer de
-  gigue des pairs et déclencherait leurs artefacts de concealment.
-- **Une tranche en PRIVÉ n'est pas enregistrée** — ni stem, ni bus MIX (décision Ben : le fichier
-  est partagé avec les autres musiciens). Sortir du privé restaure l'armement RECORD tel que
-  l'utilisateur l'avait laissé, et un armement demandé pendant le privé ne prend effet qu'au
-  retour en LIVE. Les trois cas sont couverts par des tests.
-- Le mode PRIVÉ est remis à zéro à chaque entrée en studio : on ne rejoint jamais une session sans
-  être entendu à cause d'un réglage hérité de la précédente.
-
-## [0.5.13-3] — 2026-09-04 (pré-release)
-
-### Fixed — Le VU du talkback ne bougeait plus quand on parlait
-
-Le vumètre de la tranche talkback mesurait la SORTIE du filtre antibruit : il ne bougeait donc
-que lorsque le gate s'ouvrait, et il devenait impossible de vérifier que son micro capte quoi que
-ce soit (constaté au test terrain : « ça ne module pas quand je parle »). Le vumètre mesure
-désormais l'ENTRÉE du micro ; ce qui PART réellement reste indiqué par le voyant « à l'antenne ».
-
-### Fixed — Télémétrie de la fenêtre : trois chiffres disaient autre chose que leur libellé
-
-- **« Gigue réseau »** affichait en réalité la **marge anti-gigue** que l'agent oppose au réseau,
-  pas la gigue mesurée. Renommé « Marge anti-gigue » — le chiffre était juste, le mot était faux.
-- **« Musiciens reçus »** comptait les **flux**, pas les musiciens : depuis que la voix des pairs
-  passe par l'agent, un partenaire qui parle en apporte deux et s'affichait donc en double. On
-  compte désormais les flux instrument (nouveau champ `musicians`).
-- **« Buffer carte »** pouvait afficher une **estimation de repli** (10 ms) quand le pilote ne
-  publie pas sa taille, sans distinguer mesure et supposition. Affiche maintenant « auto » dans
-  ce cas : un chiffre inventé est pire qu'une absence de chiffre.
-
-### Ajouté — Le micro du talkback est affiché dans la fenêtre
-
-La fenêtre montrait l'interface de l'instrument mais rien sur la voix. Nouvelle ligne
-« Talkback » : le micro dédié, ou « canal de l'interface » quand la voix est prise sur le flux
-instrument.
-
-### Changed — Fenêtre de l'Audio Engine
-
-- **Licences** : ouvre désormais une **vraie fenêtre**, redimensionnable et défilante, au lieu
-  d'un panneau écrasé dans une fenêtre de 300×380. La liste des composants tiers grandira avec
-  le produit (plugins d'effets open-source à venir).
-- **« Démarrer avec l'ordinateur »** passe à un **interrupteur au style Jamodio**, comme dans
-  l'app web (la case native reste dessous : focus clavier et accessibilité intacts).
-- Seconde signature de marque : **« Music creates connections. »** sous « Your studio. Anywhere. »,
-  dans la même couleur que la première, alignée à gauche sous la marque et collée à elle.
-  Fenêtre agrandie (320×470) pour que la version reste
-  visible en bas, et les boutons passent à la ligne au lieu d'être rognés.
-- **Installeur Windows en FRANÇAIS et en ANGLAIS** (un MSI par langue). L'app web sert
-  automatiquement celui qui correspond à la langue de l'interface — un utilisateur qui lit
-  Jamodio en anglais ne tombe plus sur un assistant d'installation en français. Le nom de
-  fichier stable historique reste le français : les liens en circulation gardent leur sens.
-
-### Ajouté — Micro talkback SÉPARÉ de l'interface instrument
-
-Le talkback pouvait seulement être un CANAL du flux instrument : impossible de parler avec une
-interface à une seule entrée (basse branchée = aucun canal libre), et choisir un autre micro
-faisait sortir la voix de l'agent — donc sans Filtre antibruit et avec une latence non maîtrisée.
-
-L'agent sait désormais ouvrir un **flux d'entrée dédié** sur le micro de son choix (micro-casque,
-micro interne, seconde carte). Dans les Paramètres, la liste des micros talkback devient **unique** :
-on choisit un micro, l'agent décide du mécanisme (tap sur le flux instrument si c'est la même
-interface, flux dédié sinon). L'interface instrument n'y figure qu'une fois.
-
-- **Rééchantillonnage du canal voix** quand le micro tourne à 44,1 ou 16 kHz — cas courant des
-  micros-casques. Exception ASSUMÉE et limitée au talkback : le chemin instrument garde R2
-  (48 kHz natif, aucun resampler). Coût mesuré < 4 ms, annoncé dans les Paramètres.
-- Ids de micro voix **préfixés par leur host** (`wasapi:2:Casque USB`) : sans ça, l'index d'une
-  énumération ASIO et celui d'une énumération WASAPI désigneraient deux matériels différents sous
-  le même id. Les ids instrument ne changent pas — aucun réglage instrument n'est perdu.
-- Le flux voix est tenu par un thread propriétaire : lâcher la poignée arrête le flux et **relâche
-  le périphérique**.
-- Rétro-compatible : `start-voice-capture` sans `voiceDeviceId` = comportement historique, prouvé
-  par un test sur le message legacy.
-
-⚠️ **Windows** : le canal voix passera par WASAPI pendant que l'instrument reste en ASIO (un
-pilote ASIO est exclusif). À valider sur machine Windows avant diffusion.
-
-⚠️ **Bêta** : les testeurs qui avaient choisi un micro « navigateur » devront le re-sélectionner
-une fois (l'ancien identifiant ne désigne plus rien).
-
-## [0.5.13-2] — 2026-09-03 (pré-release)
-
-**Qualité de l'isolation de voix talkback.** La 0.5.13-1 rendait le talkback muet, puis,
-une fois le VAD réparé, une voix hachée (« ça coupe quand il y a la voix »). Trois causes,
-toutes corrigées à la racine et mesurées hors-ligne sur des prises réelles (voix + guitare,
-un seul micro) avec `cargo run --release --example iso_offline`.
-
-### Fixed — VAD Silero muet (talkback silencieux)
-
-Silero v5 exige un **contexte de 64 échantillons** préfixé à chaque trame de 512 (entrée
-réelle = 576). Sans lui, la probabilité de parole restait ~0 sur TOUTE parole → gate
-toujours fermé → talkback muet. Test de non-régression sur parole réelle ajouté.
-
-### Fixed — Denoise : on n'embarquait pas les réglages validés
-
-DeepFilterNet commute des **étages entiers** selon le SNR local estimé, trame par trame :
-sous `min_snr_db` il applique un masque de zéros (trame muette), au-dessus de
-`max_erb_snr_db` il ne traite pas du tout. On utilisait les `RuntimeParams::default()` de
-la bibliothèque (**−10 / 30 / 20**) au lieu de ceux du binaire officiel `deep-filter`
-(**−15 / 35 / 35**), seuls validés à l'oreille : sur une captation où l'instrument repisse,
-le modèle basculait sans arrêt d'un régime à l'autre (voix qui « respire »). Mesure sur
-prise réelle : **67 % du niveau conservé contre 92 %**. Les seuils sont désormais explicites
-(`DenoiseParams`), documentés, et verrouillés par un test.
-
-### Fixed — Gate : le début des mots était rogné (lookahead)
-
-Le VAD ne décide qu'à la **fin** de sa trame de 32 ms, et il lui faut parfois deux trames
-sur une attaque douce. Sans retard, cette décision s'appliquait à des échantillons déjà
-partis. Mesure : **48 attaques de mots sur 150 perdaient plus de 30 ms** (jusqu'à 205 ms).
-La voix nettoyée passe maintenant par une **ligne à retard de 96 ms avant le gate** → 1
-attaque sur 150 encore concernée. S'y ajoute une **hystérésis** (ouverture 0,50 / maintien
-0,35) et une ballistique revue (attaque 5 ms, relâche 150 ms, maintien 400 ms).
-
-⚠️ **Coût explicite : le talkback porte ~96 ms de latence de plus** (canal comm uniquement —
-le monitoring instrument ne traverse JAMAIS cette chaîne). Le seuil d'ouverture reste à 0,50 :
-plus bas, la repisse d'instrument suffit à ouvrir le gate et la règle « je joue, rien ne
-sort » tombe (mesuré). La latence ajoutée est désormais **tracée au démarrage**.
-
-### Fixed — L'entrée talkback ne sature plus l'encodeur (limiteur de crête)
-
-Les logs terrain montraient `Possible clipping detected (2.619)` — **409 fois sur une journée,
-dont 193 au-dessus de 2,0**. Vérification faite dans la source de DeepFilterNet : cette valeur
-est le pic du signal **d'ENTRÉE**, pas de sortie. Autrement dit la capture livrait des crêtes à
-**+8,4 dB au-dessus du plein échelle**, avec un simple micro-casque. C'est normal et attendu :
-CoreAudio (comme WASAPI/ASIO en flottant) livre des `f32` qui ne sont pas bornés à ±1.0, et un
-micro-casque ou interne — sans aucun réglage de gain matériel — peut être amplifié par le pilote
-ou l'OS. Ces échantillons partaient tels quels dans Opus, qui les tronquait.
-
-Mesuré au passage sur prise réelle : le denoise, lui, n'ajoute que **0,1 à 0,3 dB** — il n'est
-pour rien dans le dépassement.
-
-Un **limiteur de crête à lookahead** (3 ms, plafond −1 dBFS) est désormais placé juste avant
-l'encodeur, **y compris en repli voix brute** puisque c'est l'entrée qui déborde. Sous le
-plafond, le gain vaut exactement 1.0 : le signal n'est pas touché (ce n'est pas un compresseur).
-La réduction appliquée est tracée — l'UI l'affichera.
-
-### Fixed — Le début du talkback n'est plus perdu à l'activation
-
-Le tap voix était greffé **avant** que les modèles d'isolation soient chargés (~260 ms) : la
-capture poussait déjà des blocs, la file débordait, et la **première demi-seconde de talkback
-partait en silence** (constaté dans les logs terrain grâce à la trace ci-dessous). Le thread
-voix signale désormais qu'il est **prêt à consommer** — modèles chargés et rodés — et le tap
-n'est greffé qu'à ce moment. Si le thread meurt avant d'être prêt, l'activation échoue avec une
-erreur explicite au lieu d'un talkback muet.
-
-### Changed
-- Le tap voix ne jette plus de blocs **silencieusement** quand le thread voix est en retard :
-  saturation tracée (échantillonnée). Ce thread fait tourner deux réseaux depuis la 0.5.13-1.
-- `VoiceIsolator::new` fait un **tour de rodage** : `tract` alloue ses tampons à la première
-  inférence, ce coût ne doit pas tomber sur le premier bloc de voix réel.
-
-## [0.5.13-1] — 2026-09-03 (pré-release)
-
-**Isolation de voix talkback (BÊTA, opt-in)** : sur le canal talkback, la voix est
-isolée et la repisse d'instrument enlevée ; hors parole, le talkback est **coupé**
-(silence total). 100 % **on-device**, pur Rust, **gratuit** (DeepFilterNet + Silero
-VAD, exécutés via `tract`). N'affecte **jamais** le monitoring instrument temps réel.
-
-- Cette pré-release est là pour **tester la fonction** en conditions réelles (idéalement
-  2 machines : l'une joue/parle, l'autre écoute le talkback). L'isolation est **active en
-  permanence** (le bouton on/off et le voyant arrivent ensuite) et ajoute ~30 ms de latence
-  **au talkback uniquement** (canal comm).
-- **Repli sûr** : si les modèles ne chargent pas, le talkback continue en **voix brute**
-  (jamais coupé).
+Une version dominée par un sujet : **le talkback**. Il devient utilisable comme
+un vrai canal de parole, et non plus comme un micro qu'on ouvre en croisant les
+doigts. S'y ajoutent un correctif de fond sur la veille Windows et une série de
+défauts silencieux corrigés.
 
 ### Ajouté
-- Sous-système `voice_isolation` (`jamodio-audio-core`) : denoise (DeepFilterNet) + VAD
-  (Silero) + gate + resampler, pur Rust via `tract`, embarqué (aucune dépendance native).
-- Champs `stream-levels` : `voiceOnAir` (voyant « à l'antenne ») et `isolationActive`
-  (isolation active / repli), pour l'UI web à venir.
-- `THIRD-PARTY-LICENSES.md` : crédits DeepFilterNet (MIT/Apache-2.0) + Silero VAD (MIT).
+
+- **Filtre antibruit sur le talkback.** La voix est isolée du reste — instrument,
+  ampli, clavier, bruit de pièce — avant d'être envoyée. Jouer sans parler n'envoie
+  plus rien. Traitement 100 % local, aucun envoi vers un service tiers.
+  Repli sûr : si les modèles ne chargent pas, le talkback continue en **voix brute**
+  et le studio l'affiche — jamais de dégradation muette.
+- **Micro talkback séparé de l'interface instrument.** Un micro-casque, le micro
+  interne, une seconde carte : le talkback ouvre son propre flux. Indispensable
+  quand l'interface n'a pas d'entrée libre. Rééchantillonnage automatique des micros
+  qui ne tournent pas à 48 kHz (44,1 / 16 kHz).
+- **LIVE / PRIVÉ sur la tranche instrument.** S'entendre sans que les autres
+  entendent — pour s'accorder, chercher un son, se chauffer. Une tranche en PRIVÉ
+  n'est pas enregistrée non plus.
+- **Voyant « à l'antenne »** sur la tranche talkback : on voit quand sa voix part.
+- **Le micro et le canal captés** s'affichent dans la fenêtre de l'agent, côté
+  instrument comme côté talkback.
+- **Installeur Windows en français et en anglais**, servi selon la langue de l'app.
+- **Bouton Licences** : la liste des composants tiers s'ouvre dans le lecteur de
+  texte du système.
+
+### Corrigé
+
+- **La veille moderne de Windows (S0ix) laissait l'audio cassé au réveil.** Le
+  système ne signale pas ce type de veille comme un réveil : l'agent ne
+  réinitialisait donc rien et le pilote ressortait dégradé — il fallait relancer.
+  L'état de l'écran sert maintenant de signal, et l'audio revient seul.
+- **Des commandes pouvaient être perdues sans erreur.** Une trentaine d'entre
+  elles — volumes, panoramiques, armement d'enregistrement, grille du métronome,
+  transport du backing, et **le mute du micro** — étaient abandonnées en silence
+  quand l'agent était sollicité. Elles ne peuvent plus l'être.
+- **Le talkback partait saturé.** Un micro-casque dépasse facilement le plein
+  échelle : un limiteur de crête protège désormais l'encodeur.
+- **Le début des mots était rogné**, et le début du talkback perdu à son activation.
+- **Le VU du talkback ne bougeait plus** quand on parlait.
+- **Trois chiffres de la fenêtre disaient autre chose que leur libellé** : la marge
+  anti-gigue était présentée comme la gigue réseau, les flux étaient comptés comme
+  des musiciens, et le buffer carte pouvait afficher une estimation de repli.
+- **Les logs étaient inexploitables.** Le moteur d'inférence écrivait 124 lignes par
+  seconde et remplissait 99 % de l'export support : les lignes utiles étaient
+  évincées, et un rapport de bug ne prouvait plus rien. Le bruit tiers est écarté.
+- **La fenêtre Licences figeait l'agent sur Windows** (il fallait le tuer).
+- Le talkback pouvait rester dans un état fantôme après l'échec d'ouverture d'un
+  micro, et le débruiteur créait des trous silencieux avec certains pilotes.
+
+### Sécurité et outillage
+
+- **Garde-fou d'approvisionnement** : failles connues (RustSec) et licences des
+  dépendances vérifiées à chaque livraison et chaque semaine.
+- **La suite de tests tourne enfin en intégration continue**, sur macOS et sur
+  Windows. Elle n'était jusqu'ici exécutée qu'à la main.
+- Sur macOS **virtualisé**, le filtre antibruit est refusé avec un message explicite
+  au lieu de faire tomber l'agent (le moteur d'inférence y utilise une instruction
+  indisponible en machine virtuelle).
 
 ## [0.5.12] — 2026-09-02
 
