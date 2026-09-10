@@ -7,7 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
 use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
-use jamodio_audio_core::mixer::mixer::AudioMixer;
+use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
@@ -836,7 +836,7 @@ pub struct PipelineState {
     /// bouge que quand le gate s'ouvre, si bien qu'on ne peut plus vérifier que
     /// son micro capte quelque chose. Ce qui PART réellement est indiqué par le
     /// voyant « à l'antenne » (`voice_on_air`), pas par le vumètre.
-    pub voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    pub voice_rms: Arc<LevelMeter>,
     /// Isolation de voix (Lot 2) : état LIVE « à l'antenne » (gate ouvert) diffusé
     /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
     /// flag `voice_active` ci-dessus qui indique juste que le tap voix est monté.)
@@ -1275,7 +1275,7 @@ impl PipelineState {
             voice_ctrl_tx: None,
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
-            voice_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            voice_rms: Arc::new(LevelMeter::default()),
             voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             isolation_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
@@ -4199,7 +4199,7 @@ fn voice_encode_stage_loop(
     ssrc: u32,
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
-    voice_rms: Arc<std::sync::atomic::AtomicU32>,
+    voice_rms: Arc<LevelMeter>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
@@ -4305,13 +4305,10 @@ fn voice_encode_stage_loop(
         //        (constaté au test terrain 04/09 : « ça ne module pas quand je
         //        parle »). Le VU montre donc l'entrée ; c'est le voyant « à
         //        l'antenne » qui dit ce qui PART réellement.
-        {
-            let n = mono48.len();
-            if n > 0 {
-                let sum_sq: f32 = mono48.iter().map(|s| s * s).sum();
-                voice_rms.store((sum_sq / n as f32).sqrt().to_bits(), std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        //        Le niveau est ACCUMULÉ bloc par bloc et vidé par le sender
+        //        `stream-levels` : comme les autres mètres (cf. `LevelMeter`), il
+        //        couvre toute la fenêtre écoulée et non le seul dernier bloc.
+        voice_rms.push_mono(&mono48, 1.0);
 
         // 1-ter. Isolation de voix (AVANT le gain mute) : enlève la repisse
         //        d'instrument et coupe hors parole. En cas d'erreur d'inférence,
@@ -4394,7 +4391,7 @@ fn voice_encode_stage_loop(
         // (Le niveau du VU est mesuré en ENTRÉE, cf. étape 1-bis.)
     }
     // Voix arrêtée : VU talkback à zéro.
-    voice_rms.store(0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    voice_rms.reset();
     voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
     isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");

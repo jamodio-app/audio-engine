@@ -523,6 +523,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // Les clients internes (UI Tauri webview) bypass tout slot management.
     let mut killer_rx: Option<tokio::sync::oneshot::Receiver<&'static str>> = None;
     let mut slot_taken = false;
+    // Lot 1 (0.6.1) — les mètres VU se lisent de façon DESTRUCTIVE (cf.
+    // `LevelMeter` : une lecture rend le pic/RMS de la fenêtre écoulée PUIS
+    // remet à zéro), donc il faut UN SEUL lecteur. Ce drapeau n'arme l'émission
+    // des `stream-levels` qu'à la PROMOTION (premier BrowserMessage = client
+    // réel), exactement comme le slot ACO : une probe `agent-status.js` — qui
+    // ouvre un WS sans jamais envoyer de message — ne vole plus les fenêtres de
+    // mesure du studio (et cesse de faire fabriquer 10 messages/s pour personne).
+    let levels_armed = Arc::new(AtomicBool::new(false));
 
     tracing::info!(target: "jamodio::ws", is_internal, "client connected");
 
@@ -641,6 +649,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // Spawn periodic StreamLevels sender (every 100ms)
     let levels_pipeline = handle.pipeline.clone();
     let levels_tx = out_tx.clone();
+    let levels_armed_task = levels_armed.clone();
     let levels_task = tokio::spawn(async move {
         // SEUL le client externe (jamodio.com) reçoit les StreamLevels (VU
         // mètres). La webview interne n'a pas de VU → inutile pour elle. Son
@@ -655,12 +664,35 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // la dernière transition, comme le faisait l'ancien gate).
         let mut last_voice_on_air = false;
         let mut last_isolation_active = false;
+        // Fenêtre d'amorçage : voir plus bas.
+        let mut primed = false;
         loop {
             interval.tick().await;
+            // Tant que cette connexion ne détient pas le slot agent, on ne lit
+            // RIEN (la lecture est destructive) et on n'émet rien.
+            if !levels_armed_task.load(Ordering::Relaxed) {
+                continue;
+            }
+            if !primed {
+                // Première fenêtre après la promotion : elle couvre tout le temps
+                // écoulé depuis le dernier lecteur (potentiellement plusieurs
+                // minutes si l'agent tournait sans studio). On la jette pour ne
+                // pas afficher un pic périmé à l'entrée dans le studio.
+                primed = true;
+                let pl = levels_pipeline.lock().await;
+                pl.mixer.take_stream_levels();
+                pl.mixer.take_bus_levels();
+                pl.voice_rms.take();
+                continue;
+            }
             let pl = levels_pipeline.lock().await;
-            let (rms_data, master_mix, master_mix_peak, peer_voice_rms) = {
+            // Lecture DESTRUCTIVE des mètres (cf. `LevelMeter`) : elle rend le
+            // pic/RMS sur toute la fenêtre écoulée puis remet à zéro. D'où UN
+            // seul appel par famille — et le gate ACO ci-dessus, qui garantit un
+            // lecteur unique.
+            let (stream_data, bus) = {
                 let m = &pl.mixer;
-                (m.stream_levels(), m.master_mix_rms(), m.master_mix_peak(), m.inbound_voice_rms())
+                (m.take_stream_levels(), m.take_bus_levels())
             };
             // input_rms (instrument self post-plugin) alimente le VU d'entrée
             // browser ; midi_active (Note ON dans les ~200 dernières ms) est conservé
@@ -682,7 +714,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // Bug 2 (Lot 2) — RMS du producteur voix (talkback via agent) → VU
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
-            let voice_rms = f32::from_bits(pl.voice_rms.load(std::sync::atomic::Ordering::Relaxed));
+            // Mètre du micro talkback — lecture destructive comme les autres.
+            let voice_rms = pl.voice_rms.take().1;
             // Isolation de voix : état « à l'antenne » (gate) + isolation active/repli.
             let voice_on_air = pl.voice_on_air.load(std::sync::atomic::Ordering::Relaxed);
             let isolation_active = pl.isolation_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -694,49 +727,48 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback n'a pas d'analyser navigateur et dépend exclusivement de ce
             // push. Sans lui, parler SEUL — pas de peer, instrument silencieux —
             // n'émettait aucun StreamLevels et le VU talkback restait figé.
-            let has_self_signal = input_rms > 0.0 || midi_active || voice_rms > 0.0 || peer_voice_rms > 0.0;
+            let has_self_signal =
+                input_rms > 0.0 || midi_active || voice_rms > 0.0 || bus.peer_voice_rms > 0.0;
             // Force un push si l'isolation/le voyant a CHANGÉ d'état, même sans autre
             // signal (sinon le voyant resterait figé après la dernière transition).
             let iso_changed =
                 voice_on_air != last_voice_on_air || isolation_active != last_isolation_active;
             last_voice_on_air = voice_on_air;
             last_isolation_active = isolation_active;
-            if !rms_data.is_empty() || has_self_signal || iso_changed {
-                let mut levels: Vec<StreamLevel> = rms_data
+            if !stream_data.is_empty() || has_self_signal || iso_changed {
+                let mut levels: Vec<StreamLevel> = stream_data
                     .into_iter()
-                    .map(|(producer_id, rms, rms_l, rms_r, peak_l, peak_r)| StreamLevel {
+                    .map(|(producer_id, lv)| StreamLevel {
                         producer_id,
-                        rms,
-                        rms_l: Some(rms_l),
-                        rms_r: Some(rms_r),
-                        peak: Some(peak_l.max(peak_r)),
-                        peak_l: Some(peak_l),
-                        peak_r: Some(peak_r),
+                        rms: lv.rms,
+                        rms_l: Some(lv.rms_l),
+                        rms_r: Some(lv.rms_r),
+                        peak: Some(lv.peak_l.max(lv.peak_r)),
+                        peak_l: Some(lv.peak_l),
+                        peak_r: Some(lv.peak_r),
                     })
                     .collect();
                 // Point 3 (Lot 2) — niveaux MASTER + MIX en VRAI stéréo, mesurés
                 // sur la sortie réelle du mixer (pan + faders reflétés). Le
                 // browser les consomme pour les VU master/mix (au lieu d'un proxy
                 // mono). `rms` global = max des 2 canaux (back-compat affichage).
-                let (master_l, master_r, mix_l, mix_r) = master_mix;
-                let (master_pk_l, master_pk_r, mix_pk_l, mix_pk_r) = master_mix_peak;
                 levels.push(StreamLevel {
                     producer_id: "master".into(),
-                    rms: master_l.max(master_r),
-                    rms_l: Some(master_l),
-                    rms_r: Some(master_r),
-                    peak: Some(master_pk_l.max(master_pk_r)),
-                    peak_l: Some(master_pk_l),
-                    peak_r: Some(master_pk_r),
+                    rms: bus.master.rms_l.max(bus.master.rms_r),
+                    rms_l: Some(bus.master.rms_l),
+                    rms_r: Some(bus.master.rms_r),
+                    peak: Some(bus.master.peak_l.max(bus.master.peak_r)),
+                    peak_l: Some(bus.master.peak_l),
+                    peak_r: Some(bus.master.peak_r),
                 });
                 levels.push(StreamLevel {
                     producer_id: "mix".into(),
-                    rms: mix_l.max(mix_r),
-                    rms_l: Some(mix_l),
-                    rms_r: Some(mix_r),
-                    peak: Some(mix_pk_l.max(mix_pk_r)),
-                    peak_l: Some(mix_pk_l),
-                    peak_r: Some(mix_pk_r),
+                    rms: bus.mix.rms_l.max(bus.mix.rms_r),
+                    rms_l: Some(bus.mix.rms_l),
+                    rms_r: Some(bus.mix.rms_r),
+                    peak: Some(bus.mix.peak_l.max(bus.mix.peak_r)),
+                    peak_l: Some(bus.mix.peak_l),
+                    peak_r: Some(bus.mix.peak_r),
                 });
                 // Bug 2 — niveau du talkback agent (mono) pour le VU voix browser.
                 // Tranche VOIX : RMS uniquement (pas de pic) — mètre de comm vocale,
@@ -755,9 +787,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // Idem voix : RMS seul.
                 levels.push(StreamLevel {
                     producer_id: "peer-voice".into(),
-                    rms: peer_voice_rms,
-                    rms_l: Some(peer_voice_rms),
-                    rms_r: Some(peer_voice_rms),
+                    rms: bus.peer_voice_rms,
+                    rms_l: Some(bus.peer_voice_rms),
+                    rms_r: Some(bus.peer_voice_rms),
                     peak: None,
                     peak_l: None,
                     peak_r: None,
@@ -1479,6 +1511,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
                         if is_real_browser_msg && !slot_taken && !is_internal {
                             slot_taken = true;
+                            // Client réel promu → il devient le lecteur unique
+                            // des mètres VU (cf. `levels_armed`).
+                            levels_armed.store(true, Ordering::Relaxed);
                             let (new_killer_tx, new_killer_rx) =
                                 tokio::sync::oneshot::channel();
                             let previous = handle

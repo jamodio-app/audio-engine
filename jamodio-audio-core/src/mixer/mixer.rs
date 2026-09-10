@@ -62,6 +62,218 @@ impl AtomicF32 {
     fn store(&self, v: f32) {
         self.0.store(v.to_bits(), Ordering::Relaxed);
     }
+    /// `max` atomique — VALIDE UNIQUEMENT pour des valeurs FINIES ≥ 0 (niveaux
+    /// audio). Pour les flottants positifs, l'ordre des motifs binaires IEEE-754
+    /// est le même que l'ordre des valeurs → `fetch_max` sur les bits == max sur
+    /// les f32. Réservé aux mètres ; jamais pour un gain (signé).
+    #[inline]
+    fn fetch_max_level(&self, v: f32) {
+        debug_assert!(v.is_finite() && v >= 0.0, "fetch_max_level attend un niveau fini ≥ 0");
+        self.0.fetch_max(v.to_bits(), Ordering::Relaxed);
+    }
+    /// Addition atomique (boucle CAS). Un seul écrivain (le thread audio) face à
+    /// un lecteur qui remet à zéro → la boucle aboutit au premier tour en régime.
+    #[inline]
+    fn fetch_add_level(&self, v: f32) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                Some((f32::from_bits(bits) + v).to_bits())
+            });
+    }
+    /// Lecture DESTRUCTIVE : rend la valeur courante et remet `v` à la place.
+    #[inline]
+    fn swap(&self, v: f32) -> f32 {
+        f32::from_bits(self.0.swap(v.to_bits(), Ordering::Relaxed))
+    }
+}
+
+impl Default for AtomicF32 {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
+/// Mètre de niveau d'un canal — mesure sur la fenêtre d'observation COMPLÈTE.
+///
+/// **Lot 1 (0.6.1) — racine du VU « nerveux ».** Les niveaux étaient ÉCRASÉS à
+/// chaque bloc (`store`) et lus toutes les 100 ms par le sender `stream-levels` :
+/// le browser ne voyait que le pic d'UN bloc de 2,5 ms sur 100 ms, soit **2,5 %
+/// de l'audio**. Conséquences mesurées : niveau sous-estimé de 1 à 5 dB,
+/// transitoires ratés, voyant CLIP aveugle, et une barre qui sautait deux fois
+/// plus que le signal réel (13,1 dB d'écart-type de saut contre 6,6 dB).
+///
+/// Ici on ACCUMULE bloc par bloc (pic = max, RMS = somme des carrés + nombre
+/// d'échantillons) ; `take()` rend le pic et le RMS sur TOUTE la fenêtre écoulée
+/// puis remet à zéro. La fenêtre est donc exactement l'intervalle entre deux
+/// lectures : aucun échantillon ignoré, aucun compté deux fois, et la cadence du
+/// sender peut changer sans retoucher la mesure.
+///
+/// ⚠️ `take()` est DESTRUCTIF → **un seul lecteur**. Garanti côté `ws_server` :
+/// seule la connexion qui détient le slot agent (ACO) lit les niveaux.
+///
+/// Coût côté audio : 3 RMW atomiques par bloc sur des sommes déjà calculées, et
+/// UNE passe sur le buffer au lieu de deux (`stereo_rms` + `stereo_peak`) →
+/// strictement moins de travail qu'avant dans le callback temps-réel.
+#[derive(Debug, Default)]
+pub struct LevelMeter {
+    peak: AtomicF32,
+    sum_sq: AtomicF32,
+    samples: AtomicU32,
+}
+
+impl LevelMeter {
+    /// Ajoute la mesure d'un bloc. `peak` = |max| du bloc, `sum_sq` = somme des
+    /// carrés, `samples` = nombre d'échantillons sommés.
+    ///
+    /// Un niveau non fini (NaN/inf sorti d'un plugin) est neutralisé à 0 : sans
+    /// ça, `fetch_max` verrouillerait le mètre sur NaN et la barre du browser
+    /// deviendrait illisible. L'audio, lui, est protégé par le soft-clip.
+    #[inline]
+    pub fn push_block(&self, peak: f32, sum_sq: f32, samples: usize) {
+        if samples == 0 {
+            return;
+        }
+        let (peak, sum_sq) = if peak.is_finite() && sum_sq.is_finite() {
+            (peak, sum_sq)
+        } else {
+            (0.0, 0.0)
+        };
+        self.peak.fetch_max_level(peak);
+        self.sum_sq.fetch_add_level(sum_sq);
+        self.samples
+            .fetch_add(samples as u32, Ordering::Relaxed);
+    }
+
+    /// Pic échantillon + RMS sur la fenêtre écoulée, PUIS remise à zéro.
+    /// `(0.0, 0.0)` si aucun échantillon n'a été poussé depuis la dernière
+    /// lecture (flux muet ou arrêté) — le VU retombe au lieu de rester figé.
+    pub fn take(&self) -> (f32, f32) {
+        let samples = self.samples.swap(0, Ordering::Relaxed);
+        let sum_sq = self.sum_sq.swap(0.0);
+        let peak = self.peak.swap(0.0);
+        if samples == 0 {
+            return (0.0, 0.0);
+        }
+        (peak, (sum_sq / samples as f32).sqrt())
+    }
+
+    /// Vide le mètre sans rien rendre — pour une source qui s'arrête (le VU doit
+    /// retomber immédiatement, pas afficher le reliquat de la dernière fenêtre).
+    pub fn reset(&self) {
+        self.samples.store(0, Ordering::Relaxed);
+        self.sum_sq.store(0.0);
+        self.peak.store(0.0);
+    }
+
+    /// Mesure un bloc MONO : calcule pic et somme des carrés en une passe.
+    /// `gain` s'applique aux niveaux (pas au signal).
+    #[inline]
+    pub fn push_mono(&self, buf: &[f32], gain: f32) {
+        if buf.is_empty() {
+            return;
+        }
+        let mut peak = 0.0f32;
+        let mut sum_sq = 0.0f32;
+        for s in buf {
+            peak = peak.max(s.abs());
+            sum_sq += s * s;
+        }
+        self.push_block(peak * gain, sum_sq * gain * gain, buf.len());
+    }
+}
+
+/// Niveaux L/R d'une tranche sur la fenêtre écoulée (cf. [`LevelMeter`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct StereoLevels {
+    pub peak_l: f32,
+    pub peak_r: f32,
+    pub rms_l: f32,
+    pub rms_r: f32,
+    /// RMS global (L et R confondus) — sert le prédicat « ça module » du browser.
+    pub rms: f32,
+}
+
+impl StereoLevels {
+    /// Applique la loi de balance aux niveaux (VU POST-pan, cf. [`pan_gains`]).
+    fn panned(self, pan: f32) -> Self {
+        let (gl, gr) = pan_gains(pan);
+        Self {
+            peak_l: self.peak_l * gl,
+            peak_r: self.peak_r * gr,
+            rms_l: self.rms_l * gl,
+            rms_r: self.rms_r * gr,
+            rms: self.rms,
+        }
+    }
+}
+
+/// Niveaux des bus rendus en un seul appel par [`AudioMixer::take_bus_levels`].
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct BusLevels {
+    /// Sortie finale (post dim/master/clamp) = ce que l'utilisateur entend.
+    pub master: StereoLevels,
+    /// Tap MIX REC = instruments ARMÉS post-fader, pré-dim/master.
+    pub mix: StereoLevels,
+    /// Voix des pairs mixée, post gain de bus (mono).
+    pub peer_voice_rms: f32,
+}
+
+/// Paire de mètres L/R alimentée par un buffer stéréo entrelacé.
+#[derive(Debug, Default)]
+struct StereoLevelMeter {
+    l: LevelMeter,
+    r: LevelMeter,
+}
+
+impl StereoLevelMeter {
+    /// Mesure un bloc stéréo entrelacé (L,R,L,R…) en UNE passe. Longueur impaire
+    /// (cas dégénéré) → mesure globale recopiée sur les deux canaux, comme avant.
+    #[inline]
+    fn push_interleaved(&self, buf: &[f32]) {
+        if buf.is_empty() {
+            return;
+        }
+        if buf.len() >= 2 && buf.len().is_multiple_of(2) {
+            let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
+            let (mut sq_l, mut sq_r) = (0.0f32, 0.0f32);
+            for pair in buf.as_chunks::<2>().0 {
+                pk_l = pk_l.max(pair[0].abs());
+                pk_r = pk_r.max(pair[1].abs());
+                sq_l += pair[0] * pair[0];
+                sq_r += pair[1] * pair[1];
+            }
+            let frames = buf.len() / 2;
+            self.l.push_block(pk_l, sq_l, frames);
+            self.r.push_block(pk_r, sq_r, frames);
+        } else {
+            let mut pk = 0.0f32;
+            let mut sq = 0.0f32;
+            for s in buf {
+                pk = pk.max(s.abs());
+                sq += s * s;
+            }
+            self.l.push_block(pk, sq, buf.len());
+            self.r.push_block(pk, sq, buf.len());
+        }
+    }
+
+    /// Niveaux L/R + RMS global sur la fenêtre écoulée, PUIS remise à zéro.
+    fn take(&self) -> StereoLevels {
+        let (peak_l, rms_l) = self.l.take();
+        let (peak_r, rms_r) = self.r.take();
+        // RMS global = RMS sur L+R réunis = moyenne quadratique des deux canaux
+        // (même nombre d'échantillons de chaque côté) — identique à la formule
+        // historique `sqrt(somme des carrés / n)` sur le buffer entrelacé.
+        let rms = ((rms_l * rms_l + rms_r * rms_r) / 2.0).sqrt();
+        StereoLevels {
+            peak_l,
+            peak_r,
+            rms_l,
+            rms_r,
+            rms,
+        }
+    }
 }
 
 /// Loi de balance stéréo LINÉAIRE (0 dB au centre), source unique partagée par
@@ -75,32 +287,6 @@ fn pan_gains(pan: f32) -> (f32, f32) {
     } else {
         ((1.0 - pan).min(1.0), (1.0 + pan).min(1.0))
     }
-}
-
-/// RMS par canal d'un buffer stéréo entrelacé (L,R,L,R…). `(0,0)` si vide.
-fn stereo_rms(buf: &[f32]) -> (f32, f32) {
-    let frames = buf.len() / 2;
-    if frames == 0 {
-        return (0.0, 0.0);
-    }
-    let (mut sq_l, mut sq_r) = (0.0f32, 0.0f32);
-    for pair in buf.as_chunks::<2>().0 {
-        sq_l += pair[0] * pair[0];
-        sq_r += pair[1] * pair[1];
-    }
-    ((sq_l / frames as f32).sqrt(), (sq_r / frames as f32).sqrt())
-}
-
-/// Pic échantillon (|max|) par canal d'un buffer stéréo entrelacé. `(0,0)` si
-/// vide. Alimente le VRAI peak-mètre DAW côté browser (mètres instrument/mix/
-/// master) — capte les transitoires que le RMS lisse.
-fn stereo_peak(buf: &[f32]) -> (f32, f32) {
-    let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
-    for pair in buf.as_chunks::<2>().0 {
-        pk_l = pk_l.max(pair[0].abs());
-        pk_r = pk_r.max(pair[1].abs());
-    }
-    (pk_l, pk_r)
 }
 
 /// C2.1 — cellule d'un flux : le `JitterBuffer` sous son PROPRE `Mutex` (verrou
@@ -128,13 +314,11 @@ struct StreamCell {
     /// `mix_buf` (tap fichier enregistré + VU MIX REC) ; `false` = exclu du MIX
     /// mais TOUJOURS dans le monitoring (`output`/MASTER). Défaut `false`.
     mix_armed: AtomicBool,
-    /// VU par flux (pré-pan) — ÉCRITS par `push_samples` (thread décode), LUS par
-    /// `stream_levels` (thread WS). Atomiques → lock-free des deux côtés.
-    rms: AtomicF32,
-    rms_l: AtomicF32,
-    rms_r: AtomicF32,
-    peak_l: AtomicF32,
-    peak_r: AtomicF32,
+    /// VU du flux (pré-pan) — ALIMENTÉ bloc par bloc par `push_samples` (thread
+    /// décode), VIDÉ par `take_stream_levels` (thread WS). Lock-free des deux
+    /// côtés. Cf. [`LevelMeter`] : la mesure porte sur toute la fenêtre entre
+    /// deux lectures, pas sur le dernier bloc poussé.
+    meter: StereoLevelMeter,
     /// Compteurs de logging overflow (côté push, écrivain unique = thread décode).
     last_overflow_drops: AtomicU64,
     buffer_full_count: AtomicU64,
@@ -183,11 +367,7 @@ impl StreamCell {
             volume: AtomicF32::new(volume),
             pan: AtomicF32::new(0.0),
             mix_armed: AtomicBool::new(false),
-            rms: AtomicF32::new(0.0),
-            rms_l: AtomicF32::new(0.0),
-            rms_r: AtomicF32::new(0.0),
-            peak_l: AtomicF32::new(0.0),
-            peak_r: AtomicF32::new(0.0),
+            meter: StereoLevelMeter::default(),
             last_overflow_drops: AtomicU64::new(0),
             buffer_full_count: AtomicU64::new(0),
             last_drift_drops: AtomicU64::new(0),
@@ -281,27 +461,21 @@ pub struct AudioMixer {
     /// par le callback (`advance_and_generate`) et le thread WS (config/backing/
     /// preview) — pas par le décodage, donc hors du chemin de contention corrigé.
     reference: Mutex<ReferenceSource>,
-    /// Point 3 (Lot 2) — RMS L/R du VRAI mix, mesuré dans `mix_into` sur la
-    /// sortie réelle → le VU MASTER/MIX du browser reflète pan + faders. Écrits
-    /// par le callback, lus par le sender `stream-levels` (100 ms) → atomiques.
-    /// `master_*` = sortie finale (post dim/master/clamp) ; `mix_*` = tap MIX
-    /// post-fader (pré-dim/master, parité browser `instrumentMixBus`).
-    master_rms_l: AtomicF32,
-    master_rms_r: AtomicF32,
-    mix_rms_l: AtomicF32,
-    mix_rms_r: AtomicF32,
-    /// Pic échantillon L/R du MASTER (sortie finale) et du MIX (tap post-fader).
-    master_peak_l: AtomicF32,
-    master_peak_r: AtomicF32,
-    mix_peak_l: AtomicF32,
-    mix_peak_r: AtomicF32,
+    /// Point 3 (Lot 2) — niveaux L/R du VRAI mix, mesurés dans `mix_into` sur la
+    /// sortie réelle → le VU MASTER/MIX du browser reflète pan + faders. Remplis
+    /// par le callback bloc par bloc, vidés par le sender `stream-levels`.
+    /// `master_meter` = sortie finale (post dim/master/clamp) ; `mix_meter` = tap
+    /// MIX post-fader (pré-dim/master, parité browser `instrumentMixBus`).
+    master_meter: StereoLevelMeter,
+    mix_meter: StereoLevelMeter,
     /// Gain/pan du BUS voix (une seule tranche, parité `voiceGain`/`voicePanNode`
     /// navigateur). Le mute est porté par le gain (le web envoie 0.0). Défaut 1.0/0.0.
     voice_gain: AtomicF32,
     voice_pan: AtomicF32,
-    /// RMS (mono) de la voix des pairs effectivement mixée (post gain de bus) —
-    /// remonté via `stream-levels` pour le VU voix navigateur en mode agent.
-    inbound_voice_rms: AtomicF32,
+    /// Niveau (mono) de la voix des pairs effectivement mixée (post gain de bus)
+    /// — remonté via `stream-levels` pour le VU voix navigateur en mode agent.
+    /// Mesuré sur les deux canaux de `voice_buf` réunis.
+    inbound_voice_meter: LevelMeter,
 }
 
 impl Default for AudioMixer {
@@ -323,42 +497,27 @@ impl AudioMixer {
             master_gain: AtomicF32::new(1.0),
             dim_factor: AtomicF32::new(1.0),
             reference: Mutex::new(ReferenceSource::new()),
-            master_rms_l: AtomicF32::new(0.0),
-            master_rms_r: AtomicF32::new(0.0),
-            mix_rms_l: AtomicF32::new(0.0),
-            mix_rms_r: AtomicF32::new(0.0),
-            master_peak_l: AtomicF32::new(0.0),
-            master_peak_r: AtomicF32::new(0.0),
-            mix_peak_l: AtomicF32::new(0.0),
-            mix_peak_r: AtomicF32::new(0.0),
+            master_meter: StereoLevelMeter::default(),
+            mix_meter: StereoLevelMeter::default(),
             voice_gain: AtomicF32::new(1.0),
             voice_pan: AtomicF32::new(0.0),
-            inbound_voice_rms: AtomicF32::new(0.0),
+            inbound_voice_meter: LevelMeter::default(),
         }
     }
 
-    /// Point 3 (Lot 2) — RMS L/R du MASTER (sortie finale) et du MIX (tap
-    /// post-fader), mesurés au dernier `mix_into`. `(master_l, master_r,
-    /// mix_l, mix_r)`. Lus par le sender `stream-levels` → VU MASTER/MIX
-    /// stéréo réels côté browser (pan + faders visibles).
-    pub fn master_mix_rms(&self) -> (f32, f32, f32, f32) {
-        (
-            self.master_rms_l.load(),
-            self.master_rms_r.load(),
-            self.mix_rms_l.load(),
-            self.mix_rms_r.load(),
-        )
-    }
-
-    /// Pic échantillon L/R du MASTER et du MIX (parité `master_mix_rms`, pour le
-    /// peak-mètre DAW). `(master_peak_l, master_peak_r, mix_peak_l, mix_peak_r)`.
-    pub fn master_mix_peak(&self) -> (f32, f32, f32, f32) {
-        (
-            self.master_peak_l.load(),
-            self.master_peak_r.load(),
-            self.mix_peak_l.load(),
-            self.mix_peak_r.load(),
-        )
+    /// Niveaux des BUS (MASTER, MIX REC, voix des pairs) sur la fenêtre écoulée,
+    /// PUIS remise à zéro des mètres — cf. [`LevelMeter`].
+    ///
+    /// Un seul appel pour les trois : la lecture étant destructive, les séparer
+    /// ferait rendre des zéros au deuxième appelant. `master` = sortie finale
+    /// (post dim/master/clamp) ; `mix` = tap MIX post-fader ; `peer_voice_rms` =
+    /// voix des pairs post gain de bus.
+    pub fn take_bus_levels(&self) -> BusLevels {
+        BusLevels {
+            master: self.master_meter.take(),
+            mix: self.mix_meter.take(),
+            peer_voice_rms: self.inbound_voice_meter.take().1,
+        }
     }
 
     /// DIM factor (= ducking des instruments quand le user veut entendre
@@ -438,12 +597,6 @@ impl AudioMixer {
     pub fn set_peer_voice_pan(&self, pan: f32) {
         self.voice_pan
             .store(if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 });
-    }
-
-    /// Lot C — RMS mono de la voix des pairs effectivement mixée (post gain de
-    /// bus), pour le VU voix navigateur en mode agent. `0.0` si aucune voix.
-    pub fn inbound_voice_rms(&self) -> f32 {
-        self.inbound_voice_rms.load()
     }
 
     /// Helper interne : try_send vers le record thread sans bloquer.
@@ -747,39 +900,12 @@ impl AudioMixer {
             return;
         };
 
-        // Compute RMS of pushed samples (global + par canal L/R) — hors lock
-        // (ne lit que `samples`). Posé dans les atomiques de la cellule.
-        if !samples.is_empty() {
-            let n = samples.len();
-            let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-            let rms = (sum_sq / n as f32).sqrt();
-            cell.rms.store(rms);
-            // Pic global (|max|) — fallback pour le cas dégénéré mono.
-            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-            // L = samples pairs, R = samples impairs (entrelacé stéréo). Si
-            // longueur impaire (cas dégénéré), on retombe sur le global.
-            if n >= 2 && n.is_multiple_of(2) {
-                let half = (n / 2) as f32;
-                let mut sq_l = 0.0f32;
-                let mut sq_r = 0.0f32;
-                let (mut pk_l, mut pk_r) = (0.0f32, 0.0f32);
-                for pair in samples.as_chunks::<2>().0 {
-                    sq_l += pair[0] * pair[0];
-                    sq_r += pair[1] * pair[1];
-                    pk_l = pk_l.max(pair[0].abs());
-                    pk_r = pk_r.max(pair[1].abs());
-                }
-                cell.rms_l.store((sq_l / half).sqrt());
-                cell.rms_r.store((sq_r / half).sqrt());
-                cell.peak_l.store(pk_l);
-                cell.peak_r.store(pk_r);
-            } else {
-                cell.rms_l.store(rms);
-                cell.rms_r.store(rms);
-                cell.peak_l.store(peak);
-                cell.peak_r.store(peak);
-            }
-        }
+        // VU du flux — hors lock (ne lit que `samples`), une seule passe.
+        // ACCUMULE dans le mètre de la cellule : le sender `stream-levels` lira
+        // le pic et le RMS sur toute la fenêtre écoulée, pas sur ce seul bloc
+        // (cf. [`LevelMeter`] — sans ça, 97,5 % des échantillons ne seraient
+        // jamais regardés).
+        cell.meter.push_interleaved(samples);
 
         // Verrou COURT de la cellule : push + lecture du compteur d'overflow.
         let new_drops = {
@@ -932,14 +1058,9 @@ impl AudioMixer {
             self.record_send(RecordCmd::PushMix(mix_buf.clone()));
         }
 
-        // Point 3/4 — RMS + pic L/R du MIX REC (instruments ARMÉS post-fader,
-        // pré-dim/master) pour le VU MIX REC stéréo.
-        let (mix_l, mix_r) = stereo_rms(mix_buf);
-        self.mix_rms_l.store(mix_l);
-        self.mix_rms_r.store(mix_r);
-        let (mix_pk_l, mix_pk_r) = stereo_peak(mix_buf);
-        self.mix_peak_l.store(mix_pk_l);
-        self.mix_peak_r.store(mix_pk_r);
+        // Point 3/4 — niveaux L/R du MIX REC (instruments ARMÉS post-fader,
+        // pré-dim/master) pour le VU MIX REC stéréo. Une passe, accumulée.
+        self.mix_meter.push_interleaved(mix_buf);
 
         // DIM factor — atténue les instruments quand l'user veut entendre le
         // talkback clairement. Skip si == 1.0 (cas par défaut majoritaire).
@@ -953,7 +1074,7 @@ impl AudioMixer {
         // Lot C — VOIX des pairs (talkback). Sommée ICI, exactement comme la
         // référence : APRÈS le tap RECORD (⇒ jamais enregistrée) et APRÈS le DIM
         // (⇒ jamais duckée), AVANT le master. Gain/pan de BUS unique (parité
-        // voiceGain/voicePanNode navigateur). Le VU voix lit `inbound_voice_rms`.
+        // voiceGain/voicePanNode navigateur). Le VU voix lit `inbound_voice_meter`.
         let voice_gain = self.voice_gain.load();
         if any_voice && voice_gain > f32::EPSILON {
             let (gl, gr) = pan_gains(self.voice_pan.load());
@@ -965,19 +1086,20 @@ impl AudioMixer {
                 output[i + 1] += voice_buf[i + 1] * gain_r;
                 i += 2;
             }
-            // RMS scalaire agrégé sur L+R, post-gain de bus (avant pan), pour le VU
-            // voix navigateur.
-            let frames = voice_buf.len() / 2;
-            if frames > 0 {
-                let sum_sq: f32 = voice_buf.iter().map(|s| s * s).sum();
-                self.inbound_voice_rms
-                    .store((sum_sq / voice_buf.len() as f32).sqrt() * voice_gain);
-            } else {
-                self.inbound_voice_rms.store(0.0);
+            // Niveau scalaire agrégé sur L+R, post-gain de bus (avant pan), pour
+            // le VU voix navigateur. Accumulé : voir [`LevelMeter`].
+            let mut sum_sq = 0.0f32;
+            let mut peak = 0.0f32;
+            for s in voice_buf.iter() {
+                sum_sq += s * s;
+                peak = peak.max(s.abs());
             }
-        } else {
-            self.inbound_voice_rms.store(0.0);
+            let g = voice_gain;
+            self.inbound_voice_meter
+                .push_block(peak * g, sum_sq * g * g, voice_buf.len());
         }
+        // Pas de voix ce bloc → rien à accumuler : le mètre retombera de lui-même
+        // à la prochaine lecture (compteur d'échantillons à zéro).
 
         // Référence (métronome via l'agent — Option B). Ajoutée ICI, à un point
         // DÉDIÉ hors de la boucle streams :
@@ -1002,14 +1124,9 @@ impl AudioMixer {
             *sample = sample.clamp(-1.0, 1.0);
         }
 
-        // Point 3 — RMS L/R du MASTER (sortie finale = ce que l'utilisateur
+        // Point 3 — niveaux L/R du MASTER (sortie finale = ce que l'utilisateur
         // entend, post dim/master/clamp) pour le VU MASTER stéréo.
-        let (master_l, master_r) = stereo_rms(output);
-        self.master_rms_l.store(master_l);
-        self.master_rms_r.store(master_r);
-        let (master_pk_l, master_pk_r) = stereo_peak(output);
-        self.master_peak_l.store(master_pk_l);
-        self.master_peak_r.store(master_pk_r);
+        self.master_meter.push_interleaved(output);
 
         // Report drift drains (rate-limité à puissances de 2). Coût formatage
         // négligeable hors événement. Itère le snapshot déjà cloné (pas de re-lock
@@ -1017,27 +1134,19 @@ impl AudioMixer {
         report_drift_drops(snapshot);
     }
 
-    /// Niveaux par stream pour les VU du browser.
-    /// Retourne `(producer_id, rms_global, rms_l, rms_r, peak_l, peak_r)` par
-    /// stream (RMS + pic échantillon, tous POST-pan). Lot C : les flux VOIX sont
-    /// EXCLUS (agrégat unique via `inbound_voice_rms()`).
-    pub fn stream_levels(&self) -> Vec<(String, f32, f32, f32, f32, f32)> {
+    /// Niveaux par stream pour les VU du browser, sur la fenêtre écoulée, PUIS
+    /// remise à zéro des mètres — cf. [`LevelMeter`] (lecture DESTRUCTIVE, un
+    /// seul lecteur). Lot C : les flux VOIX sont EXCLUS (agrégat unique via
+    /// `take_bus_levels().peer_voice_rms`).
+    pub fn take_stream_levels(&self) -> Vec<(String, StereoLevels)> {
         let map = self.streams.read();
         map.values()
             .filter(|cell| cell.kind != StreamKind::Voice)
             .map(|cell| {
                 // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
-                // aux niveaux L/R (stockés pré-pan) → le VU reflète le placement
+                // aux niveaux L/R (mesurés pré-pan) → le VU reflète le placement
                 // stéréo exactement comme le rendu.
-                let (gl, gr) = pan_gains(cell.pan.load());
-                (
-                    cell.id.clone(),
-                    cell.rms.load(),
-                    cell.rms_l.load() * gl,
-                    cell.rms_r.load() * gr,
-                    cell.peak_l.load() * gl,
-                    cell.peak_r.load() * gr,
-                )
+                (cell.id.clone(), cell.meter.take().panned(cell.pan.load()))
             })
             .collect()
     }
@@ -1210,6 +1319,107 @@ fn report_drift_drops(snapshot: &[Arc<StreamCell>]) {
 mod tests {
     use super::*;
 
+    /// Niveaux d'un stream — lecture DESTRUCTIVE (cf. [`LevelMeter`]) : chaque
+    /// appel vide le mètre, il faut re-pousser des échantillons entre deux
+    /// lectures. Les tests le font explicitement.
+    fn take_stream(m: &AudioMixer, id: &str) -> StereoLevels {
+        m.take_stream_levels()
+            .into_iter()
+            .find(|(pid, _)| pid == id)
+            .unwrap_or_else(|| panic!("stream {id} absent"))
+            .1
+    }
+
+    /// `(master_l, master_r, mix_l, mix_r)` en RMS — DESTRUCTIF comme ci-dessus.
+    fn master_mix_rms(m: &AudioMixer) -> (f32, f32, f32, f32) {
+        let b = m.take_bus_levels();
+        (b.master.rms_l, b.master.rms_r, b.mix.rms_l, b.mix.rms_r)
+    }
+
+    /// **Lot 1 — non-régression du VU « nerveux ».** Le transitoire est dans le
+    /// PREMIER bloc de la fenêtre, suivi de 39 blocs faibles (= ce que le sender
+    /// voyait avant : seulement le dernier bloc). Le mètre doit rendre le pic de
+    /// TOUTE la fenêtre, pas celui du dernier bloc.
+    #[test]
+    fn le_pic_dune_fenetre_survit_aux_blocs_suivants() {
+        let m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        // Bloc 1 : transitoire pleine échelle. Blocs 2..40 : signal faible.
+        m.push_samples("p1", &vec![1.0f32; 240]);
+        for _ in 0..39 {
+            m.push_samples("p1", &vec![0.01f32; 240]);
+        }
+        let lv = take_stream(&m, "p1");
+        assert!(
+            (lv.peak_l - 1.0).abs() < 1e-4,
+            "le pic du 1er bloc doit survivre à toute la fenêtre, got {}",
+            lv.peak_l
+        );
+        // Le RMS, lui, moyenne bien TOUTE la fenêtre : 1 bloc plein sur 40.
+        let attendu = (1.0f32 / 40.0).sqrt();
+        assert!(
+            (lv.rms_l - attendu).abs() < 1e-3,
+            "rms sur la fenêtre entière ≈ {attendu}, got {}",
+            lv.rms_l
+        );
+    }
+
+    /// La lecture est destructive : une 2ᵉ lecture sans nouveau bloc rend 0
+    /// (le VU retombe au lieu de rester figé sur la dernière valeur).
+    #[test]
+    fn la_lecture_vide_le_metre() {
+        let m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        m.push_samples("p1", &vec![0.5f32; 240]);
+        let first = take_stream(&m, "p1");
+        assert!(first.peak_l > 0.4, "1re lecture : niveau présent");
+        let second = take_stream(&m, "p1");
+        assert_eq!(second, StereoLevels::default(), "2e lecture sans push : tout à zéro");
+    }
+
+    /// MASTER/MIX : même garantie de fenêtre côté bus. Un transitoire au 1er
+    /// bloc de `mix_into` doit ressortir après 39 blocs faibles.
+    #[test]
+    fn le_pic_master_survit_a_la_fenetre() {
+        let m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        m.set_volume("p1", 1.0);
+        m.set_record_arm(false, &["p1".to_string()]);
+        m.push_samples("p1", &vec![1.0f32; 240]);
+        let mut out = vec![0.0f32; 240];
+        m.mix_into(&mut out);
+        for _ in 0..39 {
+            m.push_samples("p1", &vec![0.001f32; 240]);
+            out.iter_mut().for_each(|s| *s = 0.0);
+            m.mix_into(&mut out);
+        }
+        let bus = m.take_bus_levels();
+        assert!(
+            bus.master.peak_l > 0.9,
+            "pic MASTER de la fenêtre conservé, got {}",
+            bus.master.peak_l
+        );
+        assert!(
+            bus.mix.peak_l > 0.9,
+            "pic MIX de la fenêtre conservé, got {}",
+            bus.mix.peak_l
+        );
+    }
+
+    /// Un niveau non fini (plugin qui sort du NaN) ne doit PAS verrouiller le
+    /// mètre : sans neutralisation, `fetch_max` garderait NaN et la barre du
+    /// browser deviendrait illisible.
+    #[test]
+    fn un_bloc_non_fini_ne_verrouille_pas_le_metre() {
+        let m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        m.push_samples("p1", &vec![f32::NAN; 240]);
+        m.push_samples("p1", &vec![0.5f32; 240]);
+        let lv = take_stream(&m, "p1");
+        assert!(lv.peak_l.is_finite() && lv.rms_l.is_finite(), "niveaux finis");
+        assert!((lv.peak_l - 0.5).abs() < 1e-4, "le bloc sain reste mesuré, got {}", lv.peak_l);
+    }
+
     #[test]
     fn rms_par_canal_l_r_independants() {
         let m = AudioMixer::new();
@@ -1218,11 +1428,11 @@ mod tests {
         let mut s = Vec::new();
         for _ in 0..100 { s.push(1.0); s.push(0.0); }
         m.push_samples("p1", &s);
-        let (_, rms, rms_l, rms_r, _, _) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
-        assert!((rms_l - 1.0).abs() < 1e-4, "rms_l ≈ 1 (canal gauche plein)");
-        assert!(rms_r.abs() < 1e-4, "rms_r ≈ 0 (canal droit silencieux)");
+        let lv = take_stream(&m, "p1");
+        assert!((lv.rms_l - 1.0).abs() < 1e-4, "rms_l ≈ 1 (canal gauche plein)");
+        assert!(lv.rms_r.abs() < 1e-4, "rms_r ≈ 0 (canal droit silencieux)");
         // rms global = sqrt(moyenne sur tous) = sqrt(0.5) ≈ 0.707.
-        assert!((rms - 0.5f32.sqrt()).abs() < 1e-3, "rms global = sqrt(0.5)");
+        assert!((lv.rms - 0.5f32.sqrt()).abs() < 1e-3, "rms global = sqrt(0.5)");
     }
 
     /// Point 3 (Lot 2) — le VU doit refléter le pan : un flux MONO (L=R en amont,
@@ -1235,9 +1445,11 @@ mod tests {
         // Source mono dupliquée : L = R = 1.0 (200 samples = 100 frames stéréo).
         let s = vec![1.0f32; 200];
         m.push_samples("p1", &s);
+        // La lecture vide le mètre → on re-pousse le même bloc avant chacune.
         let lr = |m: &AudioMixer| {
-            let (_, _, l, r, _, _) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
-            (l, r)
+            m.push_samples("p1", &s);
+            let lv = take_stream(m, "p1");
+            (lv.rms_l, lv.rms_r)
         };
         // Centre : L = R.
         let (l0, r0) = lr(&m);
@@ -1267,15 +1479,14 @@ mod tests {
             s.push(0.0);                                // R : silence
         }
         m.push_samples("p1", &s);
-        let (_, _, rms_l, _, peak_l, peak_r) =
-            m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        let StereoLevels { rms_l, peak_l, peak_r, .. } = take_stream(&m, "p1");
         assert!((peak_l - 1.0).abs() < 1e-4, "peak_l capte le transitoire (≈1), got {peak_l}");
         assert!(peak_l > rms_l + 0.5, "peak_l ({peak_l}) >> rms_l ({rms_l}) — le pic voit le transitoire que le RMS lisse");
         assert!(peak_r.abs() < 1e-4, "peak_r ≈ 0 (canal droit muet), got {peak_r}");
         // Pané full-left → peak_r reste nul, peak_l conservé.
         m.set_pan("p1", -1.0);
         m.push_samples("p1", &s);
-        let (_, _, _, _, pl, pr) = m.stream_levels().into_iter().find(|(id, ..)| id == "p1").unwrap();
+        let StereoLevels { peak_l: pl, peak_r: pr, .. } = take_stream(&m, "p1");
         assert!((pl - 1.0).abs() < 1e-4, "full left : peak_l ≈ 1, got {pl}");
         assert!(pr.abs() < 1e-4, "full left : peak_r ≈ 0, got {pr}");
     }
@@ -1295,8 +1506,9 @@ mod tests {
         while i + 1 < s.len() { s[i] = 1.0; s[i + 1] = 1.0; i += 16; }
         m.push_samples("p1", &s);
         m.mix_into(&mut out);
-        let (mpl, mpr, xpl, xpr) = m.master_mix_peak();
-        let (mrl, _, xrl, _) = m.master_mix_rms();
+        let bus = m.take_bus_levels();
+        let (mpl, mpr, xpl, xpr) = (bus.master.peak_l, bus.master.peak_r, bus.mix.peak_l, bus.mix.peak_r);
+        let (mrl, xrl) = (bus.master.rms_l, bus.mix.rms_l);
         assert!(mpl > mrl + 0.3, "master : peak ({mpl}) >> rms ({mrl})");
         assert!(xpl > xrl + 0.3, "mix : peak ({xpl}) >> rms ({xrl})");
         assert!(mpr > 0.0 && xpr > 0.0, "canal R non nul (source centrée)");
@@ -1314,14 +1526,14 @@ mod tests {
         // Centre.
         m.push_samples("p1", &ones);
         m.mix_into(&mut out);
-        let (ml, mr, xl, xr) = m.master_mix_rms();
+        let (ml, mr, xl, xr) = master_mix_rms(&m);
         assert!((ml - mr).abs() < 1e-3, "centre : master L ≈ R ({ml} vs {mr})");
         assert!((xl - xr).abs() < 1e-3, "centre : mix L ≈ R");
         // Full left : R muet côté master ET mix.
         m.set_pan("p1", -1.0);
         m.push_samples("p1", &ones);
         m.mix_into(&mut out);
-        let (ml2, mr2, xl2, xr2) = m.master_mix_rms();
+        let (ml2, mr2, xl2, xr2) = master_mix_rms(&m);
         assert!(ml2 > 0.1, "full left : master L présent, got {ml2}");
         assert!(mr2 < 1e-3, "full left : master R ≈ 0, got {mr2}");
         assert!(xl2 > 0.1 && xr2 < 1e-3, "full left : mix L présent / R muet");
@@ -1416,7 +1628,7 @@ mod tests {
         m.mix_into(&mut out);
         let rms: f32 = (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt();
         assert!(rms > 0.5, "voix audible malgré DIM=0 (jamais duckée), rms={rms}");
-        assert!(m.inbound_voice_rms() > 0.5, "RMS voix remonté pour le VU, got {}", m.inbound_voice_rms());
+        assert!(m.take_bus_levels().peer_voice_rms > 0.5, "RMS voix remonté pour le VU, got {}", m.take_bus_levels().peer_voice_rms);
     }
 
     /// INVARIANT : la voix des pairs n'entre JAMAIS dans le RECORD — ni dans le
@@ -1523,7 +1735,7 @@ mod tests {
         // Défaut : rien armé → MIX silencieux, MASTER présent (monitoring).
         m.push_samples("peer", &ones);
         m.mix_into(&mut out);
-        let (ml, _mr, xl, _xr) = m.master_mix_rms();
+        let (ml, _mr, xl, _xr) = master_mix_rms(&m);
         assert!(ml > 0.1, "MASTER présent même sans armement (monitoring), got {ml}");
         assert!(xl < 1e-4, "MIX silencieux tant que rien n'est armé, got {xl}");
 
@@ -1531,7 +1743,7 @@ mod tests {
         m.set_record_arm(false, &["peer".to_string()]);
         m.push_samples("peer", &ones);
         m.mix_into(&mut out);
-        let (ml2, _, xl2, _) = m.master_mix_rms();
+        let (ml2, _, xl2, _) = master_mix_rms(&m);
         assert!((ml2 - ml).abs() < 1e-3, "MASTER inchangé par l'armement ({ml} vs {ml2})");
         assert!(xl2 > 0.1, "MIX présent une fois le peer armé, got {xl2}");
 
@@ -1539,7 +1751,7 @@ mod tests {
         m.set_record_arm(false, &[]);
         m.push_samples("peer", &ones);
         m.mix_into(&mut out);
-        let (_, _, xl3, _) = m.master_mix_rms();
+        let (_, _, xl3, _) = master_mix_rms(&m);
         assert!(xl3 < 1e-4, "désarmement → MIX de nouveau silencieux, got {xl3}");
     }
 
@@ -1555,14 +1767,14 @@ mod tests {
         // Self non armé → MIX silencieux.
         m.push_self_samples(&ones);
         m.mix_into(&mut out);
-        let (_, _, xl, _) = m.master_mix_rms();
+        let (_, _, xl, _) = master_mix_rms(&m);
         assert!(xl < 1e-4, "self non armé → MIX silencieux, got {xl}");
 
         // Self armé → MIX présent.
         m.set_record_arm(true, &[]);
         m.push_self_samples(&ones);
         m.mix_into(&mut out);
-        let (_, _, xl2, _) = m.master_mix_rms();
+        let (_, _, xl2, _) = master_mix_rms(&m);
         assert!(xl2 > 0.1, "self armé → MIX présent, got {xl2}");
     }
 
@@ -1588,7 +1800,7 @@ mod tests {
         // Monitoring : le signal est bien dans le MASTER (on s'entend).
         let mut out = vec![0.0f32; 512];
         m.mix_into(&mut out);
-        let (master_l, _, mix_l, _) = m.master_mix_rms();
+        let (master_l, _, mix_l, _) = master_mix_rms(&m);
         assert!(master_l > 0.1, "en privé on doit continuer à s'entendre (master={master_l})");
         // Fichier : ni stem self, ni bus MIX.
         assert!(mix_l < 1e-4, "en privé, la tranche sort du bus MIX (mix={mix_l})");
@@ -1619,7 +1831,7 @@ mod tests {
         m.push_self_samples(&ones);
         let mut out = vec![0.0f32; 512];
         m.mix_into(&mut out);
-        let (_, _, mix_l, _) = m.master_mix_rms();
+        let (_, _, mix_l, _) = master_mix_rms(&m);
         assert!(mix_l > 0.1, "de retour en LIVE, la tranche armée réintègre le MIX (mix={mix_l})");
         let mut stems = 0usize;
         while let Ok(cmd) = rx.try_recv() {
@@ -1644,13 +1856,13 @@ mod tests {
         m.push_self_samples(&ones);
         let mut out = vec![0.0f32; 512];
         m.mix_into(&mut out);
-        let (_, _, mix_l, _) = m.master_mix_rms();
+        let (_, _, mix_l, _) = master_mix_rms(&m);
         assert!(mix_l < 1e-4, "armer en privé ne doit rien enregistrer (mix={mix_l})");
 
         m.set_self_private(false);
         m.push_self_samples(&ones);
         m.mix_into(&mut out);
-        let (_, _, mix_l2, _) = m.master_mix_rms();
+        let (_, _, mix_l2, _) = master_mix_rms(&m);
         assert!(mix_l2 > 0.1, "l'armement prend effet au retour en LIVE (mix={mix_l2})");
     }
 
@@ -1710,7 +1922,7 @@ mod tests {
         t2.join().unwrap();
 
         // Les VU par flux doivent être lisibles sans lock et cohérents (finis).
-        for (_, rms, l, r, pl, pr) in mixer.stream_levels() {
+        for (_, StereoLevels { rms, rms_l: l, rms_r: r, peak_l: pl, peak_r: pr }) in mixer.take_stream_levels() {
             for v in [rms, l, r, pl, pr] {
                 assert!(v.is_finite(), "VU fini après concurrence");
             }

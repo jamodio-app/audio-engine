@@ -5,6 +5,34 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.1-1] — 2026-09-10
+
+Pré-release. **Les VU-mètres mesuraient l'audio par échantillonnage aléatoire.**
+
+### Corrigé
+
+- **Les VU-mètres ne voyaient que 2,5 % du son joué.** Les niveaux étaient écrasés
+  à chaque bloc audio (2,5 ms) et relus toutes les 100 ms : sur 40 blocs, 39
+  n'étaient jamais regardés. Le studio affichait donc un instantané tiré au hasard
+  plutôt qu'une mesure — d'où un vumètre qui « part dans tous les sens » sans
+  rapport avec ce qu'on entend, un niveau sous-estimé de 1 à 5 dB, des attaques
+  ratées et un voyant CLIP aveugle la plupart du temps. Les niveaux sont désormais
+  **accumulés en continu** : chaque envoi porte le pic et le RMS de **toute** la
+  période écoulée, sans qu'aucun échantillon ne soit ignoré ni compté deux fois.
+  Concerne les tranches instrument (self et pairs), MASTER, MIX REC et le talkback.
+- **Une sonde de détection de l'agent pouvait voler les mesures du studio.** Les
+  niveaux ne sont plus calculés ni envoyés qu'au client qui détient réellement la
+  session (même règle que le slot agent) — une page qui ouvre une connexion sans
+  s'annoncer ne consomme plus de mesures, ni 10 messages par seconde pour personne.
+- **Un plugin renvoyant une valeur invalide** (NaN) figeait le vumètre à fond
+  jusqu'au redémarrage : ces valeurs sont maintenant neutralisées.
+
+### Performance
+
+- Le calcul des niveaux fait désormais **une seule passe** sur chaque bloc au lieu
+  de deux (pic et RMS étaient parcourus séparément) — moins de travail dans le
+  callback temps-réel qu'avant ce correctif. Aucune latence ajoutée.
+
 ## [0.6.0] — 2026-09-06
 
 Une version dominée par un sujet : **le talkback**. Il devient utilisable comme
