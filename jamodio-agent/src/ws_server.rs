@@ -33,6 +33,11 @@ const LOCK_TIMEOUT_MS: u64 = 200;
 /// VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
 const VERCEL_TEAM_SUFFIX: &str = "-bengo82-9540s-projects.vercel.app";
 
+/// Cadence d'envoi des niveaux VU (Lot 3). 40 ms = 25 Hz — voir le commentaire
+/// du sender pour le pourquoi. La mesure elle-même ne dépend pas de cette
+/// valeur : chaque envoi couvre exactement la période écoulée (cf. `LevelMeter`).
+const LEVELS_PERIOD: Duration = Duration::from_millis(40);
+
 /// Vérifie l'origin de la requête WS upgrade. On accepte uniquement :
 ///   - https://jamodio.com (prod)
 ///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope Jamodio)
@@ -646,7 +651,19 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         }
     });
 
-    // Spawn periodic StreamLevels sender (every 100ms)
+    // Sender périodique des StreamLevels (VU-mètres).
+    //
+    // Lot 3 (0.6.1) — 40 ms au lieu de 100. À 10 Hz pour 60 images/s, la barre
+    // du studio avançait par marches de 100 ms : dix sauts par seconde, là où
+    // les tranches nourries par les analysers du navigateur (backing, métro)
+    // bougeaient à chaque image. Deux comportements sur la même table. À 25 Hz
+    // l'écart n'est plus perceptible, et la mesure reste exacte : depuis le
+    // Lot 1 chaque envoi porte le pic et le RMS de TOUTE la période écoulée
+    // (`LevelMeter`), donc changer la cadence ne change pas ce qui est mesuré —
+    // seulement la finesse du tracé.
+    //
+    // Coût : c'est une task tokio, hors thread audio → zéro impact latence. Le
+    // verrou pipeline est pris 25 fois/s pour quelques microsecondes.
     let levels_pipeline = handle.pipeline.clone();
     let levels_tx = out_tx.clone();
     let levels_armed_task = levels_armed.clone();
@@ -658,7 +675,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         if is_internal {
             return;
         }
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut interval = tokio::time::interval(LEVELS_PERIOD);
+        // Un retard d'ordonnancement ne doit pas provoquer une rafale de
+        // rattrapage : on saute les ticks manqués (les mètres accumulent de
+        // toute façon, rien n'est perdu — la fenêtre suivante est juste plus
+        // longue).
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Isolation de voix (Lot 2) — dernier état poussé, pour forcer un push sur
         // TRANSITION même en idle (sinon le voyant/indicateur resterait figé après
         // la dernière transition, comme le faisait l'ancien gate).
