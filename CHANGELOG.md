@@ -27,6 +27,14 @@ Pré-release. **Les VU-mètres mesuraient l'audio par échantillonnage aléatoir
 - **Un plugin renvoyant une valeur invalide** (NaN) figeait le vumètre à fond
   jusqu'au redémarrage : ces valeurs sont maintenant neutralisées.
 
+### Modifié
+
+- **Les niveaux sont envoyés au studio 25 fois par seconde** au lieu de 10. La
+  barre d'une tranche jouée par l'agent avançait par marches de 100 ms pendant
+  que celles lues par le navigateur (backing, métronome) bougeaient à chaque
+  image — deux vitesses sur la même table. Ce que mesure l'agent est inchangé :
+  chaque envoi couvre exactement la période écoulée.
+
 ### Performance
 
 - Le calcul des niveaux fait désormais **une seule passe** sur chaque bloc au lieu
