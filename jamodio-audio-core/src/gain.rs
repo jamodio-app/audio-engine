@@ -74,7 +74,7 @@ impl SmoothGain {
         if target == 1.0 && (self.current - 1.0).abs() < f32::EPSILON {
             return;
         }
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let g = self.next(target);
             frame[0] *= g;
             frame[1] *= g;
@@ -147,7 +147,7 @@ mod tests {
         let mut g = SmoothGain::new(1.0, FS);
         let mut buf = vec![1.0f32; 64];
         g.apply_stereo_block(&mut buf, 0.0);
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0 {
             assert_eq!(frame[0], frame[1], "l'image stéréo ne bouge pas pendant la rampe");
         }
     }
