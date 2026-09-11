@@ -588,8 +588,16 @@ fn main() {
             // Cloné AVANT l'enveloppe Mutex : le serveur WS écrit le gain voix
             // sans jamais prendre le verrou pipeline (cf. `WsServerHandle`).
             let voice_gain = pipeline.voice_gain.clone();
+            let send_gain_instrument = pipeline.send_gain_instrument.clone();
+            let send_gain_voice = pipeline.send_gain_voice.clone();
             let pipeline = Arc::new(tokio::sync::Mutex::new(pipeline));
-            let ws_handle = WsServerHandle::new(pipeline, mixer, voice_gain);
+            let ws_handle = WsServerHandle::new(
+                pipeline,
+                mixer,
+                voice_gain,
+                send_gain_instrument,
+                send_gain_voice,
+            );
             // Injecte le AppHandle pour que le message browser `Restart`
             // (bouton « Relancer mon agent ») puisse déclencher check_for_update
             // + app.restart() depuis la receive loop WS.

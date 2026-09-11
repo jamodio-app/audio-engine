@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use base64::Engine;
 use jamodio_audio_core::protocol::{
     AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
-    RecordStemSpec, RecordedFileWire, StreamLevel, PROTOCOL_VERSION,
+    RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
 };
 use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
@@ -164,6 +164,11 @@ pub struct WsServerHandle {
     /// la famille : le micro reste ouvert alors que l'utilisateur vient de se
     /// couper. Ce n'est pas une commande qu'on a le droit d'abandonner.
     voice_gain: Arc<AtomicU32>,
+    /// Lot B — gains d'ENVOI (bits f32), écrits sans le mutex pipeline comme
+    /// `voice_gain` : ce sont des scalaires que le thread audio relit bloc par
+    /// bloc et rejoint par une rampe.
+    send_gain_instrument: Arc<AtomicU32>,
+    send_gain_voice: Arc<AtomicU32>,
     /// True quand une WS browser EXTERNE est connectée et tient le slot.
     /// Sert au monitoring (pas à la décision d'admission). Cf. `active_client_killer`.
     client_active: Arc<AtomicBool>,
@@ -194,6 +199,8 @@ impl WsServerHandle {
         pipeline: Arc<tokio::sync::Mutex<PipelineState>>,
         mixer: Arc<jamodio_audio_core::mixer::mixer::AudioMixer>,
         voice_gain: Arc<AtomicU32>,
+        send_gain_instrument: Arc<AtomicU32>,
+        send_gain_voice: Arc<AtomicU32>,
     ) -> Self {
         let (shutdown_tx, _rx) = broadcast::channel::<&'static str>(4);
         let (update_progress_tx, _prx) = broadcast::channel::<UpdateProgressEvent>(16);
@@ -201,6 +208,8 @@ impl WsServerHandle {
             pipeline,
             mixer,
             voice_gain,
+            send_gain_instrument,
+            send_gain_voice,
             client_active: Arc::new(AtomicBool::new(false)),
             active_client_killer: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_tx,
@@ -498,7 +507,15 @@ async fn handle_one_message(
     }
 
     let responses =
-        handle_message(browser_msg, &handle.pipeline, &handle.mixer, &handle.voice_gain).await;
+        handle_message(
+            browser_msg,
+            &handle.pipeline,
+            &handle.mixer,
+            &handle.voice_gain,
+            &handle.send_gain_instrument,
+            &handle.send_gain_voice,
+        )
+        .await;
     for resp in responses {
         if out_tx.send(resp).await.is_err() {
             return false;
@@ -2356,6 +2373,8 @@ async fn handle_message(
     pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
     mixer: &Arc<jamodio_audio_core::mixer::mixer::AudioMixer>,
     voice_gain: &Arc<AtomicU32>,
+    send_gain_instrument: &Arc<AtomicU32>,
+    send_gain_voice: &Arc<AtomicU32>,
 ) -> Vec<AgentMessage> {
     match msg {
         BrowserMessage::HelloAck { protocol_version, session_id } => {
@@ -2808,6 +2827,27 @@ async fn handle_message(
         }
 
         // Lot C — bus voix des pairs (talkback via l'agent). Tranche unique.
+        BrowserMessage::SetSendGain { source, gain } => {
+            // Lot B — le niveau auquel les AUTRES me reçoivent. Écriture
+            // atomique, sans le mutex pipeline : c'est un scalaire, le thread
+            // audio le lit bloc par bloc et le rejoint par une rampe.
+            //
+            // Bornes : −40 dB (0.01) à +12 dB (≈ 3.98). Assez large pour
+            // rattraper une interface trop discrète, assez fermé pour ne pas
+            // amplifier le souffle sans s'en rendre compte. Une valeur non
+            // finie (NaN venu d'un client cassé) retombe sur 1.0 plutôt que
+            // d'empoisonner la rampe — ce serait tout le son qui disparaîtrait.
+            const MIN: f32 = 0.01;
+            const MAX: f32 = 3.98;
+            let g = if gain.is_finite() { gain.clamp(MIN, MAX) } else { 1.0 };
+            let cible = match source {
+                SendGainSource::Instrument => send_gain_instrument,
+                SendGainSource::Voice => send_gain_voice,
+            };
+            cible.store(g.to_bits(), Ordering::Relaxed);
+            tracing::info!(target: "jamodio::ws", ?source, gain = g, "SetSendGain");
+            vec![]
+        }
         BrowserMessage::SetPeerVoiceGain { gain } => {
             mixer.set_peer_voice_gain(gain);
             vec![]
@@ -3594,25 +3634,34 @@ mod etat_latche_tests {
     use super::*;
     use jamodio_audio_core::mixer::mixer::AudioMixer;
 
-    /// Monte un jeu (pipeline, mixer, gain voix) tel que le serveur WS le détient.
-    fn harnais() -> (
+    /// L'état que le serveur WS détient à côté du pipeline : mixer, gain voix,
+    /// et les deux gains d'envoi (Lot B).
+    type HarnaisWs = (
         Arc<tokio::sync::Mutex<PipelineState>>,
         Arc<AudioMixer>,
         Arc<AtomicU32>,
-    ) {
+        Arc<AtomicU32>,
+        Arc<AtomicU32>,
+    );
+
+    fn harnais() -> HarnaisWs {
         let mixer = Arc::new(AudioMixer::new());
         let pipeline = PipelineState::new(mixer.clone());
         let voice_gain = pipeline.voice_gain.clone();
+        let send_gain_instrument = pipeline.send_gain_instrument.clone();
+        let send_gain_voice = pipeline.send_gain_voice.clone();
         (
             Arc::new(tokio::sync::Mutex::new(pipeline)),
             mixer,
             voice_gain,
+            send_gain_instrument,
+            send_gain_voice,
         )
     }
 
     #[tokio::test]
     async fn le_volume_master_passe_alors_que_le_pipeline_est_verrouille() {
-        let (pipeline, mixer, voice_gain) = harnais();
+        let (pipeline, mixer, voice_gain, send_gain_instrument, send_gain_voice) = harnais();
         // Contention MAXIMALE : le mutex est tenu pour toute la durée de l'appel.
         let _tenu = pipeline.lock().await;
         handle_message(
@@ -3620,6 +3669,8 @@ mod etat_latche_tests {
             &pipeline,
             &mixer,
             &voice_gain,
+            &send_gain_instrument,
+            &send_gain_voice,
         )
         .await;
         assert!((mixer.master_gain() - 0.25).abs() < 1e-6);
@@ -3627,13 +3678,15 @@ mod etat_latche_tests {
 
     #[tokio::test]
     async fn couper_son_micro_passe_alors_que_le_pipeline_est_verrouille() {
-        let (pipeline, mixer, voice_gain) = harnais();
+        let (pipeline, mixer, voice_gain, send_gain_instrument, send_gain_voice) = harnais();
         let _tenu = pipeline.lock().await;
         handle_message(
             BrowserMessage::SetVoiceGain { gain: 0.0 },
             &pipeline,
             &mixer,
             &voice_gain,
+            &send_gain_instrument,
+            &send_gain_voice,
         )
         .await;
         assert_eq!(f32::from_bits(voice_gain.load(Ordering::Relaxed)), 0.0);
@@ -3643,7 +3696,7 @@ mod etat_latche_tests {
     /// mettrait 200 ms (le timeout) avant d'abandonner.
     #[tokio::test]
     async fn ces_commandes_n_attendent_plus_le_verrou() {
-        let (pipeline, mixer, voice_gain) = harnais();
+        let (pipeline, mixer, voice_gain, send_gain_instrument, send_gain_voice) = harnais();
         let _tenu = pipeline.lock().await;
         let t0 = std::time::Instant::now();
         handle_message(
@@ -3651,6 +3704,8 @@ mod etat_latche_tests {
             &pipeline,
             &mixer,
             &voice_gain,
+            &send_gain_instrument,
+            &send_gain_voice,
         )
         .await;
         assert!(
@@ -3658,5 +3713,58 @@ mod etat_latche_tests {
             "la commande a attendu le verrou ({:?})",
             t0.elapsed()
         );
+    }
+
+    /// Lot B — la coupure du micro et le gain d'ENVOI sont deux réglages
+    /// indépendants. Le bug qu'on refuse : rouvrir son micro remet le niveau à
+    /// fond parce que les deux valeurs partageaient un même atomique.
+    #[tokio::test]
+    async fn rouvrir_le_micro_ne_perd_pas_le_gain_denvoi() {
+        let (pipeline, mixer, voice_gain, send_gain_instrument, send_gain_voice) = harnais();
+        for m in [
+            BrowserMessage::SetSendGain { source: SendGainSource::Voice, gain: 0.5 },
+            BrowserMessage::SetVoiceGain { gain: 0.0 }, // micro coupé
+            BrowserMessage::SetVoiceGain { gain: 1.0 }, // micro rouvert
+        ] {
+            handle_message(m, &pipeline, &mixer, &voice_gain,
+                           &send_gain_instrument, &send_gain_voice).await;
+        }
+        assert_eq!(
+            f32::from_bits(send_gain_voice.load(Ordering::Relaxed)),
+            0.5,
+            "le gain d'envoi survit à la coupure puis à la réouverture"
+        );
+    }
+
+    /// Chaque source a SA valeur, et les bornes tiennent — y compris face à une
+    /// valeur non finie, qui empoisonnerait la rampe et ferait disparaître tout
+    /// le son.
+    #[tokio::test]
+    async fn les_gains_denvoi_sont_independants_et_bornes() {
+        let (pipeline, mixer, voice_gain, send_gain_instrument, send_gain_voice) = harnais();
+        let lire = |a: &Arc<AtomicU32>| f32::from_bits(a.load(Ordering::Relaxed));
+        assert_eq!(lire(&send_gain_instrument), 1.0, "défaut 0 dB");
+        assert_eq!(lire(&send_gain_voice), 1.0, "défaut 0 dB");
+
+        let regle = |gain: f32| {
+            let (p, mx, vg) = (pipeline.clone(), mixer.clone(), voice_gain.clone());
+            let (sgi, sgv) = (send_gain_instrument.clone(), send_gain_voice.clone());
+            async move {
+                handle_message(
+                    BrowserMessage::SetSendGain { source: SendGainSource::Instrument, gain },
+                    &p, &mx, &vg, &sgi, &sgv,
+                ).await
+            }
+        };
+        regle(2.0).await;
+        assert_eq!(lire(&send_gain_instrument), 2.0);
+        assert_eq!(lire(&send_gain_voice), 1.0, "l'autre source n'a pas bougé");
+
+        regle(99.0).await;
+        assert!(lire(&send_gain_instrument) <= 3.98, "borné en haut");
+        regle(0.0).await;
+        assert!(lire(&send_gain_instrument) >= 0.01, "borné en bas");
+        regle(f32::NAN).await;
+        assert_eq!(lire(&send_gain_instrument), 1.0, "NaN → neutre");
     }
 }

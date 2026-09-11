@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod gain;
 pub mod net;
 pub mod mixer;
 pub mod perfstats;

@@ -44,6 +44,16 @@ pub enum StreamKind {
     Voice,
 }
 
+/// Lot B — quelle source règle son gain d'envoi. Deux départs, un seul geste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SendGainSource {
+    /// La tranche instrument (capture, plugin inclus).
+    Instrument,
+    /// Le talkback (micro).
+    Voice,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BrowserMessage {
@@ -161,6 +171,25 @@ pub enum BrowserMessage {
     /// côté browser (`studio-mixer.js`), l'agent ne fait qu'appliquer la cible.
     /// `1.0` = voix ouverte, `0.0` = coupée. No-op si aucune voix active.
     SetVoiceGain {
+        gain: f32,
+    },
+    /// Lot B — GAIN D'ENVOI : le niveau auquel les AUTRES me reçoivent.
+    ///
+    /// Appliqué très en amont — après le plugin, avant le soft-clip — donc en
+    /// amont de la division du signal : les pairs, le stem, le fichier MIX et le
+    /// vumètre de ma tranche voient tous le même niveau. Il change aussi mon
+    /// monitoring, comme le bouton de préampli d'une console : c'est voulu.
+    ///
+    /// ⚠️ À ne pas confondre avec les deux gains voisins, qui ne font PAS ça :
+    ///   - `SetVoiceGain` coupe / rouvre MON micro ;
+    ///   - `SetPeerVoiceGain` règle MON ÉCOUTE des voix reçues.
+    ///
+    /// Pour le talkback, ce gain-ci est INDÉPENDANT de la coupure : l'agent les
+    /// multiplie, si bien que rouvrir son micro ne perd pas le niveau réglé.
+    ///
+    /// `gain` linéaire, borné côté agent. `1.0` = 0 dB = comportement d'avant.
+    SetSendGain {
+        source: SendGainSource,
         gain: f32,
     },
     AddStream {

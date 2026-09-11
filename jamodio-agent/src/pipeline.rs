@@ -837,6 +837,15 @@ pub struct PipelineState {
     /// son micro capte quelque chose. Ce qui PART réellement est indiqué par le
     /// voyant « à l'antenne » (`voice_on_air`), pas par le vumètre.
     pub voice_rms: Arc<LevelMeter>,
+    /// Lot B — GAIN D'ENVOI de l'instrument : le niveau auquel les AUTRES me
+    /// reçoivent. Appliqué après le plugin et avant le soft-clip, donc en amont
+    /// de la division du signal — pairs, stem, MIX et vumètre voient le même.
+    /// `1.0` = 0 dB = comportement d'avant le lot. Bits f32.
+    pub send_gain_instrument: Arc<std::sync::atomic::AtomicU32>,
+    /// Lot B — GAIN D'ENVOI du talkback. INDÉPENDANT de `voice_gain` (qui coupe
+    /// le micro) : le thread voix multiplie les deux, si bien que rouvrir son
+    /// micro ne perd pas le niveau réglé.
+    pub send_gain_voice: Arc<std::sync::atomic::AtomicU32>,
     /// Isolation de voix (Lot 2) : état LIVE « à l'antenne » (gate ouvert) diffusé
     /// dans `stream-levels` → voyant de la tranche voix en mode agent. (Distinct du
     /// flag `voice_active` ci-dessus qui indique juste que le tap voix est monté.)
@@ -1276,6 +1285,8 @@ impl PipelineState {
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(LevelMeter::default()),
+            send_gain_instrument: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            send_gain_voice: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             isolation_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_channels_in: 0,
@@ -2190,6 +2201,7 @@ impl PipelineState {
         //    `capture_sample_tx` sont gérés par `prepare_audio_for_session`
         //    (stables tant que le driver chaud vit ; frais à froid).
         let input_rms = self.input_rms.clone();
+        let send_gain_instrument = self.send_gain_instrument.clone();
         // 0.5.3-3 — ÉMISSION RT : plus de channel ni de tâche UDP tokio. Le thread
         // d'encode (RT/MMCSS) chiffre + envoie en non-bloquant DIRECTEMENT (cf.
         // `encode_stage_loop` → `RtpSender::send_blocking`). Supprime le hop tokio
@@ -2278,6 +2290,7 @@ impl PipelineState {
             .spawn(move || {
                 encoder_thread(
                     sample_rx, sender, stop_rx, ssrc, payload_type, input_rms,
+                    send_gain_instrument,
                     channels_in, effective_sel, mixer_for_encoder, input_cut_for_encoder,
                     instrument_private_for_encoder,
                     perfstats_for_encoder, output_device_name_for_encoder,
@@ -2426,6 +2439,7 @@ impl PipelineState {
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
+        let send_gain_voice = self.send_gain_voice.clone();
         let voice_on_air = self.voice_on_air.clone();
         let isolation_active = self.isolation_active.clone();
         let output_device_name = self
@@ -2447,6 +2461,7 @@ impl PipelineState {
                     ssrc,
                     payload_type,
                     voice_gain,
+                    send_gain_voice,
                     voice_rms,
                     voice_on_air,
                     isolation_active,
@@ -3215,6 +3230,8 @@ fn encoder_thread(
     ssrc: u32,
     payload_type: u8,
     input_rms: Arc<std::sync::atomic::AtomicU32>,
+    // Lot B — gain d'envoi de l'instrument, relayé au process stage.
+    send_gain_instrument: Arc<std::sync::atomic::AtomicU32>,
     channels_in: u16,
     channel_sel: ChannelSel,
     mixer: Arc<AudioMixer>,
@@ -3281,6 +3298,7 @@ fn encoder_thread(
     let mixer_proc = mixer.clone();
     let input_cut_proc = input_cut.clone();
     let input_rms_proc = input_rms.clone();
+    let send_gain_proc = send_gain_instrument.clone();
     let perfstats_proc = perfstats.clone();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let plugin_host_proc = plugin_host.clone();
@@ -3303,6 +3321,7 @@ fn encoder_thread(
                 mixer_proc,
                 input_cut_proc,
                 input_rms_proc,
+                send_gain_proc,
                 perfstats_proc,
                 out_name_proc,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3647,6 +3666,8 @@ fn process_stage_loop(
     mixer: Arc<AudioMixer>,
     input_cut: Arc<std::sync::atomic::AtomicBool>,
     input_rms: Arc<std::sync::atomic::AtomicU32>,
+    // Lot B — gain d'envoi de l'instrument (bits f32). Cf. `SetSendGain`.
+    send_gain: Arc<std::sync::atomic::AtomicU32>,
     perfstats: PerfHandles,
     output_device_name: Option<String>,
     #[cfg(any(target_os = "macos", target_os = "windows"))] plugin_host: Arc<Mutex<PluginHostImpl>>,
@@ -3658,6 +3679,13 @@ fn process_stage_loop(
     midi_active: Arc<std::sync::atomic::AtomicBool>,
     midi_last_note_on_ms: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    // Lot B — rampe du gain d'envoi, tenue entre les blocs. Initialisée À la
+    // valeur courante : pas de fondu parasite à l'ouverture du flux.
+    let mut send_gain_ramp = jamodio_audio_core::gain::SmoothGain::new(
+        f32::from_bits(send_gain.load(std::sync::atomic::Ordering::Relaxed)),
+        48_000.0,
+    );
+
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
     );
@@ -3941,6 +3969,26 @@ fn process_stage_loop(
                     wet_was_active = wet_applied;
                 }
 
+                // ── Lot B — GAIN D'ENVOI ─────────────────────────────────
+                // Le niveau auquel les AUTRES me reçoivent. Placé ICI, et pas
+                // ailleurs, pour trois raisons :
+                //   • APRÈS le plugin — un ampli simulé réagit au niveau
+                //     d'entrée : le poser avant changerait le SON en voulant
+                //     changer le NIVEAU ;
+                //   • AVANT le soft-clip — qui reste la protection de dernier
+                //     recours : un gain positif ne peut donc pas rouvrir la
+                //     porte au dépassement pleine échelle, et le voyant CLIP
+                //     s'allume, ce qui est exactement le message utile ;
+                //   • en AMONT de la division — pairs, self-monitor, stem, MIX
+                //     et vumètre voient le même signal, sans une ligne de plus.
+                // Il change donc aussi mon monitoring : c'est le geste d'un
+                // bouton de préampli, et c'est voulu.
+                // Rampe par frame (anti-clic) : cf. `gain::SmoothGain`.
+                send_gain_ramp.apply_stereo_block(
+                    &mut stereo,
+                    f32::from_bits(send_gain.load(std::sync::atomic::Ordering::Relaxed)),
+                );
+
                 // Chantier C — soft-clip de sécurité sur la sortie post-plugin
                 // (couvre self-monitor + encode + record, tous en aval). Zéro
                 // latence. Remonte le pic d'entrée (pré-clip) → indicateur CLIP
@@ -4199,6 +4247,8 @@ fn voice_encode_stage_loop(
     ssrc: u32,
     payload_type: u8,
     voice_gain: Arc<std::sync::atomic::AtomicU32>,
+    // Lot B — gain d'ENVOI du talkback, INDÉPENDANT de la coupure ci-dessus.
+    send_gain_voice: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<LevelMeter>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
@@ -4353,7 +4403,12 @@ fn voice_encode_stage_loop(
         //    (L=R). Le niveau du VU, lui, a été relevé en ENTRÉE (étape 1-bis) :
         //    il doit refléter ce que le micro capte, pas ce que le filtre laisse
         //    passer.
-        let target = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
+        // Lot B — la cible combine DEUX réglages indépendants : la coupure du
+        // micro (0 ou 1) et le gain d'envoi. Les garder séparés évite le bug
+        // classique où rouvrir son micro écrase le niveau réglé.
+        let mute = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
+        let envoi = f32::from_bits(send_gain_voice.load(std::sync::atomic::Ordering::Relaxed));
+        let target = mute * envoi;
         for &s in mono48.iter() {
             let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
             cur_gain += (target - cur_gain) * coeff;
