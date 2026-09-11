@@ -1651,6 +1651,26 @@ mod tests {
     /// INVARIANT : la voix des pairs n'est JAMAIS duckée par le DIM. Avec DIM=0
     /// (instruments coupés), la voix reste pleinement audible en sortie.
     #[test]
+    fn le_metre_du_talkback_rend_le_pic_et_le_rms() {
+        // Lot C3 — le pic était mesuré puis jeté : seul le RMS partait vers le
+        // browser. Il sert maintenant à alerter celui qui envoie trop fort, et
+        // une alerte fondée sur le RMS raterait les crêtes courtes — celles qui
+        // font justement mal chez les autres.
+        let m = LevelMeter::default();
+        // Un bloc quasi silencieux avec UNE crête pleine échelle : le RMS reste
+        // très bas, le pic doit voir passer la crête.
+        let mut buf = vec![0.0f32; 480];
+        buf[42] = 1.0;
+        m.push_mono(&buf, 1.0);
+        let (peak, rms) = m.take();
+        assert!((peak - 1.0).abs() < 1e-6, "pic = la crête, got {peak}");
+        assert!(rms < 0.1, "le RMS, lui, reste bas : {rms}");
+        // Lecture destructive : la fenêtre suivante repart de zéro.
+        let (peak2, rms2) = m.take();
+        assert_eq!((peak2, rms2), (0.0, 0.0));
+    }
+
+    #[test]
     fn voice_is_never_ducked_by_dim() {
         let m = AudioMixer::new();
         m.add_stream("inst", StreamKind::Instrument);

@@ -754,7 +754,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // talkback côté browser (sinon plat, pas d'analyser navigateur en
             // mode agent voix). `0.0` hors voix active.
             // Mètre du micro talkback — lecture destructive comme les autres.
-            let voice_rms = pl.voice_rms.take().1;
+            //
+            // Lot C3 — on remonte AUSSI le PIC. Le mètre le mesurait déjà, on le
+            // jetait. Il sert à alerter celui qui envoie trop fort : une alerte
+            // fondée sur le RMS arrive en retard et rate les crêtes courtes —
+            // exactement celles qui font mal chez les autres.
+            let (voice_peak, voice_rms) = pl.voice_rms.take();
             // Isolation de voix : état « à l'antenne » (gate) + isolation active/repli.
             let voice_on_air = pl.voice_on_air.load(std::sync::atomic::Ordering::Relaxed);
             let isolation_active = pl.isolation_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -809,17 +814,17 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     peak_l: Some(bus.mix.peak_l),
                     peak_r: Some(bus.mix.peak_r),
                 });
-                // Bug 2 — niveau du talkback agent (mono) pour le VU voix browser.
-                // Tranche VOIX : RMS uniquement (pas de pic) — mètre de comm vocale,
-                // le RMS est le standard ; le browser retombe sur le RMS (peak None).
+                // Bug 2 — niveau du talkback agent (mono) pour l'activité du
+                // talkback côté browser. RMS pour l'affichage (mètre de comm
+                // vocale, c'est le standard) ET pic pour l'alerte d'écrêtage.
                 levels.push(StreamLevel {
                     producer_id: "voice".into(),
                     rms: voice_rms,
                     rms_l: Some(voice_rms),
                     rms_r: Some(voice_rms),
-                    peak: None,
-                    peak_l: None,
-                    peak_r: None,
+                    peak: Some(voice_peak),
+                    peak_l: Some(voice_peak),
+                    peak_r: Some(voice_peak),
                 });
                 // Lot C — niveau agrégé de la voix des PAIRS reçue via l'agent
                 // (mono, une tranche) → VU voix navigateur en mode agent-routé.
