@@ -997,32 +997,35 @@ impl AudioMixer {
             }
 
             let vol = cell.volume.load();
-            // Point 4 — un instrument armé alimente AUSSI le bus MIX REC
-            // (`mix_buf`) avec exactement le même échantillon post-fader/pan que
-            // le monitoring. Non armé → seul `output` (monitoring/MASTER) reçoit.
+            // Point 4 / Lot A — un instrument ARMÉ alimente AUSSI le bus MIX REC
+            // (`mix_buf`). Non armé → seul `output` (monitoring/MASTER) reçoit.
+            //
+            // ⚠️ Le MIX part PRÉ-FADER et PRÉ-PAN, au même point que les stems.
+            // Avant, il recevait l'échantillon post-fader/pan du monitoring : le
+            // fichier PARTAGÉ dépendait donc du confort d'écoute d'UNE personne.
+            // Le piège était réel — le fader self démarre à 0 (anti-larsen) :
+            // qui s'écoute par son ampli dans la pièce et ne monte jamais ce
+            // fader s'enregistrait MUET dans le mix, son stem restant intact.
+            // Doctrine (11/09) : les faders et le pan ne règlent QUE l'écoute
+            // locale, ils ne doivent toucher ni ce que reçoivent les autres, ni
+            // ce qui part dans un fichier commun. Le MIX ne retient donc que
+            // l'ARMEMENT.
             let armed = cell.mix_armed.load(Ordering::Relaxed);
             let pan = cell.pan.load();
             // Balance stéréo — loi LINÉAIRE 0 dB au centre. Les streams sont
             // STÉRÉO interleaved (L,R,L,R…) : ce contrôle est un *balance*,
             // pas un pan mono. Centre = 1.0/1.0 (fast-path), extrêmes = 1.0/0.0.
+            if armed {
+                // MIX REC : le signal BRUT de la tranche, sans fader ni pan.
+                let n = temp_buf.len().min(mix_buf.len());
+                for (mb, &t) in mix_buf[..n].iter_mut().zip(temp_buf[..n].iter()) {
+                    *mb += t;
+                }
+            }
             if pan.abs() < f32::EPSILON {
                 let n = temp_buf.len().min(output.len());
-                if armed {
-                    // `output` (monitoring) ET `mix_buf` (MIX REC) reçoivent le
-                    // même échantillon post-fader — calculé une fois.
-                    for ((o, mb), &t) in output[..n]
-                        .iter_mut()
-                        .zip(mix_buf[..n].iter_mut())
-                        .zip(temp_buf[..n].iter())
-                    {
-                        let s = t * vol;
-                        *o += s;
-                        *mb += s;
-                    }
-                } else {
-                    for (o, &t) in output[..n].iter_mut().zip(temp_buf[..n].iter()) {
-                        *o += t * vol;
-                    }
+                for (o, &t) in output[..n].iter_mut().zip(temp_buf[..n].iter()) {
+                    *o += t * vol;
                 }
             } else {
                 let (gl, gr) = pan_gains(pan);
@@ -1030,14 +1033,8 @@ impl AudioMixer {
                 let gain_r = vol * gr;
                 let mut i = 0;
                 while i + 1 < temp_buf.len() && i + 1 < output.len() {
-                    let l = temp_buf[i] * gain_l;
-                    let r = temp_buf[i + 1] * gain_r;
-                    output[i] += l;
-                    output[i + 1] += r;
-                    if armed {
-                        mix_buf[i] += l;
-                        mix_buf[i + 1] += r;
-                    }
+                    output[i] += temp_buf[i] * gain_l;
+                    output[i + 1] += temp_buf[i + 1] * gain_r;
                     i += 2;
                 }
             }
@@ -1058,8 +1055,8 @@ impl AudioMixer {
             self.record_send(RecordCmd::PushMix(mix_buf.clone()));
         }
 
-        // Point 3/4 — niveaux L/R du MIX REC (instruments ARMÉS post-fader,
-        // pré-dim/master) pour le VU MIX REC stéréo. Une passe, accumulée.
+        // Point 3/4 — niveaux L/R du MIX REC (instruments ARMÉS, PRÉ-fader et
+        // PRÉ-pan, comme le fichier) pour le VU MIX REC stéréo. Une passe.
         self.mix_meter.push_interleaved(mix_buf);
 
         // DIM factor — atténue les instruments quand l'user veut entendre le
@@ -1516,6 +1513,7 @@ mod tests {
 
     /// Point 3 (Lot 2) — le VU MASTER/MIX doit refléter le pan du mix réel :
     /// un stream centré → master L ≈ R ; pané à fond à gauche → master R ≈ 0.
+    /// Lot A : le MIX REC, lui, NE suit PAS le pan — c'est un réglage d'écoute.
     #[test]
     fn master_rms_reflete_le_mix_pane() {
         let m = AudioMixer::new();
@@ -1536,7 +1534,59 @@ mod tests {
         let (ml2, mr2, xl2, xr2) = master_mix_rms(&m);
         assert!(ml2 > 0.1, "full left : master L présent, got {ml2}");
         assert!(mr2 < 1e-3, "full left : master R ≈ 0, got {mr2}");
-        assert!(xl2 > 0.1 && xr2 < 1e-3, "full left : mix L présent / R muet");
+        // Le fichier partagé ignore le pan : il reste symétrique.
+        assert!(
+            xl2 > 0.1 && (xl2 - xr2).abs() < 1e-3,
+            "full left : le MIX ignore le pan (L {xl2} ≈ R {xr2})"
+        );
+    }
+
+    /// ⭐ Lot A — LE BUG SILENCIEUX. Le fader d'écoute de la tranche instrument
+    /// démarre à 0 (protection anti-larsen) : avant, le MIX REC recevait
+    /// l'échantillon post-fader, donc qui s'écoutait par son ampli dans la pièce
+    /// et ne montait jamais ce fader s'enregistrait MUET dans le fichier PARTAGÉ.
+    /// Le MIX ne doit dépendre QUE de l'armement.
+    #[test]
+    fn le_mix_ignore_le_fader_decoute() {
+        let m = AudioMixer::new();
+        m.add_stream("p1", StreamKind::Instrument);
+        m.set_record_arm(false, &["p1".to_string()]);
+        m.set_volume("p1", 0.0); // fader d'écoute à fond en bas
+        m.push_samples("p1", &vec![1.0f32; 48_000]);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        let bus = m.take_bus_levels();
+        assert!(
+            bus.master.rms_l < 1e-3,
+            "fader à 0 : je n'entends rien, got {}",
+            bus.master.rms_l
+        );
+        assert!(
+            bus.mix.rms_l > 0.9,
+            "fader à 0 : le MIX contient QUAND MÊME l'instrument armé, got {}",
+            bus.mix.rms_l
+        );
+    }
+
+    /// Symétrique : monter le fader d'écoute ne gonfle pas le fichier non plus.
+    #[test]
+    fn le_mix_ne_suit_pas_le_fader_vers_le_haut() {
+        let mix_at = |vol: f32| {
+            let m = AudioMixer::new();
+            m.add_stream("p1", StreamKind::Instrument);
+            m.set_record_arm(false, &["p1".to_string()]);
+            m.set_volume("p1", vol);
+            m.push_samples("p1", &vec![0.5f32; 48_000]);
+            let mut out = vec![0.0f32; 512];
+            m.mix_into(&mut out);
+            m.take_bus_levels().mix.rms_l
+        };
+        let bas = mix_at(0.2);
+        let haut = mix_at(1.5);
+        assert!(
+            (bas - haut).abs() < 1e-3,
+            "le MIX est le même quel que soit le fader ({bas} vs {haut})"
+        );
     }
 
     /// Helper : pousse un signal constant 1.0 dans un stream et mixe un bloc,

@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.1-2] — 2026-09-11
+
+Pré-release. **Le fichier d'enregistrement dépendait du casque d'une seule
+personne.**
+
+### Corrigé
+
+- **Le mix enregistré suivait votre fader d'écoute.** Le bus MIX recevait le son
+  déjà passé par le volume et le pan de votre tranche — alors que le fichier est
+  **partagé** avec tout le groupe. Le piège était concret : le fader de votre
+  instrument démarre à zéro pour éviter le larsen, donc qui s'écoute par son ampli
+  dans la pièce et ne le monte jamais **s'enregistrait muet dans le mix** (son stem,
+  lui, était intact). Le mix part désormais du signal brut de chaque tranche armée,
+  avant tout réglage d'écoute : **il ne dépend plus que de l'armement**.
+- Le vumètre du MIX suit la même règle : il montre ce qui part dans le fichier.
+
+### Note
+
+Ces réglages — volume, pan — ne servent qu'à votre écoute. Ils ne changent ni ce
+que reçoivent les autres musiciens, ni ce qui est enregistré.
+
 ## [0.6.1-1] — 2026-09-10
 
 Pré-release. **Les VU-mètres mesuraient l'audio par échantillonnage aléatoire.**
