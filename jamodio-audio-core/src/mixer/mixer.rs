@@ -194,19 +194,6 @@ pub struct StereoLevels {
     pub rms: f32,
 }
 
-impl StereoLevels {
-    /// Applique la loi de balance aux niveaux (VU POST-pan, cf. [`pan_gains`]).
-    fn panned(self, pan: f32) -> Self {
-        let (gl, gr) = pan_gains(pan);
-        Self {
-            peak_l: self.peak_l * gl,
-            peak_r: self.peak_r * gr,
-            rms_l: self.rms_l * gl,
-            rms_r: self.rms_r * gr,
-            rms: self.rms,
-        }
-    }
-}
 
 /// Niveaux des bus rendus en un seul appel par [`AudioMixer::take_bus_levels`].
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -1135,16 +1122,17 @@ impl AudioMixer {
     /// remise à zéro des mètres — cf. [`LevelMeter`] (lecture DESTRUCTIVE, un
     /// seul lecteur). Lot C : les flux VOIX sont EXCLUS (agrégat unique via
     /// `take_bus_levels().peer_voice_rms`).
+    ///
+    /// Lot A — niveaux BRUTS, ni pan ni fader. Le VU d'une tranche montre ce que
+    /// la SOURCE envoie ; le pan et le fader ne règlent que l'écoute locale, ils
+    /// n'ont donc pas à le faire bouger. (Le VU était POST-pan depuis juillet,
+    /// décision prise avant cette doctrine : le placement stéréo se lit
+    /// désormais sur le bouton de pan, qui s'allume depuis le centre.)
     pub fn take_stream_levels(&self) -> Vec<(String, StereoLevels)> {
         let map = self.streams.read();
         map.values()
             .filter(|cell| cell.kind != StreamKind::Voice)
-            .map(|cell| {
-                // VU POST-pan : on applique la MÊME loi de balance que `mix_into`
-                // aux niveaux L/R (mesurés pré-pan) → le VU reflète le placement
-                // stéréo exactement comme le rendu.
-                (cell.id.clone(), cell.meter.take().panned(cell.pan.load()))
-            })
+            .map(|cell| (cell.id.clone(), cell.meter.take()))
             .collect()
     }
 
@@ -1432,35 +1420,31 @@ mod tests {
         assert!((lv.rms - 0.5f32.sqrt()).abs() < 1e-3, "rms global = sqrt(0.5)");
     }
 
-    /// Point 3 (Lot 2) — le VU doit refléter le pan : un flux MONO (L=R en amont,
-    /// comme l'instrument self) doit ressortir asymétrique dans `stream_rms` une
-    /// fois pané (le rendu `mix_into` et le VU partagent `pan_gains`).
+    /// ⭐ Lot A — le VU d'une tranche NE reflète PAS le pan. Le pan est un
+    /// réglage d'écoute locale, au même titre que le fader : ni l'un ni l'autre
+    /// ne doit bouger un vumètre qui montre ce que la SOURCE envoie. Le
+    /// placement stéréo se lit sur le bouton de pan, qui s'allume depuis le
+    /// centre. (Contrat inversé : le VU était POST-pan depuis juillet.)
     #[test]
-    fn vu_rms_reflete_le_pan_mono() {
+    fn le_vu_de_tranche_ignore_le_pan() {
         let m = AudioMixer::new();
         m.add_stream("p1", StreamKind::Instrument);
-        // Source mono dupliquée : L = R = 1.0 (200 samples = 100 frames stéréo).
-        let s = vec![1.0f32; 200];
-        m.push_samples("p1", &s);
-        // La lecture vide le mètre → on re-pousse le même bloc avant chacune.
+        let s = vec![1.0f32; 200]; // source mono dupliquée : L = R = 1.0
         let lr = |m: &AudioMixer| {
             m.push_samples("p1", &s);
             let lv = take_stream(m, "p1");
             (lv.rms_l, lv.rms_r)
         };
-        // Centre : L = R.
         let (l0, r0) = lr(&m);
         assert!((l0 - r0).abs() < 1e-4, "centre : rms_l = rms_r");
-        // Full left : rms_r muet.
         m.set_pan("p1", -1.0);
         let (ll, rl) = lr(&m);
-        assert!((ll - 1.0).abs() < 1e-4, "full left : rms_l ≈ 1, got {ll}");
-        assert!(rl.abs() < 1e-4, "full left : rms_r ≈ 0, got {rl}");
-        // Full right : symétrique.
+        assert!((ll - 1.0).abs() < 1e-4, "full left : rms_l inchangé ≈ 1, got {ll}");
+        assert!((rl - 1.0).abs() < 1e-4, "full left : rms_r INCHANGÉ ≈ 1, got {rl}");
         m.set_pan("p1", 1.0);
         let (lr_, rr) = lr(&m);
-        assert!(lr_.abs() < 1e-4, "full right : rms_l ≈ 0, got {lr_}");
-        assert!((rr - 1.0).abs() < 1e-4, "full right : rms_r ≈ 1, got {rr}");
+        assert!((lr_ - 1.0).abs() < 1e-4 && (rr - 1.0).abs() < 1e-4,
+                "full right : les deux barres restent au niveau de la source");
     }
 
     /// Peak-mètre DAW — le PIC échantillon capté par stream doit dépasser le RMS
@@ -1480,12 +1464,13 @@ mod tests {
         assert!((peak_l - 1.0).abs() < 1e-4, "peak_l capte le transitoire (≈1), got {peak_l}");
         assert!(peak_l > rms_l + 0.5, "peak_l ({peak_l}) >> rms_l ({rms_l}) — le pic voit le transitoire que le RMS lisse");
         assert!(peak_r.abs() < 1e-4, "peak_r ≈ 0 (canal droit muet), got {peak_r}");
-        // Pané full-left → peak_r reste nul, peak_l conservé.
+        // Lot A — pané full-left : les PICS ne bougent pas non plus, le pan
+        // est un réglage d'écoute.
         m.set_pan("p1", -1.0);
         m.push_samples("p1", &s);
         let StereoLevels { peak_l: pl, peak_r: pr, .. } = take_stream(&m, "p1");
-        assert!((pl - 1.0).abs() < 1e-4, "full left : peak_l ≈ 1, got {pl}");
-        assert!(pr.abs() < 1e-4, "full left : peak_r ≈ 0, got {pr}");
+        assert!((pl - 1.0).abs() < 1e-4, "full left : peak_l inchangé ≈ 1, got {pl}");
+        assert!(pr.abs() < 1e-4, "full left : peak_r ≈ 0 (canal droit muet à la source)");
     }
 
     /// Peak-mètre DAW — MASTER/MIX : le pic de sortie doit dépasser le RMS sur un
