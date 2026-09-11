@@ -291,6 +291,10 @@ struct StreamCell {
     /// Verrou COURT par flux — pris juste le temps d'un `push` (décodage) ou d'un
     /// `pull` (callback). Jamais tenu en même temps que le RwLock de la map.
     jitter: Mutex<JitterBuffer>,
+    /// Volume de la tranche. Sur un flux INSTRUMENT c'est le fader d'écoute ;
+    /// sur un flux VOIX (Lot C4) c'est le volume de talkback de CE musicien.
+    /// Dans les deux cas, il ne règle QUE mon écoute — jamais ce que les autres
+    /// reçoivent, jamais le mètre.
     volume: AtomicF32,
     /// Pan range [-1.0, 1.0]. -1 = full left, 0 = center, +1 = full right.
     /// Loi de BALANCE stéréo linéaire dans `mix_into` (0 dB au centre :
@@ -967,8 +971,8 @@ impl AudioMixer {
 
         // PASSE 1 — chaque flux est pull UNE fois (verrou court de SA cellule) :
         //   - INSTRUMENT/self → sommé (fader+balance) dans `output` ;
-        //   - VOICE (talkback pair) → accumulé BRUT dans `voice_buf` (pas de
-        //     fader/pan par pair : tranche unique) — gain/pan de bus après le DIM.
+        //   - VOICE (talkback pair) → accumulé dans `voice_buf`, à SON volume —
+        //     gain/pan de bus appliqués plus loin, après le DIM.
         for cell in snapshot.iter() {
             {
                 let mut jitter = cell.jitter.lock();
@@ -977,8 +981,29 @@ impl AudioMixer {
 
             if cell.kind == StreamKind::Voice {
                 any_voice = true;
-                for (v, &sample) in voice_buf.iter_mut().zip(temp_buf.iter()) {
-                    *v += sample;
+                // Lot C4 — CHAQUE musicien a son volume de talkback. Le champ
+                // `volume` de la cellule existait déjà et ne servait pas pour
+                // les flux voix : c'est lui que règle `SetVolume` avec l'id du
+                // producer VOIX du pair. Aucun message de protocole en plus, et
+                // aucun étage de traitement : une multiplication dans une boucle
+                // déjà parcourue.
+                //
+                // ⚠️ Le MÈTRE de la cellule, lui, est alimenté par `push_samples`
+                // AVANT ce gain : l'activité qu'on affiche est celle du musicien,
+                // pas celle de mon réglage d'écoute. Une tranche montre ce qui
+                // existe, pas ce que j'en fais.
+                let vol = cell.volume.load();
+                if vol.abs() < f32::EPSILON {
+                    continue;
+                }
+                if (vol - 1.0).abs() < f32::EPSILON {
+                    for (v, &sample) in voice_buf.iter_mut().zip(temp_buf.iter()) {
+                        *v += sample;
+                    }
+                } else {
+                    for (v, &sample) in voice_buf.iter_mut().zip(temp_buf.iter()) {
+                        *v += sample * vol;
+                    }
                 }
                 continue;
             }
@@ -1120,8 +1145,12 @@ impl AudioMixer {
 
     /// Niveaux par stream pour les VU du browser, sur la fenêtre écoulée, PUIS
     /// remise à zéro des mètres — cf. [`LevelMeter`] (lecture DESTRUCTIVE, un
-    /// seul lecteur). Lot C : les flux VOIX sont EXCLUS (agrégat unique via
-    /// `take_bus_levels().peer_voice_rms`).
+    /// seul lecteur).
+    ///
+    /// Lot C4 : les flux VOIX y figurent MAINTENANT, chacun sous son id de
+    /// producer. C'est ce qui permet à la table de montrer QUI parle au lieu de
+    /// dire que quelqu'un parle — l'agrégat `take_bus_levels().peer_voice_rms`
+    /// reste disponible pour ce dont il n'est pas besoin de détailler.
     ///
     /// Lot A — niveaux BRUTS, ni pan ni fader. Le VU d'une tranche montre ce que
     /// la SOURCE envoie ; le pan et le fader ne règlent que l'écoute locale, ils
@@ -1131,7 +1160,6 @@ impl AudioMixer {
     pub fn take_stream_levels(&self) -> Vec<(String, StereoLevels)> {
         let map = self.streams.read();
         map.values()
-            .filter(|cell| cell.kind != StreamKind::Voice)
             .map(|cell| (cell.id.clone(), cell.meter.take()))
             .collect()
     }
@@ -1668,6 +1696,41 @@ mod tests {
         // Lecture destructive : la fenêtre suivante repart de zéro.
         let (peak2, rms2) = m.take();
         assert_eq!((peak2, rms2), (0.0, 0.0));
+    }
+
+    #[test]
+    fn chaque_musicien_a_son_volume_de_talkback() {
+        // Lot C4 — baisser le talkback d'un musicien ne doit toucher QUE le sien.
+        // C'est ce qui remplace la tranche talkback commune : on ne coupe plus
+        // « les autres », on baisse QUELQU'UN.
+        let m = AudioMixer::new();
+        m.add_stream("voix-a", StreamKind::Voice);
+        m.add_stream("voix-b", StreamKind::Voice);
+        let ones = vec![1.0f32; 48_000];
+        m.set_volume("voix-a", 0.0);
+        m.push_samples("voix-a", &ones);
+        m.push_samples("voix-b", &ones);
+        let mut out = vec![0.0f32; 512];
+        m.mix_into(&mut out);
+        // A est coupé, B passe : la sortie vaut B seul, pas le double ni zéro.
+        assert!((out[0] - 1.0).abs() < 1e-6, "seul B doit s'entendre, got {}", out[0]);
+    }
+
+    #[test]
+    fn le_volume_de_talkback_ne_touche_pas_le_metre() {
+        // Doctrine : une tranche montre ce qui EXISTE, pas ce que j'en fais.
+        // Les segments d'activité doivent donc bouger même talkback baissé à
+        // zéro — sinon on ne verrait plus que quelqu'un cherche à parler.
+        let m = AudioMixer::new();
+        m.add_stream("voix", StreamKind::Voice);
+        m.set_volume("voix", 0.0);
+        m.push_samples("voix", &vec![1.0f32; 48_000]);
+        let niveaux = m.take_stream_levels();
+        let (_, lv) = niveaux
+            .iter()
+            .find(|(id, _)| id == "voix")
+            .expect("le flux voix figure dans les niveaux par stream");
+        assert!(lv.rms_l > 0.5, "le mètre voit le signal malgré le volume à 0, got {}", lv.rms_l);
     }
 
     #[test]
