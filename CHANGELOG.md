@@ -5,106 +5,70 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.6.1-5] — 2026-09-13
+## [0.6.1] — 2026-09-13
 
-Pré-release. **Corrections issues de la revue de code avant la version publique.**
-
-### Corrigé
-
-- **Un réglage d'écoute pouvait se perdre en silence.** Le volume de talkback
-  d'un musicien, et le fader, le pan ou l'armement d'un pair, envoyés juste après
-  l'arrivée de son flux étaient ignorés s'ils précédaient son premier paquet
-  audio ; et quand sa connexion était remplacée, il repartait à 100 % et au
-  centre. Les réglages sont désormais gardés et appliqués dès que le flux existe.
-- **L'alerte « trop fort » du talkback s'allumait sur un micro qui ne
-  transmettait rien** (le son d'un ampli dans la pièce, sans parler), et ratait
-  à l'inverse des crêtes rattrapées par le limiteur. Elle mesure maintenant ce
-  qui part vraiment, après le filtre antibruit et le gain.
-- Le journal ne note plus chaque mouvement du potard de gain d'envoi.
-
-## [0.6.1-4] — 2026-09-13
-
-Pré-release. **La table de mixage refondue (Lot C), et ce que la première
-recette à deux musiciens a révélé.** Cette entrée couvre aussi la 0.6.1-3.
+Une version pour la **nouvelle table de mixage du studio** : ce que vous envoyez
+aux autres musiciens devient réglable, chacun règle la voix de chacun, et les
+mesures deviennent enfin fiables.
 
 ### Ajouté
 
-- **Gain d'envoi par source** (instrument, talkback) : le niveau auquel les
-  autres musiciens vous reçoivent, distinct du fader qui ne règle que votre
-  casque.
-- **Volume de talkback par musicien** : chacun règle, dans son casque, la voix
-  de chacun des autres. Personne d'autre n'est affecté.
-- Le talkback remonte son **pic**, en plus de son niveau moyen : c'est ce qui
-  fonde l'alerte « trop fort » du studio.
-
-### Corrigé
-
-- **Le vumètre du talkback ignorait le gain d'envoi.** On ne pouvait pas régler
-  son niveau à l'œil. Il se lit maintenant comme celui de l'instrument : au
-  niveau de ce qui part.
-- **Un gain d'envoi positif pouvait faire saturer le talkback.** Le gain
-  s'appliquait après le limiteur, qui ne protégeait donc plus rien. Il passe
-  désormais avant.
-- **Le pan de votre tranche revenait au centre après un réveil de veille** (ou
-  une réouverture de l'interface), sans que l'écran le montre. L'armement pour
-  l'enregistrement tombait de la même façon. Les deux sont conservés.
-
-## [0.6.1-2] — 2026-09-11
-
-Pré-release. **Le fichier d'enregistrement dépendait du casque d'une seule
-personne.**
-
-### Corrigé
-
-- **Le mix enregistré suivait votre fader d'écoute.** Le bus MIX recevait le son
-  déjà passé par le volume et le pan de votre tranche — alors que le fichier est
-  **partagé** avec tout le groupe. Le piège était concret : le fader de votre
-  instrument démarre à zéro pour éviter le larsen, donc qui s'écoute par son ampli
-  dans la pièce et ne le monte jamais **s'enregistrait muet dans le mix** (son stem,
-  lui, était intact). Le mix part désormais du signal brut de chaque tranche armée,
-  avant tout réglage d'écoute : **il ne dépend plus que de l'armement**.
-- Le vumètre du MIX suit la même règle : il montre ce qui part dans le fichier.
-
-### Note
-
-Ces réglages — volume, pan — ne servent qu'à votre écoute. Ils ne changent ni ce
-que reçoivent les autres musiciens, ni ce qui est enregistré.
-
-## [0.6.1-1] — 2026-09-10
-
-Pré-release. **Les VU-mètres mesuraient l'audio par échantillonnage aléatoire.**
+- **Gain d'envoi par source** (instrument, talkback) : le niveau auquel les autres
+  musiciens vous reçoivent, distinct du fader, qui ne règle que votre casque. Il
+  est appliqué après le plugin, donc sans changer le son d'un ampli simulé, et
+  avant les protections anti-saturation.
+- **Volume de talkback par musicien** : chacun règle, dans son casque, la voix de
+  chacun des autres. Personne d'autre n'est affecté.
+- **Alerte « trop fort » sur le talkback**, fondée sur le pic de ce qui part
+  réellement vers les autres (après le filtre antibruit et le gain) — elle ne
+  s'allume pas sur le son d'un ampli que le filtre ne laisse pas passer.
 
 ### Corrigé
 
 - **Les VU-mètres ne voyaient que 2,5 % du son joué.** Les niveaux étaient écrasés
-  à chaque bloc audio (2,5 ms) et relus toutes les 100 ms : sur 40 blocs, 39
-  n'étaient jamais regardés. Le studio affichait donc un instantané tiré au hasard
-  plutôt qu'une mesure — d'où un vumètre qui « part dans tous les sens » sans
-  rapport avec ce qu'on entend, un niveau sous-estimé de 1 à 5 dB, des attaques
-  ratées et un voyant CLIP aveugle la plupart du temps. Les niveaux sont désormais
-  **accumulés en continu** : chaque envoi porte le pic et le RMS de **toute** la
-  période écoulée, sans qu'aucun échantillon ne soit ignoré ni compté deux fois.
-  Concerne les tranches instrument (self et pairs), MASTER, MIX REC et le talkback.
+  à chaque bloc audio et relus toutes les 100 ms : le studio affichait un
+  instantané tiré au hasard plutôt qu'une mesure — vumètre nerveux, niveau
+  sous-estimé de 1 à 5 dB, attaques ratées, voyant CLIP souvent aveugle. Les
+  niveaux sont désormais **accumulés en continu** sur toute la période écoulée.
+  Concerne les tranches instrument (vous et les autres), MASTER, MIX REC et le
+  talkback.
+- **Le mix enregistré suivait votre fader d'écoute.** Le fichier est partagé avec
+  tout le groupe, mais le bus MIX recevait le son déjà passé par le volume et le
+  pan de votre tranche : qui ne montait jamais son fader (il démarre à zéro contre
+  le larsen) **s'enregistrait muet dans le mix**. Le mix part désormais du signal
+  brut de chaque tranche armée : **il ne dépend plus que de l'armement**. Son
+  vumètre suit la même règle.
+- **Un réglage d'écoute pouvait se perdre en silence.** Le fader, le pan, le
+  volume de talkback ou l'armement d'un musicien, envoyés juste avant l'arrivée
+  de son premier paquet audio, étaient ignorés ; et quand sa connexion était
+  remplacée, il repartait à 100 % et au centre. Les réglages sont maintenant
+  gardés et appliqués dès que son flux existe.
+- **Le pan de votre tranche revenait au centre après un réveil de veille** (ou une
+  réouverture de l'interface), sans que l'écran le montre ; l'armement pour
+  l'enregistrement tombait de la même façon. Les deux sont conservés.
+- **Un talkback poussé au-delà de 0 dB pouvait saturer** : le gain est appliqué
+  avant le limiteur, qui protège donc toujours ce qui part.
 - **Une sonde de détection de l'agent pouvait voler les mesures du studio.** Les
-  niveaux ne sont plus calculés ni envoyés qu'au client qui détient réellement la
-  session (même règle que le slot agent) — une page qui ouvre une connexion sans
-  s'annoncer ne consomme plus de mesures, ni 10 messages par seconde pour personne.
+  niveaux ne sont plus envoyés qu'au client qui détient réellement la session.
 - **Un plugin renvoyant une valeur invalide** (NaN) figeait le vumètre à fond
   jusqu'au redémarrage : ces valeurs sont maintenant neutralisées.
 
 ### Modifié
 
-- **Les niveaux sont envoyés au studio 25 fois par seconde** au lieu de 10. La
-  barre d'une tranche jouée par l'agent avançait par marches de 100 ms pendant
-  que celles lues par le navigateur (backing, métronome) bougeaient à chaque
-  image — deux vitesses sur la même table. Ce que mesure l'agent est inchangé :
-  chaque envoi couvre exactement la période écoulée.
+- **Les niveaux sont envoyés au studio 25 fois par seconde** au lieu de 10 : les
+  tranches jouées par l'agent bougent au même rythme que celles lues par le
+  navigateur (backing, métronome).
 
 ### Performance
 
-- Le calcul des niveaux fait désormais **une seule passe** sur chaque bloc au lieu
-  de deux (pic et RMS étaient parcourus séparément) — moins de travail dans le
-  callback temps-réel qu'avant ce correctif. Aucune latence ajoutée.
+- Le calcul des niveaux fait **une seule passe** par bloc audio au lieu de deux.
+  Aucune latence ajoutée par cette version.
+
+### Note
+
+Les faders et le pan ne servent qu'à votre écoute : ils ne changent ni ce que
+reçoivent les autres musiciens, ni ce qui est enregistré. Pour régler ce que les
+autres reçoivent, utilisez le gain d'envoi.
 
 ## [0.6.0] — 2026-09-06
 
