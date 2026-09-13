@@ -837,6 +837,13 @@ pub struct PipelineState {
     /// son micro capte quelque chose. Ce qui PART réellement est indiqué par le
     /// voyant « à l'antenne » (`voice_on_air`), pas par le vumètre.
     pub voice_rms: Arc<LevelMeter>,
+    /// Lot C (revue) — PIC de ce qui PART vers les autres, pour l'alerte « trop
+    /// fort » : mesuré APRÈS l'isolation et le gain d'envoi, AVANT le limiteur.
+    /// Distinct de `voice_rms` (activité, avant le filtre) : mesuré avant le
+    /// filtre, le pic allumait l'alerte sur la repisse d'un ampli alors que le
+    /// gate était fermé et que rien ne partait ; mesuré après le limiteur, il ne
+    /// dépasserait jamais le plafond et l'alerte ne s'allumerait plus.
+    pub voice_send_peak: Arc<LevelMeter>,
     /// Lot B — GAIN D'ENVOI de l'instrument : le niveau auquel les AUTRES me
     /// reçoivent. Appliqué après le plugin et avant le soft-clip, donc en amont
     /// de la division du signal — pairs, stem, MIX et vumètre voient le même.
@@ -1285,6 +1292,7 @@ impl PipelineState {
             voice_active: false,
             voice_gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_rms: Arc::new(LevelMeter::default()),
+            voice_send_peak: Arc::new(LevelMeter::default()),
             send_gain_instrument: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             send_gain_voice: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             voice_on_air: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1801,6 +1809,9 @@ impl PipelineState {
             for id in ids {
                 self.remove_stream(&id);
             }
+            // Fin de session : les réglages d'écoute des pairs partent avec eux.
+            // (Hot-swap d'entrée : on garde la réception, donc aussi ses réglages.)
+            self.mixer.clear_stream_settings();
             if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
                 let _ = tx.send(DecodeMsg::Shutdown);
                 drop(tx);
@@ -2439,6 +2450,7 @@ impl PipelineState {
         let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
+        let voice_send_peak = self.voice_send_peak.clone();
         let send_gain_voice = self.send_gain_voice.clone();
         let voice_on_air = self.voice_on_air.clone();
         let isolation_active = self.isolation_active.clone();
@@ -2463,6 +2475,7 @@ impl PipelineState {
                     voice_gain,
                     send_gain_voice,
                     voice_rms,
+                    voice_send_peak,
                     voice_on_air,
                     isolation_active,
                     output_device_name,
@@ -3597,14 +3610,22 @@ fn capture_stage_loop(
 /// rouvrir la porte au dépassement : c'est le symétrique de l'instrument, où le
 /// gain d'envoi précède le soft-clip.
 ///
-/// Aucun retard ajouté : une multiplication dans un bloc déjà parcouru.
+/// Le PIC de l'alerte « trop fort » est relevé ENTRE les deux : c'est ce que les
+/// autres recevraient sans protection. Après le limiteur il ne dépasserait
+/// jamais le plafond ; avant le filtre (en amont de cet étage), il comptait la
+/// repisse d'un ampli que le gate ne laisse pas passer.
+///
+/// Aucun retard ajouté : une multiplication et une mesure dans un bloc déjà
+/// parcouru.
 fn voice_send_stage(
     block: &mut [f32],
     send_ramp: &mut jamodio_audio_core::gain::SmoothGain,
     send_target: f32,
+    send_peak: &LevelMeter,
     limiter: &mut PeakLimiter,
 ) {
     send_ramp.apply_mono_block(block, send_target);
+    send_peak.push_mono(block, 1.0);
     limiter.process_block(block);
 }
 
@@ -4271,6 +4292,8 @@ fn voice_encode_stage_loop(
     // Lot B — gain d'ENVOI du talkback, INDÉPENDANT de la coupure ci-dessus.
     send_gain_voice: Arc<std::sync::atomic::AtomicU32>,
     voice_rms: Arc<LevelMeter>,
+    // Pic de ce qui part, pour l'alerte « trop fort » (cf. `voice_send_stage`).
+    voice_send_peak: Arc<LevelMeter>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
     output_device_name: Option<String>,
@@ -4394,8 +4417,8 @@ fn voice_encode_stage_loop(
         //          potard GAIN, et on ne pouvait pas régler son niveau d'envoi à
         //          l'œil (recette 13/09). L'instrument, lui, est mesuré après son
         //          gain d'envoi depuis le Lot B : les deux sources se lisent
-        //          désormais pareil, et le pic qui fonde l'alerte TROP FORT dit
-        //          ce que les autres reçoivent.
+        //          désormais pareil. Le pic de l'alerte TROP FORT, lui, est pris
+        //          plus loin, sur ce qui part (cf. `voice_send_stage`).
         //        Le gain est passé au mètre plutôt qu'appliqué au signal : l'étage
         //        d'isolation qui suit est calibré sur le niveau du micro, et ne doit
         //        pas changer de comportement quand on tourne le potard.
@@ -4429,7 +4452,7 @@ fn voice_encode_stage_loop(
         // 1-quater. Gain d'ENVOI puis limiteur de crête (cf. `voice_send_stage`) :
         //        le limiteur borne ce qui part dans Opus sans aplatir la forme
         //        d'onde. Sous le plafond, le signal n'est pas touché.
-        voice_send_stage(&mut mono48, &mut send_ramp, envoi, &mut limiter);
+        voice_send_stage(&mut mono48, &mut send_ramp, envoi, &voice_send_peak, &mut limiter);
         if last_limiter_report.elapsed() >= std::time::Duration::from_secs(5) {
             last_limiter_report = std::time::Instant::now();
             let reduction_db = limiter.take_max_reduction_db();
@@ -4483,6 +4506,7 @@ fn voice_encode_stage_loop(
     }
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.reset();
+    voice_send_peak.reset();
     voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
     isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(target: "jamodio::pipeline", "voice-encode thread exited");
@@ -5164,6 +5188,7 @@ mod voice_send_tests {
     use super::voice_send_stage;
     use jamodio_audio_core::codec::limiter::{PeakLimiter, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS};
     use jamodio_audio_core::gain::SmoothGain;
+    use jamodio_audio_core::mixer::mixer::LevelMeter;
 
     const FS: f32 = 48_000.0;
 
@@ -5181,14 +5206,19 @@ mod voice_send_tests {
         let gain_12db = 10f32.powf(12.0 / 20.0);
         let mut ramp = SmoothGain::new(gain_12db, FS);
         let mut limiter = PeakLimiter::new(FS, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS);
+        let meter = LevelMeter::default();
         let signal = sinus(0.89, 48_000);
         let mut pic = 0.0f32;
         for bloc in signal.chunks(480) {
             let mut b = bloc.to_vec();
-            voice_send_stage(&mut b, &mut ramp, gain_12db, &mut limiter);
+            voice_send_stage(&mut b, &mut ramp, gain_12db, &meter, &mut limiter);
             pic = b.iter().fold(pic, |a, &s| a.max(s.abs()));
         }
         assert!(pic <= DEFAULT_CEILING + 1e-6, "plafond tenu malgré +12 dB, pic {pic}");
+        // …mais l'alerte, elle, voit ce qui serait parti SANS protection : c'est
+        // précisément le cas où il faut dire « trop fort ».
+        let (pic_alerte, _) = meter.take();
+        assert!(pic_alerte > 3.0, "le pic d'alerte est pris AVANT le limiteur, got {pic_alerte}");
     }
 
     /// Le gain agit bien sur le signal envoyé : −12 dB divise l'amplitude par ~4.
@@ -5197,8 +5227,9 @@ mod voice_send_tests {
         let gain = 10f32.powf(-12.0 / 20.0);
         let mut ramp = SmoothGain::new(gain, FS);
         let mut limiter = PeakLimiter::new(FS, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS);
+        let meter = LevelMeter::default();
         let mut b = sinus(0.5, 48_000);
-        voice_send_stage(&mut b, &mut ramp, gain, &mut limiter);
+        voice_send_stage(&mut b, &mut ramp, gain, &meter, &mut limiter);
         let pic = b[4_800..].iter().fold(0.0f32, |a, &s| a.max(s.abs()));
         assert!((pic - 0.5 * gain).abs() < 0.01, "attendu ~{}, got {pic}", 0.5 * gain);
     }

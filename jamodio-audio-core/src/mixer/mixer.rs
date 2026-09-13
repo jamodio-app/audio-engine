@@ -467,6 +467,31 @@ pub struct AudioMixer {
     /// — remonté via `stream-levels` pour le VU voix navigateur en mode agent.
     /// Mesuré sur les deux canaux de `voice_buf` réunis.
     inbound_voice_meter: LevelMeter,
+    /// Lot C (revue) — réglages d'ÉCOUTE de chaque flux entrant, gardés HORS de
+    /// sa cellule. La cellule d'un pair n'existe qu'à partir de son premier
+    /// paquet (cf. décodage) et elle est RECRÉÉE quand une connexion en supplante
+    /// une autre : un réglage posé avant ce paquet, ou sur la cellule remplacée,
+    /// se perdait en silence — le curseur affichait 30 %, l'agent jouait 100 %.
+    /// C'est donc ici que vivent volume et pan ; la cellule en est la copie de
+    /// travail du callback, initialisée à sa création.
+    /// Vidé au retrait explicite d'un flux par le web et en fin de session.
+    stream_settings: RwLock<HashMap<String, StreamSettings>>,
+    /// Pairs armés pour le bus MIX (dernier snapshot du web), pour la même raison :
+    /// un pair armé avant son premier paquet doit naître armé.
+    armed_peers: RwLock<Vec<String>>,
+}
+
+/// Réglages d'écoute d'un flux entrant (cf. `AudioMixer::stream_settings`).
+#[derive(Debug, Clone, Copy)]
+struct StreamSettings {
+    volume: f32,
+    pan: f32,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self { volume: 1.0, pan: 0.0 }
+    }
 }
 
 impl Default for AudioMixer {
@@ -493,6 +518,8 @@ impl AudioMixer {
             voice_gain: AtomicF32::new(1.0),
             voice_pan: AtomicF32::new(0.0),
             inbound_voice_meter: LevelMeter::default(),
+            stream_settings: RwLock::new(HashMap::new()),
+            armed_peers: RwLock::new(Vec::new()),
         }
     }
 
@@ -539,6 +566,7 @@ impl AudioMixer {
     /// false`. N'affecte JAMAIS le monitoring/MASTER (`output`).
     pub fn set_record_arm(&self, self_armed: bool, armed_peers: &[String]) {
         self.self_armed_user.store(self_armed, Ordering::Relaxed);
+        *self.armed_peers.write() = armed_peers.to_vec();
         let effective_self = self_armed && !self.self_private.load(Ordering::Relaxed);
         let map = self.streams.read();
         for (id, cell) in map.iter() {
@@ -602,10 +630,51 @@ impl AudioMixer {
     /// Add a new remote stream.
     /// Ajoute un stream entrant. `kind` (Lot C) route son mixage : `Instrument`
     /// = mix enregistré/duckable ; `Voice` = talkback pair, sommé post-tap/post-DIM.
+    ///
+    /// La cellule NAÎT avec les réglages déjà connus pour ce flux (volume, pan,
+    /// armement MIX) : ils ont pu être posés avant son premier paquet, ou sur une
+    /// cellule qu'elle remplace. Appelé par le thread de décodage à la création
+    /// d'un flux — rare, et le verrou d'écriture de la map y est déjà pris.
     pub fn add_stream(&self, producer_id: &str, kind: StreamKind) {
         let default_target = self.default_target_ms.load(Ordering::Relaxed);
-        let cell = Arc::new(StreamCell::new_peer(producer_id, kind, default_target));
-        self.streams.write().insert(producer_id.to_string(), cell);
+        let cell = StreamCell::new_peer(producer_id, kind, default_target);
+        let settings = self
+            .stream_settings
+            .read()
+            .get(producer_id)
+            .copied()
+            .unwrap_or_default();
+        cell.volume.store(settings.volume);
+        cell.pan.store(settings.pan);
+        let armed = self.armed_peers.read().iter().any(|p| p == producer_id);
+        cell.mix_armed.store(armed, Ordering::Relaxed);
+        self.streams
+            .write()
+            .insert(producer_id.to_string(), Arc::new(cell));
+    }
+
+    /// Oublie les réglages d'écoute d'un flux que le web a RETIRÉ (pair parti,
+    /// consumer fermé). Distinct de `remove_stream`, que le décodage appelle
+    /// aussi quand une connexion en supplante une autre — là, les réglages
+    /// doivent survivre.
+    pub fn forget_stream_settings(&self, producer_id: &str) {
+        self.stream_settings.write().remove(producer_id);
+    }
+
+    /// Fin de session : plus aucun réglage de flux ne doit survivre.
+    pub fn clear_stream_settings(&self) {
+        self.stream_settings.write().clear();
+        self.armed_peers.write().clear();
+    }
+
+    /// Mémorise un réglage d'écoute pour un flux entrant (hors self-monitor, qui a
+    /// sa propre cellule à vie et son propre `reset_local_stream`).
+    fn remember_stream_setting(&self, producer_id: &str, apply: impl FnOnce(&mut StreamSettings)) {
+        if producer_id == SELF_MONITOR_ID {
+            return;
+        }
+        let mut map = self.stream_settings.write();
+        apply(map.entry(producer_id.to_string()).or_default());
     }
 
     /// Remove a stream.
@@ -703,6 +772,7 @@ impl AudioMixer {
         // Garde NaN alignée sur set_pan/set_dim/set_master_gain :
         // NaN.clamp() = NaN → silence définitif du stream sinon.
         let v = if volume.is_finite() { volume.clamp(0.0, 1.5) } else { 1.0 };
+        self.remember_stream_setting(producer_id, |s| s.volume = v);
         if let Some(cell) = self.streams.read().get(producer_id) {
             cell.volume.store(v);
         }
@@ -716,7 +786,7 @@ impl AudioMixer {
     /// Set per-stream pan, range [-1.0, 1.0]. -1=full left, 0=center, +1=full right.
     /// Applique une loi de balance stéréo linéaire (0 dB au centre) dans
     /// `mix_into`. Pour SELF_MONITOR_ID, fonctionne pareil.
-    /// No-op si le stream n'existe pas (peer parti, race).
+    /// Flux pas encore créé : le réglage est mémorisé et appliqué à sa création.
     pub fn set_pan(&self, producer_id: &str, pan: f32) {
         if producer_id == REFERENCE_ID {
             self.reference.lock().set_pan(pan);
@@ -731,6 +801,7 @@ impl AudioMixer {
             return;
         }
         let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+        self.remember_stream_setting(producer_id, |s| s.pan = p);
         if let Some(cell) = self.streams.read().get(producer_id) {
             cell.pan.store(p);
         }
@@ -1682,8 +1753,6 @@ mod tests {
 
     // ─── Lot C — invariants voix des pairs (0.5.10-4) ─────────────────────────
 
-    /// INVARIANT : la voix des pairs n'est JAMAIS duckée par le DIM. Avec DIM=0
-    /// (instruments coupés), la voix reste pleinement audible en sortie.
     #[test]
     fn le_metre_du_talkback_rend_le_pic_et_le_rms() {
         // Lot C3 — le pic était mesuré puis jeté : seul le RMS partait vers le
@@ -1739,6 +1808,8 @@ mod tests {
         assert!(lv.rms_l > 0.5, "le mètre voit le signal malgré le volume à 0, got {}", lv.rms_l);
     }
 
+    /// INVARIANT : la voix des pairs n'est JAMAIS duckée par le DIM. Avec DIM=0
+    /// (instruments coupés), la voix reste pleinement audible en sortie.
     #[test]
     fn voice_is_never_ducked_by_dim() {
         let m = AudioMixer::new();
@@ -1925,6 +1996,61 @@ mod tests {
         assert!(droite < 1e-4, "pan à gauche conservé : droite muette, got {droite}");
         let (_, _, mix_l, _) = master_mix_rms(&m);
         assert!(mix_l > 0.1, "armement MIX conservé, got {mix_l}");
+    }
+
+    /// Revue Lot C — la cellule d'un pair n'existe qu'à son PREMIER paquet, or le
+    /// web envoie ses réglages juste après avoir branché le flux : avant ce
+    /// paquet. Ils doivent s'appliquer à la création, pas se perdre en silence.
+    #[test]
+    fn reglages_poses_avant_le_premier_paquet_sont_appliques() {
+        let m = AudioMixer::new();
+        m.set_volume("p1", 0.5);
+        m.set_pan("p1", -1.0);
+        m.set_record_arm(false, &["p1".to_string()]);
+        m.add_stream("p1", StreamKind::Instrument); // = premier paquet
+        let mut out = vec![0.0f32; 512];
+        m.push_samples("p1", &vec![1.0f32; 48_000]);
+        m.mix_into(&mut out);
+        assert!((out[0] - 0.5).abs() < 1e-3, "volume mémorisé, got {}", out[0]);
+        assert!(out[1].abs() < 1e-6, "pan mémorisé : droite muette, got {}", out[1]);
+        let (_, _, mix_l, _) = master_mix_rms(&m);
+        assert!(mix_l > 0.1, "armement mémorisé, got {mix_l}");
+    }
+
+    /// …et ils survivent quand le décodage remplace une connexion par une autre
+    /// (même producer) : c'était le retour à 100 % d'un talkback baissé.
+    #[test]
+    fn reglages_survivent_a_la_recreation_du_flux() {
+        let m = AudioMixer::new();
+        m.add_stream("v1", StreamKind::Voice);
+        m.set_volume("v1", 0.3);
+        m.remove_stream("v1"); // connexion supplantée
+        m.add_stream("v1", StreamKind::Voice);
+        let mut out = vec![0.0f32; 512];
+        m.push_samples("v1", &vec![1.0f32; 48_000]);
+        m.mix_into(&mut out);
+        assert!((out[0] - 0.3).abs() < 1e-3, "volume conservé, got {}", out[0]);
+    }
+
+    /// Retrait VOULU par le web, ou fin de session : on repart du neutre.
+    #[test]
+    fn un_flux_retire_par_le_web_oublie_ses_reglages() {
+        // Signal à 0.5 : la sortie est bornée à la pleine échelle, un 1.0 ne
+        // distinguerait pas « 100 % » d'« écrêté ».
+        let sortie_apres = |oublier: &dyn Fn(&AudioMixer)| {
+            let m = AudioMixer::new();
+            m.set_volume("p1", 0.2);
+            oublier(&m);
+            m.add_stream("p1", StreamKind::Instrument);
+            m.push_samples("p1", &vec![0.5f32; 48_000]);
+            let mut out = vec![0.0f32; 512];
+            m.mix_into(&mut out);
+            out[0]
+        };
+        let retire = sortie_apres(&|m| m.forget_stream_settings("p1"));
+        assert!((retire - 0.5).abs() < 1e-3, "retiré par le web → 100 %, got {retire}");
+        let fin = sortie_apres(&|m| m.clear_stream_settings());
+        assert!((fin - 0.5).abs() < 1e-3, "fin de session → 100 %, got {fin}");
     }
 
     // ─── Tranche instrument en PRIVÉ (s'entendre sans envoyer) ────────────────

@@ -722,6 +722,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 pl.mixer.take_stream_levels();
                 pl.mixer.take_bus_levels();
                 pl.voice_rms.take();
+                pl.voice_send_peak.take();
                 continue;
             }
             let pl = levels_pipeline.lock().await;
@@ -755,11 +756,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // mode agent voix). `0.0` hors voix active.
             // Mètre du micro talkback — lecture destructive comme les autres.
             //
-            // Lot C3 — on remonte AUSSI le PIC. Le mètre le mesurait déjà, on le
-            // jetait. Il sert à alerter celui qui envoie trop fort : une alerte
-            // fondée sur le RMS arrive en retard et rate les crêtes courtes —
-            // exactement celles qui font mal chez les autres.
-            let (voice_peak, voice_rms) = pl.voice_rms.take();
+            // Lot C3 — on remonte AUSSI un PIC, pour alerter celui qui envoie trop
+            // fort : une alerte fondée sur le RMS arrive en retard et rate les
+            // crêtes courtes — exactement celles qui font mal chez les autres.
+            // Deux mètres, deux questions : le RMS dit que le micro CAPTE (avant
+            // le filtre), le pic dit ce qui PART (après filtre et gain, avant le
+            // limiteur — cf. `voice_send_stage`).
+            let (_, voice_rms) = pl.voice_rms.take();
+            let (voice_peak, _) = pl.voice_send_peak.take();
             // Isolation de voix : état « à l'antenne » (gate) + isolation active/repli.
             let voice_on_air = pl.voice_on_air.load(std::sync::atomic::Ordering::Relaxed);
             let isolation_active = pl.isolation_active.load(std::sync::atomic::Ordering::Relaxed);
@@ -2669,6 +2673,10 @@ async fn handle_message(
                 return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
             };
             pl.remove_stream(&producer_id);
+            // Retrait VOULU par le web (pair parti, consumer fermé) : ses réglages
+            // d'écoute partent avec lui. Ce n'est pas le cas quand le décodage
+            // remplace une connexion par une autre — là, ils doivent survivre.
+            mixer.forget_stream_settings(&producer_id);
             vec![]
         }
 
@@ -2831,7 +2839,6 @@ async fn handle_message(
             vec![]
         }
 
-        // Lot C — bus voix des pairs (talkback via l'agent). Tranche unique.
         BrowserMessage::SetSendGain { source, gain } => {
             // Lot B — le niveau auquel les AUTRES me reçoivent. Écriture
             // atomique, sans le mutex pipeline : c'est un scalaire, le thread
@@ -2850,9 +2857,11 @@ async fn handle_message(
                 SendGainSource::Voice => send_gain_voice,
             };
             cible.store(g.to_bits(), Ordering::Relaxed);
-            tracing::info!(target: "jamodio::ws", ?source, gain = g, "SetSendGain");
+            // `debug` : le web en envoie un par mouvement du potard.
+            tracing::debug!(target: "jamodio::ws", ?source, gain = g, "SetSendGain");
             vec![]
         }
+        // Lot C — bus voix des pairs (talkback via l'agent). Tranche unique.
         BrowserMessage::SetPeerVoiceGain { gain } => {
             mixer.set_peer_voice_gain(gain);
             vec![]
