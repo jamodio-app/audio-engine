@@ -5,6 +5,33 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.1-4] — 2026-09-13
+
+Pré-release. **La table de mixage refondue (Lot C), et ce que la première
+recette à deux musiciens a révélé.** Cette entrée couvre aussi la 0.6.1-3.
+
+### Ajouté
+
+- **Gain d'envoi par source** (instrument, talkback) : le niveau auquel les
+  autres musiciens vous reçoivent, distinct du fader qui ne règle que votre
+  casque.
+- **Volume de talkback par musicien** : chacun règle, dans son casque, la voix
+  de chacun des autres. Personne d'autre n'est affecté.
+- Le talkback remonte son **pic**, en plus de son niveau moyen : c'est ce qui
+  fonde l'alerte « trop fort » du studio.
+
+### Corrigé
+
+- **Le vumètre du talkback ignorait le gain d'envoi.** On ne pouvait pas régler
+  son niveau à l'œil. Il se lit maintenant comme celui de l'instrument : au
+  niveau de ce qui part.
+- **Un gain d'envoi positif pouvait faire saturer le talkback.** Le gain
+  s'appliquait après le limiteur, qui ne protégeait donc plus rien. Il passe
+  désormais avant.
+- **Le pan de votre tranche revenait au centre après un réveil de veille** (ou
+  une réouverture de l'interface), sans que l'écran le montre. L'armement pour
+  l'enregistrement tombait de la même façon. Les deux sont conservés.
+
 ## [0.6.1-2] — 2026-09-11
 
 Pré-release. **Le fichier d'enregistrement dépendait du casque d'une seule
