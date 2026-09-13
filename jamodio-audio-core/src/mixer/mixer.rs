@@ -631,25 +631,31 @@ impl AudioMixer {
         self.streams.write().remove(SELF_MONITOR_ID);
     }
 
-    /// 0.5.4-18 — réinitialise le JitterBuffer du self-monitor en préservant le
-    /// volume. À appeler après une discontinuité d'horloge de capture (re-init ASIO
-    /// mid-session sur réveil de veille PC) : le buffer de gigue repart propre, son
-    /// estimateur de drift n'est plus faussé par le trou → plus de distorsion
-    /// persistante au casque. No-op si le self-monitor n'existe pas.
+    /// 0.5.4-18 — réinitialise le JitterBuffer du self-monitor en préservant les
+    /// RÉGLAGES de la tranche. À appeler après une discontinuité d'horloge de
+    /// capture (re-init ASIO mid-session sur réveil de veille PC) : le buffer de
+    /// gigue repart propre, son estimateur de drift n'est plus faussé par le trou
+    /// → plus de distorsion persistante au casque. No-op si le self-monitor
+    /// n'existe pas.
     ///
-    /// C2.1 — remplacement ATOMIQUE sous le write lock (lecture de l'ancien volume
-    /// puis insertion de la cellule neuve dans la même section critique) → aucune
+    /// Seul le buffer est à refaire : volume, pan et armement sont des choix de
+    /// l'utilisateur, que rien ne lui redemande. Ne reprendre que le volume
+    /// ramenait silencieusement le pan au centre et sortait la tranche du bus MIX
+    /// jusqu'au prochain geste — sans que l'interface l'affiche.
+    ///
+    /// C2.1 — remplacement ATOMIQUE sous le write lock (lecture de l'ancienne
+    /// cellule puis insertion de la neuve dans la même section critique) → aucune
     /// fenêtre où le self-monitor serait absent.
     pub fn reset_local_stream(&self) {
         let mut map = self.streams.write();
         let Some(old) = map.get(SELF_MONITOR_ID) else {
             return;
         };
-        let volume = old.volume.load();
-        map.insert(
-            SELF_MONITOR_ID.to_string(),
-            Arc::new(StreamCell::new_local(volume)),
-        );
+        let cell = StreamCell::new_local(old.volume.load());
+        cell.pan.store(old.pan.load());
+        cell.mix_armed
+            .store(old.mix_armed.load(Ordering::Relaxed), Ordering::Relaxed);
+        map.insert(SELF_MONITOR_ID.to_string(), Arc::new(cell));
     }
 
     /// Override le volume du self-monitor (0.0 = silence, 1.0 = unity, 1.5 = max).
@@ -1894,6 +1900,31 @@ mod tests {
         m.mix_into(&mut out);
         let (_, _, xl2, _) = master_mix_rms(&m);
         assert!(xl2 > 0.1, "self armé → MIX présent, got {xl2}");
+    }
+
+    /// Lot C6 — refaire le buffer du self-monitor (réveil de veille, ré-init ASIO)
+    /// ne doit PAS défaire les réglages de la tranche : le pan revenait au centre
+    /// et l'armement MIX tombait, en silence, jusqu'au prochain geste.
+    #[test]
+    fn reset_du_self_monitor_garde_pan_et_armement() {
+        let m = AudioMixer::new();
+        m.add_local_stream();
+        m.set_self_monitor_volume(1.0);
+        m.set_pan(SELF_MONITOR_ID, -1.0);
+        m.set_record_arm(true, &[]);
+
+        m.reset_local_stream();
+
+        let ones = vec![1.0f32; 48_000];
+        let mut out = vec![0.0f32; 512];
+        m.push_self_samples(&ones);
+        m.mix_into(&mut out);
+        let droite = out.iter().skip(1).step_by(2).fold(0.0f32, |a, &s| a.max(s.abs()));
+        let gauche = out.iter().step_by(2).fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert!(gauche > 0.1, "le self-monitor sonne toujours, got {gauche}");
+        assert!(droite < 1e-4, "pan à gauche conservé : droite muette, got {droite}");
+        let (_, _, mix_l, _) = master_mix_rms(&m);
+        assert!(mix_l > 0.1, "armement MIX conservé, got {mix_l}");
     }
 
     // ─── Tranche instrument en PRIVÉ (s'entendre sans envoyer) ────────────────

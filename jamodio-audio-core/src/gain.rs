@@ -62,6 +62,18 @@ impl SmoothGain {
         self.current
     }
 
+    /// Applique la rampe à un bloc MONO, en place — un gain par échantillon.
+    #[inline]
+    pub fn apply_mono_block(&mut self, buf: &mut [f32], target: f32) {
+        // Même court-circuit qu'en stéréo : au neutre, le bloc n'est pas parcouru.
+        if target == 1.0 && (self.current - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        for s in buf.iter_mut() {
+            *s *= self.next(target);
+        }
+    }
+
     /// Applique la rampe à un bloc INTERLEAVÉ STÉRÉO, en place.
     ///
     /// Les deux canaux d'une même frame reçoivent le MÊME gain — sinon la rampe
@@ -150,6 +162,26 @@ mod tests {
         for frame in buf.as_chunks::<2>().0 {
             assert_eq!(frame[0], frame[1], "l'image stéréo ne bouge pas pendant la rampe");
         }
+    }
+
+    #[test]
+    fn mono_aucune_discontinuite_sur_un_saut_de_gain() {
+        let mut g = SmoothGain::new(1.0, FS);
+        let mut buf = vec![1.0f32; 480];
+        g.apply_mono_block(&mut buf, 0.0);
+        let saut_max = buf
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(saut_max < 0.01, "pas de marche audible, plus gros écart {saut_max}");
+    }
+
+    #[test]
+    fn mono_gain_neutre_laisse_le_bloc_intact() {
+        let mut g = SmoothGain::new(1.0, FS);
+        let mut buf = vec![0.25f32; 32];
+        g.apply_mono_block(&mut buf, 1.0);
+        assert!(buf.iter().all(|&s| s == 0.25), "défaut 0 dB = signal bit-identique");
     }
 
     #[test]

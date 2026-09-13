@@ -3587,6 +3587,27 @@ fn capture_stage_loop(
 // C'est le SEUL stage qui peut spiker (plugin lourd). Le ringbuf en amont
 // (depuis capture) absorbe ~170 ms de jitter sans drop CPAL.
 
+/// Lot C6 — étage d'ENVOI du talkback : gain d'envoi, PUIS limiteur de crête.
+///
+/// L'ordre est la raison d'être de cette fonction. Le gain était appliqué APRÈS
+/// le limiteur, en même temps que la coupure du micro : avec le potard à +12 dB,
+/// un signal que le limiteur venait de borner à −1 dBFS repartait vers Opus
+/// quatre fois plus fort, et l'encodeur le tronquait — exactement la distorsion
+/// que le limiteur existe pour empêcher. Posé avant, le gain ne peut plus
+/// rouvrir la porte au dépassement : c'est le symétrique de l'instrument, où le
+/// gain d'envoi précède le soft-clip.
+///
+/// Aucun retard ajouté : une multiplication dans un bloc déjà parcouru.
+fn voice_send_stage(
+    block: &mut [f32],
+    send_ramp: &mut jamodio_audio_core::gain::SmoothGain,
+    send_target: f32,
+    limiter: &mut PeakLimiter,
+) {
+    send_ramp.apply_mono_block(block, send_target);
+    limiter.process_block(block);
+}
+
 /// Chantier C (v0.4.14, révisé v0.4.15) — soft-clip de sécurité ZÉRO-latence,
 /// plugin-agnostic.
 ///
@@ -4285,11 +4306,21 @@ fn voice_encode_stage_loop(
     let mut sequence: u16 = 0;
     let mut timestamp: u32 = 0;
 
-    // Fondu de gain PAR-SAMPLE (anti-clic). One-pole asymétrique : ouverture
-    // rapide (~15 ms), fermeture douce (~80 ms). `coeff = 1 - exp(-1/(τ·fs))`.
-    let mut cur_gain = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
-    let attack_coeff = 1.0 - (-1.0f32 / (0.015 * 48000.0)).exp();
-    let release_coeff = 1.0 - (-1.0f32 / (0.080 * 48000.0)).exp();
+    // Deux rampes anti-clic (cf. `gain::SmoothGain`), parce que deux réglages
+    // INDÉPENDANTS, placés à deux endroits différents de la chaîne :
+    //   • le gain d'ENVOI, avant le limiteur (cf. `voice_send_stage`) ;
+    //   • la COUPURE du micro, tout au bout, juste avant l'encodeur.
+    // Les garder séparés évite le bug classique où rouvrir son micro écrase le
+    // niveau réglé.
+    let voice_rate = jamodio_audio_core::voice_isolation::isolator::SAMPLE_RATE as f32;
+    let mut send_ramp = jamodio_audio_core::gain::SmoothGain::new(
+        f32::from_bits(send_gain_voice.load(std::sync::atomic::Ordering::Relaxed)),
+        voice_rate,
+    );
+    let mut mute_ramp = jamodio_audio_core::gain::SmoothGain::new(
+        f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed)),
+        voice_rate,
+    );
 
     // Isolation de voix talkback (Lot 2) : denoise (DeepFilterNet) + VAD (Silero) +
     // gate, pur Rust (tract). Chargée UNE fois au démarrage du thread voix.
@@ -4348,17 +4379,30 @@ fn voice_encode_stage_loop(
             continue;
         }
 
-        // 1-bis. NIVEAU D'ENTRÉE du micro talkback, mesuré AVANT le filtre.
-        //        C'est lui qui alimente le VU de la tranche : un vumètre branché
-        //        APRÈS le filtre ne bouge que quand le gate s'ouvre — l'utilisateur
-        //        ne peut alors plus vérifier que son micro capte quoi que ce soit
-        //        (constaté au test terrain 04/09 : « ça ne module pas quand je
-        //        parle »). Le VU montre donc l'entrée ; c'est le voyant « à
-        //        l'antenne » qui dit ce qui PART réellement.
+        // Gain d'envoi du bloc : lu UNE fois, pour que le mètre et l'étage
+        // d'envoi voient la même valeur.
+        let envoi = f32::from_bits(send_gain_voice.load(std::sync::atomic::Ordering::Relaxed));
+
+        // 1-bis. NIVEAU du micro talkback, mesuré AVANT le filtre, AU NIVEAU DU
+        //        GAIN D'ENVOI.
+        //        • Avant le filtre : un vumètre branché APRÈS ne bouge que quand
+        //          le gate s'ouvre — l'utilisateur ne peut alors plus vérifier que
+        //          son micro capte quoi que ce soit (test terrain 04/09 : « ça ne
+        //          module pas quand je parle »). C'est le voyant « à l'antenne »
+        //          qui dit ce qui PART réellement.
+        //        • Au niveau du gain (Lot C6) : mesuré à 1.0, le vumètre ignorait le
+        //          potard GAIN, et on ne pouvait pas régler son niveau d'envoi à
+        //          l'œil (recette 13/09). L'instrument, lui, est mesuré après son
+        //          gain d'envoi depuis le Lot B : les deux sources se lisent
+        //          désormais pareil, et le pic qui fonde l'alerte TROP FORT dit
+        //          ce que les autres reçoivent.
+        //        Le gain est passé au mètre plutôt qu'appliqué au signal : l'étage
+        //        d'isolation qui suit est calibré sur le niveau du micro, et ne doit
+        //        pas changer de comportement quand on tourne le potard.
         //        Le niveau est ACCUMULÉ bloc par bloc et vidé par le sender
         //        `stream-levels` : comme les autres mètres (cf. `LevelMeter`), il
         //        couvre toute la fenêtre écoulée et non le seul dernier bloc.
-        voice_rms.push_mono(&mono48, 1.0);
+        voice_rms.push_mono(&mono48, envoi);
 
         // 1-ter. Isolation de voix (AVANT le gain mute) : enlève la repisse
         //        d'instrument et coupe hors parole. En cas d'erreur d'inférence,
@@ -4382,10 +4426,10 @@ fn voice_encode_stage_loop(
             }
         }
 
-        // 1-quater. Limiteur de crête : borne ce qui part dans Opus sans aplatir la
-        //        forme d'onde (réduction de gain anticipée). Sous le plafond, le
-        //        signal n'est pas touché.
-        limiter.process_block(&mut mono48);
+        // 1-quater. Gain d'ENVOI puis limiteur de crête (cf. `voice_send_stage`) :
+        //        le limiteur borne ce qui part dans Opus sans aplatir la forme
+        //        d'onde. Sous le plafond, le signal n'est pas touché.
+        voice_send_stage(&mut mono48, &mut send_ramp, envoi, &mut limiter);
         if last_limiter_report.elapsed() >= std::time::Duration::from_secs(5) {
             last_limiter_report = std::time::Instant::now();
             let reduction_db = limiter.take_max_reduction_db();
@@ -4399,20 +4443,12 @@ fn voice_encode_stage_loop(
             }
         }
 
-        // 2. Gain lissé par-sample (mute) → accumulation → frames Opus stéréo
-        //    (L=R). Le niveau du VU, lui, a été relevé en ENTRÉE (étape 1-bis) :
-        //    il doit refléter ce que le micro capte, pas ce que le filtre laisse
-        //    passer.
-        // Lot B — la cible combine DEUX réglages indépendants : la coupure du
-        // micro (0 ou 1) et le gain d'envoi. Les garder séparés évite le bug
-        // classique où rouvrir son micro écrase le niveau réglé.
+        // 2. Coupure du micro lissée par-sample → accumulation → frames Opus
+        //    stéréo (L=R). Le gain d'envoi, lui, est déjà appliqué (étape
+        //    1-quater) : rouvrir son micro ne touche pas au niveau réglé.
         let mute = f32::from_bits(voice_gain.load(std::sync::atomic::Ordering::Relaxed));
-        let envoi = f32::from_bits(send_gain_voice.load(std::sync::atomic::Ordering::Relaxed));
-        let target = mute * envoi;
         for &s in mono48.iter() {
-            let coeff = if target > cur_gain { attack_coeff } else { release_coeff };
-            cur_gain += (target - cur_gain) * coeff;
-            acc.push(s * cur_gain);
+            acc.push(s * mute_ramp.next(mute));
             if acc.len() == frame_size {
                 for (i, &m) in acc.iter().enumerate() {
                     stereo_frame[i * 2] = m;
@@ -4443,7 +4479,7 @@ fn voice_encode_stage_loop(
                 acc.clear();
             }
         }
-        // (Le niveau du VU est mesuré en ENTRÉE, cf. étape 1-bis.)
+        // (Le niveau du VU est mesuré avant le filtre, au gain d'envoi — cf. 1-bis.)
     }
     // Voix arrêtée : VU talkback à zéro.
     voice_rms.reset();
@@ -5117,6 +5153,54 @@ mod remap_tests {
         assert!(extract_channel_mono(&block_3ch(), 0, 0).is_empty());
         // Buffer vide → vide.
         assert!(extract_channel_mono(&[], 4, 1).is_empty());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Lot C6 — étage d'envoi du talkback (gain avant le limiteur)
+// ═══════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod voice_send_tests {
+    use super::voice_send_stage;
+    use jamodio_audio_core::codec::limiter::{PeakLimiter, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS};
+    use jamodio_audio_core::gain::SmoothGain;
+
+    const FS: f32 = 48_000.0;
+
+    /// Sinus 1 kHz d'amplitude donnée, en blocs de 480 échantillons.
+    fn sinus(amp: f32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / FS).sin())
+            .collect()
+    }
+
+    /// Le cas qui a motivé l'ordre : un micro déjà fort (−1 dBFS) poussé de
+    /// +12 dB au potard. Rien ne doit partir vers Opus au-dessus du plafond.
+    #[test]
+    fn gain_positif_ne_depasse_jamais_le_plafond() {
+        let gain_12db = 10f32.powf(12.0 / 20.0);
+        let mut ramp = SmoothGain::new(gain_12db, FS);
+        let mut limiter = PeakLimiter::new(FS, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS);
+        let signal = sinus(0.89, 48_000);
+        let mut pic = 0.0f32;
+        for bloc in signal.chunks(480) {
+            let mut b = bloc.to_vec();
+            voice_send_stage(&mut b, &mut ramp, gain_12db, &mut limiter);
+            pic = b.iter().fold(pic, |a, &s| a.max(s.abs()));
+        }
+        assert!(pic <= DEFAULT_CEILING + 1e-6, "plafond tenu malgré +12 dB, pic {pic}");
+    }
+
+    /// Le gain agit bien sur le signal envoyé : −12 dB divise l'amplitude par ~4.
+    #[test]
+    fn gain_negatif_baisse_le_niveau_envoye() {
+        let gain = 10f32.powf(-12.0 / 20.0);
+        let mut ramp = SmoothGain::new(gain, FS);
+        let mut limiter = PeakLimiter::new(FS, DEFAULT_CEILING, DEFAULT_LOOKAHEAD_MS);
+        let mut b = sinus(0.5, 48_000);
+        voice_send_stage(&mut b, &mut ramp, gain, &mut limiter);
+        let pic = b[4_800..].iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert!((pic - 0.5 * gain).abs() < 0.01, "attendu ~{}, got {pic}", 0.5 * gain);
     }
 }
 
