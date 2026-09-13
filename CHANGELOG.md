@@ -5,6 +5,23 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.1-5] — 2026-09-13
+
+Pré-release. **Corrections issues de la revue de code avant la version publique.**
+
+### Corrigé
+
+- **Un réglage d'écoute pouvait se perdre en silence.** Le volume de talkback
+  d'un musicien, et le fader, le pan ou l'armement d'un pair, envoyés juste après
+  l'arrivée de son flux étaient ignorés s'ils précédaient son premier paquet
+  audio ; et quand sa connexion était remplacée, il repartait à 100 % et au
+  centre. Les réglages sont désormais gardés et appliqués dès que le flux existe.
+- **L'alerte « trop fort » du talkback s'allumait sur un micro qui ne
+  transmettait rien** (le son d'un ampli dans la pièce, sans parler), et ratait
+  à l'inverse des crêtes rattrapées par le limiteur. Elle mesure maintenant ce
+  qui part vraiment, après le filtre antibruit et le gain.
+- Le journal ne note plus chaque mouvement du potard de gain d'envoi.
+
 ## [0.6.1-4] — 2026-09-13
 
 Pré-release. **La table de mixage refondue (Lot C), et ce que la première
