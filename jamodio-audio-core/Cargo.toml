@@ -8,7 +8,7 @@ description = "Jamodio audio engine core — Opus codec, RTP, UDP, mixer, jitter
 
 [dependencies]
 audiopus = "0.3.0-rc.0"    # Opus encode/decode (safe wrapper around libopus)
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 crossbeam-channel = "0.5"  # Lock-free channels (audio thread ↔ network thread)
 ringbuf = "0.4"            # SPSC lock-free ring buffer (jitter management)
 parking_lot = "0.12"       # Verrous fins du mixer (RwLock map + Mutex par flux) — C2.1
@@ -49,7 +49,8 @@ ndarray = "=0.15.6"        # version attendue par deep_filter
 #                   Wrapper : net/srtp_webrtc.rs (cfg(windows)).
 #
 # Les deux wrappers exposent EXACTEMENT la même API publique (SrtpParameters,
-# SrtpContext::new/protect/unprotect) → udp.rs ne voit aucune différence.
+# SrtpContext::new/protect/unprotect, SrtcpContext::new/protect_rtcp/unprotect_rtcp)
+# → udp.rs et uplink.rs ne voient aucune différence.
 [target.'cfg(not(windows))'.dependencies]
 srtp = { version = "0.7", default-features = false, features = ["bytes", "log", "build-libsrtp", "build-openssl"] }
 

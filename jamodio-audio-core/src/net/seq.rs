@@ -42,13 +42,6 @@ pub enum Arrival {
     Jump,
 }
 
-impl Arrival {
-    /// Le paquet doit-il être décodé et joué ?
-    pub fn is_playable(self) -> bool {
-        matches!(self, Arrival::Start | Arrival::Next { .. })
-    }
-}
-
 /// Compteurs cumulés d'un flux reçu.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeqCounters {
@@ -193,7 +186,6 @@ mod tests {
                 Arrival::Next { missing: 0 },
             ]
         );
-        assert!(!Arrival::Late.is_playable());
         // Le réseau a tout livré : aucune perte, un retard.
         assert_eq!(
             t.counters(),

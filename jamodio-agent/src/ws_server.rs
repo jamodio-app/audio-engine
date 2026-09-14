@@ -949,6 +949,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             net_tick = net_tick.wrapping_add(1);
             let pl = perfstats_pipeline.lock().await;
             net_target = pl.sfu_addr;
+            // Flux montant vu par le SFU (voie B), présent pendant la capture seulement.
+            let uplink = pl.uplink.as_ref().and_then(|u| u.latest()).map(|report| {
+                jamodio_audio_core::protocol::UplinkPerf {
+                    rtt_ms: report.rtt_ms,
+                    fraction_lost_pct: report.fraction_lost_pct,
+                    packets_lost: report.packets_lost,
+                    jitter_ms: report.jitter_ms,
+                    report_age_ms: report.received_at.elapsed().as_millis() as u64,
+                }
+            });
             // Flush histograms (acquièrent le lock parking_lot une fois chacun)
             let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
             let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
@@ -1401,6 +1411,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 memory_pressure: machine_sample.memory_pressure,
                 memory_load_pct: machine_sample.memory_load_pct,
                 net_interface: net_watcher.latest(),
+                uplink,
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;

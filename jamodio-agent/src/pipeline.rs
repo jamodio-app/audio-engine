@@ -10,8 +10,9 @@ use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
 use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
-use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
+use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
+use jamodio_audio_core::net::uplink;
 use jamodio_audio_core::perfstats::Histogram;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
@@ -748,6 +749,9 @@ pub struct PipelineState {
     com_recycle_pending: bool,
     /// Handle to stop the encoder thread.
     encoder_stop: Option<Sender<()>>,
+    /// Rapports RTCP du flux d'envoi instrument (cf. `uplink`), vivant tant que la
+    /// capture tourne. Le lâcher arrête la tâche.
+    pub uplink: Option<uplink::UplinkHandle>,
     /// Handles to stop per-stream receive I/O tasks (async tokio).
     pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
     /// Type de chaque flux reçu (instrument / voix). Depuis que la voix des
@@ -1290,6 +1294,7 @@ impl PipelineState {
             warm: None,
             com_recycle_pending: false,
             encoder_stop: None,
+            uplink: None,
             recv_stops: HashMap::new(),
             recv_kinds: HashMap::new(),
             decode_thread: None,
@@ -1815,6 +1820,8 @@ impl PipelineState {
         if let Some(stop) = self.encoder_stop.take() {
             let _ = stop.send(());
         }
+        // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
+        self.uplink = None;
         // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
         // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
         // le thread `voice_encode` termine en cascade (Disconnected). On lâche
@@ -2236,6 +2243,9 @@ impl PipelineState {
         // 2. Create SRTP context: nos clés (TX, à transmettre au SFU) + clés SFU (RX).
         let agent_srtp = SrtpParameters::generate_aead_aes_256_gcm();
         let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp).map_err(CaptureStartError::Other)?);
+        // Contexte DÉDIÉ aux rapports RTCP (mêmes clés) : la tâche RTCP ne prend
+        // jamais le verrou sous lequel le thread d'encodage chiffre le son.
+        let srtcp_ctx = SrtcpContext::new(&agent_srtp, &sfu_srtp).map_err(CaptureStartError::Other)?;
 
         // 3. Create UDP sender (chiffre via le contexte SRTP).
         let sender = RtpSender::new(sfu_addr, srtp_ctx)
@@ -2256,6 +2266,7 @@ impl PipelineState {
         // `encode_stage_loop` → `RtpSender::send_blocking`). Supprime le hop tokio
         // normal-priorité = supprime la gigue d'égression sous charge Windows.
         let sender = Arc::new(sender);
+        let sender_for_uplink = sender.clone();
         let (stop_tx, stop_rx) = bounded::<()>(1);
         self.encoder_stop = Some(stop_tx);
 
@@ -2354,6 +2365,10 @@ impl PipelineState {
                 );
             })
             .map_err(|e| CaptureStartError::Other(format!("Spawn encoder: {}", e)))?;
+
+        // Voie B — rapports RTCP du flux instrument (pertes, gigue et aller-retour
+        // UDP vus par le SFU), dans une tâche tokio hors du thread audio.
+        self.uplink = Some(uplink::spawn(sender_for_uplink, srtcp_ctx, ssrc));
 
         // 0.5.4-7 — l'encodeur consomme désormais le canal capture : le callback
         // peut pousser (et compter de vrais drops). Mis APRÈS le spawn pour que le
@@ -4185,8 +4200,13 @@ fn encode_stage_loop(
     let frame_len = frame_size * CHANNELS; // 240 f32s stéréo interleaved
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_len * 2);
     let mut opus_buf = vec![0u8; 4000];
-    let mut sequence: u16 = 0;
-    let mut timestamp: u32 = 0;
+    // Départ aléatoire (RFC 3550 §5.1), cf. `rtp::random_start`.
+    let (first_sequence, first_timestamp) = rtp::random_start();
+    let mut sequence = first_sequence;
+    let mut timestamp = first_timestamp;
+    // Totaux du flux pour le Sender Report (RFC 3550 : modulo 2^32).
+    let mut packets_sent: u32 = 0;
+    let mut octets_sent: u32 = 0;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4222,7 +4242,7 @@ fn encode_stage_loop(
                                 sequence,
                                 timestamp,
                                 ssrc,
-                                marker: sequence == 0,
+                                marker: sequence == first_sequence,
                             };
                             let packet =
                                 rtp::build_packet(&header, &opus_buf[..encoded_len]);
@@ -4236,9 +4256,17 @@ fn encode_stage_loop(
                             // le PLC récepteur) au lieu de staller le thread RT.
                             let produced_at = std::time::Instant::now();
                             match sender.send_blocking(packet) {
-                                Ok(_) => {
+                                Ok(sent) => {
                                     let send_delay_ms = produced_at.elapsed().as_secs_f32() * 1000.0;
                                     perfstats.send_path_latency.lock().observe(send_delay_ms);
+                                    // Voie B — de quoi écrire le Sender Report, lu par la
+                                    // tâche RTCP (cf. `uplink`) : deux écritures atomiques.
+                                    // `0` = chiffrement refusé, rien n'est parti.
+                                    if sent > 0 {
+                                        packets_sent = packets_sent.wrapping_add(1);
+                                        octets_sent = octets_sent.wrapping_add(encoded_len as u32);
+                                        sender.activity().record(timestamp, produced_at, packets_sent, octets_sent);
+                                    }
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     static WOULDBLOCK: std::sync::atomic::AtomicU64 =
@@ -4374,8 +4402,10 @@ fn voice_encode_stage_loop(
     let mut acc: Vec<f32> = Vec::with_capacity(frame_size * 2);
     let mut stereo_frame: Vec<f32> = vec![0.0; frame_len];
     let mut opus_buf = vec![0u8; 4000];
-    let mut sequence: u16 = 0;
-    let mut timestamp: u32 = 0;
+    // Départ aléatoire (RFC 3550 §5.1), cf. `rtp::random_start`.
+    let (first_sequence, first_timestamp) = rtp::random_start();
+    let mut sequence = first_sequence;
+    let mut timestamp = first_timestamp;
 
     // Deux rampes anti-clic (cf. `gain::SmoothGain`), parce que deux réglages
     // INDÉPENDANTS, placés à deux endroits différents de la chaîne :
@@ -4532,7 +4562,7 @@ fn voice_encode_stage_loop(
                             sequence,
                             timestamp,
                             ssrc,
-                            marker: sequence == 0,
+                            marker: sequence == first_sequence,
                         };
                         let packet = rtp::build_packet(&header, &opus_buf[..encoded_len]);
                         // Best-effort : sur WouldBlock/erreur on DROP la frame

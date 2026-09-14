@@ -1059,6 +1059,10 @@ pub enum AgentMessage {
         /// sur la boucle locale ou si la route est introuvable.
         #[serde(rename = "netInterface", skip_serializing_if = "Option::is_none")]
         net_interface: Option<NetInterface>,
+        /// Flux montant de l'instrument vu par le SFU (Receiver Reports RTCP).
+        /// Absent hors capture et avant le premier rapport (~5 s après le départ).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uplink: Option<UplinkPerf>,
     },
     /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
     /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de
@@ -1174,6 +1178,27 @@ pub struct PeerPerf {
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     #[serde(rename = "concealedFrames")]
     pub concealed_frames: u64,
+}
+
+/// Flux montant de l'instrument d'après le dernier Receiver Report du SFU.
+#[derive(Debug, Serialize)]
+pub struct UplinkPerf {
+    /// Temps d'aller-retour agent ↔ SFU (ms) sur le chemin UDP du son. Absent si le
+    /// rapport ne cite aucun Sender Report de l'agent.
+    #[serde(rename = "rttMs", skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f32>,
+    /// Pertes constatées par le SFU depuis son rapport précédent (%).
+    #[serde(rename = "fractionLostPct")]
+    pub fraction_lost_pct: f32,
+    /// Pertes cumulées constatées par le SFU depuis le début du flux.
+    #[serde(rename = "packetsLost")]
+    pub packets_lost: i32,
+    /// Gigue d'arrivée au SFU (ms).
+    #[serde(rename = "jitterMs")]
+    pub jitter_ms: f32,
+    /// Âge du rapport (ms) : le SFU en envoie un toutes les ~5 s.
+    #[serde(rename = "reportAgeMs")]
+    pub report_age_ms: u64,
 }
 
 /// Wire format pour un MIDI device (cf. `audio::midi::MidiDeviceInfo` côté agent).

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
+use super::rtcp::SendActivity;
 use super::srtp::SrtpContext;
 
 // DSCP EF (Expedited Forwarding, RFC 3246) pour le trafic audio temps réel.
@@ -34,12 +35,46 @@ pub struct RtpSender {
     socket: UdpSocket,
     target: SocketAddr,
     srtp: Arc<SrtpContext>,
+    activity: SendActivity,
 }
 
 impl RtpSender {
     pub async fn new(target: SocketAddr, srtp: Arc<SrtpContext>) -> std::io::Result<Self> {
         let socket = bind_udp_dscp_ef()?;
-        Ok(Self { socket, target, srtp })
+        Ok(Self {
+            socket,
+            target,
+            srtp,
+            activity: SendActivity::new(),
+        })
+    }
+
+    /// Activité d'envoi du flux : écrite par le thread d'encodage après chaque
+    /// paquet parti, lue pour le Sender Report (cf. `net::rtcp`).
+    pub fn activity(&self) -> &SendActivity {
+        &self.activity
+    }
+
+    /// Envoie un paquet RTCP DÉJÀ chiffré (cf. `SrtcpContext`) par le socket du
+    /// flux : avec rtcpMux + comedia, le SFU n'accepte le RTCP que de l'adresse
+    /// d'où part le RTP. Appelé par la tâche RTCP, jamais par le thread audio.
+    pub async fn send_rtcp(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.socket.send_to(packet, self.target).await.map(|_| ())
+    }
+
+    /// Attend le prochain datagramme reçu sur le socket d'envoi. Le SFU n'y
+    /// envoie que ses rapports RTCP (Receiver Reports, chiffrés). Rend `false`,
+    /// buffer vidé, pour un datagramme venu d'une autre adresse que le SFU.
+    pub async fn recv_from_sfu(&self, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+        let cap = buf.capacity();
+        buf.resize(cap, 0);
+        let (len, from) = self.socket.recv_from(buf).await?;
+        if from != self.target {
+            buf.clear();
+            return Ok(false);
+        }
+        buf.truncate(len);
+        Ok(true)
     }
 
     /// Chiffre SRTP puis envoie en **NON-BLOQUANT** — conçu pour être appelé
