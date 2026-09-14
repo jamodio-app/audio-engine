@@ -5,6 +5,34 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2-1] — 2026-09-14 (pré-release de test)
+
+Une version pour **la bulle du lien** du studio : savoir chez qui se trouve un
+souci (machine ou réseau, vous ou un autre musicien) et lire une latence juste.
+
+### Ajouté
+
+- **Mesure du lien avec le serveur sur le chemin même du son** : l'agent envoie
+  des rapports RTCP et lit ceux du serveur. Il obtient le vrai temps d'aller-retour
+  UDP et les paquets que le serveur n'a pas reçus. Le son n'est pas touché : le
+  thread audio ne fait que deux écritures atomiques, et les rapports sont chiffrés
+  à part.
+- **Latences déclarées par le pilote (macOS)** : entrée, sortie et sortie
+  Bluetooth, comptées dans la latence affichée.
+- **Santé de la machine** : callbacks audio manquants, pression mémoire (macOS),
+  mémoire utilisée (Windows), charge CPU.
+- **Type de réseau vers le serveur** (Ethernet, Wi-Fi, mobile), relevé sans
+  envoyer de paquet.
+- **Pertes par musicien reçu** : paquets perdus, arrivés trop tard, masqués.
+
+### Corrigé
+
+- **Un paquet arrivé en retard était joué hors de sa place**, puis suivi d'un
+  masquage de trop : il est désormais écarté, sans faux trou.
+- **Le serveur comptait 65 536 pertes fictives** sur chaque flux de l'agent, qui
+  numérotait ses paquets à partir de zéro. La numérotation démarre désormais au
+  hasard, comme le recommande la norme RTP.
+
 ## [0.6.1] — 2026-09-13
 
 Une version pour la **nouvelle table de mixage du studio** : ce que vous envoyez
