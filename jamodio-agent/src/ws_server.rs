@@ -1283,10 +1283,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 p99_ms: pipeline_snap.p99_ms,
                 max_ms: pipeline_snap.max_ms,
                 mean_ms: pipeline_snap.mean_ms,
-                // Inclut les drops "RTP channel full" agrégés par l'histogramme
-                // (record_drop côté encoder) + les drops capture côté CPAL.
-                // Les deux sont des indicateurs de saturation à reporter ensemble.
-                drops_per_sec: pipeline_snap.drops + capture_drops_window,
+                // Blocs du callback d'entrée refusés parce que l'étage suivant ne
+                // suit pas (canal plein) : le seul compteur de saturation réellement
+                // alimenté. (L'ancien terme « drops encodeur » de l'histogramme n'était
+                // incrémenté par aucun code : retiré.)
+                drops_per_sec: capture_drops_window,
             };
 
             // Construction des peers : on dérive de mixer_stats + net_stats_map.

@@ -218,38 +218,17 @@ pub fn build_capture_stream(
     // (CoreAudio/WASAPI : f32 natif → la branche F32 est prise, inchangé.)
     let sample_format = default_cfg.sample_format();
 
-    // Buffer size — stratégie PAR HOST (cause racine du gel ASIO Focusrite,
-    // sessions du 29/06) :
+    // Taille de buffer — chemin CPAL (CoreAudio ; WASAPI partagé). Cible basse
+    // latence pilotée par `buffer_policy::target()` : 64 échantillons, 128 après le
+    // backoff automatique sous charge. `Fixed(cible)` si le périphérique l'expose
+    // dans sa plage, sinon `Default` (WASAPI partagé impose ~10 ms). Entrée et
+    // sortie lisent la MÊME cible.
     //
-    // - **ASIO (Windows)** : on DÉFÈRE à la taille PRÉFÉRÉE du driver
-    //   (`BufferSize::Default` → asio-sys utilise `ASIOGetBufferSize().pref`),
-    //   exactement comme un DAW. Forcer `Fixed(128)`
-    //   était fautif : asio-sys ne valide QUE `demandé ≤ max` (il IGNORE le min,
-    //   la taille préférée ET la granularité du driver). Sur le Focusrite USB,
-    //   128 hors-grille était accepté par `ASIOCreateBuffers` mais faisait HALTER
-    //   les callbacks après ~75 s de streaming → studio injouable. La taille
-    //   réellement retenue par le driver est révélée par `log_first_callback`.
-    //   La basse latence (128 = 2,7 ms) n'était qu'un choix : ni Opus (encodeur à
-    //   accumulateur → frames 120) ni les plugins (process_stage re-bloque en
-    //   sous-blocs) ne dépendent de la taille de capture.
-    // - **CoreAudio / WASAPI** : INCHANGÉ — Fixed(128) low-latency si exposé,
-    //   sinon Default. (CoreAudio ignore de toute façon la valeur et prend la
-    //   taille native du device ; WASAPI shared impose la sienne.)
-    // Taille de buffer : cible basse latence UNIFIÉE (CoreAudio + ASIO), pilotée
-    // par `buffer_policy` (64 par défaut, 128 après backoff auto sous charge —
-    // cf. son doc). On demande `Fixed(cible)` si le device l'expose dans sa plage,
-    // sinon `Default` (le backend choisit ; WASAPI shared → ~10 ms, inchangé).
-    //
-    // 0.5.4-17 — l'ASIO passe de `Default`(préféré du driver, souvent 128) à
-    // `Fixed(cible)`. Le gel Focusrite venait de la RÉ-ÉNUMÉRATION concurrente
-    // (corrigée en 0.5.4-17), PAS de la taille de buffer : le driver est stable
-    // de 16 à 1024 samples (mesuré au banc). Forcer une petite taille est donc
-    // sûr et met la latence PC à parité avec le Mac. Entrée et sortie lisent la
-    // MÊME cible → cohérence du `ASIOCreateBuffers` duplex partagé.
-    // Taille basse latence pilotée par `buffer_policy::target()` (64 par défaut, 128
-    // après backoff auto sous charge) : `Fixed(cible)` si le device l'expose, sinon
-    // `Default` (WASAPI shared ~10 ms). Chemin CoreAudio/WASAPI uniquement — l'ASIO
-    // passe par `audio::asio_host`, qui gère sa propre taille (snap grille légale).
+    // L'ASIO ne passe pas par ici : `audio::asio_host` demande la même cible, alignée
+    // sur la grille légale du pilote (asio-sys ne valide que `demandé ≤ max`).
+    // Historique : le gel du Focusrite (29/06) venait de la ré-énumération
+    // concurrente des pilotes (corrigée en 0.5.4-17), pas de la taille de buffer —
+    // le pilote est stable de 16 à 1024 échantillons, mesuré au banc.
     let target_buf = crate::audio::buffer_policy::target();
     let (buffer_size, fixed_buffer) =
         if device_supports_fixed_buffer(device, channels, native_sr, target_buf) {

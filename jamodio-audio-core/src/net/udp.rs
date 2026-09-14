@@ -133,11 +133,13 @@ impl RtpReceiver {
         buf.resize(cap, 0);
         let (len, addr) = self.socket.recv_from(buf).await?;
         buf.truncate(len);
-        // SRTCP packets (PT 200..=204 in second byte) need unprotect_rtcp,
-        // but for now mediasoup doesn't send SRTCP back to comedia agents — drop them.
-        // RTP packets : decrypt in place.
+        // SRTCP (PT 200..=204 au 2e octet) : le SFU en ENVOIE bien aux agents — des
+        // Sender Reports sur ce transport de réception, des Receiver Reports sur le
+        // transport d'envoi (cf. worker mediasoup `Transport::SendRtcp`). L'agent ne
+        // parle pas encore RTCP : on les ignore ici, sans les déchiffrer (voie B du
+        // plan « infobulle latence » côté web).
+        // Paquets RTP : déchiffrés en place.
         if len >= 2 && buf[1] >= 200 && buf[1] <= 204 {
-            // RTCP : currently not handled (no encoder/decoder for SR/RR feedback)
             return Ok((0, addr));
         }
         if let Err(e) = self.srtp.unprotect(buf) {

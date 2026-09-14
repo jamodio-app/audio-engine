@@ -26,8 +26,6 @@ pub struct Histogram {
     write_idx: usize,
     /// Nombre d'observations valides depuis le dernier flush (≤ cap après le 1er tour).
     count: usize,
-    /// Compteur de drops/erreurs accumulé depuis le dernier flush (hors `buf`).
-    drops: u64,
 }
 
 impl Histogram {
@@ -39,7 +37,6 @@ impl Histogram {
             sort_scratch: Vec::with_capacity(capacity),
             write_idx: 0,
             count: 0,
-            drops: 0,
         }
     }
 
@@ -54,31 +51,13 @@ impl Histogram {
         }
     }
 
-    /// Incrémente le compteur de drops (cf. "sample channel full" en capture.rs).
-    /// Saturating pour éviter overflow théorique sur sessions très longues.
-    #[inline]
-    pub fn record_drop(&mut self) {
-        self.drops = self.drops.saturating_add(1);
-    }
-
     /// Snapshot triée + percentiles. **Cold path** (typiquement 1 Hz).
-    /// Réinitialise `count` et `drops` pour la fenêtre suivante. `buf` n'est
-    /// pas zeroisé — il sera overwrité par les `observe()` futurs.
+    /// Réinitialise `count` pour la fenêtre suivante. `buf` n'est pas zeroisé — il
+    /// sera overwrité par les `observe()` futurs.
     pub fn flush(&mut self) -> HistogramSnapshot {
         let n = self.count;
-        let drops = self.drops;
         if n == 0 {
-            // Reset compteurs même si rien à mesurer (pour ne pas mélanger
-            // les drops d'une fenêtre où il n'y a plus de hot path actif).
-            self.drops = 0;
-            return HistogramSnapshot {
-                count: 0,
-                p50_ms: 0.0,
-                p99_ms: 0.0,
-                max_ms: 0.0,
-                mean_ms: 0.0,
-                drops,
-            };
+            return HistogramSnapshot::default();
         }
 
         // Copie zero-alloc dans le scratch buffer (capacity == buf.len()).
@@ -101,7 +80,6 @@ impl Histogram {
 
         self.count = 0;
         self.write_idx = 0;
-        self.drops = 0;
 
         HistogramSnapshot {
             count: n,
@@ -109,14 +87,13 @@ impl Histogram {
             p99_ms,
             max_ms,
             mean_ms,
-            drops,
         }
     }
 
     /// Vrai si aucune observation depuis le dernier flush. Utile pour skipper
     /// l'émission d'un PerfStats vide quand le pipeline est idle.
     pub fn is_empty(&self) -> bool {
-        self.count == 0 && self.drops == 0
+        self.count == 0
     }
 }
 
@@ -133,8 +110,6 @@ pub struct HistogramSnapshot {
     pub max_ms: f32,
     /// Moyenne arithmétique (ms).
     pub mean_ms: f32,
-    /// Compteur de drops/erreurs accumulé depuis le dernier flush.
-    pub drops: u64,
 }
 
 #[cfg(test)]
@@ -149,7 +124,6 @@ mod tests {
         assert_eq!(s.p50_ms, 0.0);
         assert_eq!(s.p99_ms, 0.0);
         assert_eq!(s.max_ms, 0.0);
-        assert_eq!(s.drops, 0);
     }
 
     #[test]
@@ -198,14 +172,11 @@ mod tests {
         let mut h = Histogram::new(16);
         h.observe(1.0);
         h.observe(2.0);
-        h.record_drop();
         let s1 = h.flush();
         assert_eq!(s1.count, 2);
-        assert_eq!(s1.drops, 1);
 
         let s2 = h.flush();
         assert_eq!(s2.count, 0);
-        assert_eq!(s2.drops, 0);
 
         h.observe(5.0);
         let s3 = h.flush();
@@ -214,25 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn drops_independent_of_observations() {
-        let mut h = Histogram::new(8);
-        for _ in 0..20 {
-            h.record_drop();
-        }
-        let s = h.flush();
-        assert_eq!(s.count, 0);
-        assert_eq!(s.drops, 20);
-    }
-
-    #[test]
-    fn is_empty_tracks_both_axes() {
+    fn is_empty_tracks_observations() {
         let mut h = Histogram::new(4);
         assert!(h.is_empty());
         h.observe(1.0);
         assert!(!h.is_empty());
         h.flush();
         assert!(h.is_empty());
-        h.record_drop();
-        assert!(!h.is_empty());
     }
 }
