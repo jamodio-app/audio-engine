@@ -1,4 +1,5 @@
 pub mod rtp;
+pub mod seq;
 // SRTP : 2 backends derrière la même API publique. macOS/Linux = libsrtp2,
 // Windows = webrtc-srtp (cf. mémoire `srtp_strategy.md`).
 #[cfg(not(windows))]

@@ -1305,6 +1305,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         buffer_target_ms: target_ms,
                         underruns,
                         drift_drops,
+                        packets_expected: net.packets_expected,
+                        packets_lost: net.packets_lost,
+                        packets_late: net.packets_late,
+                        concealed_frames: net.concealed_frames,
                     }
                 })
                 .collect();

@@ -9,6 +9,7 @@ use jamodio_audio_core::codec::encoder::MusicEncoder;
 use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
 use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
+use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::perfstats::Histogram;
@@ -974,6 +975,13 @@ pub struct ProducerNetStats {
     /// Chantier #1 — gigue de QUEUE (pire-cas récent), en ms. C'est elle qui
     /// pilote le plancher du jitter buffer ; exposée pour la calibration.
     pub jitter_tail_ms: f64,
+    /// Compteurs cumulés du flux (cf. [`jamodio_audio_core::net::seq`]) : paquets
+    /// attendus, jamais arrivés, arrivés trop tard pour être joués.
+    pub packets_expected: u64,
+    pub packets_lost: u64,
+    pub packets_late: u64,
+    /// Trames de masquage (PLC) jouées à la place de paquets absents.
+    pub concealed_frames: u64,
 }
 
 /// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
@@ -4605,8 +4613,10 @@ struct DecodeState {
     decoder: MusicDecoder,
     drift: DriftEstimator,
     jitter: JitterEstimator,
-    last_seq: Option<u16>,
-    last_pushed: ProducerNetStats,
+    /// Place de chaque paquet dans le flux (ordre, trous, retards) + compteurs.
+    seq: SeqTracker,
+    /// Trames de masquage (PLC) jouées depuis la création du flux.
+    concealed_frames: u64,
     pkt_count: u64,
     logged_large_jump: bool,
 }
@@ -4626,8 +4636,8 @@ impl DecodeState {
             decoder,
             drift: DriftEstimator::new(drift_label),
             jitter: JitterEstimator::new(),
-            last_seq: None,
-            last_pushed: ProducerNetStats::default(),
+            seq: SeqTracker::new(),
+            concealed_frames: 0,
             pkt_count: 0,
             logged_large_jump: false,
         })
@@ -4771,53 +4781,78 @@ fn decode_one_packet(
         return;
     };
 
+    // Place du paquet dans le flux, AVANT tout traitement : un paquet en retard ou
+    // en double n'est jamais joué. Le décoder maintenant le ferait entendre hors de
+    // sa place, et le paquet suivant verrait un faux trou (masquage de trop).
+    let arrival = st.seq.on_packet(header.sequence);
+
     // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
-    // (celui horodaté dans recv_io_task) pour drift ET gigue.
-    st.drift.observe(header.timestamp, recv_instant);
-    st.jitter.observe(header.timestamp, recv_instant);
-    // Miroir paresseux dans la map partagée : on n'écrit que si drift > 1 ppm OU
-    // gigue > 0,5 ms de variation depuis la dernière écriture (limite la
-    // contention ; ws_server lit à 1 Hz).
-    let current = ProducerNetStats {
-        drift_ppm: st.drift.drift_ppm(),
-        jitter_ms: st.jitter.jitter_ms(),
-        jitter_tail_ms: st.jitter.jitter_tail_ms(),
-    };
-    if (current.drift_ppm - st.last_pushed.drift_ppm).abs() > 1.0
-        || (current.jitter_ms - st.last_pushed.jitter_ms).abs() > 0.5
-        || (current.jitter_tail_ms - st.last_pushed.jitter_tail_ms).abs() > 0.5
-    {
-        net_stats_by_producer.lock().insert(producer_id.to_string(), current);
-        st.last_pushed = current;
+    // (celui horodaté dans recv_io_task) pour drift ET gigue. Un paquet en retard
+    // y entre : son retard EST de la gigue. Un double ou un saut non confirmé non.
+    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late) {
+        st.drift.observe(header.timestamp, recv_instant);
+        st.jitter.observe(header.timestamp, recv_instant);
     }
-    // Chantier #1 — pilote le plancher du jitter buffer avec la gigue de QUEUE
-    // (pire-cas récent, pas la moyenne), ~10×/s (1 paquet sur 40) et seulement
-    // une fois l'estimateur fiable (warmup).
-    if st.jitter.is_warm() && st.pkt_count.is_multiple_of(40) {
-        let jitter_tail_ms = st.jitter.jitter_tail_ms();
-        mixer.observe_jitter(producer_id, jitter_tail_ms);
+    if st.pkt_count.is_multiple_of(40) {
+        // ~10×/s (1 paquet sur 40). Chantier #1 — pilote le plancher du jitter
+        // buffer avec la gigue de QUEUE (pire-cas récent, pas la moyenne), une fois
+        // l'estimateur fiable (warmup).
+        if st.jitter.is_warm() {
+            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms());
+        }
+        // Miroir dans la map partagée, lue à 1 Hz par ws_server. Mise à jour EN
+        // PLACE : aucune allocation sur ce thread une fois l'entrée créée.
+        let counters = st.seq.counters();
+        let current = ProducerNetStats {
+            drift_ppm: st.drift.drift_ppm(),
+            jitter_ms: st.jitter.jitter_ms(),
+            jitter_tail_ms: st.jitter.jitter_tail_ms(),
+            packets_expected: counters.expected,
+            packets_lost: counters.lost(),
+            packets_late: counters.late,
+            concealed_frames: st.concealed_frames,
+        };
+        let mut map = net_stats_by_producer.lock();
+        match map.get_mut(producer_id) {
+            Some(slot) => *slot = current,
+            None => {
+                map.insert(producer_id.to_string(), current);
+            }
+        }
     }
-    // Détection de perte → PLC
-    if let Some(prev) = st.last_seq {
-        let expected = prev.wrapping_add(1);
-        if header.sequence != expected {
-            let gap = header.sequence.wrapping_sub(expected);
-            if gap <= 10 {
-                for _ in 0..gap.min(3) {
+
+    match arrival {
+        Arrival::Start => {}
+        Arrival::Next { missing } => {
+            // Politique de masquage inchangée : un trou court est comblé par au plus
+            // PLC_MAX_FRAMES trames ; un trou plus long n'est pas masqué (le PLC
+            // Opus s'éteint de lui-même, le jitter buffer gère le manque).
+            const PLC_MAX_GAP: u16 = 10;
+            const PLC_MAX_FRAMES: u16 = 3;
+            if (1..=PLC_MAX_GAP).contains(&missing) {
+                for _ in 0..missing.min(PLC_MAX_FRAMES) {
                     // Copie obligatoire avant push : decode_loss() rend une slice
                     // d'un buffer interne écrasé au decode suivant (Sprint 3 BUG 7).
                     let plc_owned: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
                     if let Some(plc) = plc_owned {
                         mixer.push_samples(producer_id, &plc);
+                        st.concealed_frames += 1;
                     }
                 }
-            } else if !st.logged_large_jump {
-                tracing::warn!(target: "jamodio::recv", producer = short, prev_seq = prev, got_seq = header.sequence, gap, "large seq jump (skipping PLC)");
+            } else if missing > PLC_MAX_GAP && !st.logged_large_jump {
+                tracing::warn!(target: "jamodio::recv", producer = short, got_seq = header.sequence, missing, "large seq gap (skipping PLC)");
                 st.logged_large_jump = true;
             }
         }
+        Arrival::Late | Arrival::Duplicate => return,
+        Arrival::Jump => {
+            if !st.logged_large_jump {
+                tracing::warn!(target: "jamodio::recv", producer = short, got_seq = header.sequence, "seq jump — packet held until the stream restart is confirmed");
+                st.logged_large_jump = true;
+            }
+            return;
+        }
     }
-    st.last_seq = Some(header.sequence);
 
     // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
     // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.

@@ -1160,6 +1160,20 @@ pub struct PeerPerf {
     pub underruns: u64,
     #[serde(rename = "driftDrops")]
     pub drift_drops: u64,
+    /// Compteurs CUMULÉS du flux reçu (cf. `net::seq`), remis à zéro si le flux
+    /// est recréé : le web calcule les écarts et traite une baisse comme un
+    /// nouveau départ. Paquets attendus d'après les numéros de séquence.
+    #[serde(rename = "packetsExpected")]
+    pub packets_expected: u64,
+    /// Paquets jamais arrivés (attendus − reçus, retards compris dans les reçus).
+    #[serde(rename = "packetsLost")]
+    pub packets_lost: u64,
+    /// Paquets arrivés trop tard pour être joués (écartés).
+    #[serde(rename = "packetsLate")]
+    pub packets_late: u64,
+    /// Trames de masquage (PLC) jouées à la place de paquets absents.
+    #[serde(rename = "concealedFrames")]
+    pub concealed_frames: u64,
 }
 
 /// Wire format pour un MIDI device (cf. `audio::midi::MidiDeviceInfo` côté agent).
