@@ -76,6 +76,11 @@ windows-sys = { version = "0.59", features = [
     # Santé machine (machine_health.rs) : charge mémoire du système
     # (GlobalMemoryStatusEx). La charge CPU passe par GetSystemTimes (Threading).
     "Win32_System_SystemInformation",
+    # Type de l'interface réseau vers le SFU (net_interface.rs) : GetAdaptersAddresses.
+    # Ndis porte le type IF_OPER_STATUS de IP_ADAPTER_ADDRESSES_LH, WinSock les SOCKADDR.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     # 0.5.9-2 — Job Object KILL_ON_JOB_CLOSE : lie le worker de scan
     # out-of-process à l'agent → l'OS tue le worker si l'agent meurt, même
     # sur kill -9. Cf. plugin_scan/coordinator.rs::job. `Win32_Security` est

@@ -793,6 +793,10 @@ pub struct PipelineState {
     pub input_declared: Option<crate::audio::declared_latency::DeclaredLatency>,
     /// Idem pour la sortie ouverte (`Stats.outputHwMs`, `Stats.outputTransport`).
     pub output_declared: Option<crate::audio::declared_latency::DeclaredLatency>,
+    /// Adresse du SFU de la session en cours, pour relever le type d'interface réseau
+    /// qui y mène (`PerfStats.netInterface`). Effacée à la vraie fin de session, pas
+    /// lors d'un changement d'entrée en cours de session.
+    pub sfu_addr: Option<SocketAddr>,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
     /// MIDI Note ON récent — true tant qu'au moins un Note ON a été reçu dans
@@ -1290,6 +1294,7 @@ impl PipelineState {
             output_buffer_samples: None,
             input_declared: None,
             output_declared: None,
+            sfu_addr: None,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             midi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1815,6 +1820,8 @@ impl PipelineState {
         // garde intacte, sinon le pair qui change son entrée perd tous les autres
         // instruments jusqu'au rejoin (bug asymétrique Mac/PC du 21/07).
         if !preserve_peers {
+            // Vraie fin de session : plus de SFU vers lequel relever le réseau local.
+            self.sfu_addr = None;
             // Coupe les réceptions pair + le thread de décodage RT partagé.
             let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
             for id in ids {
@@ -2216,6 +2223,7 @@ impl PipelineState {
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
             .map_err(|e| CaptureStartError::Other(format!("Bad SFU address: {}", e)))?;
+        self.sfu_addr = Some(sfu_addr);
 
         // 2. Create SRTP context: nos clés (TX, à transmettre au SFU) + clés SFU (RX).
         let agent_srtp = SrtpParameters::generate_aead_aes_256_gcm();

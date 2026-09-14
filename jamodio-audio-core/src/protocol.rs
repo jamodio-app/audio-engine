@@ -558,6 +558,17 @@ pub enum MemoryPressure {
     Critical,
 }
 
+/// Type de l'interface réseau qui porte le trafic vers le SFU, tel que le système
+/// le déclare (cf. `PerfStats.netInterface`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetInterface {
+    Ethernet,
+    Wifi,
+    Cellular,
+    Other,
+}
+
 // ─── Agent → Browser ───────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -1044,6 +1055,10 @@ pub enum AgentMessage {
         /// Mémoire physique utilisée (%), telle que le système la déclare (Windows).
         #[serde(rename = "memoryLoadPct", skip_serializing_if = "Option::is_none")]
         memory_load_pct: Option<f32>,
+        /// Type de l'interface réseau vers le SFU de la session. Absent hors session,
+        /// sur la boucle locale ou si la route est introuvable.
+        #[serde(rename = "netInterface", skip_serializing_if = "Option::is_none")]
+        net_interface: Option<NetInterface>,
     },
     /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
     /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de

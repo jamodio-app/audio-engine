@@ -927,6 +927,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // RÉELLEMENT écoulé (l'intervalle tokio dérive de quelques ms).
         let mut machine = crate::machine_health::MachineSampler::default();
         let mut prev_tick = Instant::now();
+        // Réseau local (cf. `net_interface`) : relevé toutes les 5 s EN TÂCHE DE FOND
+        // (jamais attendu ici), vers l'adresse SFU de la session lue au tick
+        // précédent. Un changement de réseau (câble branché, Wi-Fi coupé) est vu en
+        // 5 s environ.
+        const NET_INTERFACE_EVERY_TICKS: u32 = 5;
+        let net_watcher = crate::net_interface::Watcher::default();
+        let mut net_target: Option<std::net::SocketAddr> = None;
+        let mut net_tick: u32 = 0;
         // Sécurité — nombre de fenêtres perfstats consécutives où la sortie
         // s'emballe (peak pré-clip ≫ plein-échelle). Exiger PLUSIEURS fenêtres
         // évite un faux positif sur un transitoire fort légitime.
@@ -935,7 +943,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             interval.tick().await;
             // Relevé système HORS du verrou pipeline (appels système de quelques µs).
             let machine_sample = machine.sample();
+            if net_tick.is_multiple_of(NET_INTERFACE_EVERY_TICKS) {
+                net_watcher.refresh(net_target);
+            }
+            net_tick = net_tick.wrapping_add(1);
             let pl = perfstats_pipeline.lock().await;
+            net_target = pl.sfu_addr;
             // Flush histograms (acquièrent le lock parking_lot une fois chacun)
             let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
             let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
@@ -1382,6 +1395,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 cpu_pct: machine_sample.cpu_pct,
                 memory_pressure: machine_sample.memory_pressure,
                 memory_load_pct: machine_sample.memory_load_pct,
+                net_interface: net_watcher.latest(),
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;

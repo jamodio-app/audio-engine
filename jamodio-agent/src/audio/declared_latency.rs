@@ -118,9 +118,7 @@ fn frames_to_ms(frames: u32, sample_rate: f64) -> Option<f32> {
 mod coreaudio {
     use super::{frames_to_ms, hardware_frames, unique_match, Candidate, DeclaredLatency, Scope};
     use core_foundation_sys::base::{CFRelease, CFTypeRef};
-    use core_foundation_sys::string::{
-        kCFStringEncodingUTF8, CFStringGetCString, CFStringGetCStringPtr, CFStringRef,
-    };
+    use core_foundation_sys::string::CFStringRef;
     use coreaudio_sys::{
         kAudioDevicePropertyDeviceNameCFString, kAudioDevicePropertyLatency,
         kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertySafetyOffset,
@@ -133,9 +131,7 @@ mod coreaudio {
         AudioObjectPropertyAddress,
     };
     use jamodio_audio_core::protocol::AudioTransport;
-    use std::ffi::CStr;
     use std::mem::size_of;
-    use std::os::raw::c_char;
     use std::ptr::null;
 
     fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
@@ -209,30 +205,10 @@ mod coreaudio {
         if cf.is_null() {
             return None;
         }
-        let name = cfstring_to_string(cf);
+        let name = crate::cf_string::to_string(cf);
         // SAFETY : la propriété rend une CFString possédée par l'appelant.
         unsafe { CFRelease(cf as CFTypeRef) };
         name
-    }
-
-    fn cfstring_to_string(cf: CFStringRef) -> Option<String> {
-        // SAFETY : `cf` est une CFString valide ; le pointeur rapide, s'il existe,
-        // vit aussi longtemps qu'elle ; sinon copie dans un tampon local terminé par 0.
-        unsafe {
-            let fast = CFStringGetCStringPtr(cf, kCFStringEncodingUTF8);
-            if !fast.is_null() {
-                return CStr::from_ptr(fast).to_str().ok().map(str::to_owned);
-            }
-            let mut buf = [0 as c_char; 512];
-            if CFStringGetCString(cf, buf.as_mut_ptr(), buf.len() as _, kCFStringEncodingUTF8) == 0
-            {
-                return None;
-            }
-            CStr::from_ptr(buf.as_ptr())
-                .to_str()
-                .ok()
-                .map(str::to_owned)
-        }
     }
 
     fn scope_of(scope: Scope) -> u32 {
