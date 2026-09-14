@@ -100,6 +100,13 @@ winreg = "0.52"
 # Hôte AU plugins — macOS uniquement.
 [target.'cfg(target_os = "macos")'.dependencies]
 jamodio-au-host = { path = "../jamodio-au-host" }
+# Latence matérielle DÉCLARÉE par CoreAudio (latence du périphérique, safety
+# offset, latence du flux) et type de transport (Bluetooth), que cpal n'expose
+# pas. Mêmes versions et mêmes features que celles déjà tirées par cpal
+# (coreaudio-rs → coreaudio-sys `core_audio`) : aucune compilation en plus.
+# Cf. audio/declared_latency.rs.
+coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+core-foundation-sys = "0.8"
 # Sprint S2 — bindings Mach (thread_policy_set, mach_timebase_info) pour le
 # fallback QoS+time-constraint quand os_workgroup_join échoue. Cf. rt_priority.rs.
 mach2 = "0.4"

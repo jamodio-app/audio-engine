@@ -538,6 +538,16 @@ pub struct RecordStemSpec {
     pub peer_name: Option<String>,
 }
 
+/// Type de transport d'un périphérique audio, tel que le système le déclare.
+/// Seul le Bluetooth est distingué : c'est le seul qui fonde une « part de
+/// latence évitable » certaine (cf. `Stats.outputTransport`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioTransport {
+    Bluetooth,
+    Other,
+}
+
 // ─── Agent → Browser ───────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -649,6 +659,18 @@ pub enum AgentMessage {
         /// Même sémantique de `None` que `inputBufferMs`.
         #[serde(rename = "outputBufferMs", skip_serializing_if = "Option::is_none")]
         output_buffer_ms: Option<f32>,
+        /// Latence matérielle DÉCLARÉE par le pilote pour l'entrée, AU-DELÀ du
+        /// buffer (convertisseurs, transport, marges), en ms. Absent (`None`) si
+        /// non attribuable avec certitude ou pas encore lu sur cette plateforme :
+        /// le browser publie alors la constante comme estimation.
+        #[serde(rename = "inputHwMs", skip_serializing_if = "Option::is_none")]
+        input_hw_ms: Option<f32>,
+        /// Idem pour la sortie.
+        #[serde(rename = "outputHwMs", skip_serializing_if = "Option::is_none")]
+        output_hw_ms: Option<f32>,
+        /// Type de transport de la sortie (`bluetooth` / `other`). Absent si inconnu.
+        #[serde(rename = "outputTransport", skip_serializing_if = "Option::is_none")]
+        output_transport: Option<AudioTransport>,
         /// Cible adaptative du jitter buffer (moyenne des streams actifs, ms).
         /// 0 si aucun stream actif. C'est le levier principal de tuning latence
         /// vs robustesse au jitter — affiché dans l'UI agent.

@@ -787,6 +787,12 @@ pub struct PipelineState {
     /// l'input sur Windows WASAPI shared où un côté tombe sur Fixed et
     /// l'autre sur Default. Reset à `None` quand pas en playback.
     pub output_buffer_samples: Option<u32>,
+    /// Latence matérielle DÉCLARÉE par le pilote pour l'entrée ouverte (au-delà du
+    /// buffer) et type de transport. Lue à l'ouverture, hors temps réel ; `None` si
+    /// non attribuable avec certitude. Publiée dans `Stats.inputHwMs`.
+    pub input_declared: Option<crate::audio::declared_latency::DeclaredLatency>,
+    /// Idem pour la sortie ouverte (`Stats.outputHwMs`, `Stats.outputTransport`).
+    pub output_declared: Option<crate::audio::declared_latency::DeclaredLatency>,
     /// Input RMS for VU meter
     pub input_rms: Arc<std::sync::atomic::AtomicU32>,
     /// MIDI Note ON récent — true tant qu'au moins un Note ON a été reçu dans
@@ -1282,6 +1288,8 @@ impl PipelineState {
             state: AgentState::Idle,
             input_buffer_samples: None,
             output_buffer_samples: None,
+            input_declared: None,
+            output_declared: None,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             midi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             midi_last_note_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1680,6 +1688,7 @@ impl PipelineState {
             OutputOpen::Opened { stream, buffer, name, .. } => {
                 self.playback_stream = Some(stream);
                 self.output_buffer_samples = buffer;
+                self.output_declared = crate::audio::declared_latency::output(&name);
                 tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
             }
             OutputOpen::NotFound => {
@@ -1689,6 +1698,7 @@ impl PipelineState {
                     "output device introuvable — playback désactivé jusqu'à nouvelle sélection"
                 );
                 self.output_buffer_samples = None;
+                self.output_declared = None;
             }
             OutputOpen::BuildFailed(e) => {
                 tracing::error!(
@@ -1697,6 +1707,7 @@ impl PipelineState {
                     "restart_playback échoué — playback désactivé jusqu'à nouvelle sélection"
                 );
                 self.output_buffer_samples = None;
+                self.output_declared = None;
             }
             // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
             // duplex de start_capture).
@@ -1843,6 +1854,8 @@ impl PipelineState {
         self.warm = None;
         self.output_buffer_samples = None;
         self.input_buffer_samples = None;
+        self.output_declared = None;
+        self.input_declared = None;
     }
 
     /// 0.5.4-5 — PARK : sortie de studio sur ASIO en gardant le driver CHAUD.
@@ -1859,6 +1872,7 @@ impl PipelineState {
             w.parked_since = Some(std::time::Instant::now());
         }
         self.input_buffer_samples = None;
+        self.input_declared = None;
         self.state = AgentState::Idle;
         tracing::info!(
             target: "jamodio::pipeline",
@@ -1958,6 +1972,7 @@ impl PipelineState {
             // continué à pousser sans consommateur → vieux audio dans le canal).
             while w.sample_rx.try_recv().is_ok() {}
             self.input_buffer_samples = w.input_buf;
+            self.input_declared = crate::audio::declared_latency::input(&w.in_name);
             tracing::info!(
                 target: "jamodio::pipeline",
                 device = %w.in_name,
@@ -2027,6 +2042,7 @@ impl PipelineState {
                 self.reset_guard = Some(reset_guard);
                 tracing::info!(target: "jamodio::pipeline", device = %input.name, "input device opened");
                 self.input_buffer_samples = input.input_buf;
+                self.input_declared = crate::audio::declared_latency::input(&input.name);
                 let in_meta = (input.channels, input.native_sr, input.input_buf, input.name, input.resolved_id);
                 self.capture_stream = Some(input.stream);
                 let (out_name, out_fallback) = match output {
@@ -2038,6 +2054,7 @@ impl PipelineState {
                         }
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
+                        self.output_declared = crate::audio::declared_latency::output(&name);
                         (name, fallback_from.is_some())
                     }
                     OutputOpen::BuildFailed(e) => {
@@ -2061,6 +2078,11 @@ impl PipelineState {
                 tracing::info!(target: "jamodio::pipeline", device = %a.name, "AsioDuplexHost — entrée + sortie ouvertes (single-owner)");
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
+                // ASIO : `ASIOGetLatencies` pas encore branché (validation de la sonde
+                // sur machine Windows d'abord) → rien de déclaré, constante publiée
+                // comme estimation.
+                self.input_declared = None;
+                self.output_declared = None;
                 let out_name = a.name.clone(); // ASIO mono-device : sortie = même interface que l'entrée
                 self.asio_host = Some(a.host);
                 (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id, out_name, false)
@@ -2721,6 +2743,8 @@ impl PipelineState {
         close_host_on_com(self.asio_host.take());
         self.output_buffer_samples = None;
         self.input_buffer_samples = None;
+        self.output_declared = None;
+        self.input_declared = None;
     }
 
     /// 0.5.4-2 — PHASE 2 du reset ASIO à chaud : reconstruit entrée + sortie sans
@@ -2769,11 +2793,13 @@ impl PipelineState {
                 // remplace le garde (l'ancien a déjà été droppé en phase 1).
                 self.reset_guard = Some(reset_guard);
                 self.input_buffer_samples = input.input_buf;
+                self.input_declared = crate::audio::declared_latency::input(&input.name);
                 self.capture_stream = Some(input.stream);
                 match output {
                     OutputOpen::Opened { stream, buffer, name, .. } => {
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
+                        self.output_declared = crate::audio::declared_latency::output(&name);
                         tracing::info!(
                             target: "jamodio::pipeline",
                             device = %name,
@@ -2798,6 +2824,11 @@ impl PipelineState {
                 self.reset_guard = None;
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
+                // ASIO : `ASIOGetLatencies` pas encore branché (validation de la sonde
+                // sur machine Windows d'abord) → rien de déclaré, constante publiée
+                // comme estimation.
+                self.input_declared = None;
+                self.output_declared = None;
                 let new_sr = a.native_sr;
                 self.asio_host = Some(a.host);
                 tracing::info!(
@@ -2973,9 +3004,10 @@ impl PipelineState {
                 self.perfstats.output_frames.clone(),
                 self.output_pair_start.clone(),
             ) {
-                OutputOpen::Opened { stream, buffer, .. } => {
+                OutputOpen::Opened { stream, buffer, name, .. } => {
                     self.playback_stream = Some(stream);
                     self.output_buffer_samples = buffer;
+                    self.output_declared = crate::audio::declared_latency::output(&name);
                 }
                 OutputOpen::NotFound => return Err("output device introuvable".into()),
                 OutputOpen::BuildFailed(e) => return Err(format!("CPAL output: {}", e)),

@@ -10,6 +10,7 @@ pub mod callback_health;
 pub mod buffer_policy;
 pub mod buffer_size;
 pub mod com_exec;
+pub mod declared_latency;
 pub mod device;
 pub mod host;
 pub mod capture;

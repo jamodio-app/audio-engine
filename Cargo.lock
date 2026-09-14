@@ -2576,6 +2576,8 @@ dependencies = [
  "asio-sys",
  "axum",
  "base64 0.22.1",
+ "core-foundation-sys",
+ "coreaudio-sys",
  "cpal",
  "crossbeam-channel",
  "futures",
