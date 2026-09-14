@@ -6,6 +6,7 @@
 
 mod audio;
 mod logging;
+mod machine_health;
 mod pipeline;
 mod plugin_scan;
 #[cfg(target_os = "windows")]

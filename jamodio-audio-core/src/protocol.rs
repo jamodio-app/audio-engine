@@ -548,6 +548,16 @@ pub enum AudioTransport {
     Other,
 }
 
+/// Pression mémoire telle que le système la déclare (macOS :
+/// `kern.memorystatus_vm_pressure_level`, la même que le Moniteur d'activité).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryPressure {
+    Normal,
+    Warning,
+    Critical,
+}
+
 // ─── Agent → Browser ───────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -1016,6 +1026,24 @@ pub enum AgentMessage {
         monitor_buffer_ms: usize,
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
+        /// Callbacks audio d'ENTRÉE manquants par seconde (attendus sur le temps
+        /// écoulé − réellement servis) : chaque callback manquant est un bloc de
+        /// son perdu. Absent hors capture ou tant que la taille de bloc est inconnue.
+        #[serde(rename = "callbackDeficitIn", skip_serializing_if = "Option::is_none")]
+        callback_deficit_in: Option<f32>,
+        /// Idem pour la SORTIE.
+        #[serde(rename = "callbackDeficitOut", skip_serializing_if = "Option::is_none")]
+        callback_deficit_out: Option<f32>,
+        /// Charge CPU du SYSTÈME sur la fenêtre (%). Absent au premier relevé.
+        #[serde(rename = "cpuPct", skip_serializing_if = "Option::is_none")]
+        cpu_pct: Option<f32>,
+        /// Pression mémoire DÉCLARÉE par le système (macOS). Absent si l'OS n'en
+        /// déclare pas (Windows : voir `memoryLoadPct`).
+        #[serde(rename = "memoryPressure", skip_serializing_if = "Option::is_none")]
+        memory_pressure: Option<MemoryPressure>,
+        /// Mémoire physique utilisée (%), telle que le système la déclare (Windows).
+        #[serde(rename = "memoryLoadPct", skip_serializing_if = "Option::is_none")]
+        memory_load_pct: Option<f32>,
     },
     /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
     /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de

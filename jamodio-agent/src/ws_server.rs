@@ -922,12 +922,19 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // du compteur quand le self-monitor est recréé à un nouveau start).
         let mut buffer_low_pressure: u32 = 0;
         let mut prev_monitor_underruns: u64 = 0;
+        // Santé machine (cf. `machine_health`) : relevé système CPU / mémoire, et
+        // instant du tick précédent pour rapporter les callbacks servis au temps
+        // RÉELLEMENT écoulé (l'intervalle tokio dérive de quelques ms).
+        let mut machine = crate::machine_health::MachineSampler::default();
+        let mut prev_tick = Instant::now();
         // Sécurité — nombre de fenêtres perfstats consécutives où la sortie
         // s'emballe (peak pré-clip ≫ plein-échelle). Exiger PLUSIEURS fenêtres
         // évite un faux positif sur un transitoire fort légitime.
         let mut runaway_windows: u32 = 0;
         loop {
             interval.tick().await;
+            // Relevé système HORS du verrou pipeline (appels système de quelques µs).
+            let machine_sample = machine.sample();
             let pl = perfstats_pipeline.lock().await;
             // Flush histograms (acquièrent le lock parking_lot une fois chacun)
             let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
@@ -951,6 +958,33 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let output_cb_per_sec = output_callbacks_total.saturating_sub(prev_output_callbacks);
             prev_capture_callbacks = capture_callbacks_total;
             prev_output_callbacks = output_callbacks_total;
+            // Callbacks manquants : servis vs attendus sur le temps écoulé depuis le
+            // tick précédent, lu au même point que les compteurs. Seulement en
+            // capture (hors session, aucun callback n'est attendu).
+            let tick_now = Instant::now();
+            let elapsed_secs = tick_now.duration_since(prev_tick).as_secs_f64();
+            prev_tick = tick_now;
+            let capturing_now = matches!(pl.state, AgentState::Capturing);
+            let callback_deficit_in = capturing_now
+                .then(|| {
+                    crate::machine_health::callback_deficit_per_sec(
+                        elapsed_secs,
+                        capture_cb_per_sec,
+                        pl.perfstats.input_frames.load(Ordering::Relaxed),
+                        48_000,
+                    )
+                })
+                .flatten();
+            let callback_deficit_out = capturing_now
+                .then(|| {
+                    crate::machine_health::callback_deficit_per_sec(
+                        elapsed_secs,
+                        output_cb_per_sec,
+                        pl.perfstats.output_frames.load(Ordering::Relaxed),
+                        48_000,
+                    )
+                })
+                .flatten();
             // Reset+swap atomic des drops capture
             let capture_drops_window = pl
                 .perfstats
@@ -1343,6 +1377,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
+                callback_deficit_in,
+                callback_deficit_out,
+                cpu_pct: machine_sample.cpu_pct,
+                memory_pressure: machine_sample.memory_pressure,
+                memory_load_pct: machine_sample.memory_load_pct,
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;
