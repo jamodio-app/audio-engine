@@ -187,8 +187,9 @@ pub struct WsServerHandle {
     /// restart, error). Chaque connexion s'y abonne et forwarde vers son client.
     /// Capacité 16 : le throttle côté `check_for_update` borne le débit.
     update_progress_tx: broadcast::Sender<UpdateProgressEvent>,
-    /// Handle Tauri — permet de déclencher le flux d'auto-update + restart à la
-    /// demande (message browser `Restart`, bouton « Relancer mon agent »).
+    /// Handle Tauri — permet de déclencher la mise à jour + restart à la demande
+    /// du navigateur (message `Restart`, bouton « Mettre à jour maintenant » de
+    /// la fenêtre « Mise à jour requise » du studio).
     /// `OnceLock` car le handle n'est connu qu'au `setup()` (après `new`), mais
     /// on veut garder `new` testable sans environnement Tauri.
     app: Arc<OnceLock<tauri::AppHandle>>,
@@ -238,10 +239,12 @@ impl WsServerHandle {
         let _ = self.shutdown_tx.send(reason);
     }
 
-    /// Déclenche le redémarrage de l'agent à la demande du browser (bouton
-    /// « Relancer mon agent »). Réutilise exactement le flux d'auto-update du
-    /// boot : `check_for_update` télécharge + installe la version dispo,
-    /// broadcaste `Shutdown`, puis `app.restart()`. Fire-and-forget (spawn) pour
+    /// Déclenche la mise à jour de l'agent à la demande du navigateur (bouton
+    /// « Mettre à jour maintenant » de la fenêtre « Mise à jour requise »).
+    /// C'est le SEUL déclencheur : l'agent ne vérifie jamais les mises à jour
+    /// tout seul, ni au démarrage ni en tâche de fond. `check_for_update`
+    /// télécharge + installe la version dispo, broadcaste `Shutdown`, puis
+    /// `app.restart()`. Fire-and-forget (spawn) pour
     /// ne pas bloquer la receive loop WS pendant le download. No-op + warn si le
     /// `AppHandle` n'a pas été injecté (ne devrait pas arriver en prod).
     pub fn trigger_restart(&self) {
