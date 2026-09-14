@@ -2368,7 +2368,20 @@ impl PipelineState {
 
         // Voie B — rapports RTCP du flux instrument (pertes, gigue et aller-retour
         // UDP vus par le SFU), dans une tâche tokio hors du thread audio.
-        self.uplink = Some(uplink::spawn(sender_for_uplink, srtcp_ctx, ssrc));
+        // Interrupteur de DIAGNOSTIC du banc (PROTOCOLE-BANC-LATENCE §8) :
+        // `JAMODIO_DIAG_NO_RTCP=1` coupe la tâche pour comparer, avec le même
+        // binaire et dans les mêmes conditions, l'envoi du son avec et sans RTCP.
+        // Jamais silencieux : chaque démarrage de capture le journalise.
+        self.uplink = if std::env::var("JAMODIO_DIAG_NO_RTCP").is_ok_and(|v| v == "1") {
+            tracing::warn!(
+                target: "jamodio::uplink",
+                "RTCP coupé pour diagnostic (JAMODIO_DIAG_NO_RTCP=1) : aucun rapport envoyé ni lu"
+            );
+            None
+        } else {
+            tracing::info!(target: "jamodio::uplink", "RTCP actif : rapports envoyés et lus");
+            Some(uplink::spawn(sender_for_uplink, srtcp_ctx, ssrc))
+        };
 
         // 0.5.4-7 — l'encodeur consomme désormais le canal capture : le callback
         // peut pousser (et compter de vrais drops). Mis APRÈS le spawn pour que le

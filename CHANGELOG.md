@@ -5,6 +5,13 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2-2] — 2026-09-14 (pré-release de test)
+
+Identique à 0.6.2-1, avec un **interrupteur de diagnostic** pour le banc de
+latence : la variable d'environnement `JAMODIO_DIAG_NO_RTCP=1` coupe les rapports
+RTCP, afin de comparer l'envoi du son avec et sans eux, avec le même programme.
+Le journal indique à chaque démarrage de capture si RTCP est actif ou coupé.
+
 ## [0.6.2-1] — 2026-09-14 (pré-release de test)
 
 Une version pour **la bulle du lien** du studio : savoir chez qui se trouve un
