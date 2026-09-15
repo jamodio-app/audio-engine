@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2-5] — 2026-09-15 (pré-release de test)
+
+### Corrigé
+
+- **Changement d'entrée en session qui échouait sous Windows (ASIO4ALL).**
+  L'Audio Engine traite les messages du studio dans l'ordre ; la liste des
+  appareils MIDI, demandée à l'ouverture des Réglages, était calculée au milieu
+  de cette file. Un pilote MIDI lent l'a bloquée une dizaine de secondes : la
+  demande de capture suivante a expiré côté studio, puis s'est exécutée trop
+  tard, sur un flux que personne ne recevait. La liste MIDI est désormais
+  calculée à part, avec un délai maximum ; au-delà, le studio reçoit une erreur
+  explicite. Le nom d'un appareil MIDI est lu dans son identifiant au lieu de
+  relancer toute l'énumération.
+- **Demandes de capture identifiées** : l'Audio Engine renvoie l'identifiant de
+  chaque demande dans ses réponses. Une réponse tardive à une demande abandonnée
+  ne peut plus être prise pour celle d'une demande plus récente.
+
+### Ajouté
+
+- **Journal** : tout message du studio dont le traitement dépasse 250 ms est
+  signalé avec son type et sa durée.
+
 ## [0.6.2-4] — 2026-09-15 (pré-release de test)
 
 ### Corrigé
