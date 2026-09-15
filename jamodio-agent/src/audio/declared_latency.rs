@@ -8,8 +8,11 @@
 //!
 //! - **macOS** : CoreAudio — latence du périphérique + safety offset + latence
 //!   du flux, dans le sens voulu.
-//! - **Windows** : pas encore lu. `ASIOGetLatencies` sera branché après validation
-//!   de la sonde `examples/asio_latency_probe.rs` sur une vraie machine.
+//! - **Windows** : `ASIOGetLatencies`, lu par le host ASIO après la création des
+//!   buffers (`asio_beyond_buffer`). La latence déclarée INCLUT le buffer ; on en
+//!   publie la part au-delà. ASIO ne dit rien du transport (Bluetooth indétectable
+//!   derrière un pilote générique). Validé par la sonde du 15/09/2026 (Focusrite USB :
+//!   2,60 ms au-delà du buffer ; ASIO4ALL : 10,29 ms).
 //!
 //! Lu à l'OUVERTURE du périphérique, hors du thread temps réel. Une valeur qui ne
 //! peut pas être attribuée avec certitude (deux périphériques homonymes, flux aux
@@ -30,8 +33,9 @@ pub enum Scope {
 pub struct DeclaredLatency {
     /// Latence matérielle au-delà du buffer, en millisecondes.
     pub hw_ms: f32,
-    /// Type de transport du périphérique (Bluetooth ou autre).
-    pub transport: AudioTransport,
+    /// Type de transport du périphérique (Bluetooth ou autre) ; `None` quand le
+    /// système ne le déclare pas (ASIO).
+    pub transport: Option<AudioTransport>,
 }
 
 /// Latence déclarée pour l'ENTRÉE ouverte (`device_name` = nom exact rendu par cpal).
@@ -42,6 +46,24 @@ pub fn input(device_name: &str) -> Option<DeclaredLatency> {
 /// Latence déclarée pour la SORTIE ouverte (`device_name` = nom exact rendu par cpal).
 pub fn output(device_name: &str) -> Option<DeclaredLatency> {
     declared(device_name, Scope::Output)
+}
+
+/// Latence déclarée par un pilote ASIO (`ASIOGetLatencies`, buffer INCLUS), ramenée à
+/// la part au-delà du buffer. Transport inconnu (`None`). Valeur incohérente
+/// (négative, inférieure au buffer, rate invalide) → `None` : jamais devinée.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn asio_beyond_buffer(
+    latency_frames: i32,
+    buffer_frames: u32,
+    sample_rate: u32,
+) -> Option<DeclaredLatency> {
+    let beyond = u32::try_from(latency_frames)
+        .ok()?
+        .checked_sub(buffer_frames)?;
+    Some(DeclaredLatency {
+        hw_ms: frames_to_ms(beyond, f64::from(sample_rate))?,
+        transport: None,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -108,7 +130,6 @@ fn hardware_frames(device: u32, safety_offset: u32, streams: &[u32]) -> Option<u
     device.checked_add(safety_offset)?.checked_add(stream)
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn frames_to_ms(frames: u32, sample_rate: f64) -> Option<f32> {
     (sample_rate.is_finite() && sample_rate > 0.0)
         .then(|| (f64::from(frames) * 1000.0 / sample_rate) as f32)
@@ -271,13 +292,15 @@ mod coreaudio {
         )?;
         Some(DeclaredLatency {
             hw_ms: frames_to_ms(frames, rate)?,
-            transport: if transport == kAudioDeviceTransportTypeBluetooth
-                || transport == kAudioDeviceTransportTypeBluetoothLE
-            {
-                AudioTransport::Bluetooth
-            } else {
-                AudioTransport::Other
-            },
+            transport: Some(
+                if transport == kAudioDeviceTransportTypeBluetooth
+                    || transport == kAudioDeviceTransportTypeBluetoothLE
+                {
+                    AudioTransport::Bluetooth
+                } else {
+                    AudioTransport::Other
+                },
+            ),
         })
     }
 
@@ -368,5 +391,30 @@ mod tests {
         assert_eq!(frames_to_ms(96, 48_000.0), Some(2.0));
         assert_eq!(frames_to_ms(96, 0.0), None);
         assert_eq!(frames_to_ms(96, f64::NAN), None);
+    }
+
+    #[test]
+    fn asio_part_au_dela_du_buffer_releves_de_la_sonde() {
+        // Sonde du 15/09/2026, buffer 64 à 48 kHz.
+        let focusrite = asio_beyond_buffer(189, 64, 48_000).expect("Focusrite USB ASIO");
+        assert!((focusrite.hw_ms - 2.604_166_7).abs() < 1e-4);
+        assert_eq!(focusrite.transport, None);
+        let generic = asio_beyond_buffer(558, 64, 48_000).expect("ASIO4ALL");
+        assert!((generic.hw_ms - 10.291_667).abs() < 1e-4);
+    }
+
+    #[test]
+    fn asio_latence_egale_au_buffer_rien_au_dela() {
+        assert_eq!(
+            asio_beyond_buffer(64, 64, 48_000).map(|d| d.hw_ms),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn asio_valeurs_incoherentes_non_declarees() {
+        assert_eq!(asio_beyond_buffer(32, 64, 48_000), None);
+        assert_eq!(asio_beyond_buffer(-1, 64, 48_000), None);
+        assert_eq!(asio_beyond_buffer(189, 64, 0), None);
     }
 }

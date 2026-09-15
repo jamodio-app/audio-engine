@@ -25,6 +25,7 @@
 
 use crate::audio::asio_reset::ResetSignal;
 use crate::audio::callback_health::{block_budget_us, late_threshold_us, CallbackHealth};
+use crate::audio::declared_latency::{self, DeclaredLatency};
 use crate::audio::output_pair::clamp_output_pair;
 use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
@@ -34,11 +35,14 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// `ASIOGetBufferSize` n'est pas wrappé par asio-sys mais est compilé dans le même
-// objet (asio.cpp). Symbole C++ mangled MSVC (`long __cdecl f(long*, …)`).
+// `ASIOGetBufferSize` et `ASIOGetLatencies` ne sont pas wrappés par asio-sys mais
+// sont compilés dans le même objet (asio.cpp). Symboles C++ mangled MSVC
+// (`long __cdecl f(long*, …)`), éprouvés par la sonde `asio_latency_probe`.
 extern "C" {
     #[link_name = "?ASIOGetBufferSize@@YAJPEAJ000@Z"]
     fn ASIOGetBufferSize(min: *mut i32, max: *mut i32, pref: *mut i32, gran: *mut i32) -> i32;
+    #[link_name = "?ASIOGetLatencies@@YAJPEAJ0@Z"]
+    fn ASIOGetLatencies(input: *mut i32, output: *mut i32) -> i32;
 }
 
 /// Durée de la réchauffe (priming) : create → start → PRIME_MS → stop → dispose.
@@ -134,6 +138,14 @@ fn asio_buffer_sizes() -> Option<(i32, i32, i32, i32)> {
     (rc == 0).then_some((mn, mx, pf, gr))
 }
 
+/// Lit `ASIOGetLatencies(entrée, sortie)` en trames (buffer INCLUS) sur le driver
+/// global chargé. Valide après `ASIOCreateBuffers`.
+fn asio_latencies() -> Option<(i32, i32)> {
+    let (mut input, mut output) = (0i32, 0i32);
+    let rc = unsafe { ASIOGetLatencies(&mut input, &mut output) };
+    (rc == 0).then_some((input, output))
+}
+
 /// Snappe une taille de buffer désirée à une taille **légale** du driver (min/max/
 /// granularité). Ne renvoie JAMAIS une taille hors grille : hors `[min,max]` →
 /// préférée ; granularité `-1` → puissance de 2 la plus proche ; `<= 0` → toute taille
@@ -195,6 +207,10 @@ pub struct AsioDuplexHost {
     pub native_sr: u32,
     /// Taille de buffer réellement retenue (frames/canal).
     pub buffer_size: u32,
+    /// Latence d'entrée déclarée par le pilote au-delà du buffer (`ASIOGetLatencies`).
+    pub input_declared: Option<DeclaredLatency>,
+    /// Idem pour la sortie.
+    pub output_declared: Option<DeclaredLatency>,
 }
 
 // Le handle est déplacé entre le thread appelant et le thread COM-STA (`com_exec`),
@@ -334,6 +350,9 @@ impl AsioDuplexHost {
             .map(|s| s.buffer_size)
             .unwrap_or(size)
             .max(1) as u32;
+        // Latences déclarées, lues une fois après la création des buffers (valeurs
+        // identiques avant/après, sonde du 15/09) — jamais dans le callback.
+        let latencies = asio_latencies();
         let streams = Arc::new(Mutex::new(Some(asio_streams)));
 
         // Vérification d'armement (télémétrie objective à chaque cold-start) : le
@@ -584,6 +603,26 @@ impl AsioDuplexHost {
                 });
         }
 
+        // Part au-delà du buffer, au rate RÉEL retenu (corrigé ci-dessus si le
+        // pilote mentait sur sa fréquence).
+        let (input_declared, output_declared) = match latencies {
+            Some((input, output)) => (
+                declared_latency::asio_beyond_buffer(input, buffer_size, native_sr),
+                declared_latency::asio_beyond_buffer(output, buffer_size, native_sr),
+            ),
+            None => (None, None),
+        };
+        tracing::info!(
+            target: "jamodio::audio",
+            driver = %driver_name,
+            latency_frames = ?latencies,
+            buffer_size,
+            native_sr,
+            input_hw_ms = ?input_declared.map(|d| d.hw_ms),
+            output_hw_ms = ?output_declared.map(|d| d.hw_ms),
+            "latences déclarées par le pilote ASIO (au-delà du buffer)"
+        );
+
         Ok(Self {
             driver,
             streams,
@@ -592,6 +631,8 @@ impl AsioDuplexHost {
             channels_in: n_in as u16,
             native_sr,
             buffer_size,
+            input_declared,
+            output_declared,
         })
     }
 }

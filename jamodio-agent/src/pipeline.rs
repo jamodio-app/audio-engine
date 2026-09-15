@@ -1994,7 +1994,15 @@ impl PipelineState {
             // continué à pousser sans consommateur → vieux audio dans le canal).
             while w.sample_rx.try_recv().is_ok() {}
             self.input_buffer_samples = w.input_buf;
-            self.input_declared = crate::audio::declared_latency::input(&w.in_name);
+            // Driver chaud réutilisé : la latence déclarée est celle lue à son ouverture.
+            #[cfg(target_os = "windows")]
+            {
+                self.input_declared = self.asio_host.as_ref().and_then(|h| h.input_declared);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                self.input_declared = crate::audio::declared_latency::input(&w.in_name);
+            }
             tracing::info!(
                 target: "jamodio::pipeline",
                 device = %w.in_name,
@@ -2100,11 +2108,9 @@ impl PipelineState {
                 tracing::info!(target: "jamodio::pipeline", device = %a.name, "AsioDuplexHost — entrée + sortie ouvertes (single-owner)");
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
-                // ASIO : `ASIOGetLatencies` pas encore branché (validation de la sonde
-                // sur machine Windows d'abord) → rien de déclaré, constante publiée
-                // comme estimation.
-                self.input_declared = None;
-                self.output_declared = None;
+                // Latences déclarées par le pilote ASIO, lues à l'ouverture du host.
+                self.input_declared = a.host.input_declared;
+                self.output_declared = a.host.output_declared;
                 let out_name = a.name.clone(); // ASIO mono-device : sortie = même interface que l'entrée
                 self.asio_host = Some(a.host);
                 (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id, out_name, false)
@@ -2868,11 +2874,9 @@ impl PipelineState {
                 self.reset_guard = None;
                 self.input_buffer_samples = a.input_buf;
                 self.output_buffer_samples = a.input_buf;
-                // ASIO : `ASIOGetLatencies` pas encore branché (validation de la sonde
-                // sur machine Windows d'abord) → rien de déclaré, constante publiée
-                // comme estimation.
-                self.input_declared = None;
-                self.output_declared = None;
+                // Latences déclarées par le pilote ASIO, lues à l'ouverture du host.
+                self.input_declared = a.host.input_declared;
+                self.output_declared = a.host.output_declared;
                 let new_sr = a.native_sr;
                 self.asio_host = Some(a.host);
                 tracing::info!(

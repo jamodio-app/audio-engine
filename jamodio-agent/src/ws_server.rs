@@ -2856,7 +2856,7 @@ async fn handle_message(
                     output_buffer_ms: output_buf_ms_opt,
                     input_hw_ms: pl.input_declared.map(|d| d.hw_ms),
                     output_hw_ms: pl.output_declared.map(|d| d.hw_ms),
-                    output_transport: pl.output_declared.map(|d| d.transport),
+                    output_transport: pl.output_declared.and_then(|d| d.transport),
                     jitter_target_ms,
                     total_latency_ms,
                     streams: stream_count,
