@@ -6,6 +6,10 @@
 
 mod audio;
 mod logging;
+#[cfg(target_os = "macos")]
+mod cf_string;
+mod machine_health;
+mod net_interface;
 mod pipeline;
 mod plugin_scan;
 #[cfg(target_os = "windows")]
