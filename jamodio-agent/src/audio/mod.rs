@@ -11,6 +11,8 @@ pub mod buffer_policy;
 pub mod buffer_size;
 pub mod com_exec;
 pub mod declared_latency;
+/// Latences matérielles mesurées par Jamodio là où le système déclare faux.
+pub mod measured_latency;
 pub mod device;
 pub mod host;
 pub mod capture;

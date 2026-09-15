@@ -548,6 +548,25 @@ pub enum AudioTransport {
     Other,
 }
 
+/// D'où vient une latence matérielle publiée (`Stats.inputHwSource` / `outputHwSource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwLatencySource {
+    /// Déclarée par le pilote (CoreAudio, ASIO).
+    Declared,
+    /// Mesurée au banc par Jamodio : remplace une déclaration connue pour être fausse.
+    Bench,
+}
+
+/// Nature d'un périphérique reconnu par la table des mesures Jamodio
+/// (`Stats.inputHwKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HwDeviceKind {
+    /// Micro intégré d'un Mac.
+    AppleBuiltInMic,
+}
+
 /// Pression mémoire telle que le système la déclare (macOS :
 /// `kern.memorystatus_vm_pressure_level`, la même que le Moniteur d'activité).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -680,15 +699,29 @@ pub enum AgentMessage {
         /// Même sémantique de `None` que `inputBufferMs`.
         #[serde(rename = "outputBufferMs", skip_serializing_if = "Option::is_none")]
         output_buffer_ms: Option<f32>,
-        /// Latence matérielle DÉCLARÉE par le pilote pour l'entrée, AU-DELÀ du
-        /// buffer (convertisseurs, transport, marges), en ms. Absent (`None`) si
-        /// non attribuable avec certitude ou pas encore lu sur cette plateforme :
-        /// le browser publie alors la constante comme estimation.
+        /// Latence matérielle de l'entrée, AU-DELÀ du buffer (convertisseurs,
+        /// transport, marges), en ms : déclarée par le pilote, ou mesurée par
+        /// Jamodio quand la déclaration est connue pour être fausse
+        /// (`inputHwSource`). Absent (`None`) si non attribuable avec certitude ou
+        /// pas encore lu sur cette plateforme : le browser publie alors la
+        /// constante comme estimation.
         #[serde(rename = "inputHwMs", skip_serializing_if = "Option::is_none")]
         input_hw_ms: Option<f32>,
-        /// Idem pour la sortie.
+        /// Origine de `inputHwMs`. Présent si et seulement si `inputHwMs` l'est.
+        #[serde(rename = "inputHwSource", skip_serializing_if = "Option::is_none")]
+        input_hw_source: Option<HwLatencySource>,
+        /// Nature du périphérique reconnu, quand `inputHwSource` vaut `bench`.
+        #[serde(rename = "inputHwKind", skip_serializing_if = "Option::is_none")]
+        input_hw_kind: Option<HwDeviceKind>,
+        /// Ce que le pilote déclarait, quand `inputHwSource` vaut `bench`.
+        #[serde(rename = "inputHwDeclaredMs", skip_serializing_if = "Option::is_none")]
+        input_hw_declared_ms: Option<f32>,
+        /// Idem `inputHwMs` pour la sortie.
         #[serde(rename = "outputHwMs", skip_serializing_if = "Option::is_none")]
         output_hw_ms: Option<f32>,
+        /// Origine de `outputHwMs`. Présent si et seulement si `outputHwMs` l'est.
+        #[serde(rename = "outputHwSource", skip_serializing_if = "Option::is_none")]
+        output_hw_source: Option<HwLatencySource>,
         /// Type de transport de la sortie (`bluetooth` / `other`). Absent si inconnu.
         #[serde(rename = "outputTransport", skip_serializing_if = "Option::is_none")]
         output_transport: Option<AudioTransport>,
@@ -1373,6 +1406,18 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    // Contrat wire — origine et nature d'une latence matérielle (`Stats.inputHwSource`,
+    // `Stats.inputHwKind`), lues par latency-budget.js côté browser.
+    #[test]
+    fn hw_latency_source_and_kind_serialize_to_wire() {
+        assert_eq!(serde_json::to_string(&HwLatencySource::Declared).unwrap(), r#""declared""#);
+        assert_eq!(serde_json::to_string(&HwLatencySource::Bench).unwrap(), r#""bench""#);
+        assert_eq!(
+            serde_json::to_string(&HwDeviceKind::AppleBuiltInMic).unwrap(),
+            r#""appleBuiltInMic""#
+        );
     }
 
     // Contrat wire Lot 4 — `set-record-arm` (snapshot armement MIX REC).

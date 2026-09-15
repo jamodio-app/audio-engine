@@ -25,7 +25,7 @@
 
 use crate::audio::asio_reset::ResetSignal;
 use crate::audio::callback_health::{block_budget_us, late_threshold_us, CallbackHealth};
-use crate::audio::declared_latency::{self, DeclaredLatency};
+use crate::audio::declared_latency::{self, HardwareLatency};
 use crate::audio::output_pair::clamp_output_pair;
 use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
@@ -207,10 +207,11 @@ pub struct AsioDuplexHost {
     pub native_sr: u32,
     /// Taille de buffer réellement retenue (frames/canal).
     pub buffer_size: u32,
-    /// Latence d'entrée déclarée par le pilote au-delà du buffer (`ASIOGetLatencies`).
-    pub input_declared: Option<DeclaredLatency>,
+    /// Latence d'entrée déclarée par le pilote au-delà du buffer (`ASIOGetLatencies`) ;
+    /// aucune mesure Jamodio ne la remplace aujourd'hui sous Windows.
+    pub input_hw: Option<HardwareLatency>,
     /// Idem pour la sortie.
-    pub output_declared: Option<DeclaredLatency>,
+    pub output_hw: Option<HardwareLatency>,
 }
 
 // Le handle est déplacé entre le thread appelant et le thread COM-STA (`com_exec`),
@@ -605,7 +606,7 @@ impl AsioDuplexHost {
 
         // Part au-delà du buffer, au rate RÉEL retenu (corrigé ci-dessus si le
         // pilote mentait sur sa fréquence).
-        let (input_declared, output_declared) = match latencies {
+        let (input_hw, output_hw) = match latencies {
             Some((input, output)) => (
                 declared_latency::asio_beyond_buffer(input, buffer_size, native_sr),
                 declared_latency::asio_beyond_buffer(output, buffer_size, native_sr),
@@ -618,8 +619,8 @@ impl AsioDuplexHost {
             latency_frames = ?latencies,
             buffer_size,
             native_sr,
-            input_hw_ms = ?input_declared.map(|d| d.hw_ms),
-            output_hw_ms = ?output_declared.map(|d| d.hw_ms),
+            input_hw_ms = ?input_hw.map(|d| d.hw_ms),
+            output_hw_ms = ?output_hw.map(|d| d.hw_ms),
             "latences déclarées par le pilote ASIO (au-delà du buffer)"
         );
 
@@ -631,8 +632,8 @@ impl AsioDuplexHost {
             channels_in: n_in as u16,
             native_sr,
             buffer_size,
-            input_declared,
-            output_declared,
+            input_hw,
+            output_hw,
         })
     }
 }
