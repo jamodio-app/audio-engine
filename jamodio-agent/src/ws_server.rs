@@ -462,6 +462,11 @@ fn bind_ws_listener() -> std::io::Result<tokio::net::TcpListener> {
 /// traite les messages en ligne, les suivants l'ont attendu.
 const SLOW_MESSAGE_WARN: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Seuil propre aux ouvertures de capture : ouvrir un pilote ASIO prend
+/// normalement 1 à 2 s (1,3 s mesurées le 15/09/2026). Au-delà, c'est anormal —
+/// et encore bien sous le délai d'attente du studio (15 s).
+const SLOW_CAPTURE_WARN: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// Délai maximum d'une énumération MIDI (appel système synchrone, pilote lent).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const MIDI_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -590,6 +595,10 @@ async fn handle_one_message(
         return true;
     }
 
+    let slow_after = match &browser_msg {
+        BrowserMessage::StartCapture { .. } | BrowserMessage::StartVoiceCapture { .. } => SLOW_CAPTURE_WARN,
+        _ => SLOW_MESSAGE_WARN,
+    };
     let started = std::time::Instant::now();
     let responses =
         handle_message(
@@ -602,7 +611,7 @@ async fn handle_one_message(
         )
         .await;
     let elapsed = started.elapsed();
-    if elapsed >= SLOW_MESSAGE_WARN {
+    if elapsed >= slow_after {
         tracing::warn!(
             target: "jamodio::ws",
             message = %message_kind(&text),
