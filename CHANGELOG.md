@@ -5,6 +5,24 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2-4] — 2026-09-15 (pré-release de test)
+
+### Corrigé
+
+- **Micro intégré des Mac : latence surestimée d'environ 20 ms.** macOS déclare
+  51 ms au-delà du buffer ; le banc de latence en mesure 30. L'Audio Engine
+  reconnaît ce micro par sa nature (appareil intégré, source « micro interne »),
+  jamais par son nom, et publie la mesure Jamodio avec sa source ; la déclaration
+  du système reste écrite dans le journal et transmise pour la bulle du studio.
+  Les autres périphériques gardent la latence que leur pilote déclare.
+
+### Ajouté
+
+- **Journal** : les trois termes que CoreAudio additionne (latence de
+  l'appareil, marge de sécurité, latence du flux), la source d'entrée et la valeur
+  retenue, à chaque ouverture de périphérique. Lu hors du son : aucune latence
+  ajoutée.
+
 ## [0.6.2-3] — 2026-09-15 (pré-release de test)
 
 ### Ajouté
