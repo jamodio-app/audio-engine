@@ -59,6 +59,16 @@ pub const VIRTUAL_PORT_NAME: &str = "Jamodio Virtual MIDI";
 /// ce préfixe pour réutiliser le port existant au lieu d'ouvrir un physique.
 pub const VIRTUAL_PORT_ID_PREFIX: &str = "virtual:";
 
+/// Nom d'un port MIDI lu dans son identifiant (`{idx}:{name}` ou
+/// `virtual:{name}`), SANS énumérer les ports : l'énumération est un appel
+/// système synchrone qui peut durer plusieurs secondes (pilote lent).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn name_from_id(id: &str) -> Option<String> {
+    id.split_once(':')
+        .map(|(_, name)| name.to_string())
+        .filter(|name| !name.is_empty())
+}
+
 /// Métadonnées d'un MIDI device exposées au browser via WS.
 #[derive(Debug, Clone, Serialize)]
 pub struct MidiDeviceInfo {
@@ -259,5 +269,27 @@ impl Drop for MidiInput {
     fn drop(&mut self) {
         tracing::info!(target: "jamodio::midi", device_id = %self.device_id, "MIDI input closed");
         // _conn est dropped automatiquement → midir ferme le port + thread interne.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nom_lu_dans_l_identifiant_sans_enumerer() {
+        assert_eq!(name_from_id("2:Arturia KeyStep"), Some("Arturia KeyStep".to_string()));
+        assert_eq!(
+            name_from_id(&format!("{VIRTUAL_PORT_ID_PREFIX}{VIRTUAL_PORT_NAME}")),
+            Some(VIRTUAL_PORT_NAME.to_string())
+        );
+        // Un nom peut contenir « : » : seul le premier sépare l'index.
+        assert_eq!(name_from_id("0:MIDI 1: In"), Some("MIDI 1: In".to_string()));
+    }
+
+    #[test]
+    fn identifiant_sans_nom_rien() {
+        assert_eq!(name_from_id("3:"), None);
+        assert_eq!(name_from_id("sans-separateur"), None);
     }
 }

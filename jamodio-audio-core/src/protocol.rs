@@ -119,6 +119,12 @@ pub enum BrowserMessage {
         /// ⇒ wipe complet = comportement historique).
         #[serde(rename = "sessionContinues", default)]
         session_continues: bool,
+        /// Identifiant de la demande, choisi par le browser et renvoyé tel quel
+        /// dans `LocalPort`, `CaptureStarted`, `CaptureError` et l'erreur corrélée.
+        /// Une réponse tardive à une demande abandonnée ne peut ainsi jamais être
+        /// prise pour celle d'une demande plus récente. Absent = ancien browser.
+        #[serde(rename = "requestId", default)]
+        request_id: Option<String>,
     },
     /// Talkback via l'agent (Lot 2, v0.5.7) — ajoute un SECOND producteur
     /// Opus/RTP (la voix) qui extrait un canal mono du MÊME buffer ASIO que
@@ -802,6 +808,9 @@ pub enum AgentMessage {
         /// back-compat : absent = ancien agent = pas de repli signalé.
         #[serde(rename = "outputFallback", default)]
         output_fallback: bool,
+        /// `requestId` du `StartCapture` confirmé (absent hors demande browser).
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Erreur explicite quand la capture ne peut pas démarrer parce que le
     /// device demandé n'est pas trouvé. Plus de silent fallback to default :
@@ -815,6 +824,10 @@ pub enum AgentMessage {
         /// Détail technique facultatif (logs/debug).
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// `requestId` du `StartCapture` refusé ; absent pour une erreur de fond
+        /// (dérive de rate en session), qui ne répond à aucune demande.
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Agent reports the local UDP port + SRTP keys.
     /// Le browser doit relayer `srtpParameters` au SFU via `connect-plain-transport`
@@ -825,6 +838,10 @@ pub enum AgentMessage {
         port: u16,
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
+        /// `requestId` du `StartCapture` servi (absent pour voix et flux reçus,
+        /// corrélés par `producer_id`).
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Per-stream RMS levels for VU meters.
     ///
@@ -1406,6 +1423,29 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent
+    // pour une erreur de fond (lu par agent-bridge.js#_routeResponse).
+    #[test]
+    fn capture_error_carries_request_id_only_when_answering_a_request() {
+        let answered = serde_json::to_value(AgentMessage::CaptureError {
+            reason: "input-device-not-found".into(),
+            requested_device: Some("0:ASIO4ALL v2".into()),
+            detail: None,
+            request_id: Some("req-42".into()),
+        })
+        .unwrap();
+        assert_eq!(answered["type"], "capture-error");
+        assert_eq!(answered["requestId"], "req-42");
+        let background = serde_json::to_value(AgentMessage::CaptureError {
+            reason: "rate-drift-48khz".into(),
+            requested_device: None,
+            detail: None,
+            request_id: None,
+        })
+        .unwrap();
+        assert!(background.get("requestId").is_none());
     }
 
     // Contrat wire — origine et nature d'une latence matérielle (`Stats.inputHwSource`,

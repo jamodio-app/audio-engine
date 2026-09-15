@@ -458,6 +458,73 @@ fn bind_ws_listener() -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::from_std(socket.into())
 }
 
+/// Au-delà, un message du navigateur est journalisé comme lent : la boucle WS
+/// traite les messages en ligne, les suivants l'ont attendu.
+const SLOW_MESSAGE_WARN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Délai maximum d'une énumération MIDI (appel système synchrone, pilote lent).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const MIDI_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Clé de l'erreur d'énumération MIDI (`AgentMessage::Error.key`), lue par le browser.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const MIDI_LIST_ERROR_KEY: &str = "list-midi-devices";
+
+/// Type d'un message browser (champ `type` du JSON), pour les journaux.
+fn message_kind(text: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    serde_json::from_str::<Kind>(text)
+        .map(|k| k.kind)
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Liste MIDI calculée hors du runtime async et bornée par `MIDI_LIST_TIMEOUT`.
+/// Jamais une liste vide inventée : un dépassement ou un échec renvoie une
+/// erreur corrélée à `MIDI_LIST_ERROR_KEY`.
+async fn midi_device_list_reply() -> AgentMessage {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(
+            MIDI_LIST_TIMEOUT,
+            tokio::task::spawn_blocking(crate::audio::midi::list_devices),
+        )
+        .await
+        {
+            Ok(Ok(list)) => AgentMessage::MidiDeviceList {
+                devices: list
+                    .into_iter()
+                    .map(|d| jamodio_audio_core::protocol::MidiDeviceWire {
+                        id: d.id,
+                        name: d.name,
+                        is_default: d.is_default,
+                    })
+                    .collect(),
+            },
+            Ok(Err(e)) => {
+                tracing::warn!(target: "jamodio::midi", error = %e, "énumération MIDI interrompue");
+                AgentMessage::error_keyed(format!("midi enumeration failed: {e}"), MIDI_LIST_ERROR_KEY)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "jamodio::midi",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "énumération MIDI trop lente (pilote MIDI qui ne répond pas) — erreur renvoyée au navigateur"
+                );
+                AgentMessage::error_keyed("midi enumeration timed out", MIDI_LIST_ERROR_KEY)
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        AgentMessage::MidiDeviceList { devices: vec![] }
+    }
+}
+
 /// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
 /// `true` si on doit continuer la receive loop, `false` si on doit la
 /// quitter (envoi sortant cassé). Partagé entre la branche `is_internal`
@@ -509,6 +576,21 @@ async fn handle_one_message(
         return true;
     }
 
+    // Énumération MIDI : appels système synchrones (WinMM, CoreMIDI) qui peuvent
+    // durer plusieurs secondes quand un pilote est lent. Traitée EN LIGNE, elle a
+    // gelé cette boucle ~10 s le 15/09/2026 (Windows) : le start-capture suivant a
+    // expiré côté browser puis s'est exécuté trop tard. Hors de la boucle et
+    // bornée : la réponse part quand elle est prête, les messages suivants ne
+    // l'attendent pas (l'ordre n'importe pas pour une liste).
+    if matches!(browser_msg, BrowserMessage::ListMidiDevices) {
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let _ = out_tx.send(midi_device_list_reply().await).await;
+        });
+        return true;
+    }
+
+    let started = std::time::Instant::now();
     let responses =
         handle_message(
             browser_msg,
@@ -519,6 +601,15 @@ async fn handle_one_message(
             &handle.send_gain_voice,
         )
         .await;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_MESSAGE_WARN {
+        tracing::warn!(
+            target: "jamodio::ws",
+            message = %message_kind(&text),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "traitement long d'un message du navigateur : les messages suivants l'ont attendu"
+        );
+    }
     for resp in responses {
         if out_tx.send(resp).await.is_err() {
             return false;
@@ -608,10 +699,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         let (src_str, dev_id, dev_name) = match &src {
             crate::pipeline::InputSource::Audio => ("audio".to_string(), None, None),
             crate::pipeline::InputSource::Midi(id) => {
-                let name = crate::audio::midi::list_devices()
-                    .into_iter()
-                    .find(|d| &d.id == id)
-                    .map(|d| d.name);
+                // Nom lu dans l'id : jamais d'énumération MIDI (appel lent) ici.
+                let name = crate::audio::midi::name_from_id(id);
                 ("midi".to_string(), Some(id.clone()), name)
             }
         };
@@ -2053,6 +2142,7 @@ async fn audio_liveness_supervisor(
             let _ = out_tx
                 .send(AgentMessage::CaptureError {
                     reason: "rate-drift-48khz".into(),
+                    request_id: None,
                     requested_device: None,
                     detail: Some(format!("{} Hz", actual_sr)),
                 })
@@ -2168,6 +2258,7 @@ async fn audio_liveness_supervisor(
                 let _ = out_tx
                     .send(AgentMessage::CaptureError {
                         reason: "rate-drift-48khz".into(),
+                        request_id: None,
                         requested_device: None,
                         detail: Some(format!("~{} Hz", measured)),
                     })
@@ -2509,7 +2600,7 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters, session_continues } => {
+        BrowserMessage::StartCapture { ssrc, sfu_ip, sfu_port, payload_type: _, input_device, channel_index, stereo_start, srtp_parameters, session_continues, request_id } => {
             tracing::info!(
                 target: "jamodio::ws",
                 ssrc,
@@ -2518,8 +2609,12 @@ async fn handle_message(
                 ?channel_index,
                 ?stereo_start,
                 session_continues,
+                request_id = request_id.as_deref().unwrap_or("-"),
                 "StartCapture"
             );
+            // Erreurs corrélées à la demande : `requestId` du browser, ou la clé
+            // vide historique pour un browser qui ne l'envoie pas.
+            let request_key = request_id.clone().unwrap_or_default();
             // Validation de la destination (M-agent-2, review pré-BETA 2026-07-12).
             // Le browser fournit sfu_ip/sfu_port ; on refuse une IP invalide ou
             // manifestement bogue avant d'ouvrir le flux. En release on rejette
@@ -2528,13 +2623,13 @@ async fn handle_message(
             // barrière principale contre la redirection du flux micro.
             if !is_valid_sfu_dest(&sfu_ip) {
                 tracing::warn!(target: "jamodio::ws", sfu = %sfu_ip, "StartCapture rejeté : destination SFU invalide");
-                return vec![AgentMessage::error_keyed("invalid sfu destination", "")];
+                return vec![AgentMessage::error_keyed("invalid sfu destination", request_key)];
             }
             // Setup critique : on ATTEND le lock (jamais de drop → sinon tranche
-            // figée jusqu'au relaunch). Erreur corrélée à la clé vide "" (comme
+            // figée jusqu'au relaunch). Erreur corrélée à la demande (comme
             // LocalPort/CaptureError) → pas de reject collatéral côté browser.
             let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
-                return vec![AgentMessage::error_keyed("agent overloaded", "")];
+                return vec![AgentMessage::error_keyed("agent overloaded", request_key)];
             };
             // Le browser passe l'id du device directement dans start-capture
             // (le plus fiable — select-devices pouvait ne jamais arriver).
@@ -2555,6 +2650,7 @@ async fn handle_message(
                     vec![
                         AgentMessage::LocalPort {
                             producer_id: String::new(),
+                            request_id: request_id.clone(),
                             port: local_port,
                             srtp_parameters: agent_srtp,
                         },
@@ -2565,6 +2661,7 @@ async fn handle_message(
                             native_sample_rate: info.native_sample_rate,
                             output_name: info.output_name,
                             output_fallback: info.output_fallback,
+                            request_id: request_id.clone(),
                         },
                     ]
                 }
@@ -2576,6 +2673,7 @@ async fn handle_message(
                     );
                     vec![AgentMessage::CaptureError {
                         reason: "input-device-not-found".into(),
+                        request_id: request_id.clone(),
                         requested_device: requested,
                         detail: None,
                     }]
@@ -2589,6 +2687,7 @@ async fn handle_message(
                     tracing::warn!(target: "jamodio::ws", "StartCapture refusé : WASAPI, ASIO requis (R1)");
                     vec![AgentMessage::CaptureError {
                         reason: "no-asio".into(),
+                        request_id: request_id.clone(),
                         requested_device: input_device,
                         detail: None,
                     }]
@@ -2599,6 +2698,7 @@ async fn handle_message(
                     tracing::warn!(target: "jamodio::ws", actual_sr, "StartCapture refusé : hors 48 kHz natif (R2)");
                     vec![AgentMessage::CaptureError {
                         reason: "not-48khz".into(),
+                        request_id: request_id.clone(),
                         requested_device: input_device,
                         detail: Some(format!("{} Hz", actual_sr)),
                     }]
@@ -2609,6 +2709,7 @@ async fn handle_message(
                     tracing::warn!(target: "jamodio::ws", actual_sr, "StartCapture refusé : SORTIE hors 48 kHz natif (R2 sortie)");
                     vec![AgentMessage::CaptureError {
                         reason: "output-not-48khz".into(),
+                        request_id: request_id.clone(),
                         requested_device: input_device,
                         detail: Some(format!("{} Hz", actual_sr)),
                     }]
@@ -2630,13 +2731,14 @@ async fn handle_message(
                         );
                         vec![AgentMessage::CaptureError {
                             reason: "asio-open-failed".into(),
+                            request_id: request_id.clone(),
                             requested_device: input_device,
                             detail: Some(msg),
                         }]
                     } else {
-                        // Corrélé à la clé vide "" (comme LocalPort/CaptureError)
-                        // → le browser rejette seulement la requête StartCapture.
-                        vec![AgentMessage::error_keyed(msg, "")]
+                        // Corrélé à la demande (comme LocalPort/CaptureError)
+                        // → le browser rejette seulement cette requête StartCapture.
+                        vec![AgentMessage::error_keyed(msg, request_key)]
                     }
                 }
             }
@@ -2668,6 +2770,7 @@ async fn handle_message(
             {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id: "voice".into(),
+                    request_id: None,
                     port: local_port,
                     srtp_parameters: agent_srtp,
                 }],
@@ -2732,6 +2835,7 @@ async fn handle_message(
             match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters, media_tag).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id,
+                    request_id: None,
                     port: local_port,
                     srtp_parameters: agent_srtp,
                 }],
@@ -3365,24 +3469,9 @@ async fn handle_message(
         }
 
         // Sprint INSERT instruments (S2) — discovery + selection MIDI input.
-        BrowserMessage::ListMidiDevices => {
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            {
-                let devices = crate::audio::midi::list_devices()
-                    .into_iter()
-                    .map(|d| jamodio_audio_core::protocol::MidiDeviceWire {
-                        id: d.id,
-                        name: d.name,
-                        is_default: d.is_default,
-                    })
-                    .collect();
-                vec![AgentMessage::MidiDeviceList { devices }]
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            {
-                vec![AgentMessage::MidiDeviceList { devices: vec![] }]
-            }
-        }
+        // La boucle WS l'intercepte (`handle_one_message`) pour ne pas l'attendre ;
+        // ce chemin sert aux appels directs de `handle_message`.
+        BrowserMessage::ListMidiDevices => vec![midi_device_list_reply().await],
 
         BrowserMessage::SetInputSource { source, midi_device_id } => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3418,10 +3507,9 @@ async fn handle_message(
                                 ("audio".to_string(), None, None)
                             }
                             crate::pipeline::InputSource::Midi(id) => {
-                                let name = crate::audio::midi::list_devices()
-                                    .into_iter()
-                                    .find(|d| &d.id == id)
-                                    .map(|d| d.name);
+                                // Nom lu dans l'id : jamais d'énumération MIDI
+                                // (appel lent) sous le verrou pipeline.
+                                let name = crate::audio::midi::name_from_id(id);
                                 ("midi".to_string(), Some(id.clone()), name)
                             }
                         };
@@ -3726,6 +3814,12 @@ mod runaway_tests {
 mod etat_latche_tests {
     use super::*;
     use jamodio_audio_core::mixer::mixer::AudioMixer;
+
+    #[test]
+    fn type_d_un_message_lu_pour_le_journal_des_messages_lents() {
+        assert_eq!(message_kind(r#"{"type":"list-midi-devices"}"#), "list-midi-devices");
+        assert_eq!(message_kind("pas du json"), "?");
+    }
 
     /// L'état que le serveur WS détient à côté du pipeline : mixer, gain voix,
     /// et les deux gains d'envoi (Lot B).
