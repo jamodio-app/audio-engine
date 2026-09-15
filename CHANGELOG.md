@@ -5,6 +5,20 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2-3] — 2026-09-15 (pré-release de test)
+
+### Ajouté
+
+- **Latences déclarées par le pilote ASIO (Windows)**, comptées dans la latence
+  affichée comme sur macOS : lues une fois à l'ouverture du pilote, jamais pendant
+  le son. Relevé sur le PC de test : 2,6 ms au-delà du buffer pour une Focusrite
+  USB, 10,3 ms pour le pilote générique ASIO4ALL, là où l'agent comptait 2 ms.
+
+### Corrigé
+
+- **Faille RUSTSEC-2026-0285** dans `rustls` (téléchargement des mises à jour) :
+  version corrigée 0.23.45.
+
 ## [0.6.2-2] — 2026-09-14 (pré-release de test)
 
 Identique à 0.6.2-1, avec un **interrupteur de diagnostic** pour le banc de
