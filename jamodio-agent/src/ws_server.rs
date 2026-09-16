@@ -8,7 +8,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use base64::Engine;
 use jamodio_audio_core::protocol::{
-    AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
+    AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf, RecvStreamPerf,
     RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
 };
 use std::sync::OnceLock;
@@ -1179,6 +1179,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let (mt, mu) = m.self_monitor_stats();
                 (stats, mt, mu)
             };
+            // Flux reçus (même silencieux) : silences et réconciliation côté navigateur.
+            let recv_streams: Vec<RecvStreamPerf> = pl
+                .recv_stream_states()
+                .into_iter()
+                .map(|st| RecvStreamPerf { producer_id: st.producer_id, kind: st.kind, silent_ms: st.silent_ms })
+                .collect();
 
             // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
@@ -1486,6 +1492,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 && pipeline_latency_ms.count == 0
                 && pipeline_latency_ms.drops_per_sec == 0
                 && peers.is_empty()
+                && recv_streams.is_empty()
             {
                 continue;
             }
@@ -1555,6 +1562,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 memory_load_pct: machine_sample.memory_load_pct,
                 net_interface: net_watcher.latest(),
                 uplink,
+                recv_streams,
             };
             if perfstats_tx.send(msg).await.is_err() {
                 break;
@@ -2941,7 +2949,7 @@ async fn handle_message(
                 return vec![AgentMessage::error("agent overloaded")];
             };
             let is_capturing = matches!(pl.state, AgentState::Capturing);
-            let stream_count = pl.recv_stops.len();
+            let stream_count = pl.recv_stream_count();
             // L'UI agent affiche le nom lisible (pas l'id complet `{idx}:{name}`),
             // suivi du canal capté QUAND une capture tourne — même forme que la
             // ligne Talkback, pour qu'on ne croie pas à deux réglages de nature
