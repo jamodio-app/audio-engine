@@ -82,36 +82,42 @@ pub struct SrtpContext {
     rx: Mutex<Context>,
 }
 
+/// Contextes sortant (clé locale) et entrant (clé du SFU) d'un transport.
+fn contexts(local: &SrtpParameters, remote: &SrtpParameters) -> Result<(Context, Context), String> {
+    let (local_key, local_salt) = local.decode()?;
+    let (remote_key, remote_salt) = remote.decode()?;
+
+    let tx = Context::new(
+        &local_key[..],
+        &local_salt[..],
+        ProtectionProfile::AeadAes256Gcm,
+        None,
+        None,
+    )
+    .map_err(|e| format!("create outbound SRTP context: {e}"))?;
+
+    // Anti-replay sur le contexte ENTRANT : sans ces options,
+    // webrtc-srtp installe `srtp_no_replay_protection()` (cf. sources
+    // 0.17.1) → un attaquant on-path pourrait rejouer des paquets SRTP
+    // capturés. Le backend mac (libsrtp2) a sa fenêtre replay active par
+    // défaut ; on aligne Windows dessus pour une sécurité identique.
+    let rx = Context::new(
+        &remote_key[..],
+        &remote_salt[..],
+        ProtectionProfile::AeadAes256Gcm,
+        Some(srtp_replay_protection(SRTP_REPLAY_WINDOW)),
+        Some(srtcp_replay_protection(SRTP_REPLAY_WINDOW)),
+    )
+    .map_err(|e| format!("create inbound SRTP context: {e}"))?;
+
+    Ok((tx, rx))
+}
+
 impl SrtpContext {
     /// `local` : clés générées par nous, communiquées au SFU via connect-plain-transport.
     /// `remote` : clés du SFU, reçues via plain-transport-created / plain-consumer-created.
     pub fn new(local: &SrtpParameters, remote: &SrtpParameters) -> Result<Self, String> {
-        let (local_key, local_salt) = local.decode()?;
-        let (remote_key, remote_salt) = remote.decode()?;
-
-        let tx = Context::new(
-            &local_key[..],
-            &local_salt[..],
-            ProtectionProfile::AeadAes256Gcm,
-            None,
-            None,
-        )
-        .map_err(|e| format!("create outbound SRTP context: {e}"))?;
-
-        // Anti-replay sur le contexte ENTRANT : sans ces options,
-        // webrtc-srtp installe `srtp_no_replay_protection()` (cf. sources
-        // 0.17.1) → un attaquant on-path pourrait rejouer des paquets SRTP
-        // capturés. Le backend mac (libsrtp2) a sa fenêtre replay active par
-        // défaut ; on aligne Windows dessus pour une sécurité identique.
-        let rx = Context::new(
-            &remote_key[..],
-            &remote_salt[..],
-            ProtectionProfile::AeadAes256Gcm,
-            Some(srtp_replay_protection(SRTP_REPLAY_WINDOW)),
-            Some(srtcp_replay_protection(SRTP_REPLAY_WINDOW)),
-        )
-        .map_err(|e| format!("create inbound SRTP context: {e}"))?;
-
+        let (tx, rx) = contexts(local, remote)?;
         Ok(Self {
             tx: Mutex::new(tx),
             rx: Mutex::new(rx),
@@ -138,6 +144,49 @@ impl SrtpContext {
         let decrypted = rx
             .decrypt_rtp(buf.as_slice())
             .map_err(|e| format!("SRTP decrypt: {e}"))?;
+        buf.clear();
+        buf.extend_from_slice(&decrypted);
+        Ok(())
+    }
+}
+
+/// Contexte SRTCP d'un transport : chiffre nos rapports RTCP, déchiffre ceux du SFU.
+///
+/// DISTINCT de [`SrtpContext`] : le thread d'encodage RT chiffre le son sous le
+/// verrou de `SrtpContext`, les rapports n'y touchent jamais. Sûr avec les mêmes
+/// clés : SRTP et SRTCP dérivent des clés de session distinctes et ont chacun leur
+/// compteur (RFC 3711 §4.3, RFC 7714 §9), et ce contexte ne chiffre jamais de RTP.
+/// Détenu par une seule tâche : pas de verrou.
+pub struct SrtcpContext {
+    tx: Context,
+    rx: Context,
+}
+
+impl SrtcpContext {
+    /// Mêmes paramètres que [`SrtpContext::new`] pour le même transport.
+    pub fn new(local: &SrtpParameters, remote: &SrtpParameters) -> Result<Self, String> {
+        let (tx, rx) = contexts(local, remote)?;
+        Ok(Self { tx, rx })
+    }
+
+    /// Chiffre un paquet RTCP (ajoute l'index SRTCP et le tag d'auth). Comme
+    /// `SrtpContext::protect`, webrtc-srtp rend un buffer neuf recopié dans `buf`.
+    pub fn protect_rtcp(&mut self, buf: &mut Vec<u8>) -> Result<(), String> {
+        let encrypted = self
+            .tx
+            .encrypt_rtcp(buf.as_slice())
+            .map_err(|e| format!("SRTCP encrypt: {e}"))?;
+        buf.clear();
+        buf.extend_from_slice(&encrypted);
+        Ok(())
+    }
+
+    /// Déchiffre un paquet SRTCP (rejette un rejeu ou un paquet altéré).
+    pub fn unprotect_rtcp(&mut self, buf: &mut Vec<u8>) -> Result<(), String> {
+        let decrypted = self
+            .rx
+            .decrypt_rtcp(buf.as_slice())
+            .map_err(|e| format!("SRTCP decrypt: {e}"))?;
         buf.clear();
         buf.extend_from_slice(&decrypted);
         Ok(())

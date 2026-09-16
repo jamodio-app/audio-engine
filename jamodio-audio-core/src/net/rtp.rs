@@ -47,6 +47,25 @@ pub fn build_packet(header: &RtpHeader, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Numéro de séquence et horodatage de départ d'un flux émis, aléatoires comme le
+/// recommande le RFC 3550 §5.1. Le numéro n'est jamais 0 : le worker mediasoup
+/// initialise son dernier numéro vu à `premier − 1`, qui vaut 65535 pour un départ
+/// à 0 ; le premier paquet compte alors un tour complet de numérotation et le SFU
+/// rapporte 65 536 paquets perdus de trop, plus ~100 % de pertes sur le premier
+/// intervalle (`RtpStream::ReceiveStreamPacket` / `UpdateSeq`, mediasoup 3.19).
+///
+/// Appelé une fois au démarrage du thread d'encodage, jamais dans la boucle.
+pub fn random_start() -> (u16, u32) {
+    let mut seed = [0u8; 6];
+    if let Err(e) = getrandom::getrandom(&mut seed) {
+        tracing::warn!(target: "jamodio::rtp", error = %e, "aléa indisponible : départ du flux RTP fixe (séquence 1)");
+        return (1, 0);
+    }
+    let sequence = u16::from_be_bytes([seed[0], seed[1]]).max(1);
+    let timestamp = u32::from_be_bytes([seed[2], seed[3], seed[4], seed[5]]);
+    (sequence, timestamp)
+}
+
 /// Parse an RTP packet header, accounting for CSRC and header extensions.
 /// Returns None if packet is too small or malformed.
 pub fn parse_header(data: &[u8]) -> Option<(RtpHeader, &[u8])> {
@@ -122,5 +141,13 @@ mod tests {
         assert_eq!(parsed.ssrc, 0xDEADBEEF);
         assert!(!parsed.marker);
         assert_eq!(parsed_payload, payload);
+    }
+
+    #[test]
+    fn depart_aleatoire_jamais_a_zero() {
+        let starts: Vec<(u16, u32)> = (0..64).map(|_| random_start()).collect();
+        assert!(starts.iter().all(|&(sequence, _)| sequence != 0));
+        // 64 tirages identiques trahiraient un départ fixe.
+        assert!(starts.iter().any(|&s| s != starts[0]));
     }
 }

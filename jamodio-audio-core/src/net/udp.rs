@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
+use super::rtcp::SendActivity;
 use super::srtp::SrtpContext;
 
 // DSCP EF (Expedited Forwarding, RFC 3246) pour le trafic audio temps réel.
@@ -34,12 +35,46 @@ pub struct RtpSender {
     socket: UdpSocket,
     target: SocketAddr,
     srtp: Arc<SrtpContext>,
+    activity: SendActivity,
 }
 
 impl RtpSender {
     pub async fn new(target: SocketAddr, srtp: Arc<SrtpContext>) -> std::io::Result<Self> {
         let socket = bind_udp_dscp_ef()?;
-        Ok(Self { socket, target, srtp })
+        Ok(Self {
+            socket,
+            target,
+            srtp,
+            activity: SendActivity::new(),
+        })
+    }
+
+    /// Activité d'envoi du flux : écrite par le thread d'encodage après chaque
+    /// paquet parti, lue pour le Sender Report (cf. `net::rtcp`).
+    pub fn activity(&self) -> &SendActivity {
+        &self.activity
+    }
+
+    /// Envoie un paquet RTCP DÉJÀ chiffré (cf. `SrtcpContext`) par le socket du
+    /// flux : avec rtcpMux + comedia, le SFU n'accepte le RTCP que de l'adresse
+    /// d'où part le RTP. Appelé par la tâche RTCP, jamais par le thread audio.
+    pub async fn send_rtcp(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.socket.send_to(packet, self.target).await.map(|_| ())
+    }
+
+    /// Attend le prochain datagramme reçu sur le socket d'envoi. Le SFU n'y
+    /// envoie que ses rapports RTCP (Receiver Reports, chiffrés). Rend `false`,
+    /// buffer vidé, pour un datagramme venu d'une autre adresse que le SFU.
+    pub async fn recv_from_sfu(&self, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+        let cap = buf.capacity();
+        buf.resize(cap, 0);
+        let (len, from) = self.socket.recv_from(buf).await?;
+        if from != self.target {
+            buf.clear();
+            return Ok(false);
+        }
+        buf.truncate(len);
+        Ok(true)
     }
 
     /// Chiffre SRTP puis envoie en **NON-BLOQUANT** — conçu pour être appelé
@@ -133,11 +168,13 @@ impl RtpReceiver {
         buf.resize(cap, 0);
         let (len, addr) = self.socket.recv_from(buf).await?;
         buf.truncate(len);
-        // SRTCP packets (PT 200..=204 in second byte) need unprotect_rtcp,
-        // but for now mediasoup doesn't send SRTCP back to comedia agents — drop them.
-        // RTP packets : decrypt in place.
+        // SRTCP (PT 200..=204 au 2e octet) : le SFU en ENVOIE bien aux agents — des
+        // Sender Reports sur ce transport de réception, des Receiver Reports sur le
+        // transport d'envoi (cf. worker mediasoup `Transport::SendRtcp`). L'agent ne
+        // parle pas encore RTCP : on les ignore ici, sans les déchiffrer (voie B du
+        // plan « infobulle latence » côté web).
+        // Paquets RTP : déchiffrés en place.
         if len >= 2 && buf[1] >= 200 && buf[1] <= 204 {
-            // RTCP : currently not handled (no encoder/decoder for SR/RR feedback)
             return Ok((0, addr));
         }
         if let Err(e) = self.srtp.unprotect(buf) {

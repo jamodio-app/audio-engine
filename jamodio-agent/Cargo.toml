@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -73,6 +73,14 @@ jamodio-vst3-host = { path = "../jamodio-vst3-host" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # Santé machine (machine_health.rs) : charge mémoire du système
+    # (GlobalMemoryStatusEx). La charge CPU passe par GetSystemTimes (Threading).
+    "Win32_System_SystemInformation",
+    # Type de l'interface réseau vers le SFU (net_interface.rs) : GetAdaptersAddresses.
+    # Ndis porte le type IF_OPER_STATUS de IP_ADAPTER_ADDRESSES_LH, WinSock les SOCKADDR.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     # 0.5.9-2 — Job Object KILL_ON_JOB_CLOSE : lie le worker de scan
     # out-of-process à l'agent → l'OS tue le worker si l'agent meurt, même
     # sur kill -9. Cf. plugin_scan/coordinator.rs::job. `Win32_Security` est
@@ -100,6 +108,13 @@ winreg = "0.52"
 # Hôte AU plugins — macOS uniquement.
 [target.'cfg(target_os = "macos")'.dependencies]
 jamodio-au-host = { path = "../jamodio-au-host" }
+# Latence matérielle DÉCLARÉE par CoreAudio (latence du périphérique, safety
+# offset, latence du flux) et type de transport (Bluetooth), que cpal n'expose
+# pas. Mêmes versions et mêmes features que celles déjà tirées par cpal
+# (coreaudio-rs → coreaudio-sys `core_audio`) : aucune compilation en plus.
+# Cf. audio/declared_latency.rs.
+coreaudio-sys = { version = "0.2", default-features = false, features = ["core_audio"] }
+core-foundation-sys = "0.8"
 # Sprint S2 — bindings Mach (thread_policy_set, mach_timebase_info) pour le
 # fallback QoS+time-constraint quand os_workgroup_join échoue. Cf. rt_priority.rs.
 mach2 = "0.4"

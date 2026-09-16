@@ -5,6 +5,61 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.2] — 2026-09-16
+
+Une version pour **la bulle du lien** du studio : savoir si tout va bien, et
+sinon **sur quel axe** — la machine ou le réseau, chez vous ou chez un autre
+musicien — et lire une latence **mesurée**, jamais supposée.
+
+### Ajouté
+
+- **Mesure du lien avec le serveur sur le chemin même du son** : l'Audio Engine
+  envoie des rapports RTCP et lit ceux du serveur. Il obtient le vrai temps
+  d'aller-retour UDP et les paquets que le serveur n'a pas reçus. Le son n'est pas
+  touché : le thread audio ne fait que deux écritures atomiques, et les rapports
+  sont chiffrés à part.
+- **Ce que le son subit chez vous, musicien par musicien** : paquets perdus,
+  arrivés trop tard, masqués, et coupures du tampon de réception. Le studio s'en
+  sert pour dire si un lien perd des paquets ou arrive par à-coups.
+- **Santé de la machine** : callbacks audio manquants, pression mémoire (macOS),
+  mémoire utilisée (Windows), charge CPU.
+- **Type de réseau vers le serveur** (Ethernet, Wi-Fi, mobile), relevé sans
+  envoyer de paquet.
+- **Latences matérielles lues chez le pilote**, chacune avec sa source : CoreAudio
+  (entrée, sortie, sortie Bluetooth) et ASIO sous Windows — par exemple 2,6 ms
+  au-delà du buffer pour une Focusrite USB, 10,3 ms pour le pilote générique
+  ASIO4ALL. Lues une fois à l'ouverture du périphérique, jamais pendant le son.
+  Un pilote peut se tromper : le studio les affiche à part, comme matériel non
+  compté, et le chiffre de latence ne retient que ce que Jamodio mesure.
+- **Micro intégré des Mac mesuré par Jamodio** : macOS déclare 51 ms au-delà du
+  buffer, le banc de latence en mesure 30. L'Audio Engine reconnaît ce micro par
+  sa nature (appareil intégré, source « micro interne »), jamais par son nom, et
+  publie la mesure avec sa source, à côté de la déclaration du système.
+- **Journal** : les trois termes que CoreAudio additionne et la valeur retenue à
+  chaque ouverture de périphérique ; tout message du studio dont le traitement est
+  anormalement long, avec son type et sa durée. Pour le banc, la variable
+  `JAMODIO_DIAG_NO_RTCP=1` coupe les rapports RTCP afin de comparer l'envoi du son
+  avec et sans eux.
+
+### Corrigé
+
+- **Changement d'entrée en session qui échouait sous Windows (ASIO4ALL).** La
+  liste des appareils MIDI, calculée au milieu de la file des messages du studio,
+  la bloquait une dizaine de secondes avec un pilote MIDI lent : la demande de
+  capture suivante expirait côté studio, puis s'exécutait trop tard. La liste MIDI
+  est désormais calculée à part, avec un délai maximum et une erreur explicite
+  au-delà, et une seule à la fois : un pilote MIDI figé ne voit jamais
+  s'accumuler des énumérations en parallèle.
+- **Demandes de capture identifiées** : une réponse tardive à une demande
+  abandonnée ne peut plus être prise pour celle d'une demande plus récente.
+- **Un paquet arrivé en retard était joué hors de sa place**, puis suivi d'un
+  masquage de trop : il est désormais écarté, sans faux trou.
+- **Le serveur comptait 65 536 pertes fictives** sur chaque flux de l'Audio
+  Engine, qui numérotait ses paquets à partir de zéro. La numérotation démarre
+  désormais au hasard, comme le recommande la norme RTP.
+- **Faille RUSTSEC-2026-0285** dans `rustls` (téléchargement des mises à jour) :
+  version corrigée 0.23.45.
+
 ## [0.6.1] — 2026-09-13
 
 Une version pour la **nouvelle table de mixage du studio** : ce que vous envoyez

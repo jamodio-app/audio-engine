@@ -64,27 +64,33 @@ pub struct SrtpContext {
     rx: Mutex<Session>,
 }
 
+/// Sessions sortante (clé locale) et entrante (clé du SFU) d'un transport.
+fn sessions(local: &SrtpParameters, remote: &SrtpParameters) -> Result<(Session, Session), String> {
+    let local_key = local.decode()?;
+    let remote_key = remote.decode()?;
+    let policy = CryptoPolicy::aes_gcm_256_16_auth();
+    let tx = Session::with_outbound_template(StreamPolicy {
+        key: &local_key[..],
+        rtp: policy,
+        rtcp: policy,
+        ..Default::default()
+    })
+    .map_err(|e| format!("create outbound SRTP session: {e:?}"))?;
+    let rx = Session::with_inbound_template(StreamPolicy {
+        key: &remote_key[..],
+        rtp: policy,
+        rtcp: policy,
+        ..Default::default()
+    })
+    .map_err(|e| format!("create inbound SRTP session: {e:?}"))?;
+    Ok((tx, rx))
+}
+
 impl SrtpContext {
     /// `local` : clés générées par nous, communiquées au SFU via connect-plain-transport.
     /// `remote` : clés du SFU, reçues via plain-transport-created / plain-consumer-created.
     pub fn new(local: &SrtpParameters, remote: &SrtpParameters) -> Result<Self, String> {
-        let local_key = local.decode()?;
-        let remote_key = remote.decode()?;
-        let policy = CryptoPolicy::aes_gcm_256_16_auth();
-        let tx = Session::with_outbound_template(StreamPolicy {
-            key: &local_key[..],
-            rtp: policy,
-            rtcp: policy,
-            ..Default::default()
-        })
-        .map_err(|e| format!("create outbound SRTP session: {e:?}"))?;
-        let rx = Session::with_inbound_template(StreamPolicy {
-            key: &remote_key[..],
-            rtp: policy,
-            rtcp: policy,
-            ..Default::default()
-        })
-        .map_err(|e| format!("create inbound SRTP session: {e:?}"))?;
+        let (tx, rx) = sessions(local, remote)?;
         Ok(Self {
             tx: Mutex::new(tx),
             rx: Mutex::new(rx),
@@ -103,5 +109,39 @@ impl SrtpContext {
         let mut rx = self.rx.lock().map_err(|_| "SRTP rx lock poisoned")?;
         rx.unprotect(buf)
             .map_err(|e| format!("SRTP unprotect: {e:?}"))
+    }
+}
+
+/// Contexte SRTCP d'un transport : chiffre nos rapports RTCP, déchiffre ceux du SFU.
+///
+/// DISTINCT de [`SrtpContext`] : le thread d'encodage RT chiffre le son sous le
+/// verrou de `SrtpContext`, les rapports n'y touchent jamais. Sûr avec les mêmes
+/// clés : SRTP et SRTCP dérivent des clés de session distinctes et ont chacun leur
+/// compteur (RFC 3711 §4.3, RFC 7714 §9), et ce contexte ne chiffre jamais de RTP.
+/// Détenu par une seule tâche : pas de verrou.
+pub struct SrtcpContext {
+    tx: Session,
+    rx: Session,
+}
+
+impl SrtcpContext {
+    /// Mêmes paramètres que [`SrtpContext::new`] pour le même transport.
+    pub fn new(local: &SrtpParameters, remote: &SrtpParameters) -> Result<Self, String> {
+        let (tx, rx) = sessions(local, remote)?;
+        Ok(Self { tx, rx })
+    }
+
+    /// Chiffre un paquet RTCP en place (ajoute l'index SRTCP et le tag d'auth).
+    pub fn protect_rtcp(&mut self, buf: &mut Vec<u8>) -> Result<(), String> {
+        self.tx
+            .protect_rtcp(buf)
+            .map_err(|e| format!("SRTCP protect: {e:?}"))
+    }
+
+    /// Déchiffre un paquet SRTCP en place (rejette un rejeu ou un paquet altéré).
+    pub fn unprotect_rtcp(&mut self, buf: &mut Vec<u8>) -> Result<(), String> {
+        self.rx
+            .unprotect_rtcp(buf)
+            .map_err(|e| format!("SRTCP unprotect: {e:?}"))
     }
 }

@@ -119,6 +119,12 @@ pub enum BrowserMessage {
         /// ⇒ wipe complet = comportement historique).
         #[serde(rename = "sessionContinues", default)]
         session_continues: bool,
+        /// Identifiant de la demande, choisi par le browser et renvoyé tel quel
+        /// dans `LocalPort`, `CaptureStarted`, `CaptureError` et l'erreur corrélée.
+        /// Une réponse tardive à une demande abandonnée ne peut ainsi jamais être
+        /// prise pour celle d'une demande plus récente. Absent = ancien browser.
+        #[serde(rename = "requestId", default)]
+        request_id: Option<String>,
     },
     /// Talkback via l'agent (Lot 2, v0.5.7) — ajoute un SECOND producteur
     /// Opus/RTP (la voix) qui extrait un canal mono du MÊME buffer ASIO que
@@ -538,6 +544,56 @@ pub struct RecordStemSpec {
     pub peer_name: Option<String>,
 }
 
+/// Type de transport d'un périphérique audio, tel que le système le déclare.
+/// Seul le Bluetooth est distingué : c'est le seul qui fonde une « part de
+/// latence évitable » certaine (cf. `Stats.outputTransport`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioTransport {
+    Bluetooth,
+    Other,
+}
+
+/// D'où vient une latence matérielle publiée (`Stats.inputHwSource` / `outputHwSource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HwLatencySource {
+    /// Déclarée par le pilote (CoreAudio, ASIO).
+    Declared,
+    /// Mesurée au banc par Jamodio : remplace une déclaration connue pour être fausse.
+    Bench,
+}
+
+/// Nature d'un périphérique reconnu par la table des mesures Jamodio
+/// (`Stats.inputHwKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HwDeviceKind {
+    /// Micro intégré d'un Mac.
+    AppleBuiltInMic,
+}
+
+/// Pression mémoire telle que le système la déclare (macOS :
+/// `kern.memorystatus_vm_pressure_level`, la même que le Moniteur d'activité).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryPressure {
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Type de l'interface réseau qui porte le trafic vers le SFU, tel que le système
+/// le déclare (cf. `PerfStats.netInterface`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetInterface {
+    Ethernet,
+    Wifi,
+    Cellular,
+    Other,
+}
+
 // ─── Agent → Browser ───────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -649,6 +705,32 @@ pub enum AgentMessage {
         /// Même sémantique de `None` que `inputBufferMs`.
         #[serde(rename = "outputBufferMs", skip_serializing_if = "Option::is_none")]
         output_buffer_ms: Option<f32>,
+        /// Latence matérielle de l'entrée, AU-DELÀ du buffer (convertisseurs,
+        /// transport, marges), en ms : déclarée par le pilote, ou mesurée par
+        /// Jamodio quand la déclaration est connue pour être fausse
+        /// (`inputHwSource`). Absent (`None`) si non attribuable avec certitude ou
+        /// pas encore lu sur cette plateforme : le browser publie alors la
+        /// constante comme estimation.
+        #[serde(rename = "inputHwMs", skip_serializing_if = "Option::is_none")]
+        input_hw_ms: Option<f32>,
+        /// Origine de `inputHwMs`. Présent si et seulement si `inputHwMs` l'est.
+        #[serde(rename = "inputHwSource", skip_serializing_if = "Option::is_none")]
+        input_hw_source: Option<HwLatencySource>,
+        /// Nature du périphérique reconnu, quand `inputHwSource` vaut `bench`.
+        #[serde(rename = "inputHwKind", skip_serializing_if = "Option::is_none")]
+        input_hw_kind: Option<HwDeviceKind>,
+        /// Ce que le pilote déclarait, quand `inputHwSource` vaut `bench`.
+        #[serde(rename = "inputHwDeclaredMs", skip_serializing_if = "Option::is_none")]
+        input_hw_declared_ms: Option<f32>,
+        /// Idem `inputHwMs` pour la sortie.
+        #[serde(rename = "outputHwMs", skip_serializing_if = "Option::is_none")]
+        output_hw_ms: Option<f32>,
+        /// Origine de `outputHwMs`. Présent si et seulement si `outputHwMs` l'est.
+        #[serde(rename = "outputHwSource", skip_serializing_if = "Option::is_none")]
+        output_hw_source: Option<HwLatencySource>,
+        /// Type de transport de la sortie (`bluetooth` / `other`). Absent si inconnu.
+        #[serde(rename = "outputTransport", skip_serializing_if = "Option::is_none")]
+        output_transport: Option<AudioTransport>,
         /// Cible adaptative du jitter buffer (moyenne des streams actifs, ms).
         /// 0 si aucun stream actif. C'est le levier principal de tuning latence
         /// vs robustesse au jitter — affiché dans l'UI agent.
@@ -726,6 +808,9 @@ pub enum AgentMessage {
         /// back-compat : absent = ancien agent = pas de repli signalé.
         #[serde(rename = "outputFallback", default)]
         output_fallback: bool,
+        /// `requestId` du `StartCapture` confirmé (absent hors demande browser).
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Erreur explicite quand la capture ne peut pas démarrer parce que le
     /// device demandé n'est pas trouvé. Plus de silent fallback to default :
@@ -739,6 +824,10 @@ pub enum AgentMessage {
         /// Détail technique facultatif (logs/debug).
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// `requestId` du `StartCapture` refusé ; absent pour une erreur de fond
+        /// (dérive de rate en session), qui ne répond à aucune demande.
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Agent reports the local UDP port + SRTP keys.
     /// Le browser doit relayer `srtpParameters` au SFU via `connect-plain-transport`
@@ -749,6 +838,10 @@ pub enum AgentMessage {
         port: u16,
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
+        /// `requestId` du `StartCapture` servi (absent pour voix et flux reçus,
+        /// corrélés par `producer_id`).
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Per-stream RMS levels for VU meters.
     ///
@@ -994,6 +1087,32 @@ pub enum AgentMessage {
         monitor_buffer_ms: usize,
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
+        /// Callbacks audio d'ENTRÉE manquants par seconde (attendus sur le temps
+        /// écoulé − réellement servis) : chaque callback manquant est un bloc de
+        /// son perdu. Absent hors capture ou tant que la taille de bloc est inconnue.
+        #[serde(rename = "callbackDeficitIn", skip_serializing_if = "Option::is_none")]
+        callback_deficit_in: Option<f32>,
+        /// Idem pour la SORTIE.
+        #[serde(rename = "callbackDeficitOut", skip_serializing_if = "Option::is_none")]
+        callback_deficit_out: Option<f32>,
+        /// Charge CPU du SYSTÈME sur la fenêtre (%). Absent au premier relevé.
+        #[serde(rename = "cpuPct", skip_serializing_if = "Option::is_none")]
+        cpu_pct: Option<f32>,
+        /// Pression mémoire DÉCLARÉE par le système (macOS). Absent si l'OS n'en
+        /// déclare pas (Windows : voir `memoryLoadPct`).
+        #[serde(rename = "memoryPressure", skip_serializing_if = "Option::is_none")]
+        memory_pressure: Option<MemoryPressure>,
+        /// Mémoire physique utilisée (%), telle que le système la déclare (Windows).
+        #[serde(rename = "memoryLoadPct", skip_serializing_if = "Option::is_none")]
+        memory_load_pct: Option<f32>,
+        /// Type de l'interface réseau vers le SFU de la session. Absent hors session,
+        /// sur la boucle locale ou si la route est introuvable.
+        #[serde(rename = "netInterface", skip_serializing_if = "Option::is_none")]
+        net_interface: Option<NetInterface>,
+        /// Flux montant de l'instrument vu par le SFU (Receiver Reports RTCP).
+        /// Absent hors capture et avant le premier rapport (~5 s après le départ).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uplink: Option<UplinkPerf>,
     },
     /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
     /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de
@@ -1095,6 +1214,41 @@ pub struct PeerPerf {
     pub underruns: u64,
     #[serde(rename = "driftDrops")]
     pub drift_drops: u64,
+    /// Compteurs CUMULÉS du flux reçu (cf. `net::seq`), remis à zéro si le flux
+    /// est recréé : le web calcule les écarts et traite une baisse comme un
+    /// nouveau départ. Paquets attendus d'après les numéros de séquence.
+    #[serde(rename = "packetsExpected")]
+    pub packets_expected: u64,
+    /// Paquets jamais arrivés (attendus − reçus, retards compris dans les reçus).
+    #[serde(rename = "packetsLost")]
+    pub packets_lost: u64,
+    /// Paquets arrivés trop tard pour être joués (écartés).
+    #[serde(rename = "packetsLate")]
+    pub packets_late: u64,
+    /// Trames de masquage (PLC) jouées à la place de paquets absents.
+    #[serde(rename = "concealedFrames")]
+    pub concealed_frames: u64,
+}
+
+/// Flux montant de l'instrument d'après le dernier Receiver Report du SFU.
+#[derive(Debug, Serialize)]
+pub struct UplinkPerf {
+    /// Temps d'aller-retour agent ↔ SFU (ms) sur le chemin UDP du son. Absent si le
+    /// rapport ne cite aucun Sender Report de l'agent.
+    #[serde(rename = "rttMs", skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f32>,
+    /// Pertes constatées par le SFU depuis son rapport précédent (%).
+    #[serde(rename = "fractionLostPct")]
+    pub fraction_lost_pct: f32,
+    /// Pertes cumulées constatées par le SFU depuis le début du flux.
+    #[serde(rename = "packetsLost")]
+    pub packets_lost: i32,
+    /// Gigue d'arrivée au SFU (ms).
+    #[serde(rename = "jitterMs")]
+    pub jitter_ms: f32,
+    /// Âge du rapport (ms) : le SFU en envoie un toutes les ~5 s.
+    #[serde(rename = "reportAgeMs")]
+    pub report_age_ms: u64,
 }
 
 /// Wire format pour un MIDI device (cf. `audio::midi::MidiDeviceInfo` côté agent).
@@ -1269,6 +1423,41 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent
+    // pour une erreur de fond (lu par agent-bridge.js#_routeResponse).
+    #[test]
+    fn capture_error_carries_request_id_only_when_answering_a_request() {
+        let answered = serde_json::to_value(AgentMessage::CaptureError {
+            reason: "input-device-not-found".into(),
+            requested_device: Some("0:ASIO4ALL v2".into()),
+            detail: None,
+            request_id: Some("req-42".into()),
+        })
+        .unwrap();
+        assert_eq!(answered["type"], "capture-error");
+        assert_eq!(answered["requestId"], "req-42");
+        let background = serde_json::to_value(AgentMessage::CaptureError {
+            reason: "rate-drift-48khz".into(),
+            requested_device: None,
+            detail: None,
+            request_id: None,
+        })
+        .unwrap();
+        assert!(background.get("requestId").is_none());
+    }
+
+    // Contrat wire — origine et nature d'une latence matérielle (`Stats.inputHwSource`,
+    // `Stats.inputHwKind`), lues par latency-budget.js côté browser.
+    #[test]
+    fn hw_latency_source_and_kind_serialize_to_wire() {
+        assert_eq!(serde_json::to_string(&HwLatencySource::Declared).unwrap(), r#""declared""#);
+        assert_eq!(serde_json::to_string(&HwLatencySource::Bench).unwrap(), r#""bench""#);
+        assert_eq!(
+            serde_json::to_string(&HwDeviceKind::AppleBuiltInMic).unwrap(),
+            r#""appleBuiltInMic""#
+        );
     }
 
     // Contrat wire Lot 4 — `set-record-arm` (snapshot armement MIX REC).
