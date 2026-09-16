@@ -5,9 +5,9 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.6.3-1] — 2026-09-16
+## [0.6.3] — 2026-09-16
 
-Pré-release. **Un musicien ne devient plus muet après une coupure réseau.**
+**Un musicien ne devient plus muet après une coupure réseau.**
 
 ### Corrigé
 
