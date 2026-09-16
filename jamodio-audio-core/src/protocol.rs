@@ -1113,6 +1113,11 @@ pub enum AgentMessage {
         /// Absent hors capture et avant le premier rapport (~5 s après le départ).
         #[serde(skip_serializing_if = "Option::is_none")]
         uplink: Option<UplinkPerf>,
+        /// Tous les flux reçus des pairs (instrument et voix), même silencieux ou
+        /// sans paquet encore : le navigateur y lit les silences et retire ceux qu'il
+        /// ne connaît plus. Vide hors réception.
+        #[serde(rename = "recvStreams")]
+        recv_streams: Vec<RecvStreamPerf>,
     },
     /// Option B — réponse au `ReferenceClockPing`. Fournit l'ancre EXACTE
     /// échantillon↔mural (que Chrome ne connaît pas sur WASAPI) : le frame de
@@ -1228,6 +1233,18 @@ pub struct PeerPerf {
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     #[serde(rename = "concealedFrames")]
     pub concealed_frames: u64,
+}
+
+/// Un flux reçu d'un pair, tel que l'Audio Engine le tient. Un flux silencieux reste
+/// ouvert et reprend tout seul : seul le navigateur le retire (`remove-stream`).
+#[derive(Debug, Serialize)]
+pub struct RecvStreamPerf {
+    #[serde(rename = "producerId")]
+    pub producer_id: String,
+    pub kind: StreamKind,
+    /// Durée sans paquet reçu (ms) ; depuis l'ajout du flux si aucun n'est arrivé.
+    #[serde(rename = "silentMs")]
+    pub silent_ms: u64,
 }
 
 /// Flux montant de l'instrument d'après le dernier Receiver Report du SFU.

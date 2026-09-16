@@ -18,6 +18,7 @@ use jamodio_audio_core::perfstats::Histogram;
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::audio::midi::CapturedMidiEvent;
+use crate::recv_activity::{RecvActivity, SILENCE_LOG_AFTER_MS};
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::voice_isolation::{IsolationConfig, VoiceIsolator};
@@ -752,13 +753,10 @@ pub struct PipelineState {
     /// Rapports RTCP du flux d'envoi instrument (cf. `uplink`), vivant tant que la
     /// capture tourne. Le lâcher arrête la tâche.
     pub uplink: Option<uplink::UplinkHandle>,
-    /// Handles to stop per-stream receive I/O tasks (async tokio).
-    pub recv_stops: HashMap<String, tokio::sync::oneshot::Sender<()>>,
-    /// Type de chaque flux reçu (instrument / voix). Depuis que la voix des
-    /// pairs transite aussi par l'agent, compter les flux ne compte PLUS les
-    /// musiciens : un partenaire qui parle en apporte deux. Cette carte permet
-    /// de distinguer les deux dans la télémétrie.
-    recv_kinds: HashMap<String, StreamKind>,
+    /// Flux reçus des pairs, par producer. Leur durée de vie appartient au
+    /// navigateur (`add-stream` / `remove-stream`) : un flux qui se tait n'est
+    /// jamais supprimé ici (cf. `recv_activity`).
+    recv_streams: HashMap<String, RecvStream>,
     /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
     /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
     /// `None` = pas de stream reçu en cours.
@@ -965,6 +963,21 @@ pub struct PipelineState {
     /// `net_stats_by_producer` est mis à jour par les recv tasks après chaque
     /// paquet (drift + gigue réseau). Lecture côté ws_server au flush 1 Hz.
     pub perfstats: PerfHandles,
+}
+
+/// Un flux reçu d'un pair : la tâche I/O à arrêter, son type, et son activité.
+struct RecvStream {
+    stop: tokio::sync::oneshot::Sender<()>,
+    kind: StreamKind,
+    activity: Arc<RecvActivity>,
+}
+
+/// État d'un flux reçu publié dans les perf-stats (`recvStreams`).
+pub struct RecvStreamState {
+    pub producer_id: String,
+    pub kind: StreamKind,
+    /// Durée sans paquet (ms) ; depuis la création si aucun paquet n'est arrivé.
+    pub silent_ms: u64,
 }
 
 /// Métriques de timing réseau mesurées par stream entrant, alimentées par les
@@ -1296,8 +1309,7 @@ impl PipelineState {
             com_recycle_pending: false,
             encoder_stop: None,
             uplink: None,
-            recv_stops: HashMap::new(),
-            recv_kinds: HashMap::new(),
+            recv_streams: HashMap::new(),
             decode_thread: None,
             recv_epoch: 0,
             input_device_id: None,
@@ -1839,7 +1851,7 @@ impl PipelineState {
             // Vraie fin de session : plus de SFU vers lequel relever le réseau local.
             self.sfu_addr = None;
             // Coupe les réceptions pair + le thread de décodage RT partagé.
-            let ids: Vec<String> = self.recv_stops.keys().cloned().collect();
+            let ids: Vec<String> = self.recv_streams.keys().cloned().collect();
             for id in ids {
                 self.remove_stream(&id);
             }
@@ -2648,9 +2660,9 @@ impl PipelineState {
     /// INSTRUMENT. La voix des pairs arrive dans des flux séparés : les compter
     /// afficherait deux « musiciens » pour un partenaire qui parle.
     pub fn musician_count(&self) -> usize {
-        self.recv_kinds
+        self.recv_streams
             .values()
-            .filter(|k| matches!(k, StreamKind::Instrument))
+            .filter(|stream| matches!(stream.kind, StreamKind::Instrument))
             .count()
     }
 
@@ -2983,7 +2995,7 @@ impl PipelineState {
         // d'AddStream. Le remove ci-dessus garantit qu'un ré-ajout du même
         // producer ne compte pas double.
         const MAX_RECV_STREAMS: usize = 16;
-        if self.recv_stops.len() >= MAX_RECV_STREAMS {
+        if self.recv_streams.len() >= MAX_RECV_STREAMS {
             return Err(format!("too many streams (max {})", MAX_RECV_STREAMS));
         }
 
@@ -3027,10 +3039,13 @@ impl PipelineState {
 
         // Stop signal pour la tâche I/O de ce pair.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        self.recv_stops.insert(producer_id.clone(), stop_tx);
-        self.recv_kinds.insert(producer_id.clone(), media_tag);
+        let activity = Arc::new(RecvActivity::new(std::time::Instant::now()));
+        self.recv_streams.insert(
+            producer_id.clone(),
+            RecvStream { stop: stop_tx, kind: media_tag, activity: activity.clone() },
+        );
 
-        // Spawn la tâche I/O async (recv UDP + horodatage + punch + idle-timeout).
+        // Spawn la tâche I/O async (recv UDP + horodatage + punch + silence).
         // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
         let tx = decode.tx.clone();
         let pool_rx = decode.pool_rx.clone();
@@ -3038,7 +3053,7 @@ impl PipelineState {
         self.recv_epoch = self.recv_epoch.wrapping_add(1);
         let epoch = self.recv_epoch;
         tokio::spawn(async move {
-            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, tx, pool_rx, stop_rx).await;
+            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, activity, tx, pool_rx, stop_rx).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
@@ -3077,10 +3092,28 @@ impl PipelineState {
         // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
         // thread de décodage qui retire l'état + le stream mixer + net_stats,
         // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
-        self.recv_kinds.remove(producer_id);
-        if let Some(stop) = self.recv_stops.remove(producer_id) {
-            let _ = stop.send(());
+        if let Some(stream) = self.recv_streams.remove(producer_id) {
+            let _ = stream.stop.send(());
         }
+    }
+
+    /// Nombre de flux reçus (instrument et voix).
+    pub fn recv_stream_count(&self) -> usize {
+        self.recv_streams.len()
+    }
+
+    /// État de chaque flux reçu, pour les perf-stats : le navigateur y lit les
+    /// silences et retire les flux qu'il ne connaît plus.
+    pub fn recv_stream_states(&self) -> Vec<RecvStreamState> {
+        let now = std::time::Instant::now();
+        self.recv_streams
+            .iter()
+            .map(|(producer_id, stream)| RecvStreamState {
+                producer_id: producer_id.clone(),
+                kind: stream.kind,
+                silent_ms: stream.activity.silent_ms(now),
+            })
+            .collect()
     }
 
     /// Arrêt COMPLET : démonte la session ET ferme le driver audio (ASIOExit,
@@ -3100,7 +3133,7 @@ impl PipelineState {
         // ferme une WS toutes les 30 s).
         let was_active = self.audio_streams_open()
             || self.playback_stream.is_some()
-            || !self.recv_stops.is_empty()
+            || !self.recv_streams.is_empty()
             || self.recorder.is_some();
         // REC-3 : si un recording était en cours, on l'arrête proprement (fichiers
         // produits mais perdus — l'utilisateur a quitté). Pas de thread orphelin.
@@ -4912,8 +4945,9 @@ fn decode_one_packet(
 }
 
 /// Tâche I/O de réception (async tokio, 1 par pair). Recv UDP + horodatage +
-/// comedia punch + idle-timeout. Ne décode RIEN : forwarde le paquet brut au
-/// thread de décodage RT. Envoie un `Remove` terminal sur sortie (stop/idle).
+/// comedia punch + activité (silence). Ne décode RIEN : forwarde le paquet brut au
+/// thread de décodage RT. S'arrête UNIQUEMENT sur `remove_stream` (ou arrêt du
+/// thread de décodage) et envoie alors un `Remove` terminal.
 #[allow(clippy::too_many_arguments)]
 async fn recv_io_task(
     receiver: RtpReceiver,
@@ -4921,6 +4955,7 @@ async fn recv_io_task(
     producer_id: Arc<str>,
     epoch: u64,
     kind: StreamKind,
+    activity: Arc<RecvActivity>,
     tx: Sender<DecodeMsg>,
     pool_rx: Receiver<Vec<u8>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -4933,24 +4968,14 @@ async fn recv_io_task(
     punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut punch_remaining: u32 = 30;
 
-    // Idle-timeout : un flux INSTRUMENT vivant envoie ~400 pkt/s en continu (Opus
-    // CBR + DTX OFF, MÊME en silence, cf. encoder.rs) → 8 s sans paquet = flux mort
-    // (reconnexion non signalée par le browser) → auto-terminaison du fantôme.
-    //
-    // VOIX (Lot C) : le talkback est LÉGITIMEMENT silencieux quand personne ne
-    // parle — la piste d'envoi est DÉSACTIVÉE au mute/auto-mute → AUCUN paquet,
-    // pour une durée potentiellement longue (tout un morceau). On DÉSACTIVE donc
-    // l'idle-timeout pour la voix : sinon un silence > 8 s la terminait à tort et
-    // le talkback était perdu jusqu'à un rejoin (régression Lot C observée
-    // 2026-07-26). Le nettoyage d'un flux voix mort passe par le `remove-stream`
-    // explicite du browser (consumer-closed), fiable.
-    let idle_timeout: Option<std::time::Duration> = match kind {
-        StreamKind::Instrument => Some(std::time::Duration::from_secs(8)),
-        StreamKind::Voice => None,
-    };
-    let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(2));
-    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_packet = std::time::Instant::now();
+    // Silence : un flux qui se tait n'est JAMAIS terminé ici (cf. `recv_activity`) —
+    // sa fin vient du navigateur (`remove-stream`). On journalise seulement le début
+    // et la fin d'un silence de l'INSTRUMENT (~400 paquets/s en continu, même quand
+    // le musicien ne joue pas) ; la voix se tait légitimement dès que personne ne
+    // parle.
+    let mut silence_check = tokio::time::interval(std::time::Duration::from_secs(1));
+    silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut silence_logged = false;
     let mut got_first = false;
 
     // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
@@ -4963,13 +4988,11 @@ async fn recv_io_task(
                 let _ = receiver.punch(sfu_addr).await;
                 punch_remaining -= 1;
             }
-            _ = idle_check.tick() => {
-                // Voix : `idle_timeout == None` → jamais terminée sur silence.
-                if let Some(timeout) = idle_timeout {
-                    if got_first && last_packet.elapsed() >= timeout {
-                        tracing::warn!(target: "jamodio::recv", producer = short, "no packet for 8s — terminating (ghost/orphan stream)");
-                        break;
-                    }
+            _ = silence_check.tick(), if matches!(kind, StreamKind::Instrument) => {
+                let silent_ms = activity.silent_ms(std::time::Instant::now());
+                if !silence_logged && got_first && silent_ms >= SILENCE_LOG_AFTER_MS {
+                    tracing::warn!(target: "jamodio::recv", producer = short, silent_ms, "aucun paquet reçu — flux conservé, reprise automatique à leur retour");
+                    silence_logged = true;
                 }
             }
             result = receiver.recv(&mut buf) => {
@@ -4977,7 +5000,12 @@ async fn recv_io_task(
                     Ok((len, _addr)) if len > 0 => {
                         // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
                         let recv_instant = std::time::Instant::now();
-                        last_packet = recv_instant;
+                        if silence_logged {
+                            let silent_ms = activity.silent_ms(recv_instant);
+                            tracing::info!(target: "jamodio::recv", producer = short, silent_ms, "paquets revenus après un silence");
+                            silence_logged = false;
+                        }
+                        activity.mark_packet(recv_instant);
                         // 1er paquet valide : comedia activé → on stoppe les punches.
                         if !got_first {
                             got_first = true;

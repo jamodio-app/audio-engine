@@ -12,6 +12,7 @@ mod machine_health;
 mod net_interface;
 mod pipeline;
 mod plugin_scan;
+mod recv_activity;
 #[cfg(target_os = "windows")]
 mod tray_promote;
 mod ws_server;

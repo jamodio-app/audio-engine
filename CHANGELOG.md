@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.3] — 2026-09-16
+
+**Un musicien ne devient plus muet après une coupure réseau.**
+
+### Corrigé
+
+- **Après 8 secondes sans paquet, le son d'un musicien était supprimé et ne
+  revenait jamais**, jusqu'à la sortie du studio — sans que le studio le sache
+  (recette du 16/09 : une coupure réseau de quelques secondes suffisait). Un flux
+  reçu qui se tait reste désormais ouvert, et le son reprend tout seul dès que les
+  paquets reviennent. Seul le studio retire un flux, quand le musicien part ou
+  change d'instrument.
+
+### Ajouté
+
+- **L'état de chaque flux reçu** (instrument ou voix, durée sans paquet) est publié
+  au studio, qui affiche « sans son » pendant une coupure et retire lui-même un
+  flux qu'il ne connaît plus.
+- **Journal** : le début d'un silence de l'instrument d'un musicien (au-delà de
+  3 s) et la reprise des paquets, avec sa durée.
+
 ## [0.6.2] — 2026-09-16
 
 Une version pour **la bulle du lien** du studio : savoir si tout va bien, et
