@@ -48,7 +48,8 @@ musicien — et lire une latence **mesurée**, jamais supposée.
   la bloquait une dizaine de secondes avec un pilote MIDI lent : la demande de
   capture suivante expirait côté studio, puis s'exécutait trop tard. La liste MIDI
   est désormais calculée à part, avec un délai maximum et une erreur explicite
-  au-delà.
+  au-delà, et une seule à la fois : un pilote MIDI figé ne voit jamais
+  s'accumuler des énumérations en parallèle.
 - **Demandes de capture identifiées** : une réponse tardive à une demande
   abandonnée ne peut plus être prise pour celle d'une demande plus récente.
 - **Un paquet arrivé en retard était joué hors de sa place**, puis suivi d'un

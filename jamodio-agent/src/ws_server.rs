@@ -487,20 +487,65 @@ fn message_kind(text: &str) -> String {
         .unwrap_or_else(|_| "?".to_string())
 }
 
-/// Liste MIDI calculée hors du runtime async et bornée par `MIDI_LIST_TIMEOUT`.
-/// Jamais une liste vide inventée : un dépassement ou un échec renvoie une
-/// erreur corrélée à `MIDI_LIST_ERROR_KEY`.
+/// Échec d'un appel système lent exécuté par `single_flight_blocking`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[derive(Debug)]
+enum BlockingCallError {
+    /// Délai dépassé : l'appel en cours (ou celui qu'on attendait) n'a pas rendu.
+    TimedOut,
+    /// L'appel a paniqué.
+    Failed(String),
+}
+
+/// Exécute un appel système BLOQUANT (énumération de pilotes) hors du runtime
+/// async, borné par `timeout`, et UN SEUL à la fois.
+///
+/// Un `timeout` n'interrompt pas un appel bloquant : il rend la main, mais le fil
+/// reste coincé dans le pilote. Sans exclusion, chaque nouvelle demande lancerait
+/// un appel de plus dans le même pilote figé, en parallèle des précédents (revue du
+/// 16/09/2026). Le verrou est tenu par le fil de l'appel jusqu'à son vrai retour :
+/// tant qu'un appel est coincé, les demandes suivantes attendent le verrou puis
+/// échouent au délai, SANS lancer de nouvel appel.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+async fn single_flight_blocking<T, F>(
+    lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    timeout: std::time::Duration,
+    work: F,
+) -> Result<T, BlockingCallError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let lock = lock.clone();
+    tokio::time::timeout(timeout, async move {
+        let guard = lock.lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _held_until_the_call_returns = guard;
+            work()
+        })
+        .await
+    })
+    .await
+    .map_err(|_| BlockingCallError::TimedOut)?
+    .map_err(|e| BlockingCallError::Failed(e.to_string()))
+}
+
+/// Une seule énumération MIDI à la fois (cf. `single_flight_blocking`).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn midi_enumeration_lock() -> &'static std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(Default::default)
+}
+
+/// Liste MIDI calculée hors du runtime async, bornée par `MIDI_LIST_TIMEOUT`, une
+/// énumération à la fois. Jamais une liste vide inventée : un dépassement ou un
+/// échec renvoie une erreur corrélée à `MIDI_LIST_ERROR_KEY`.
 async fn midi_device_list_reply() -> AgentMessage {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         let started = std::time::Instant::now();
-        match tokio::time::timeout(
-            MIDI_LIST_TIMEOUT,
-            tokio::task::spawn_blocking(crate::audio::midi::list_devices),
-        )
-        .await
-        {
-            Ok(Ok(list)) => AgentMessage::MidiDeviceList {
+        match single_flight_blocking(midi_enumeration_lock(), MIDI_LIST_TIMEOUT, crate::audio::midi::list_devices).await {
+            Ok(list) => AgentMessage::MidiDeviceList {
                 devices: list
                     .into_iter()
                     .map(|d| jamodio_audio_core::protocol::MidiDeviceWire {
@@ -510,11 +555,11 @@ async fn midi_device_list_reply() -> AgentMessage {
                     })
                     .collect(),
             },
-            Ok(Err(e)) => {
+            Err(BlockingCallError::Failed(e)) => {
                 tracing::warn!(target: "jamodio::midi", error = %e, "énumération MIDI interrompue");
                 AgentMessage::error_keyed(format!("midi enumeration failed: {e}"), MIDI_LIST_ERROR_KEY)
             }
-            Err(_) => {
+            Err(BlockingCallError::TimedOut) => {
                 tracing::warn!(
                     target: "jamodio::midi",
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3823,6 +3868,46 @@ mod runaway_tests {
 mod etat_latche_tests {
     use super::*;
     use jamodio_audio_core::mixer::mixer::AudioMixer;
+
+    #[tokio::test]
+    async fn appel_bloquant_rendu_dans_le_delai() {
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let value = single_flight_blocking(&lock, std::time::Duration::from_secs(1), || 42).await;
+        assert!(matches!(value, Ok(42)));
+    }
+
+    #[tokio::test]
+    async fn un_appel_coince_n_en_lance_pas_d_autre() {
+        // TEST-GARDE (revue du 16/09) : un pilote figé ne doit jamais accumuler des
+        // appels en parallèle — le 2e demandeur échoue au délai sans rien lancer.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let launched = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let short = std::time::Duration::from_millis(50);
+
+        let first_launched = launched.clone();
+        let first = single_flight_blocking(&lock, short, move || {
+            first_launched.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx.recv(); // pilote figé jusqu'à libération
+        })
+        .await;
+        assert!(matches!(first, Err(BlockingCallError::TimedOut)));
+
+        let second_launched = launched.clone();
+        let second = single_flight_blocking(&lock, short, move || {
+            second_launched.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(matches!(second, Err(BlockingCallError::TimedOut)));
+        assert_eq!(launched.load(Ordering::SeqCst), 1, "le 2e appel ne doit pas avoir été lancé");
+
+        // Le pilote rend la main : le verrou se libère, un nouvel appel passe.
+        release_tx.send(()).unwrap();
+        let third = single_flight_blocking(&lock, std::time::Duration::from_secs(2), || 7).await;
+        assert!(matches!(third, Ok(7)));
+    }
 
     #[test]
     fn type_d_un_message_lu_pour_le_journal_des_messages_lents() {
