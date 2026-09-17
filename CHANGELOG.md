@@ -5,6 +5,23 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-3] — 2026-09-17
+
+Pré-release de DIAGNOSTIC. **Aucun comportement changé** : uniquement de quoi
+trancher, dans le journal, une panne qu'on ne savait pas nommer.
+
+### Diagnostic
+
+- **Interface débranchée en session (recette PC du 17/09)** : le pilote ASIO d'une
+  interface débranchée reste chargeable — il s'ouvre, annonce ses latences, et ne
+  délivre plus un seul callback. L'Audio Engine croyait donc avoir réussi sa
+  reconstruction et recommençait toutes les 2 s, sans fin, sans rien dire, en
+  saturant son propre verrou (commandes du studio ignorées).
+- Le journal compte désormais les **reconstructions consécutives restées muettes**,
+  et dit ce que le SYSTÈME pense du matériel (Windows : liste WASAPI, qui suit le
+  branchement USB réel) : matériel absent, ou matériel présent mais pilote muet.
+- Au démarrage, la liste des points audio vus par le système est journalisée.
+
 ## [0.6.4-2] — 2026-09-17
 
 Pré-release. **Plus de faux « débranché » quand on branche ou débranche un autre périphérique.**

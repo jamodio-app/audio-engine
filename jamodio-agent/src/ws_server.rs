@@ -2154,6 +2154,12 @@ async fn audio_liveness_supervisor(
     let mut last_progress = Instant::now();
     let mut last_reset_seen = reset_signal.request_count();
     let mut degraded = false;
+    // Lot 0 (chantier robustesse ASIO, 17/09/2026) — nombre de reconstructions
+    // consécutives qui N'ONT PAS ramené les callbacks. Un pilote ASIO débranché
+    // se rouvre sans erreur et reste muet : `rebuild Ok` ne prouve donc RIEN. On
+    // compte, et on journalise ce que le SYSTÈME dit du matériel (WASAPI sur
+    // Windows). Aucune décision prise ici — c'est la matière du lot 1.
+    let mut silent_rebuilds: u32 = 0;
     let mut last_repair: Option<Instant> = None;
     // Lot A2 — suivi live du défaut de sortie OS (« Défaut système »). `None` =
     // pas de base établie (hors suivi, ou session pas encore observée). Le poll
@@ -2523,6 +2529,14 @@ async fn audio_liveness_supervisor(
         prev_out = out;
         if advancing && !reset_requested {
             last_progress = Instant::now();
+            if silent_rebuilds > 0 {
+                tracing::info!(
+                    target: "jamodio::ws",
+                    after_silent_rebuilds = silent_rebuilds,
+                    "callbacks audio de nouveau délivrés"
+                );
+                silent_rebuilds = 0;
+            }
             if degraded {
                 tracing::info!(
                     target: "jamodio::ws",
@@ -2557,12 +2571,22 @@ async fn audio_liveness_supervisor(
                 "kAsioResetRequest reçu — reset coopératif du driver ASIO"
             );
         } else {
+            if has_stream {
+                silent_rebuilds = silent_rebuilds.saturating_add(1);
+            }
             tracing::warn!(
                 target: "jamodio::ws",
                 flatline_ms = last_progress.elapsed().as_millis() as u64,
                 has_stream,
+                silent_rebuilds,
                 "callbacks audio figés — reconstruction des flux audio"
             );
+            // Le pilote se rouvre mais reste muet : le matériel est-il seulement
+            // encore branché ? On le demande au SYSTÈME, pas au pilote. Journal
+            // seul (lot 0), et pas à chaque tour pour ne pas noyer le fichier.
+            if matches!(silent_rebuilds, 1 | 3 | 5) || (silent_rebuilds > 5 && silent_rebuilds.is_multiple_of(5)) {
+                log_hardware_presence(&pipeline, silent_rebuilds).await;
+            }
         }
 
         // Reset borné avec settle + backoff (verrou pipeline relâché pendant les
@@ -2623,6 +2647,30 @@ async fn audio_liveness_supervisor(
             }
         }
     }
+}
+
+/// Lot 0 — journalise ce que le SYSTÈME dit du matériel de la session, pilote ASIO
+/// exclu (cf. `audio::hardware_presence`). Diagnostic seul : rien n'est décidé.
+/// Hors thread audio et hors thread COM-STA réservé à ASIO.
+async fn log_hardware_presence(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+    silent_rebuilds: u32,
+) {
+    let Some(device) = pipeline.lock().await.input_device_name() else { return };
+    let probed = tokio::task::spawn_blocking({
+        let device = device.clone();
+        move || crate::audio::hardware_presence::probe(&device)
+    })
+    .await;
+    let Ok((presence, endpoints)) = probed else { return };
+    tracing::warn!(
+        target: "jamodio::devices",
+        device = %device,
+        presence = presence.as_str(),
+        silent_rebuilds,
+        endpoints = %endpoints.join(" | "),
+        "le pilote se rouvre mais ne délivre aucun callback — présence du matériel selon le système"
+    );
 }
 
 /// Nature d'un périphérique dont on surveille le retour.

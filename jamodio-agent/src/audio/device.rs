@@ -395,10 +395,27 @@ pub fn default_input_id() -> Option<String> {
     None
 }
 
+/// Points d'entrée/sortie vus par le SYSTÈME au démarrage, pilote ASIO exclu
+/// (Windows : WASAPI). Sert de repère dans un rapport de bug : si l'interface
+/// manque ICI, elle n'était pas branchée — quoi qu'en dise son pilote ASIO.
+/// Inerte sur macOS (CoreAudio est déjà la vérité).
+fn log_system_endpoints() {
+    let names = super::hardware_presence::system_endpoint_names();
+    if names.is_empty() {
+        return;
+    }
+    tracing::info!(
+        target: "jamodio::devices",
+        endpoints = %names.join(" | "),
+        "points audio vus par le système (hors pilote ASIO)"
+    );
+}
+
 /// Dump tous les devices CPAL (appelé une fois au démarrage) : nom exact, canaux,
 /// sample rate par défaut, flag default. Aide le debug des cas où le nom d'un device
 /// est surprenant (aggregate device, virtuel, UID numérique CoreAudio, etc.).
 pub fn log_devices() {
+    log_system_endpoints();
     let host = super::host::active();
     // Défaut PRÉFÉRÉ (natif > wrapper) — cohérent avec `default_input_id`/`list_inputs`.
     let def_in = preferred_default_input_name(&host).unwrap_or_default();

@@ -14,6 +14,7 @@ pub mod declared_latency;
 /// Latences matérielles mesurées par Jamodio là où le système déclare faux.
 pub mod measured_latency;
 pub mod device;
+pub mod hardware_presence;
 pub mod host;
 pub mod capture;
 pub mod voice_capture;
