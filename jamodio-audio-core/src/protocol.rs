@@ -731,6 +731,10 @@ pub enum AgentMessage {
         /// Type de transport de la sortie (`bluetooth` / `other`). Absent si inconnu.
         #[serde(rename = "outputTransport", skip_serializing_if = "Option::is_none")]
         output_transport: Option<AudioTransport>,
+        /// Nom de la sortie RÉELLEMENT ouverte (y compris en « Défaut système », où le
+        /// système décide). Absent sans sortie.
+        #[serde(rename = "outputDevice", skip_serializing_if = "Option::is_none")]
+        output_device: Option<String>,
         /// Cible adaptative du jitter buffer (moyenne des streams actifs, ms).
         /// 0 si aucun stream actif. C'est le levier principal de tuning latence
         /// vs robustesse au jitter — affiché dans l'UI agent.
@@ -812,6 +816,28 @@ pub enum AgentMessage {
         #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
+    /// L'entrée de la session a disparu (périphérique débranché) : plus de capture,
+    /// la réception continue. Émis une fois, à la perte.
+    InputLost {
+        /// Id `{idx}:{name}` de l'entrée choisie.
+        device: String,
+        /// La réception continue (sortie rouverte seule). Faux quand l'interface
+        /// entière ne répond plus (ASIO : entrée et sortie sont la même interface).
+        #[serde(rename = "keepsOutput")]
+        keeps_output: bool,
+    },
+    /// La même entrée est revenue et la capture est repartie d'elle-même.
+    InputRestored { device: String },
+    /// La sortie choisie a disparu en session : le son passe par `fallback`, la
+    /// sortie du système. Émis une fois, à la perte.
+    OutputLost {
+        /// Id `{idx}:{name}` de la sortie choisie.
+        device: String,
+        /// Nom de la sortie ouverte à la place.
+        fallback: String,
+    },
+    /// La sortie choisie est revenue et le son y repasse.
+    OutputRestored { device: String },
     /// Erreur explicite quand la capture ne peut pas démarrer parce que le
     /// device demandé n'est pas trouvé. Plus de silent fallback to default :
     /// le browser doit afficher un toast et forcer l'ouverture de Settings.
@@ -1444,6 +1470,33 @@ mod tests {
 
     // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent
     // pour une erreur de fond (lu par agent-bridge.js#_routeResponse).
+    #[test]
+    fn device_loss_messages_are_kebab_case_with_camel_fields() {
+        let lost = serde_json::to_value(AgentMessage::InputLost {
+            device: "0:Microphone externe".into(),
+            keeps_output: true,
+        })
+        .unwrap();
+        assert_eq!(lost["type"], "input-lost");
+        assert_eq!(lost["keepsOutput"], true);
+        assert_eq!(lost["device"], "0:Microphone externe");
+        let out = serde_json::to_value(AgentMessage::OutputLost {
+            device: "2:Écouteurs externes".into(),
+            fallback: "Haut-parleurs MacBook Pro".into(),
+        })
+        .unwrap();
+        assert_eq!(out["type"], "output-lost");
+        assert_eq!(out["fallback"], "Haut-parleurs MacBook Pro");
+        assert_eq!(
+            serde_json::to_value(AgentMessage::InputRestored { device: "d".into() }).unwrap()["type"],
+            "input-restored"
+        );
+        assert_eq!(
+            serde_json::to_value(AgentMessage::OutputRestored { device: "d".into() }).unwrap()["type"],
+            "output-restored"
+        );
+    }
+
     #[test]
     fn capture_error_carries_request_id_only_when_answering_a_request() {
         let answered = serde_json::to_value(AgentMessage::CaptureError {

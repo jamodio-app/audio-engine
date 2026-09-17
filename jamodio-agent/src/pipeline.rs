@@ -797,6 +797,12 @@ pub struct PipelineState {
     pub input_hw: Option<crate::audio::declared_latency::HardwareLatency>,
     /// Idem pour la sortie ouverte (`Stats.outputHw*`, `Stats.outputTransport`).
     pub output_hw: Option<crate::audio::declared_latency::HardwareLatency>,
+    /// Nom de la sortie RÉELLEMENT ouverte (`Stats.outputDevice`) ; `None` sans
+    /// sortie. Seule source juste, y compris en « Défaut système » où macOS décide
+    /// (le nom affiché par le studio restait figé, recette du 17/09 — D5a).
+    pub output_device_name: Option<String>,
+    /// Périphériques perdus en session et événements à relayer (D5b / D5c).
+    device_loss: crate::device_loss::DeviceLoss,
     /// Adresse du SFU de la session en cours, pour relever le type d'interface réseau
     /// qui y mène (`PerfStats.netInterface`). Effacée à la vraie fin de session, pas
     /// lors d'un changement d'entrée en cours de session.
@@ -1320,6 +1326,8 @@ impl PipelineState {
             output_buffer_samples: None,
             input_hw: None,
             output_hw: None,
+            output_device_name: None,
+            device_loss: crate::device_loss::DeviceLoss::default(),
             sfu_addr: None,
             input_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             midi_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1695,6 +1703,8 @@ impl PipelineState {
         self.input_device_id = input;
         self.output_device_id = output;
         if output_changed && self.playback_stream.is_some() {
+            // Un nouveau choix de sortie remplace une sortie perdue : plus rien à attendre.
+            self.device_loss.forget_output();
             self.restart_playback();
         }
     }
@@ -1721,6 +1731,7 @@ impl PipelineState {
                 self.output_buffer_samples = buffer;
                 self.output_hw = crate::audio::declared_latency::output(&name);
                 tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
+                self.output_device_name = Some(name);
             }
             OutputOpen::NotFound => {
                 tracing::warn!(
@@ -1730,6 +1741,7 @@ impl PipelineState {
                 );
                 self.output_buffer_samples = None;
                 self.output_hw = None;
+                self.output_device_name = None;
             }
             OutputOpen::BuildFailed(e) => {
                 tracing::error!(
@@ -1739,6 +1751,7 @@ impl PipelineState {
                 );
                 self.output_buffer_samples = None;
                 self.output_hw = None;
+                self.output_device_name = None;
             }
             // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
             // duplex de start_capture).
@@ -1878,6 +1891,7 @@ impl PipelineState {
         self.perfstats.output_frames.store(0, std::sync::atomic::Ordering::Relaxed);
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
+        self.output_device_name = None;
         #[cfg(target_os = "windows")]
         close_host_on_com(self.asio_host.take());
         // 0.5.4-17 — driver relâché (ASIOExit fait par le drop ci-dessus, sur
@@ -1970,6 +1984,9 @@ impl PipelineState {
     /// caractéristiques du device (pour l'encodeur + `CaptureStartedInfo`) et le
     /// `Receiver` capture.
     fn prepare_audio_for_session(&mut self, preserve_peers: bool) -> Result<AcquiredAudio, CaptureStartError> {
+        // Nouvelle capture (join, changement d'entrée) : les pertes passées ne
+        // concernent plus rien ; le navigateur repart de `capture-started`.
+        self.device_loss.forget();
         let input_id = self.input_device_id.clone();
         let output_id = self.output_device_id.clone();
 
@@ -2098,6 +2115,7 @@ impl PipelineState {
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
                         self.output_hw = crate::audio::declared_latency::output(&name);
+                        self.output_device_name = Some(name.clone());
                         (name, fallback_from.is_some())
                     }
                     OutputOpen::BuildFailed(e) => {
@@ -2125,6 +2143,7 @@ impl PipelineState {
                 self.input_hw = a.host.input_hw;
                 self.output_hw = a.host.output_hw;
                 let out_name = a.name.clone(); // ASIO mono-device : sortie = même interface que l'entrée
+                self.output_device_name = Some(out_name.clone());
                 self.asio_host = Some(a.host);
                 (a.channels_in, a.native_sr, a.input_buf, a.name, a.resolved_id, out_name, false)
             }
@@ -2802,6 +2821,7 @@ impl PipelineState {
         // reconstruire.
         close_stream_on_com(self.capture_stream.take());
         close_stream_on_com(self.playback_stream.take());
+        self.output_device_name = None;
         #[cfg(target_os = "windows")]
         close_host_on_com(self.asio_host.take());
         self.output_buffer_samples = None;
@@ -2858,16 +2878,25 @@ impl PipelineState {
                 self.input_buffer_samples = input.input_buf;
                 self.input_hw = crate::audio::declared_latency::input(&input.name);
                 self.capture_stream = Some(input.stream);
+                // La capture est repartie : une entrée perdue est revenue.
+                self.device_loss.input_back();
                 match output {
-                    OutputOpen::Opened { stream, buffer, name, .. } => {
+                    OutputOpen::Opened { stream, buffer, name, fallback_from } => {
                         self.playback_stream = Some(stream);
                         self.output_buffer_samples = buffer;
                         self.output_hw = crate::audio::declared_latency::output(&name);
                         tracing::info!(
                             target: "jamodio::pipeline",
                             device = %name,
-                            "streams audio recréés (reset ASIO)"
+                            "flux audio recréés"
                         );
+                        // Sortie choisie introuvable à la reconstruction : repli sur la
+                        // sortie du système (on garde le son), DIT au navigateur (D5c).
+                        match &fallback_from {
+                            Some(requested) => self.device_loss.output_fell_back(requested, &name),
+                            None => self.device_loss.output_back(),
+                        }
+                        self.output_device_name = Some(name);
                     }
                     // Sortie non rétablie : l'entrée prime (la capture repart), le
                     // self-monitor/peers seront muets jusqu'à une nouvelle sélection.
@@ -2891,7 +2920,10 @@ impl PipelineState {
                 self.input_hw = a.host.input_hw;
                 self.output_hw = a.host.output_hw;
                 let new_sr = a.native_sr;
+                self.output_device_name = Some(a.name.clone());
                 self.asio_host = Some(a.host);
+                // Interface rouverte : entrée (et sortie, même interface) revenues.
+                self.device_loss.input_back();
                 tracing::info!(
                     target: "jamodio::pipeline",
                     device = %a.name,
@@ -2919,6 +2951,94 @@ impl PipelineState {
         // re-prime à la cible de démarrage. Évite de rejouer le retard accumulé.
         self.mixer.reset_streams_for_recovery();
         Ok(())
+    }
+
+    /// D5b — l'entrée de la session est introuvable à la reconstruction (casque
+    /// débranché qui emporte son micro) : la capture reste fermée, mais la SORTIE est
+    /// rouverte seule pour que le musicien continue d'entendre les autres, et la
+    /// perte est signalée au navigateur. Hors ASIO seulement : en ASIO l'entrée et la
+    /// sortie sont la même interface (rien à rouvrir sans elle).
+    pub fn keep_listening_without_input(&mut self) {
+        let device = self.input_device_id.clone().unwrap_or_default();
+        self.device_loss.input_lost(&device, true);
+        if self.playback_stream.is_some() {
+            return;
+        }
+        let open = |id: Option<String>, pl: &Self| {
+            open_output_on_com(
+                id,
+                pl.mixer.clone(),
+                pl.perfstats.output_callbacks.clone(),
+                pl.perfstats.output_frames.clone(),
+                pl.output_pair_start.clone(),
+            )
+        };
+        let mut opened = open(self.output_device_id.clone(), self);
+        let mut fell_back_from = None;
+        if matches!(opened, OutputOpen::NotFound) {
+            if let Some(requested) = self.output_device_id.clone() {
+                opened = open(None, self);
+                fell_back_from = Some(requested);
+            }
+        }
+        match opened {
+            OutputOpen::Opened { stream, buffer, name, .. } => {
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+                self.output_hw = crate::audio::declared_latency::output(&name);
+                if let Some(requested) = &fell_back_from {
+                    self.device_loss.output_fell_back(requested, &name);
+                }
+                tracing::info!(target: "jamodio::pipeline", device = %name, "entrée introuvable — sortie rouverte seule, la réception continue");
+                self.output_device_name = Some(name);
+            }
+            OutputOpen::NotFound => tracing::warn!(
+                target: "jamodio::pipeline",
+                "entrée introuvable et aucune sortie disponible — aucun son"
+            ),
+            OutputOpen::BuildFailed(e) => tracing::warn!(
+                target: "jamodio::pipeline",
+                error = %e,
+                "entrée introuvable — réouverture de la sortie seule échouée"
+            ),
+            OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
+        }
+    }
+
+    /// L'interface de la session est indisponible (reconstruction en échec, ex.
+    /// interface ASIO débranchée : entrée et sortie à la fois) : le dire au navigateur.
+    pub fn note_input_unavailable(&mut self) {
+        let device = self.input_device_id.clone().unwrap_or_default();
+        // Reconstruction complète en échec : entrée ET sortie indisponibles.
+        self.device_loss.input_lost(&device, false);
+    }
+
+    /// D5c — la sortie choisie est de nouveau présente : on y revient.
+    pub fn return_to_chosen_output(&mut self) {
+        self.restart_playback();
+        if self.playback_stream.is_some() {
+            self.device_loss.output_back();
+        }
+    }
+
+    /// Entrée perdue en session (id `{idx}:{name}`), si c'est le cas.
+    pub fn lost_input_device(&self) -> Option<String> {
+        self.device_loss.lost_input().map(str::to_string)
+    }
+
+    /// Sortie choisie perdue en session (le son passe par la sortie du système).
+    pub fn lost_output_device(&self) -> Option<String> {
+        self.device_loss.lost_output().map(str::to_string)
+    }
+
+    /// Événements de périphériques à relayer au navigateur (vidés).
+    pub fn take_device_events(&mut self) -> Vec<crate::device_loss::DeviceEvent> {
+        self.device_loss.take_events()
+    }
+
+    /// Hors ASIO, la sortie peut vivre sans l'entrée (deux flux séparés).
+    pub fn output_can_outlive_input(&self) -> bool {
+        !Self::host_is_asio()
     }
 
     /// R4 (décision 48k/ASIO-only) — DRAINE un hard-stop de rate en attente :
@@ -3072,6 +3192,7 @@ impl PipelineState {
                     self.playback_stream = Some(stream);
                     self.output_buffer_samples = buffer;
                     self.output_hw = crate::audio::declared_latency::output(&name);
+                    self.output_device_name = Some(name);
                 }
                 OutputOpen::NotFound => return Err("output device introuvable".into()),
                 OutputOpen::BuildFailed(e) => return Err(format!("CPAL output: {}", e)),

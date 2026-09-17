@@ -2127,6 +2127,9 @@ async fn audio_liveness_supervisor(
     // suivi live du « Défaut système ». Événement rare et manuel → 1 s suffit
     // largement, et c'est hors du thread audio (zéro latence).
     const DEFAULT_OUT_POLL: Duration = Duration::from_secs(1);
+    // D5b / D5c — sondage du retour d'un périphérique perdu en session (entrée
+    // débranchée, sortie choisie débranchée). Énumération hors thread audio.
+    const LOST_DEVICE_POLL: Duration = Duration::from_secs(3);
 
     // Canal de signalisation kAsioResetRequest (stable pour la vie du pipeline).
     let reset_signal = { pipeline.lock().await.reset_signal() };
@@ -2157,6 +2160,7 @@ async fn audio_liveness_supervisor(
     // est étranglé à `DEFAULT_OUT_POLL` (le tick liveness est à 250 ms).
     let mut last_default_out: Option<String> = None;
     let mut last_default_check = Instant::now();
+    let mut last_lost_device_check = Instant::now();
     // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE DE RATE (déterministe). On
     // déduit le rate RÉEL du driver de son débit de callbacks
     // (`cb_per_sec × frames_livrés_par_callback`) et on le confronte au 48 kHz
@@ -2220,6 +2224,23 @@ async fn audio_liveness_supervisor(
         {
             let mut pl = pipeline.lock().await;
             pl.close_warm_if_grace_expired(PARK_GRACE);
+        }
+
+        // D5b / D5c — relaie au navigateur les pertes et retours de périphériques
+        // (entrée ou sortie débranchée en session). Jamais une bascule silencieuse.
+        let device_events = { pipeline.lock().await.take_device_events() };
+        for event in device_events {
+            let msg = match event {
+                crate::device_loss::DeviceEvent::InputLost { device, keeps_output } => {
+                    AgentMessage::InputLost { device, keeps_output }
+                }
+                crate::device_loss::DeviceEvent::InputRestored { device } => AgentMessage::InputRestored { device },
+                crate::device_loss::DeviceEvent::OutputLost { device, fallback } => {
+                    AgentMessage::OutputLost { device, fallback }
+                }
+                crate::device_loss::DeviceEvent::OutputRestored { device } => AgentMessage::OutputRestored { device },
+            };
+            let _ = out_tx.send(msg).await;
         }
 
         // Observation atomique (lock bref).
@@ -2443,6 +2464,49 @@ async fn audio_liveness_supervisor(
             continue;
         }
 
+        // D5b / D5c — PÉRIPHÉRIQUE PERDU EN SESSION.
+        let (lost_input, lost_output, output_outlives_input) = {
+            let pl = pipeline.lock().await;
+            (pl.lost_input_device(), pl.lost_output_device(), pl.output_can_outlive_input())
+        };
+        // Sortie choisie débranchée : le son passe par la sortie du système ; dès
+        // qu'elle revient, on y retourne (c'était le choix du musicien).
+        if let Some(id) = lost_output.clone() {
+            if lost_input.is_none() && last_lost_device_check.elapsed() >= LOST_DEVICE_POLL {
+                last_lost_device_check = Instant::now();
+                if device_present(DeviceKind::Output, id).await {
+                    tracing::info!(target: "jamodio::ws", "sortie choisie revenue — retour sur elle");
+                    pipeline.lock().await.return_to_chosen_output();
+                }
+            }
+        }
+        // Entrée débranchée (hors ASIO) : la sortie tourne seule, la capture est
+        // fermée PAR NATURE — ni flatline ni reconstruction tant que l'entrée n'est
+        // pas revenue (sinon on couperait la réception en boucle). Au retour, une
+        // reconstruction complète relance la capture.
+        if let Some(id) = lost_input {
+            if output_outlives_input {
+                if last_lost_device_check.elapsed() >= LOST_DEVICE_POLL {
+                    last_lost_device_check = Instant::now();
+                    if device_present(DeviceKind::Input, id).await {
+                        tracing::info!(target: "jamodio::ws", "entrée revenue — reconstruction des flux audio");
+                        let repaired = repair_audio_streams(&pipeline).await;
+                        if let Err(e) = &repaired {
+                            tracing::warn!(target: "jamodio::ws", error = %e, "entrée revenue mais reconstruction échouée — nouvel essai au prochain sondage");
+                            pipeline.lock().await.keep_listening_without_input();
+                        }
+                        last_repair = Some(Instant::now());
+                    }
+                }
+                let pl = pipeline.lock().await;
+                prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
+                prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
+                last_progress = Instant::now();
+                last_reset_seen = reset_signal.request_count();
+                continue;
+            }
+        }
+
         // Un kAsioResetRequest est-il arrivé depuis la dernière observation ?
         let reqs = reset_signal.request_count();
         let reset_requested = reqs != last_reset_seen;
@@ -2462,7 +2526,7 @@ async fn audio_liveness_supervisor(
             if degraded {
                 tracing::info!(
                     target: "jamodio::ws",
-                    "callbacks audio rétablis — moteur ASIO récupéré"
+                    "callbacks audio rétablis — moteur audio récupéré"
                 );
                 degraded = false;
             }
@@ -2497,7 +2561,7 @@ async fn audio_liveness_supervisor(
                 target: "jamodio::ws",
                 flatline_ms = last_progress.elapsed().as_millis() as u64,
                 has_stream,
-                "callbacks audio figés — reset du driver ASIO"
+                "callbacks audio figés — reconstruction des flux audio"
             );
         }
 
@@ -2521,27 +2585,39 @@ async fn audio_liveness_supervisor(
                 if degraded {
                     tracing::info!(
                         target: "jamodio::ws",
-                        "moteur ASIO reconstruit après période dégradée"
+                        "moteur audio reconstruit après période dégradée"
                     );
                     degraded = false;
                 }
+            }
+            // D5b — entrée introuvable hors ASIO : on garde la réception (sortie
+            // seule), on le signale, et le sondage ci-dessus attendra son retour.
+            Err(crate::pipeline::CaptureStartError::InputDeviceNotFound { .. }) if output_outlives_input => {
+                tracing::warn!(
+                    target: "jamodio::ws",
+                    "entrée de la session introuvable (débranchée ?) — réception conservée, retour de l'entrée surveillé"
+                );
+                pipeline.lock().await.keep_listening_without_input();
+                last_lost_device_check = Instant::now();
             }
             Err(last_err) => {
                 if !degraded {
                     // Transition → dégradé : un seul ERROR, actionnable (analyse).
                     tracing::error!(
                         target: "jamodio::ws",
-                        asio_error = %last_err,
-                        "reset ASIO en échec — driver probablement bloqué au niveau USB. \
+                        error = %last_err,
+                        "reconstruction des flux audio en échec — interface débranchée ou driver bloqué. \
                          Session maintenue, relance auto en arrière-plan (rebrancher \
                          l'interface relancera l'audio sans coupure réseau)."
                     );
+                    // L'interface (entrée et sortie en ASIO) est indisponible : le dire.
+                    pipeline.lock().await.note_input_unavailable();
                     degraded = true;
                 } else {
                     tracing::debug!(
                         target: "jamodio::ws",
-                        asio_error = %last_err,
-                        "reset ASIO toujours en échec (dégradé)"
+                        error = %last_err,
+                        "reconstruction des flux audio toujours en échec (dégradé)"
                     );
                 }
             }
@@ -2549,12 +2625,35 @@ async fn audio_liveness_supervisor(
     }
 }
 
+/// Nature d'un périphérique dont on surveille le retour.
+#[derive(Clone, Copy)]
+enum DeviceKind {
+    Input,
+    Output,
+}
+
+/// Le périphérique `id` (`{idx}:{name}`) est-il de nouveau présent ? Énumération sur
+/// le thread COM (Windows) dans une tâche bloquante : jamais sur le thread audio ni
+/// sur la boucle tokio.
+async fn device_present(kind: DeviceKind, id: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        crate::audio::com_exec::run(move || match kind {
+            DeviceKind::Input => crate::audio::device::get_input_device(&id).is_some(),
+            DeviceKind::Output => crate::audio::device::get_output_device(&id).is_some(),
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// 0.5.4-2 — exécute un reset ASIO à chaud, BORNÉ. Ferme les streams (→ `ASIOExit`
 /// au dernier drop = dé-init complète exigée par la spec) puis tente la
 /// reconstruction avec un délai de settle initial + backoff. Relâche le verrou
 /// pipeline pendant les attentes. Renvoie l'erreur ASIO du dernier essai si tous
 /// échouent (le superviseur passe alors en mode dégradé sans couper la session).
-async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>) -> Result<(), String> {
+async fn repair_audio_streams(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+) -> Result<(), crate::pipeline::CaptureStartError> {
     // Délais AVANT chaque tentative de reconstruction. Le 1er (~350 ms) laisse le
     // driver USB relâcher après l'`ASIOExit` — c'est la cause des échecs immédiats
     // de reconstruction sur wedge dur (recréer sur un driver pas encore relâché
@@ -2567,7 +2666,7 @@ async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>)
         pl.close_audio_streams_for_reset();
     }
 
-    let mut last_err = String::from("inconnu");
+    let mut last_err = crate::pipeline::CaptureStartError::Other("inconnu".into());
     for (i, delay) in BACKOFF_MS.iter().enumerate() {
         tokio::time::sleep(Duration::from_millis(*delay)).await;
         let res = {
@@ -2579,19 +2678,22 @@ async fn repair_audio_streams(pipeline: &Arc<tokio::sync::Mutex<PipelineState>>)
                 tracing::info!(
                     target: "jamodio::ws",
                     attempt = i + 1,
-                    "reset ASIO : streams reconstruits"
+                    "flux audio reconstruits"
                 );
                 return Ok(());
             }
+            // Entrée absente (périphérique débranché) : attendre ne la fera pas
+            // revenir — l'appelant décide (réception seule, sondage du retour).
+            Err(e @ crate::pipeline::CaptureStartError::InputDeviceNotFound { .. }) => return Err(e),
             Err(e) => {
-                last_err = e.to_string();
                 tracing::warn!(
                     target: "jamodio::ws",
                     attempt = i + 1,
                     max = BACKOFF_MS.len(),
-                    asio_error = %last_err,
-                    "reset ASIO : reconstruction échouée, nouvel essai"
+                    error = %e,
+                    "reconstruction des flux audio échouée, nouvel essai"
                 );
+                last_err = e;
             }
         }
     }
@@ -3027,6 +3129,7 @@ async fn handle_message(
                     output_hw_ms: pl.output_hw.map(|d| d.hw_ms),
                     output_hw_source: pl.output_hw.map(|d| d.source()),
                     output_transport: pl.output_hw.and_then(|d| d.transport),
+                    output_device: pl.output_device_name.clone(),
                     jitter_target_ms,
                     total_latency_ms,
                     streams: stream_count,
