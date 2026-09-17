@@ -1374,6 +1374,17 @@ pub struct AudioDevice {
     /// cachée). 0 si la probe échoue.
     #[serde(rename = "nativeSampleRate")]
     pub native_sample_rate: u32,
+    /// Le MATÉRIEL est-il branché ? `None` = on ne peut pas savoir (macOS, où
+    /// l'énumération retire déjà les périphériques débranchés ; pilote enveloppe
+    /// ASIO4ALL/FlexASIO, qui n'est pas une interface).
+    ///
+    /// Un pilote ASIO reste installé quand son interface est débranchée : sans
+    /// cette information, la liste proposait de choisir une interface incapable de
+    /// fonctionner (recette PC du 17/09/2026). Le studio l'affiche « non branchée »
+    /// et empêche de la choisir — jamais un filtrage silencieux, le nom cherché
+    /// reste visible.
+    #[serde(rename = "available", skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -5,6 +5,21 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-5] — 2026-09-17
+
+Pré-release. **Une interface débranchée ne se fait plus passer pour disponible.**
+
+### Corrigé
+
+- **La liste des entrées proposait une interface débranchée** : un pilote ASIO
+  reste installé quand son interface part, donc il restait listé, et le choisir ne
+  donnait rien. Chaque périphérique dit maintenant s'il est branché — vérité prise
+  au SYSTÈME (Windows : WASAPI), jamais au pilote. Le studio l'affiche
+  « non branchée » et empêche de le choisir, sans jamais faire disparaître le nom.
+- **Même pendant une session** : la liste est servie depuis le cache (le pilote
+  mono-client ne doit pas être rechargé), mais le branchement, lui, est relu.
+- macOS inchangé : CoreAudio retire déjà les périphériques débranchés.
+
 ## [0.6.4-4] — 2026-09-17
 
 Pré-release. **Une interface qui revient ne coupe plus la session, et une interface muette est enfin annoncée.**
