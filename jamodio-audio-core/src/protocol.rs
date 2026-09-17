@@ -816,8 +816,8 @@ pub enum AgentMessage {
         #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
-    /// L'entrée de la session a disparu (périphérique débranché) : plus de capture,
-    /// la réception continue. Émis une fois, à la perte.
+    /// L'entrée de la session n'est plus utilisable : plus de capture. Émis une
+    /// fois par panne (et une fois de plus si la panne CHANGE de nature).
     InputLost {
         /// Id `{idx}:{name}` de l'entrée choisie.
         device: String,
@@ -825,6 +825,11 @@ pub enum AgentMessage {
         /// entière ne répond plus (ASIO : entrée et sortie sont la même interface).
         #[serde(rename = "keepsOutput")]
         keeps_output: bool,
+        /// `"unplugged"` (périphérique disparu du système) ou `"silent"` (le pilote
+        /// s'ouvre encore mais ne délivre plus aucun son). Deux pannes, deux
+        /// phrases. Absent = ancien agent → le navigateur lit « débranché ».
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// La même entrée est revenue et la capture est repartie d'elle-même.
     InputRestored { device: String },
@@ -1475,11 +1480,21 @@ mod tests {
         let lost = serde_json::to_value(AgentMessage::InputLost {
             device: "0:Microphone externe".into(),
             keeps_output: true,
+            reason: Some("unplugged".into()),
         })
         .unwrap();
         assert_eq!(lost["type"], "input-lost");
         assert_eq!(lost["keepsOutput"], true);
         assert_eq!(lost["device"], "0:Microphone externe");
+        assert_eq!(lost["reason"], "unplugged");
+        // Pilote muet : même message, autre raison — le navigateur en fait une phrase.
+        let silent = serde_json::to_value(AgentMessage::InputLost {
+            device: "1:Focusrite USB ASIO".into(),
+            keeps_output: false,
+            reason: Some("silent".into()),
+        })
+        .unwrap();
+        assert_eq!(silent["reason"], "silent");
         let out = serde_json::to_value(AgentMessage::OutputLost {
             device: "2:Écouteurs externes".into(),
             fallback: "Haut-parleurs MacBook Pro".into(),

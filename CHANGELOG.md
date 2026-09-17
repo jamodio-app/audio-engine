@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-4] — 2026-09-17
+
+Pré-release. **Une interface qui revient ne coupe plus la session, et une interface muette est enfin annoncée.**
+
+### Corrigé
+
+- **Rebrancher son interface coupait la session** avec « ton interface a quitté le
+  48 kHz », alors qu'elle était bien à 48 kHz. Le détecteur de dérive d'horloge
+  mesurait la fréquence sur une fenêtre traversée par la coupure — donc sur du
+  silence (54 Hz, puis 3343 Hz) — et la règle « jamais d'audio dégradé » arrêtait
+  la capture. Le détecteur ne juge plus que des fenêtres où le son a été délivré
+  sans discontinuité.
+- **Une interface qui s'ouvre mais reste muette n'était jamais signalée** : l'Audio
+  Engine reconstruisait ses flux toutes les 2 s sans fin (24 fois d'affilée dans la
+  recette du 17/09), saturait son propre verrou et ignorait les commandes du studio
+  — impossible d'en changer. Au bout de trois reconstructions sans un seul son,
+  l'interface est déclarée indisponible : le studio le dit, les tentatives
+  s'espacent, et l'Audio Engine reste répondant.
+- **« Entrée rétablie » n'est plus annoncée sur une simple réouverture de pilote** :
+  seul du son réellement délivré vaut rétablissement.
+
 ## [0.6.4-3] — 2026-09-17
 
 Pré-release de DIAGNOSTIC. **Aucun comportement changé** : uniquement de quoi

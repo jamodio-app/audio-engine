@@ -2160,7 +2160,16 @@ async fn audio_liveness_supervisor(
     // compte, et on journalise ce que le SYSTÈME dit du matériel (WASAPI sur
     // Windows). Aucune décision prise ici — c'est la matière du lot 1.
     let mut silent_rebuilds: u32 = 0;
+    // Au-delà, l'interface est déclarée indisponible : on cesse de reconstruire en
+    // boucle (le verrou pipeline étranglait les commandes du studio — « agent
+    // overloaded » du 17/09), on espace, et on le DIT au musicien.
+    const SILENT_REBUILD_LIMIT: u32 = 3;
     let mut last_repair: Option<Instant> = None;
+    // Dernière INTERRUPTION du flux (reconstruction, flatline, passage en dégradé).
+    // Le détecteur de dérive ci-dessous ne juge que des fenêtres postérieures : une
+    // mesure faite sur du silence donnait « 54 Hz » puis « 3343 Hz » et coupait la
+    // session en accusant l'interface d'avoir quitté le 48 kHz (recette PC 17/09).
+    let mut last_disruption = Instant::now();
     // Lot A2 — suivi live du défaut de sortie OS (« Défaut système »). `None` =
     // pas de base établie (hors suivi, ou session pas encore observée). Le poll
     // est étranglé à `DEFAULT_OUT_POLL` (le tick liveness est à 250 ms).
@@ -2237,8 +2246,8 @@ async fn audio_liveness_supervisor(
         let device_events = { pipeline.lock().await.take_device_events() };
         for event in device_events {
             let msg = match event {
-                crate::device_loss::DeviceEvent::InputLost { device, keeps_output } => {
-                    AgentMessage::InputLost { device, keeps_output }
+                crate::device_loss::DeviceEvent::InputLost { device, keeps_output, reason } => {
+                    AgentMessage::InputLost { device, keeps_output, reason: Some(reason.wire().into()) }
                 }
                 crate::device_loss::DeviceEvent::InputRestored { device } => AgentMessage::InputRestored { device },
                 crate::device_loss::DeviceEvent::OutputLost { device, fallback } => {
@@ -2280,6 +2289,7 @@ async fn audio_liveness_supervisor(
             last_default_out = None; // hors session : oublie la base de suivi OS
             detector_prev_cap = cap; // re-base le détecteur à l'entrée en session
             detector_window_start = Instant::now();
+            last_disruption = Instant::now(); // hors capture : rien de jugeable
             continue;
         }
 
@@ -2288,12 +2298,14 @@ async fn audio_liveness_supervisor(
         // callbacks et on le confronte au 48 kHz assumé. Écart franc PERSISTANT
         // (débounce) = re-clock silencieux → HARD-STOP. Sondage hors thread audio.
         if detector_window_start.elapsed() >= DETECTOR_WINDOW {
-            // Fenêtre chevauchant un reset récent (callbacks gelés pendant la
-            // reconstruction) → mesure faussée : on la JETTE et on re-base, sans
-            // évaluer. Le prochain fenêtrage repartira sur un flux continu.
-            let repair_in_window = last_repair
-                .map(|t| t.elapsed() < DETECTOR_WINDOW)
-                .unwrap_or(false);
+            // Fenêtre traversée par une INTERRUPTION (reconstruction, flatline,
+            // mode dégradé) → mesure faite sur du silence : on la JETTE et on
+            // re-base. Seul un flux continu du début à la fin de la fenêtre peut
+            // accuser une interface d'avoir changé de fréquence.
+            let window_clean = drift_window_is_clean(
+                detector_window_start.elapsed(),
+                last_disruption.elapsed(),
+            );
             let elapsed = detector_window_start.elapsed().as_secs_f64();
             let cb_delta = cap.saturating_sub(detector_prev_cap);
             // `input_frames` = frames RÉELLEMENT livrés par callback (publié à
@@ -2312,7 +2324,7 @@ async fn audio_liveness_supervisor(
             // avant le 1er callback) ou que le rate assumé est nul (pas encore de
             // capture confirmée).
             let mut hard_stop_sr: Option<u32> = None;
-            if !repair_in_window && assumed_sr > 0 && frames_per_cb > 0 && elapsed > 0.0 && cb_delta > 0 {
+            if window_clean && assumed_sr > 0 && frames_per_cb > 0 && elapsed > 0.0 && cb_delta > 0 {
                 let cb_per_sec = cb_delta as f64 / elapsed;
                 let measured_sr = cb_per_sec * frames_per_cb as f64;
                 let rel_err = (measured_sr - assumed_sr as f64).abs() / assumed_sr as f64;
@@ -2333,6 +2345,10 @@ async fn audio_liveness_supervisor(
                 } else {
                     detector_mismatch_streak = 0; // fenêtre saine → reset du débounce
                 }
+            } else if !window_clean {
+                // Interruption dans la fenêtre : la mesure ne veut rien dire, et le
+                // débounce ne doit RIEN garder d'une fenêtre jetée.
+                detector_mismatch_streak = 0;
             }
             detector_prev_cap = cap;
             detector_window_start = Instant::now();
@@ -2408,6 +2424,7 @@ async fn audio_liveness_supervisor(
             last_resume_seen = resume_signal.resume_count();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
+            last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
             {
                 let pl = pipeline.lock().await;
                 prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
@@ -2462,6 +2479,7 @@ async fn audio_liveness_supervisor(
             last_resume_seen = resume_signal.resume_count();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
+            last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
             {
                 let pl = pipeline.lock().await;
                 prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
@@ -2502,6 +2520,7 @@ async fn audio_liveness_supervisor(
                             pipeline.lock().await.keep_listening_without_input();
                         }
                         last_repair = Some(Instant::now());
+                        last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
                     }
                 }
                 let pl = pipeline.lock().await;
@@ -2537,6 +2556,14 @@ async fn audio_liveness_supervisor(
                 );
                 silent_rebuilds = 0;
             }
+            // L'entrée est revenue POUR DE BON : du son est livré, pas seulement un
+            // pilote rouvert. C'est ici — et nulle part ailleurs — qu'on l'annonce.
+            {
+                let mut pl = pipeline.lock().await;
+                if pl.lost_input_device().is_some() {
+                    pl.note_input_back();
+                }
+            }
             if degraded {
                 tracing::info!(
                     target: "jamodio::ws",
@@ -2554,6 +2581,10 @@ async fn audio_liveness_supervisor(
         if !(reset_requested || !has_stream || flatline) {
             continue;
         }
+
+        // Toute reconstruction interrompt le flux : le détecteur de dérive ne doit
+        // plus juger la fenêtre en cours (ni les suivantes tant que ça dure).
+        last_disruption = Instant::now();
 
         // Throttle : burst initial, puis relance lente en dégradé. Jamais de
         // boucle serrée.
@@ -2604,7 +2635,23 @@ async fn audio_liveness_supervisor(
             prev_out = pl.perfstats.output_callbacks.load(Ordering::Relaxed);
         }
 
+        last_disruption = Instant::now();
+
         match repaired {
+            // Le pilote s'est rouvert — ce qui ne prouve rien : une interface
+            // débranchée dont le pilote survit se rouvre sans erreur et reste muette.
+            // Au-delà de SILENT_REBUILD_LIMIT reconstructions sans un seul callback,
+            // on cesse de marteler, on passe en dégradé (relances espacées, verrou
+            // libre pour les commandes du studio) et on le dit au musicien.
+            Ok(()) if silent_rebuilds >= SILENT_REBUILD_LIMIT && !degraded => {
+                tracing::error!(
+                    target: "jamodio::ws",
+                    silent_rebuilds,
+                    "l'interface se rouvre mais ne délivre aucun son — déclarée indisponible, relances espacées"
+                );
+                pipeline.lock().await.note_input_silent();
+                degraded = true;
+            }
             Ok(()) => {
                 if degraded {
                     tracing::info!(
@@ -2647,6 +2694,24 @@ async fn audio_liveness_supervisor(
             }
         }
     }
+}
+
+/// La fenêtre du détecteur de dérive est-elle jugeable ? PURE.
+///
+/// Elle ne l'est que si la dernière interruption du flux (reconstruction, flatline,
+/// mode dégradé) est ANTÉRIEURE au début de la fenêtre — autrement dit si du son a
+/// été délivré sans discontinuité du début à la fin.
+///
+/// # Pourquoi (recette PC du 17/09/2026)
+///
+/// L'ancien garde comparait « temps écoulé depuis le DÉBUT de la réparation » à la
+/// durée d'une fenêtre (2 s), alors qu'une réparation dure 4 à 8 s et qu'en mode
+/// dégradé le silence dure des dizaines de secondes. Il ne jouait donc jamais : la
+/// fréquence était « mesurée » sur du silence (54 Hz, puis 3343 Hz), et la règle
+/// « jamais d'audio dégradé » coupait la session en accusant une interface restée
+/// à 48 kHz d'en être sortie.
+fn drift_window_is_clean(window_elapsed: Duration, since_disruption: Duration) -> bool {
+    since_disruption >= window_elapsed
 }
 
 /// Lot 0 — journalise ce que le SYSTÈME dit du matériel de la session, pilote ASIO
@@ -4023,6 +4088,50 @@ mod runaway_tests {
 /// `SetVoiceGain` perdu laissait le micro à l'inverse de ce que l'utilisateur
 /// venait de demander. Elles n'ont jamais eu besoin de ce verrou : le mixer est
 /// un `Arc` à synchronisation interne, le gain voix un simple atomique.
+#[cfg(test)]
+mod derive_de_rate_tests {
+    use super::drift_window_is_clean;
+    use std::time::Duration;
+
+    const WINDOW: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn flux_continu_pendant_toute_la_fenetre_est_jugeable() {
+        // Dernière interruption il y a 30 s, fenêtre de 2 s : rien ne l'a traversée.
+        assert!(drift_window_is_clean(WINDOW, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn interruption_pendant_la_fenetre_rend_la_mesure_invalide() {
+        // Reconstruction il y a 1 s dans une fenêtre de 2 s : la moitié du temps
+        // mesuré est du silence — c'est ce qui donnait « 54 Hz » puis « 3343 Hz ».
+        assert!(!drift_window_is_clean(WINDOW, Duration::from_secs(1)));
+        assert!(!drift_window_is_clean(WINDOW, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn une_reparation_longue_ne_passe_plus_entre_les_mailles() {
+        // Réparation de 4 à 8 s (le cas réel) : tant qu'elle est plus récente que le
+        // début de la fenêtre, aucune mesure n'est retenue. L'ancien garde, qui
+        // comparait à la seule durée de fenêtre, laissait passer ces cas-là.
+        for reparation_il_y_a in [0u64, 500, 1_000, 1_999] {
+            assert!(
+                !drift_window_is_clean(WINDOW, Duration::from_millis(reparation_il_y_a)),
+                "interruption il y a {reparation_il_y_a} ms : fenêtre non jugeable"
+            );
+        }
+        // Une fois la fenêtre entièrement postérieure, on juge de nouveau.
+        assert!(drift_window_is_clean(WINDOW, Duration::from_millis(2_001)));
+    }
+
+    #[test]
+    fn fenetre_plus_longue_que_prevu_reste_couverte() {
+        // Le tick peut décaler la fenêtre (250 ms) : la règle suit la fenêtre RÉELLE.
+        assert!(!drift_window_is_clean(Duration::from_millis(2_300), Duration::from_millis(2_100)));
+        assert!(drift_window_is_clean(Duration::from_millis(2_300), Duration::from_millis(2_400)));
+    }
+}
+
 #[cfg(test)]
 mod etat_latche_tests {
     use super::*;
