@@ -38,6 +38,11 @@ jobs:
   build:
     strategy:
       fail-fast: false
+      # UN SEUL job à la fois : les deux plateformes complètent le MÊME draft de
+      # release, et leurs envois simultanés se marchaient dessus (« Error saving
+      # asset » une publication sur deux, 17/09/2026 — relances manuelles à
+      # chaque version). Publier plus lentement, mais à coup sûr.
+      max-parallel: 1
       matrix:
         include:
           # macOS Apple Silicon : runner ARM natif. macOS Intel ABANDONNÉ
@@ -67,7 +72,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install Rust toolchain
         # SHA épinglé (branche stable) — cf. review pré-BETA 2026-07-12 (M-infra-1).

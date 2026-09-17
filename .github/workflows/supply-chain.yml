@@ -36,7 +36,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH relatif
       # (workaround dev Mac) ; inutile ici et source d'échecs.
       - run: rm -f .cargo/config.toml
@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - run: rm -f .cargo/config.toml
       # L'action tourne dans SON image, avec SON cargo. La v2.0.4 embarquait
       # Rust 1.83, incapable de lire un `Cargo.toml` en edition 2024 — dès qu'une
