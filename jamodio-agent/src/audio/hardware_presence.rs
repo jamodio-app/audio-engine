@@ -19,6 +19,15 @@
 //! (déclarer l'interface indisponible, espacer les tentatives, prévenir le
 //! navigateur) viendront au lot suivant.
 //!
+//! # Ce que le système ne dit PAS toujours (recette du 17/09/2026, PC en Bureau à distance)
+//!
+//! En session Bureau à distance, Windows masque les périphériques audio locaux et
+//! n'expose que « Sortie audio de l'ordinateur distant ». La vérité système est
+//! alors AVEUGLE : elle répondrait « absent » pour une interface pourtant branchée.
+//! D'où la règle de [`corroborate`] : on n'affirme une absence que si l'on a prouvé,
+//! sur CETTE machine, qu'on sait reconnaître une interface présente. Sinon on ne
+//! conclut rien — le doute ne s'affiche jamais comme une certitude.
+//!
 //! Hors thread audio, jamais dans un callback : aucune latence ajoutée.
 
 /// Ce que dit le matériel, indépendamment du pilote ASIO.
@@ -137,6 +146,32 @@ pub fn probe(driver: &str) -> (Presence, Vec<String>) {
     (presence_from_names(driver, &endpoints), endpoints)
 }
 
+/// Règle de prudence : une absence ne se déclare qu'avec une preuve locale.
+///
+/// `availabilities` = la disponibilité calculée pour CHAQUE périphérique de la
+/// liste. Si aucun n'a été reconnu présent, le rapprochement est inapplicable sur
+/// cette machine (Bureau à distance, points audio masqués, noms inhabituels) : on
+/// rend `None` partout. Sinon on garde les verdicts — puisqu'on sait reconnaître
+/// une interface présente ici, ne pas reconnaître les autres veut bien dire absentes.
+///
+/// PURE, et volontairement indépendante du NOM des fabricants : aucune liste de
+/// marques connues, donc rien à maintenir quand une interface inconnue arrive.
+pub fn corroborate(availabilities: &mut [Option<bool>]) {
+    let some_present = availabilities.contains(&Some(true));
+    if some_present {
+        return;
+    }
+    if availabilities.contains(&Some(false)) {
+        tracing::info!(
+            target: "jamodio::devices",
+            "aucune interface reconnue parmi les points audio du système : branchement non concluant (Bureau à distance ?) — aucune mention affichée"
+        );
+    }
+    for a in availabilities.iter_mut() {
+        *a = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +230,33 @@ mod tests {
         // « 2- » (numérotation Windows) ne doit JAMAIS servir de preuve.
         let endpoints = names(&["Ligne (2- Behringer UMC)"]);
         assert_eq!(presence_from_names("2- Focusrite USB ASIO", &endpoints), Presence::Absent);
+    }
+
+    #[test]
+    fn sans_aucune_interface_reconnue_on_ne_conclut_rien() {
+        // PC en Bureau à distance : Windows n'expose que « Sortie audio de
+        // l'ordinateur distant ». Aucune interface ne correspond → la vérité
+        // système est aveugle ici, on ne dit RIEN plutôt que « non branchée ».
+        let mut a = [Some(false), Some(false), None];
+        corroborate(&mut a);
+        assert_eq!(a, [None, None, None]);
+    }
+
+    #[test]
+    fn une_interface_reconnue_valide_le_verdict_des_autres() {
+        // Une interface est reconnue présente : le rapprochement marche sur cette
+        // machine, donc celle qu'on ne reconnaît pas est bien débranchée.
+        let mut a = [Some(true), Some(false), None];
+        corroborate(&mut a);
+        assert_eq!(a, [Some(true), Some(false), None]);
+    }
+
+    #[test]
+    fn liste_sans_verdict_reste_sans_verdict() {
+        let mut a = [None, None];
+        corroborate(&mut a);
+        assert_eq!(a, [None, None]);
+        let mut vide: [Option<bool>; 0] = [];
+        corroborate(&mut vide);
     }
 }

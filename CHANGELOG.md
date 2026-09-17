@@ -5,6 +5,20 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-7] — 2026-09-17
+
+Pré-release. **Une absence ne se déclare qu'avec une preuve.**
+
+### Corrigé
+
+- **« Non branchée » s'affichait à tort** sur un PC piloté en Bureau à distance :
+  Windows y masque les périphériques audio locaux et n'expose que sa sortie
+  distante, donc aucune interface n'était reconnue. Désormais, tant qu'aucune
+  interface de la liste n'a été reconnue présente sur la machine, l'Audio Engine
+  ne conclut rien et n'affiche aucune mention. Il n'affirme une absence que là où
+  il a prouvé qu'il sait reconnaître une présence.
+- Aucune liste de marques : la règle vaut pour toute interface, connue ou non.
+
 ## [0.6.4-6] — 2026-09-17
 
 Pré-release. **Revue de code du 17/09 : quatre correctifs avant la version publique.**

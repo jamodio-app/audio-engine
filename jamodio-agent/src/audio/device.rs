@@ -79,6 +79,17 @@ fn availability(name: &str, endpoints: &[String]) -> Option<bool> {
     }
 }
 
+/// Applique la règle de prudence à une liste : sans AUCUNE interface reconnue
+/// présente, on n'affirme aucune absence (cf. `hardware_presence::corroborate`).
+fn corroborated(mut list: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    let mut availabilities: Vec<Option<bool>> = list.iter().map(|d| d.available).collect();
+    super::hardware_presence::corroborate(&mut availabilities);
+    for (d, a) in list.iter_mut().zip(availabilities) {
+        d.available = a;
+    }
+    list
+}
+
 /// Réévalue le champ `available` d'une liste déjà établie, SANS toucher aux
 /// pilotes : la présence vient du système (WASAPI), jamais de l'ASIO. Sert au
 /// cache servi pendant une session (driver mono-client tenu) — sinon la liste
@@ -90,7 +101,7 @@ fn with_fresh_availability(mut list: Vec<AudioDevice>, endpoints: &[String]) -> 
     for d in &mut list {
         d.available = availability(&d.name, endpoints);
     }
-    list
+    corroborated(list)
 }
 
 /// Format de l'id : `"{index}:{name}"`. Le `:` au plus tôt sépare index/nom.
@@ -248,6 +259,7 @@ fn list_inputs_inner(endpoints: &[String]) -> Vec<AudioDevice> {
             })
         })
         .collect();
+    let list = corroborated(list);
     // Mémorise pour servir pendant une session (quand le driver sera tenu).
     *INPUT_CACHE.lock().unwrap() = Some(list.clone());
     list
@@ -272,7 +284,7 @@ fn list_outputs_inner(endpoints: &[String]) -> Vec<AudioDevice> {
 
     let host = super::host::active();
     let default = host.default_output_device().and_then(|d| d.name().ok());
-    let list = enumerate_outputs(&host, default.as_deref(), endpoints);
+    let list = corroborated(enumerate_outputs(&host, default.as_deref(), endpoints));
     *OUTPUT_CACHE.lock().unwrap() = Some(list.clone());
     list
 }
@@ -873,5 +885,33 @@ mod tests {
         // énumération système (macOS, ou indisponible), la liste est rendue telle quelle.
         let cached = vec![dev("Focusrite USB ASIO")];
         assert_eq!(with_fresh_availability(cached.clone(), &[])[0].available, None);
+    }
+
+    #[test]
+    fn la_liste_ne_declare_une_absence_qu_avec_une_preuve() {
+        // PC en Bureau à distance : Windows ne montre que sa sortie distante, aucune
+        // interface n'est reconnue → aucune mention de branchement (17/09/2026).
+        let distant = vec!["Sortie audio de l\u{2019}ordinateur distant".to_string()];
+        let mut liste = vec![dev("Focusrite USB ASIO"), dev("ASIO4ALL v2")];
+        for d in &mut liste {
+            d.available = availability(&d.name, &distant);
+        }
+        let liste = corroborated(liste);
+        assert_eq!(liste[0].available, None, "branchée ou non : on n'en sait rien ici");
+        assert_eq!(liste[1].available, None);
+
+        // Session Windows locale : une interface est reconnue, le verdict des autres
+        // devient exploitable.
+        let local = vec![
+            "Ligne (Focusrite USB Audio)".to_string(),
+            "Haut-parleurs (Realtek(R) Audio)".to_string(),
+        ];
+        let mut liste = vec![dev("Focusrite USB ASIO"), dev("Scarlett 2i2 USB")];
+        for d in &mut liste {
+            d.available = availability(&d.name, &local);
+        }
+        let liste = corroborated(liste);
+        assert_eq!(liste[0].available, Some(true));
+        assert_eq!(liste[1].available, Some(false), "installée mais débranchée");
     }
 }
