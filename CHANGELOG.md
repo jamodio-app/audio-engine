@@ -5,6 +5,11 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-8] — 2026-09-18
+
+**Candidat de release** : contenu identique à la 0.6.4 publique à venir, seul le
+numéro change. Sert à vérifier une dernière fois sur Mac et PC avant diffusion.
+
 ## [0.6.4-7] — 2026-09-17
 
 Pré-release. **Une absence ne se déclare qu'avec une preuve.**
