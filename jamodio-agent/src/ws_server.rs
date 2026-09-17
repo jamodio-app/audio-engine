@@ -2170,6 +2170,9 @@ async fn audio_liveness_supervisor(
     // mesure faite sur du silence donnait « 54 Hz » puis « 3343 Hz » et coupait la
     // session en accusant l'interface d'avoir quitté le 48 kHz (recette PC 17/09).
     let mut last_disruption = Instant::now();
+    // Entrée observée au tour précédent : un changement d'interface repart d'une
+    // page blanche (compteur de reconstructions muettes).
+    let mut last_input_device: Option<String> = None;
     // Lot A2 — suivi live du défaut de sortie OS (« Défaut système »). `None` =
     // pas de base établie (hors suivi, ou session pas encore observée). Le poll
     // est étranglé à `DEFAULT_OUT_POLL` (le tick liveness est à 250 ms).
@@ -2259,7 +2262,7 @@ async fn audio_liveness_supervisor(
         }
 
         // Observation atomique (lock bref).
-        let (state_capturing, has_stream, has_output, cap, out) = {
+        let (state_capturing, has_stream, has_output, cap, out, input_device) = {
             let pl = pipeline.lock().await;
             (
                 matches!(pl.state, AgentState::Capturing),
@@ -2267,8 +2270,18 @@ async fn audio_liveness_supervisor(
                 pl.has_playback_stream(),
                 pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
                 pl.perfstats.output_callbacks.load(Ordering::Relaxed),
+                pl.input_device_name(),
             )
         };
+
+        // Le musicien a changé d'entrée : ce qui précède ne dit plus rien de
+        // celle-ci. Sans ça, une interface saine héritait du compteur d'une
+        // interface muette et était déclarée indisponible au premier hoquet
+        // (revue du 17/09).
+        if input_device != last_input_device {
+            last_input_device = input_device.clone();
+            silent_rebuilds = 0;
+        }
 
         // Hors session, ou transition Idle→Capturing : base propre, on oublie
         // tout état dégradé, on attend.
@@ -2287,6 +2300,7 @@ async fn audio_liveness_supervisor(
             // éviter un rebuild parasite au démarrage suivant.
             crate::audio::buffer_policy::take_rebuild_request();
             last_default_out = None; // hors session : oublie la base de suivi OS
+            silent_rebuilds = 0;     // rien à reprocher à la prochaine interface
             detector_prev_cap = cap; // re-base le détecteur à l'entrée en session
             detector_window_start = Instant::now();
             last_disruption = Instant::now(); // hors capture : rien de jugeable
@@ -2653,12 +2667,15 @@ async fn audio_liveness_supervisor(
                 degraded = true;
             }
             Ok(()) => {
+                // Le pilote s'est rouvert. Ça ne lève PAS l'état dégradé : seul du
+                // son réellement délivré le fait (branche `advancing`). Sinon, la
+                // reconstruction muette suivante relançait la cadence rapide et
+                // l'espacement des tentatives ne tenait pas (revue du 17/09).
                 if degraded {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "jamodio::ws",
-                        "moteur audio reconstruit après période dégradée"
+                        "flux rouverts en mode dégradé — en attente de callbacks réels"
                     );
-                    degraded = false;
                 }
             }
             // D5b — entrée introuvable hors ASIO : on garde la réception (sortie

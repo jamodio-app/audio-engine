@@ -5,6 +5,24 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-6] — 2026-09-17
+
+Pré-release. **Revue de code du 17/09 : quatre correctifs avant la version publique.**
+
+### Corrigé
+
+- **L'espacement des tentatives ne tenait pas** : une fois l'interface déclarée
+  indisponible, la reconstruction suivante — qui rouvre le pilote à vide — levait
+  l'état dégradé et relançait la cadence rapide. Seul du son réellement délivré
+  lève désormais cet état.
+- **Changer d'interface repart d'une page blanche** : le compteur de
+  reconstructions muettes est remis à zéro au changement d'entrée et hors session.
+  Sans ça, une interface saine héritait du compteur d'une interface muette et
+  pouvait être déclarée indisponible au premier hoquet.
+- **L'énumération du système ne passe plus par le thread COM réservé à ASIO** :
+  la présence du matériel est lue avant d'y entrer, comme la liste des micros.
+- Commentaire de documentation rendu à sa fonction (`lost_input_device`).
+
 ## [0.6.4-5] — 2026-09-17
 
 Pré-release. **Une interface débranchée ne se fait plus passer pour disponible.**

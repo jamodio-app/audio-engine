@@ -3049,15 +3049,16 @@ impl PipelineState {
         }
     }
 
-    /// Entrée perdue en session (id `{idx}:{name}`), si c'est le cas.
-    /// Nom du périphérique d'ENTRÉE de la session (sans l'index de l'id) — pour
-    /// journaliser, et interroger la présence réelle du matériel (lot 0 ASIO).
+    /// Nom du périphérique d'ENTRÉE **courant** de la session (sans l'index de
+    /// l'id) — pour journaliser, et interroger la présence réelle du matériel.
+    /// À ne pas confondre avec `lost_input_device` (l'entrée PERDUE).
     pub fn input_device_name(&self) -> Option<String> {
         self.input_device_id
             .as_deref()
             .map(|id| id.split_once(':').map(|(_, n)| n).unwrap_or(id).to_string())
     }
 
+    /// Entrée perdue en session (id `{idx}:{name}`), si c'est le cas.
     pub fn lost_input_device(&self) -> Option<String> {
         self.device_loss.lost_input().map(str::to_string)
     }
