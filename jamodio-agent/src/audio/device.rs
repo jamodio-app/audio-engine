@@ -67,6 +67,43 @@ fn asio_stream_active() -> bool {
     ASIO_STREAM_ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Le matériel de ce périphérique est-il branché ? `None` quand on ne peut pas
+/// savoir (macOS : l'énumération retire déjà les débranchés ; pilote enveloppe).
+/// Un pilote ASIO reste installé — et listé — interface débranchée : sans ça, la
+/// liste proposait de choisir une interface incapable de fonctionner (17/09/2026).
+fn availability(name: &str, endpoints: &[String]) -> Option<bool> {
+    match super::hardware_presence::presence_from_names(name, endpoints) {
+        super::hardware_presence::Presence::Present => Some(true),
+        super::hardware_presence::Presence::Absent => Some(false),
+        super::hardware_presence::Presence::Unknown => None,
+    }
+}
+
+/// Applique la règle de prudence à une liste : sans AUCUNE interface reconnue
+/// présente, on n'affirme aucune absence (cf. `hardware_presence::corroborate`).
+fn corroborated(mut list: Vec<AudioDevice>) -> Vec<AudioDevice> {
+    let mut availabilities: Vec<Option<bool>> = list.iter().map(|d| d.available).collect();
+    super::hardware_presence::corroborate(&mut availabilities);
+    for (d, a) in list.iter_mut().zip(availabilities) {
+        d.available = a;
+    }
+    list
+}
+
+/// Réévalue le champ `available` d'une liste déjà établie, SANS toucher aux
+/// pilotes : la présence vient du système (WASAPI), jamais de l'ASIO. Sert au
+/// cache servi pendant une session (driver mono-client tenu) — sinon la liste
+/// resterait figée sur l'état du branchement au moment de l'énumération.
+fn with_fresh_availability(mut list: Vec<AudioDevice>, endpoints: &[String]) -> Vec<AudioDevice> {
+    if endpoints.is_empty() {
+        return list; // rien à dire (macOS, ou énumération indisponible)
+    }
+    for d in &mut list {
+        d.available = availability(&d.name, endpoints);
+    }
+    corroborated(list)
+}
+
 /// Format de l'id : `"{index}:{name}"`. Le `:` au plus tôt sépare index/nom.
 fn make_id(index: usize, name: &str) -> String {
     format!("{}:{}", index, name)
@@ -141,6 +178,9 @@ pub fn list_voice_inputs() -> Vec<AudioDevice> {
                 // chemin instrument où R2 impose 48 kHz natif.
                 native_sample_rate: cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0),
                 name,
+                // Liste voix = énumération du système lui-même : ce qu'elle contient
+                // est branché, par construction.
+                available: None,
             })
         })
         .collect()
@@ -172,15 +212,22 @@ pub fn get_voice_input_device(id: &str) -> Option<cpal::Device> {
 
 /// List all available audio input devices.
 pub fn list_inputs() -> Vec<AudioDevice> {
-    super::com_exec::run(list_inputs_inner)
+    // La présence du matériel est lue AVANT d'entrer sur le thread COM-STA : ce
+    // thread est réservé à ASIO (apartment unique pour tous les objets du driver),
+    // et l'énumération WASAPI n'a rien à y faire — même raison que la liste voix,
+    // énumérée en ligne. Revue du 17/09/2026.
+    let endpoints = super::hardware_presence::system_endpoint_names();
+    super::com_exec::run(move || list_inputs_inner(&endpoints))
 }
 
-fn list_inputs_inner() -> Vec<AudioDevice> {
+fn list_inputs_inner(endpoints: &[String]) -> Vec<AudioDevice> {
     // Stream ASIO actif → ne PAS recharger le driver mono-client : sert le cache.
     if asio_stream_active() {
         if let Some(cached) = INPUT_CACHE.lock().unwrap().clone() {
             tracing::debug!(target: "jamodio::devices", "stream ASIO actif — inputs servis depuis le cache (pas de rechargement du driver)");
-            return cached;
+            // La liste date, mais le BRANCHEMENT, lui, est relu (via le système) :
+            // une interface débranchée en session est vue comme telle.
+            return with_fresh_availability(cached, endpoints);
         }
         tracing::warn!(target: "jamodio::devices", "stream ASIO actif sans cache d'inputs — renvoi vide (évite le rechargement du driver mono-client)");
         return vec![];
@@ -204,6 +251,7 @@ fn list_inputs_inner() -> Vec<AudioDevice> {
             let native_sample_rate = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
             Some(AudioDevice {
                 id: make_id(idx, &name),
+                available: availability(&name, endpoints),
                 name: name.clone(),
                 is_default: Some(&name) == default.as_ref(),
                 channels,
@@ -211,6 +259,7 @@ fn list_inputs_inner() -> Vec<AudioDevice> {
             })
         })
         .collect();
+    let list = corroborated(list);
     // Mémorise pour servir pendant une session (quand le driver sera tenu).
     *INPUT_CACHE.lock().unwrap() = Some(list.clone());
     list
@@ -218,15 +267,16 @@ fn list_inputs_inner() -> Vec<AudioDevice> {
 
 /// List all available audio output devices.
 pub fn list_outputs() -> Vec<AudioDevice> {
-    super::com_exec::run(list_outputs_inner)
+    let endpoints = super::hardware_presence::system_endpoint_names();
+    super::com_exec::run(move || list_outputs_inner(&endpoints))
 }
 
-fn list_outputs_inner() -> Vec<AudioDevice> {
+fn list_outputs_inner(endpoints: &[String]) -> Vec<AudioDevice> {
     // Stream ASIO actif → ne PAS recharger le driver mono-client : sert le cache.
     if asio_stream_active() {
         if let Some(cached) = OUTPUT_CACHE.lock().unwrap().clone() {
             tracing::debug!(target: "jamodio::devices", "stream ASIO actif — outputs servis depuis le cache (pas de rechargement du driver)");
-            return cached;
+            return with_fresh_availability(cached, endpoints);
         }
         tracing::warn!(target: "jamodio::devices", "stream ASIO actif sans cache d'outputs — renvoi vide (évite le rechargement du driver mono-client)");
         return vec![];
@@ -234,7 +284,7 @@ fn list_outputs_inner() -> Vec<AudioDevice> {
 
     let host = super::host::active();
     let default = host.default_output_device().and_then(|d| d.name().ok());
-    let list = enumerate_outputs(&host, default.as_deref());
+    let list = corroborated(enumerate_outputs(&host, default.as_deref(), endpoints));
     *OUTPUT_CACHE.lock().unwrap() = Some(list.clone());
     list
 }
@@ -245,7 +295,7 @@ fn list_outputs_inner() -> Vec<AudioDevice> {
 /// (cause racine du gel Focusrite). L'index de l'id = position dans
 /// `host.output_devices()` (cohérent avec `get_output_device` non-macOS).
 #[cfg(not(target_os = "macos"))]
-fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevice> {
+fn enumerate_outputs(host: &cpal::Host, default: Option<&str>, endpoints: &[String]) -> Vec<AudioDevice> {
     let Ok(devices) = host.output_devices() else { return vec![] };
     devices
         .enumerate()
@@ -256,6 +306,7 @@ fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevic
             let native_sample_rate = cfg.as_ref().map(|c| c.sample_rate().0).unwrap_or(0);
             Some(AudioDevice {
                 id: make_id(idx, &name),
+                available: availability(&name, endpoints),
                 name: name.clone(),
                 is_default: Some(name.as_str()) == default,
                 channels,
@@ -276,7 +327,7 @@ fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevic
 /// = position dans `host.devices()` (cohérent avec `get_output_device` macOS).
 /// Résultat mis en cache par l'appelant → le probe ne tourne qu'au rebuild.
 #[cfg(target_os = "macos")]
-fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevice> {
+fn enumerate_outputs(host: &cpal::Host, default: Option<&str>, _endpoints: &[String]) -> Vec<AudioDevice> {
     let Ok(devices) = host.devices() else { return vec![] };
     let mut recovered = 0usize;
     let list: Vec<AudioDevice> = devices
@@ -287,6 +338,7 @@ fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevic
             if let Ok(cfg) = d.default_output_config() {
                 return Some(AudioDevice {
                     id: make_id(idx, &name),
+                    available: None, // CoreAudio retire déjà les débranchés
                     name: name.clone(),
                     is_default: Some(name.as_str()) == default,
                     channels: cfg.channels(),
@@ -301,6 +353,7 @@ fn enumerate_outputs(host: &cpal::Host, default: Option<&str>) -> Vec<AudioDevic
                 recovered += 1;
                 return Some(AudioDevice {
                     id: make_id(idx, &name),
+                    available: None, // CoreAudio retire déjà les débranchés
                     name: name.clone(),
                     is_default: Some(name.as_str()) == default,
                     channels: 2,
@@ -395,10 +448,27 @@ pub fn default_input_id() -> Option<String> {
     None
 }
 
+/// Points d'entrée/sortie vus par le SYSTÈME au démarrage, pilote ASIO exclu
+/// (Windows : WASAPI). Sert de repère dans un rapport de bug : si l'interface
+/// manque ICI, elle n'était pas branchée — quoi qu'en dise son pilote ASIO.
+/// Inerte sur macOS (CoreAudio est déjà la vérité).
+fn log_system_endpoints() {
+    let names = super::hardware_presence::system_endpoint_names();
+    if names.is_empty() {
+        return;
+    }
+    tracing::info!(
+        target: "jamodio::devices",
+        endpoints = %names.join(" | "),
+        "points audio vus par le système (hors pilote ASIO)"
+    );
+}
+
 /// Dump tous les devices CPAL (appelé une fois au démarrage) : nom exact, canaux,
 /// sample rate par défaut, flag default. Aide le debug des cas où le nom d'un device
 /// est surprenant (aggregate device, virtuel, UID numérique CoreAudio, etc.).
 pub fn log_devices() {
+    log_system_endpoints();
     let host = super::host::active();
     // Défaut PRÉFÉRÉ (natif > wrapper) — cohérent avec `default_input_id`/`list_inputs`.
     let def_in = preferred_default_input_name(&host).unwrap_or_default();
@@ -650,6 +720,7 @@ mod tests {
     fn dev(name: &str) -> AudioDevice {
         AudioDevice {
             id: format!("0:{name}"),
+            available: None,
             name: name.into(),
             is_default: false,
             channels: 2,
@@ -675,15 +746,15 @@ mod tests {
         // Stream actif → sert le cache SANS toucher cpal (sinon ce test paniquerait
         // ou dépendrait du matériel sur une machine de CI).
         set_asio_stream_active(true);
-        let ins = list_inputs_inner();
-        let outs = list_outputs_inner();
+        let ins = list_inputs_inner(&[]);
+        let outs = list_outputs_inner(&[]);
         assert_eq!(ins.len(), 1, "inputs servis depuis le cache");
         assert_eq!(ins[0].name, "Focusrite USB ASIO");
         assert_eq!(outs.len(), 1, "outputs servis depuis le cache");
 
         // Stream actif MAIS cache vide → renvoi vide (jamais de rechargement driver).
         *INPUT_CACHE.lock().unwrap() = None;
-        let ins_empty = list_inputs_inner();
+        let ins_empty = list_inputs_inner(&[]);
         assert!(ins_empty.is_empty(), "actif sans cache ⇒ vide, pas de reload");
 
         // Nettoyage (statics globaux partagés avec les autres tests).
@@ -797,4 +868,50 @@ mod tests {
         assert_eq!(locate(0, "Focusrite USB ASIO", &n, |_| true), Located::Moved { from: 0, to: 1 });
     }
 
+
+    #[test]
+    fn disponibilite_derivee_de_la_presence_materielle() {
+        let endpoints = vec!["Ligne (Focusrite USB Audio)".to_string()];
+        assert_eq!(availability("Focusrite USB ASIO", &endpoints), Some(true));
+        assert_eq!(availability("Scarlett 2i2 USB", &endpoints), Some(false), "installée mais débranchée");
+        assert_eq!(availability("ASIO4ALL v2", &endpoints), None, "pilote enveloppe : rien à conclure");
+        assert_eq!(availability("Focusrite USB ASIO", &[]), None, "sans énumération système : rien à conclure");
+    }
+
+    #[test]
+    fn le_cache_ne_fige_pas_le_branchement() {
+        // Pendant une session ASIO, la liste vient du cache (le driver mono-client
+        // ne doit pas être rechargé) — mais la présence, elle, est relue. Sans
+        // énumération système (macOS, ou indisponible), la liste est rendue telle quelle.
+        let cached = vec![dev("Focusrite USB ASIO")];
+        assert_eq!(with_fresh_availability(cached.clone(), &[])[0].available, None);
+    }
+
+    #[test]
+    fn la_liste_ne_declare_une_absence_qu_avec_une_preuve() {
+        // PC en Bureau à distance : Windows ne montre que sa sortie distante, aucune
+        // interface n'est reconnue → aucune mention de branchement (17/09/2026).
+        let distant = vec!["Sortie audio de l\u{2019}ordinateur distant".to_string()];
+        let mut liste = vec![dev("Focusrite USB ASIO"), dev("ASIO4ALL v2")];
+        for d in &mut liste {
+            d.available = availability(&d.name, &distant);
+        }
+        let liste = corroborated(liste);
+        assert_eq!(liste[0].available, None, "branchée ou non : on n'en sait rien ici");
+        assert_eq!(liste[1].available, None);
+
+        // Session Windows locale : une interface est reconnue, le verdict des autres
+        // devient exploitable.
+        let local = vec![
+            "Ligne (Focusrite USB Audio)".to_string(),
+            "Haut-parleurs (Realtek(R) Audio)".to_string(),
+        ];
+        let mut liste = vec![dev("Focusrite USB ASIO"), dev("Scarlett 2i2 USB")];
+        for d in &mut liste {
+            d.available = availability(&d.name, &local);
+        }
+        let liste = corroborated(liste);
+        assert_eq!(liste[0].available, Some(true));
+        assert_eq!(liste[1].available, Some(false), "installée mais débranchée");
+    }
 }

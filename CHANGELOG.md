@@ -5,6 +5,91 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-7] — 2026-09-17
+
+Pré-release. **Une absence ne se déclare qu'avec une preuve.**
+
+### Corrigé
+
+- **« Non branchée » s'affichait à tort** sur un PC piloté en Bureau à distance :
+  Windows y masque les périphériques audio locaux et n'expose que sa sortie
+  distante, donc aucune interface n'était reconnue. Désormais, tant qu'aucune
+  interface de la liste n'a été reconnue présente sur la machine, l'Audio Engine
+  ne conclut rien et n'affiche aucune mention. Il n'affirme une absence que là où
+  il a prouvé qu'il sait reconnaître une présence.
+- Aucune liste de marques : la règle vaut pour toute interface, connue ou non.
+
+## [0.6.4-6] — 2026-09-17
+
+Pré-release. **Revue de code du 17/09 : quatre correctifs avant la version publique.**
+
+### Corrigé
+
+- **L'espacement des tentatives ne tenait pas** : une fois l'interface déclarée
+  indisponible, la reconstruction suivante — qui rouvre le pilote à vide — levait
+  l'état dégradé et relançait la cadence rapide. Seul du son réellement délivré
+  lève désormais cet état.
+- **Changer d'interface repart d'une page blanche** : le compteur de
+  reconstructions muettes est remis à zéro au changement d'entrée et hors session.
+  Sans ça, une interface saine héritait du compteur d'une interface muette et
+  pouvait être déclarée indisponible au premier hoquet.
+- **L'énumération du système ne passe plus par le thread COM réservé à ASIO** :
+  la présence du matériel est lue avant d'y entrer, comme la liste des micros.
+- Commentaire de documentation rendu à sa fonction (`lost_input_device`).
+
+## [0.6.4-5] — 2026-09-17
+
+Pré-release. **Une interface débranchée ne se fait plus passer pour disponible.**
+
+### Corrigé
+
+- **La liste des entrées proposait une interface débranchée** : un pilote ASIO
+  reste installé quand son interface part, donc il restait listé, et le choisir ne
+  donnait rien. Chaque périphérique dit maintenant s'il est branché — vérité prise
+  au SYSTÈME (Windows : WASAPI), jamais au pilote. Le studio l'affiche
+  « non branchée » et empêche de le choisir, sans jamais faire disparaître le nom.
+- **Même pendant une session** : la liste est servie depuis le cache (le pilote
+  mono-client ne doit pas être rechargé), mais le branchement, lui, est relu.
+- macOS inchangé : CoreAudio retire déjà les périphériques débranchés.
+
+## [0.6.4-4] — 2026-09-17
+
+Pré-release. **Une interface qui revient ne coupe plus la session, et une interface muette est enfin annoncée.**
+
+### Corrigé
+
+- **Rebrancher son interface coupait la session** avec « ton interface a quitté le
+  48 kHz », alors qu'elle était bien à 48 kHz. Le détecteur de dérive d'horloge
+  mesurait la fréquence sur une fenêtre traversée par la coupure — donc sur du
+  silence (54 Hz, puis 3343 Hz) — et la règle « jamais d'audio dégradé » arrêtait
+  la capture. Le détecteur ne juge plus que des fenêtres où le son a été délivré
+  sans discontinuité.
+- **Une interface qui s'ouvre mais reste muette n'était jamais signalée** : l'Audio
+  Engine reconstruisait ses flux toutes les 2 s sans fin (24 fois d'affilée dans la
+  recette du 17/09), saturait son propre verrou et ignorait les commandes du studio
+  — impossible d'en changer. Au bout de trois reconstructions sans un seul son,
+  l'interface est déclarée indisponible : le studio le dit, les tentatives
+  s'espacent, et l'Audio Engine reste répondant.
+- **« Entrée rétablie » n'est plus annoncée sur une simple réouverture de pilote** :
+  seul du son réellement délivré vaut rétablissement.
+
+## [0.6.4-3] — 2026-09-17
+
+Pré-release de DIAGNOSTIC. **Aucun comportement changé** : uniquement de quoi
+trancher, dans le journal, une panne qu'on ne savait pas nommer.
+
+### Diagnostic
+
+- **Interface débranchée en session (recette PC du 17/09)** : le pilote ASIO d'une
+  interface débranchée reste chargeable — il s'ouvre, annonce ses latences, et ne
+  délivre plus un seul callback. L'Audio Engine croyait donc avoir réussi sa
+  reconstruction et recommençait toutes les 2 s, sans fin, sans rien dire, en
+  saturant son propre verrou (commandes du studio ignorées).
+- Le journal compte désormais les **reconstructions consécutives restées muettes**,
+  et dit ce que le SYSTÈME pense du matériel (Windows : liste WASAPI, qui suit le
+  branchement USB réel) : matériel absent, ou matériel présent mais pilote muet.
+- Au démarrage, la liste des points audio vus par le système est journalisée.
+
 ## [0.6.4-2] — 2026-09-17
 
 Pré-release. **Plus de faux « débranché » quand on branche ou débranche un autre périphérique.**

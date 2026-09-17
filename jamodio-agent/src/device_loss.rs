@@ -13,13 +13,33 @@
 //! superviseur relaie au navigateur. Un événement n'est émis qu'aux transitions :
 //! jamais de répétition tant que rien ne change.
 
+/// Pourquoi l'entrée n'est plus utilisable — deux pannes distinctes, deux phrases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostReason {
+    /// Le périphérique a disparu du système : débranché.
+    Unplugged,
+    /// Le pilote s'ouvre encore mais ne délivre plus aucun son (interface
+    /// débranchée dont le pilote ASIO survit, interface plantée). Recette PC du
+    /// 17/09/2026 : l'agent reconstruisait en boucle en croyant avoir réussi.
+    Silent,
+}
+
+impl LostReason {
+    pub fn wire(self) -> &'static str {
+        match self {
+            LostReason::Unplugged => "unplugged",
+            LostReason::Silent => "silent",
+        }
+    }
+}
+
 /// Événement à relayer au navigateur (ids `{idx}:{name}` des périphériques).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceEvent {
     /// L'entrée choisie a disparu : plus de capture. `keeps_output` : la réception
     /// continue (hors ASIO) ; faux quand l'interface entière manque (ASIO : entrée
     /// et sortie sont la même interface).
-    InputLost { device: String, keeps_output: bool },
+    InputLost { device: String, keeps_output: bool, reason: LostReason },
     /// La même entrée est revenue et la capture est repartie.
     InputRestored { device: String },
     /// La sortie choisie a disparu : le son passe par `fallback` (sortie du système).
@@ -30,7 +50,8 @@ pub enum DeviceEvent {
 
 #[derive(Debug, Default)]
 pub struct DeviceLoss {
-    input: Option<String>,
+    /// Entrée perdue, et pourquoi.
+    input: Option<(String, LostReason)>,
     /// Sortie choisie perdue, et la sortie de repli par laquelle passe le son.
     output: Option<(String, String)>,
     pending: Vec<DeviceEvent>,
@@ -38,20 +59,24 @@ pub struct DeviceLoss {
 
 impl DeviceLoss {
     /// L'entrée `device` est introuvable (`keeps_output` : la réception continue).
-    pub fn input_lost(&mut self, device: &str, keeps_output: bool) {
-        if self.input.as_deref() == Some(device) {
+    pub fn input_lost(&mut self, device: &str, keeps_output: bool, reason: LostReason) {
+        if self.input.as_ref().is_some_and(|(d, r)| d == device && *r == reason) {
             return;
         }
-        self.input = Some(device.to_string());
+        // Une panne qui CHANGE de nature (pilote muet → périphérique disparu) mérite
+        // sa phrase : on réémet, mais jamais la même deux fois.
+        self.input = Some((device.to_string(), reason));
         self.pending.push(DeviceEvent::InputLost {
             device: device.to_string(),
             keeps_output,
+            reason,
         });
     }
 
-    /// La capture est repartie : si une entrée était perdue, elle est revenue.
+    /// La capture est repartie POUR DE BON (callbacks à nouveau délivrés, pas
+    /// seulement pilote rouvert) : si une entrée était perdue, elle est revenue.
     pub fn input_back(&mut self) {
-        if let Some(device) = self.input.take() {
+        if let Some((device, _)) = self.input.take() {
             self.pending.push(DeviceEvent::InputRestored { device });
         }
     }
@@ -92,7 +117,7 @@ impl DeviceLoss {
     }
 
     pub fn lost_input(&self) -> Option<&str> {
-        self.input.as_deref()
+        self.input.as_ref().map(|(d, _)| d.as_str())
     }
 
     pub fn lost_output(&self) -> Option<&str> {
@@ -112,8 +137,8 @@ mod tests {
     #[test]
     fn input_lost_then_back_emits_each_transition_once() {
         let mut loss = DeviceLoss::default();
-        loss.input_lost("0:Microphone externe", true);
-        loss.input_lost("0:Microphone externe", true); // relances en boucle : rien de plus
+        loss.input_lost("0:Microphone externe", true, LostReason::Unplugged);
+        loss.input_lost("0:Microphone externe", true, LostReason::Unplugged); // relances en boucle : rien de plus
         assert_eq!(loss.lost_input(), Some("0:Microphone externe"));
         loss.input_back();
         loss.input_back(); // capture saine : rien de plus
@@ -123,7 +148,8 @@ mod tests {
             vec![
                 DeviceEvent::InputLost {
                     device: "0:Microphone externe".into(),
-                    keeps_output: true
+                    keeps_output: true,
+                    reason: LostReason::Unplugged,
                 },
                 DeviceEvent::InputRestored {
                     device: "0:Microphone externe".into()
@@ -165,7 +191,7 @@ mod tests {
     #[test]
     fn forget_drops_state_and_pending_events_silently() {
         let mut loss = DeviceLoss::default();
-        loss.input_lost("0:Microphone externe", false);
+        loss.input_lost("0:Microphone externe", false, LostReason::Unplugged);
         loss.output_fell_back("2:Écouteurs externes", "Haut-parleurs MacBook Pro");
         loss.forget();
         assert_eq!(loss.lost_input(), None);
@@ -197,5 +223,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn une_panne_qui_change_de_nature_est_redite_une_fois() {
+        // Pilote muet, puis périphérique vraiment disparu : deux phrases différentes
+        // à l'écran, donc deux événements — mais jamais deux fois la même.
+        let mut loss = DeviceLoss::default();
+        loss.input_lost("1:Focusrite USB ASIO", false, LostReason::Silent);
+        loss.input_lost("1:Focusrite USB ASIO", false, LostReason::Silent);
+        loss.input_lost("1:Focusrite USB ASIO", false, LostReason::Unplugged);
+        loss.input_lost("1:Focusrite USB ASIO", false, LostReason::Unplugged);
+        assert_eq!(
+            loss.take_events(),
+            vec![
+                DeviceEvent::InputLost {
+                    device: "1:Focusrite USB ASIO".into(),
+                    keeps_output: false,
+                    reason: LostReason::Silent,
+                },
+                DeviceEvent::InputLost {
+                    device: "1:Focusrite USB ASIO".into(),
+                    keeps_output: false,
+                    reason: LostReason::Unplugged,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn le_nom_wire_des_raisons_est_stable() {
+        assert_eq!(LostReason::Unplugged.wire(), "unplugged");
+        assert_eq!(LostReason::Silent.wire(), "silent");
     }
 }

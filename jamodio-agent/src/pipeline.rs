@@ -2884,8 +2884,9 @@ impl PipelineState {
                 self.input_buffer_samples = input.input_buf;
                 self.input_hw = crate::audio::declared_latency::input(&input.name);
                 self.capture_stream = Some(input.stream);
-                // La capture est repartie : une entrée perdue est revenue.
-                self.device_loss.input_back();
+                // Rien ici : un pilote qui se rouvre ne prouve pas que le son revient
+                // (recette PC 17/09). C'est le superviseur qui déclare l'entrée
+                // revenue, sur des callbacks réellement délivrés (`note_input_back`).
                 match output {
                     OutputOpen::Opened { stream, buffer, name, fallback_from } => {
                         self.playback_stream = Some(stream);
@@ -2928,8 +2929,8 @@ impl PipelineState {
                 let new_sr = a.native_sr;
                 self.output_device_name = Some(a.name.clone());
                 self.asio_host = Some(a.host);
-                // Interface rouverte : entrée (et sortie, même interface) revenues.
-                self.device_loss.input_back();
+                // Interface rouverte — mais « ouverte » n'est pas « vivante » : c'est
+                // le superviseur qui déclarera le retour sur des callbacks délivrés.
                 tracing::info!(
                     target: "jamodio::pipeline",
                     device = %a.name,
@@ -2966,7 +2967,7 @@ impl PipelineState {
     /// sortie sont la même interface (rien à rouvrir sans elle).
     pub fn keep_listening_without_input(&mut self) {
         let device = self.input_device_id.clone().unwrap_or_default();
-        self.device_loss.input_lost(&device, true);
+        self.device_loss.input_lost(&device, true, crate::device_loss::LostReason::Unplugged);
         if self.playback_stream.is_some() {
             return;
         }
@@ -3018,9 +3019,26 @@ impl PipelineState {
     /// L'interface de la session est indisponible (reconstruction en échec, ex.
     /// interface ASIO débranchée : entrée et sortie à la fois) : le dire au navigateur.
     pub fn note_input_unavailable(&mut self) {
+        self.note_input_lost(crate::device_loss::LostReason::Unplugged);
+    }
+
+    /// L'interface s'ouvre encore mais ne délivre plus aucun son (pilote muet) :
+    /// le dire, avec sa propre phrase (lot 1 du chantier robustesse ASIO).
+    pub fn note_input_silent(&mut self) {
+        self.note_input_lost(crate::device_loss::LostReason::Silent);
+    }
+
+    /// La capture délivre de nouveau des callbacks : une entrée perdue est revenue.
+    /// Appelé par le SUPERVISEUR, sur du son réellement livré — jamais sur une simple
+    /// réouverture de pilote, qui « réussit » même interface débranchée.
+    pub fn note_input_back(&mut self) {
+        self.device_loss.input_back();
+    }
+
+    fn note_input_lost(&mut self, reason: crate::device_loss::LostReason) {
         let device = self.input_device_id.clone().unwrap_or_default();
         // Reconstruction complète en échec : entrée ET sortie indisponibles.
-        self.device_loss.input_lost(&device, false);
+        self.device_loss.input_lost(&device, false, reason);
     }
 
     /// D5c — la sortie choisie est de nouveau présente : on y revient.
@@ -3029,6 +3047,15 @@ impl PipelineState {
         if self.playback_stream.is_some() {
             self.device_loss.output_back();
         }
+    }
+
+    /// Nom du périphérique d'ENTRÉE **courant** de la session (sans l'index de
+    /// l'id) — pour journaliser, et interroger la présence réelle du matériel.
+    /// À ne pas confondre avec `lost_input_device` (l'entrée PERDUE).
+    pub fn input_device_name(&self) -> Option<String> {
+        self.input_device_id
+            .as_deref()
+            .map(|id| id.split_once(':').map(|(_, n)| n).unwrap_or(id).to_string())
     }
 
     /// Entrée perdue en session (id `{idx}:{name}`), si c'est le cas.
