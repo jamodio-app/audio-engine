@@ -5,6 +5,42 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-2] — 2026-09-17
+
+Pré-release. **Plus de faux « débranché » quand on branche ou débranche un autre périphérique.**
+
+### Corrigé
+
+- **Brancher ou débrancher un périphérique faisait croire à la perte d'un autre,
+  toujours branché** (Mac, Windows ASIO et WASAPI, micro du talkback). Le système
+  renumérote ses périphériques à chaque branchement, et l'Audio Engine rejetait
+  celui du musicien dès que son numéro changeait : faux « entrée débranchée »,
+  faux « sortie débranchée : le son passe par… » la même sortie. Un périphérique
+  est désormais retrouvé par son nom exact s'il est le seul à le porter ; s'il y
+  en a plusieurs du même nom, l'Audio Engine refuse plutôt que de choisir au hasard.
+- **Sortie choisie débranchée : le son reste sur la sortie annoncée.** Sur Mac, le
+  repli suivait la sortie du système : rebrancher un casque y envoyait le son
+  quelques secondes. Le repli se fait maintenant sur un périphérique précis, et si
+  celui-ci disparaît à son tour, le studio annonce le nouveau.
+
+## [0.6.4-1] — 2026-09-17
+
+Pré-release. **Un périphérique débranché en session ne coupe plus tout, et le studio le dit.**
+
+### Corrigé
+
+- **Débrancher le casque qui servait d'entrée coupait tout le son**, y compris
+  celui des autres musiciens, sans le moindre message. La sortie continue
+  désormais seule : on entend toujours les autres, le studio prévient que
+  l'entrée a été débranchée, et la capture repart d'elle-même quand elle revient.
+- **Une sortie choisie débranchée en session basculait sur la sortie du système
+  sans le dire.** Le studio l'indique, et le son revient sur la sortie choisie dès
+  qu'elle est rebranchée.
+- **Le nom de la sortie affiché par le studio pouvait rester figé** après un
+  changement de sortie : l'Audio Engine publie la sortie réellement ouverte.
+- Journal : libellés neutres pour la reconstruction des flux audio (plus de
+  « reset ASIO » sur Mac).
+
 ## [0.6.3] — 2026-09-16
 
 **Un musicien ne devient plus muet après une coupure réseau.**
