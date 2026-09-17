@@ -409,9 +409,15 @@ fn open_duplex_on_com(
                     "sortie demandée introuvable au start — repli sur la sortie par défaut système (non-fatal)"
                 );
             }
-            let dev = match requested_dev {
-                Some(d) => Some(d), // sortie demandée trouvée
-                None => crate::audio::device::default_output_device().map(|(d, _)| d), // défaut (demandé ou repli)
+            let dev = match (requested_dev, &fallback_from) {
+                (Some(d), _) => Some(d), // sortie demandée trouvée
+                // Repli : la sortie par défaut ouverte par son id → elle ne suit pas
+                // les changements du système (cf. `device::default_output_id`).
+                (None, Some(_)) => crate::audio::device::default_output_id()
+                    .as_deref()
+                    .and_then(crate::audio::device::get_output_device),
+                // « Défaut système » choisi : suit le défaut du système.
+                (None, None) => crate::audio::device::default_output_device().map(|(d, _)| d),
             };
             match dev {
                 None => OutputOpen::BuildFailed(
@@ -2977,7 +2983,11 @@ impl PipelineState {
         let mut fell_back_from = None;
         if matches!(opened, OutputOpen::NotFound) {
             if let Some(requested) = self.output_device_id.clone() {
-                opened = open(None, self);
+                // Repli sur la sortie par défaut ouverte par son id (elle ne suit
+                // pas le système, cf. `device::default_output_id`).
+                if let Some(fallback) = crate::audio::com_exec::run(crate::audio::device::default_output_id) {
+                    opened = open(Some(fallback), self);
+                }
                 fell_back_from = Some(requested);
             }
         }

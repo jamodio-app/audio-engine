@@ -31,7 +31,8 @@ pub enum DeviceEvent {
 #[derive(Debug, Default)]
 pub struct DeviceLoss {
     input: Option<String>,
-    output: Option<String>,
+    /// Sortie choisie perdue, et la sortie de repli par laquelle passe le son.
+    output: Option<(String, String)>,
     pending: Vec<DeviceEvent>,
 }
 
@@ -56,11 +57,13 @@ impl DeviceLoss {
     }
 
     /// La sortie choisie `device` est introuvable ; le son passe par `fallback`.
+    /// Réémis si le repli change (la sortie de repli a disparu à son tour) : le
+    /// message « le son passe par X » doit rester vrai.
     pub fn output_fell_back(&mut self, device: &str, fallback: &str) {
-        if self.output.as_deref() == Some(device) {
+        if self.output.as_ref().is_some_and(|(d, f)| d == device && f == fallback) {
             return;
         }
-        self.output = Some(device.to_string());
+        self.output = Some((device.to_string(), fallback.to_string()));
         self.pending.push(DeviceEvent::OutputLost {
             device: device.to_string(),
             fallback: fallback.to_string(),
@@ -69,7 +72,7 @@ impl DeviceLoss {
 
     /// La sortie choisie est rouverte : si elle était perdue, elle est revenue.
     pub fn output_back(&mut self) {
-        if let Some(device) = self.output.take() {
+        if let Some((device, _)) = self.output.take() {
             self.pending.push(DeviceEvent::OutputRestored { device });
         }
     }
@@ -93,7 +96,7 @@ impl DeviceLoss {
     }
 
     pub fn lost_output(&self) -> Option<&str> {
-        self.output.as_deref()
+        self.output.as_ref().map(|(d, _)| d.as_str())
     }
 
     /// Événements à relayer, dans l'ordre (vidés).
@@ -172,6 +175,27 @@ mod tests {
         assert!(
             loss.take_events().is_empty(),
             "rien à dire d'une perte oubliée"
+        );
+    }
+
+    #[test]
+    fn a_new_fallback_is_announced_again() {
+        let mut loss = DeviceLoss::default();
+        loss.output_fell_back("2:Écouteurs externes", "Haut-parleurs MacBook Pro");
+        loss.output_fell_back("2:Écouteurs externes", "BlackHole 2ch");
+        assert_eq!(loss.lost_output(), Some("2:Écouteurs externes"));
+        assert_eq!(
+            loss.take_events(),
+            vec![
+                DeviceEvent::OutputLost {
+                    device: "2:Écouteurs externes".into(),
+                    fallback: "Haut-parleurs MacBook Pro".into(),
+                },
+                DeviceEvent::OutputLost {
+                    device: "2:Écouteurs externes".into(),
+                    fallback: "BlackHole 2ch".into(),
+                },
+            ]
         );
     }
 }

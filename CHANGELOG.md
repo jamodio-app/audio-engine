@@ -5,6 +5,24 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.4-2] — 2026-09-17
+
+Pré-release. **Plus de faux « débranché » quand on branche ou débranche un autre périphérique.**
+
+### Corrigé
+
+- **Brancher ou débrancher un périphérique faisait croire à la perte d'un autre,
+  toujours branché** (Mac, Windows ASIO et WASAPI, micro du talkback). Le système
+  renumérote ses périphériques à chaque branchement, et l'Audio Engine rejetait
+  celui du musicien dès que son numéro changeait : faux « entrée débranchée »,
+  faux « sortie débranchée : le son passe par… » la même sortie. Un périphérique
+  est désormais retrouvé par son nom exact s'il est le seul à le porter ; s'il y
+  en a plusieurs du même nom, l'Audio Engine refuse plutôt que de choisir au hasard.
+- **Sortie choisie débranchée : le son reste sur la sortie annoncée.** Sur Mac, le
+  repli suivait la sortie du système : rebrancher un casque y envoyait le son
+  quelques secondes. Le repli se fait maintenant sur un périphérique précis, et si
+  celui-ci disparaît à son tour, le studio annonce le nouveau.
+
 ## [0.6.4-1] — 2026-09-17
 
 Pré-release. **Un périphérique débranché en session ne coupe plus tout, et le studio le dit.**

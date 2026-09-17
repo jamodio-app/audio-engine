@@ -160,21 +160,8 @@ pub fn get_voice_input_device(id: &str) -> Option<cpal::Device> {
         );
         return None;
     }
-    let host = super::host::voice();
-    let dev = host.input_devices().ok()?.nth(idx)?;
-    let actual_name = dev.name().ok()?;
-    if actual_name == expected_name {
-        Some(dev)
-    } else {
-        tracing::warn!(
-            target: "jamodio::devices",
-            kind = "voice-input",
-            requested_id = %id,
-            actual_name = %actual_name,
-            "id voix résolu vers un device de nom différent (hot-plug ?) → refus"
-        );
-        None
-    }
+    let devices: Vec<cpal::Device> = super::host::voice().input_devices().ok()?.collect();
+    resolve_among(devices, "voice-input", id, idx, expected_name, |_| true)
 }
 
 // Énumération ASIO : voir `super::com_exec` pour le « pourquoi » (asio-sys
@@ -452,9 +439,122 @@ pub fn log_devices() {
     }
 }
 
-/// Résolution stricte input : parse l'id, vérifie que le device à cet index
-/// existe et a toujours le même nom. **Pas de fuzzy match. Pas de fallback
-/// sur le device par défaut.** Si quelque chose ne match pas → `None`.
+/// Où se trouve, dans une énumération, le périphérique désigné par `{idx}:{name}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Located {
+    /// À sa position, sous son nom : le cas normal.
+    AtIndex(usize),
+    /// Plus à sa position, mais présent sous le MÊME nom exact, une seule fois : sa
+    /// position a glissé (un autre périphérique a été branché/débranché avant lui).
+    Moved { from: usize, to: usize },
+    /// Aucun périphérique ne porte ce nom : il est absent (débranché).
+    Missing,
+    /// Plusieurs périphériques portent ce nom et aucun n'est à la position
+    /// demandée : impossible de savoir lequel est celui du musicien → refus.
+    Ambiguous(usize),
+}
+
+/// Localise `{idx}:{expected}` dans `names` (noms de l'énumération, dans l'ordre ;
+/// `None` = nom illisible). `eligible(i)` écarte un homonyme qui n'est pas du bon
+/// type (macOS : une entrée seule portant le nom d'une sortie) ; il n'est consulté
+/// QUE pour les homonymes, jamais pour le cas nominal.
+///
+/// # Pourquoi (recette D5, 17/09/2026)
+///
+/// L'index d'un id est la position dans l'énumération du système, et cette position
+/// n'est PAS stable : débrancher un casque jack (CoreAudio), un pilote ASIO dont
+/// l'interface est absente (cpal saute les pilotes qui ne chargent pas), un
+/// périphérique virtuel qui apparaît (WASAPI)… décale tous les suivants. Rejeter sur
+/// la seule position faisait déclarer « perdu » un périphérique toujours branché.
+///
+/// Ce n'est PAS un rapprochement approximatif : le nom doit être IDENTIQUE et
+/// UNIQUE. Deux homonymes hors position (deux interfaces identiques) → refus
+/// explicite, jamais un choix au hasard. Même règle que la page (`resolveAgentDeviceId`).
+fn locate(
+    idx: usize,
+    expected: &str,
+    names: &[Option<String>],
+    eligible: impl Fn(usize) -> bool,
+) -> Located {
+    if names.get(idx).and_then(|n| n.as_deref()) == Some(expected) {
+        return Located::AtIndex(idx);
+    }
+    match unique_by_name(expected, names, eligible) {
+        Ok(to) => Located::Moved { from: idx, to },
+        Err(0) => Located::Missing,
+        Err(count) => Located::Ambiguous(count),
+    }
+}
+
+/// Position de l'unique périphérique nommé exactement `expected` (homonymes
+/// départagés par `eligible`), ou `Err(nombre de candidats)` : 0 = absent, ≥ 2 = ambigu.
+fn unique_by_name(
+    expected: &str,
+    names: &[Option<String>],
+    eligible: impl Fn(usize) -> bool,
+) -> Result<usize, usize> {
+    let same_name: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.as_deref() == Some(expected))
+        .map(|(i, _)| i)
+        .collect();
+    let candidates: Vec<usize> = if same_name.len() > 1 {
+        same_name.into_iter().filter(|&i| eligible(i)).collect()
+    } else {
+        same_name
+    };
+    match candidates.as_slice() {
+        [one] => Ok(*one),
+        many => Err(many.len()),
+    }
+}
+
+/// Résout `id` parmi `devices` selon [`locate`], journalise tout écart au cas
+/// nominal et renvoie le périphérique, ou `None` (absent / ambigu).
+fn resolve_among(
+    devices: Vec<cpal::Device>,
+    kind: &'static str,
+    id: &str,
+    idx: usize,
+    expected: &str,
+    eligible: impl Fn(&cpal::Device) -> bool,
+) -> Option<cpal::Device> {
+    let names: Vec<Option<String>> = devices.iter().map(|d| d.name().ok()).collect();
+    let at = match locate(idx, expected, &names, |i| eligible(&devices[i])) {
+        Located::AtIndex(i) => i,
+        Located::Moved { from, to } => {
+            tracing::info!(
+                target: "jamodio::devices",
+                kind,
+                requested_id = %id,
+                from,
+                to,
+                "position du périphérique décalée (branchement/débranchement d'un autre) → retrouvé par son nom exact"
+            );
+            to
+        }
+        Located::Missing => {
+            tracing::info!(target: "jamodio::devices", kind, requested_id = %id, "périphérique absent (aucun périphérique de ce nom)");
+            return None;
+        }
+        Located::Ambiguous(count) => {
+            tracing::warn!(
+                target: "jamodio::devices",
+                kind,
+                requested_id = %id,
+                count,
+                "plusieurs périphériques portent ce nom, aucun à la position demandée → refus (impossible de savoir lequel)"
+            );
+            return None;
+        }
+    };
+    devices.into_iter().nth(at)
+}
+
+/// Résolution stricte input : parse l'id et retrouve le périphérique selon
+/// [`locate`] (position + nom exact ; position glissée → nom exact unique).
+/// **Pas de rapprochement approximatif. Pas de repli sur le défaut.** Sinon `None`.
 ///
 /// Le caller (pipeline / ws_server) doit traiter `None` comme une erreur
 /// utilisateur explicite (CaptureError côté wire).
@@ -462,48 +562,61 @@ pub fn get_input_device(id: &str) -> Option<cpal::Device> {
     let (idx, expected_name) = parse_id(id)?;
     let host = super::host::active();
     let devices: Vec<cpal::Device> = host.input_devices().ok()?.collect();
-    let dev = devices.into_iter().nth(idx)?;
-    let actual_name = dev.name().ok()?;
-    if actual_name == expected_name {
-        Some(dev)
-    } else {
-        tracing::warn!(
-            target: "jamodio::devices",
-            kind = "input",
-            requested_id = %id,
-            actual_name = %actual_name,
-            "id resolved to a device with a different name (hot-plug ?) → reject"
-        );
-        None
-    }
+    resolve_among(devices, "input", id, idx, expected_name, |_| true)
 }
 
-/// Résolution stricte output : même logique que `get_input_device`.
+/// Résolution stricte output : même règle que `get_input_device`.
 pub fn get_output_device(id: &str) -> Option<cpal::Device> {
     let (idx, expected_name) = parse_id(id)?;
     let host = super::host::active();
     // L'index de l'id doit indexer la MÊME énumération que `enumerate_outputs` :
     // macOS = `host.devices()` (tolérant, inclut les sorties ouvrables non
-    // queryables) ; Windows = `host.output_devices()` (inchangé). Sinon l'index
-    // glisse et la résolution stricte par nom rejette (→ repli non-fatal côté
-    // pipeline). La vérification de nom ci-dessous reste le garde strict.
+    // queryables, mais aussi les entrées seules → un homonyme doit prouver qu'il
+    // sort du son) ; Windows = `host.output_devices()` (que des sorties).
+    #[cfg(target_os = "macos")]
+    {
+        let devices: Vec<cpal::Device> = host.devices().ok()?.collect();
+        resolve_among(devices, "output", id, idx, expected_name, |d| {
+            d.default_output_config().is_ok() || probe_output_openable(d)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
+        resolve_among(devices, "output", id, idx, expected_name, |_| true)
+    }
+}
+
+/// Id `{idx}:{name}` de la sortie par défaut du système À CET INSTANT, dans
+/// l'énumération de `get_output_device`. Sert au REPLI quand la sortie choisie a
+/// disparu : on ouvre CE périphérique précis, pas « la sortie par défaut ».
+///
+/// Pourquoi : sur macOS, un flux ouvert sur la sortie par défaut la SUIT (cpal
+/// prend l'unité CoreAudio `DefaultOutput`). Rebrancher un casque y envoyait le son
+/// quelques secondes avant le retour sur la sortie choisie (recette D5), et le
+/// message « le son passe par X » devenait faux. Ouvert par son id, le repli reste
+/// là où on l'a annoncé, sur tous les systèmes. `None` : pas de sortie par défaut,
+/// ou homonymes indépartageables.
+///
+/// Appelable depuis le thread COM (ne repasse pas par `com_exec`).
+pub fn default_output_id() -> Option<String> {
+    let host = super::host::active();
+    let name = host.default_output_device()?.name().ok()?;
     #[cfg(target_os = "macos")]
     let devices: Vec<cpal::Device> = host.devices().ok()?.collect();
     #[cfg(not(target_os = "macos"))]
     let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
-    let dev = devices.into_iter().nth(idx)?;
-    let actual_name = dev.name().ok()?;
-    if actual_name == expected_name {
-        Some(dev)
-    } else {
-        tracing::warn!(
-            target: "jamodio::devices",
-            kind = "output",
-            requested_id = %id,
-            actual_name = %actual_name,
-            "id resolved to a device with a different name (hot-plug ?) → reject"
-        );
-        None
+    let names: Vec<Option<String>> = devices.iter().map(|d| d.name().ok()).collect();
+    #[cfg(target_os = "macos")]
+    let eligible = |i: usize| devices[i].default_output_config().is_ok() || probe_output_openable(&devices[i]);
+    #[cfg(not(target_os = "macos"))]
+    let eligible = |_: usize| true;
+    match unique_by_name(&name, &names, eligible) {
+        Ok(idx) => Some(make_id(idx, &name)),
+        Err(count) => {
+            tracing::warn!(target: "jamodio::devices", default = %name, count, "sortie par défaut introuvable ou homonyme dans l'énumération");
+            None
+        }
     }
 }
 
@@ -609,4 +722,79 @@ mod tests {
         assert!(parse_voice_id("wasapi:2").is_none(), "nom manquant refusé");
         assert!(parse_voice_id("").is_none());
     }
+
+    fn names(list: &[&str]) -> Vec<Option<String>> {
+        list.iter().map(|n| Some((*n).to_string())).collect()
+    }
+
+    #[test]
+    fn locate_nominal_a_sa_position() {
+        let n = names(&["Microphone externe", "Microphone MacBook Pro"]);
+        assert_eq!(locate(1, "Microphone MacBook Pro", &n, |_| true), Located::AtIndex(1));
+    }
+
+    #[test]
+    fn locate_position_glissee_retrouve_par_nom_exact() {
+        // Recette D5 : casque jack débranché → « Microphone externe » disparaît,
+        // le micro intégré passe de 1 à 0 — il est toujours là.
+        let n = names(&["Microphone MacBook Pro", "MJAudioRecorder"]);
+        assert_eq!(
+            locate(1, "Microphone MacBook Pro", &n, |_| true),
+            Located::Moved { from: 1, to: 0 }
+        );
+        // ASIO : un pilote sans interface n'est pas listé, le suivant remonte.
+        let n = names(&["Focusrite USB ASIO"]);
+        assert_eq!(locate(1, "Focusrite USB ASIO", &n, |_| true), Located::Moved { from: 1, to: 0 });
+        // Un périphérique branché avant décale vers le bas.
+        let n = names(&["BlackHole 2ch", "Microsoft Teams Audio", "Haut-parleurs MacBook Pro"]);
+        assert_eq!(
+            locate(1, "Haut-parleurs MacBook Pro", &n, |_| true),
+            Located::Moved { from: 1, to: 2 }
+        );
+    }
+
+    #[test]
+    fn locate_absent() {
+        let n = names(&["Microphone MacBook Pro"]);
+        assert_eq!(locate(0, "Microphone externe", &n, |_| true), Located::Missing);
+        assert_eq!(locate(5, "Microphone externe", &[], |_| true), Located::Missing);
+    }
+
+    #[test]
+    fn locate_jamais_de_nom_approchant() {
+        // Windows renumérote « 2- USB Audio » : ce n'est PAS le même nom → absent.
+        let n = names(&["Haut-parleurs (2- USB Audio CODEC)"]);
+        assert_eq!(locate(0, "Haut-parleurs (USB Audio CODEC)", &n, |_| true), Located::Missing);
+        let n = names(&["scarlett 2i2 usb"]);
+        assert_eq!(locate(0, "Scarlett 2i2 USB", &n, |_| true), Located::Missing, "casse différente = autre nom");
+    }
+
+    #[test]
+    fn locate_homonymes_hors_position_refus() {
+        // Deux interfaces identiques, celle du musicien n'est plus à sa position :
+        // impossible de savoir laquelle → refus, jamais un choix au hasard.
+        let n = names(&["USB Audio CODEC", "Haut-parleurs", "USB Audio CODEC"]);
+        assert_eq!(locate(3, "USB Audio CODEC", &n, |_| true), Located::Ambiguous(2));
+    }
+
+    #[test]
+    fn locate_homonymes_departages_par_le_type() {
+        // macOS : un casque USB expose une entrée seule et une sortie seule du même
+        // nom ; en sortie, seul l'homonyme qui sort du son compte.
+        let n = names(&["USB PnP Sound Device", "USB PnP Sound Device"]);
+        let only_second_outputs = |i: usize| i == 1;
+        assert_eq!(
+            locate(4, "USB PnP Sound Device", &n, only_second_outputs),
+            Located::Moved { from: 4, to: 1 }
+        );
+        // Le cas nominal ne consulte jamais le type.
+        assert_eq!(locate(0, "USB PnP Sound Device", &n, |_| panic!("non consulté")), Located::AtIndex(0));
+    }
+
+    #[test]
+    fn locate_ignore_les_noms_illisibles() {
+        let n = vec![None, Some("Focusrite USB ASIO".to_string())];
+        assert_eq!(locate(0, "Focusrite USB ASIO", &n, |_| true), Located::Moved { from: 0, to: 1 });
+    }
+
 }
