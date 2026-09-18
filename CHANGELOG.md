@@ -5,126 +5,41 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.6.4-7] — 2026-09-17
+## [0.6.4] — 2026-09-18
 
-Pré-release. **Une absence ne se déclare qu'avec une preuve.**
-
-### Corrigé
-
-- **« Non branchée » s'affichait à tort** sur un PC piloté en Bureau à distance :
-  Windows y masque les périphériques audio locaux et n'expose que sa sortie
-  distante, donc aucune interface n'était reconnue. Désormais, tant qu'aucune
-  interface de la liste n'a été reconnue présente sur la machine, l'Audio Engine
-  ne conclut rien et n'affiche aucune mention. Il n'affirme une absence que là où
-  il a prouvé qu'il sait reconnaître une présence.
-- Aucune liste de marques : la règle vaut pour toute interface, connue ou non.
-
-## [0.6.4-6] — 2026-09-17
-
-Pré-release. **Revue de code du 17/09 : quatre correctifs avant la version publique.**
+**La robustesse des périphériques audio.** Tout ce qui se passe quand une interface
+lâche en pleine session — et ce que le studio en dit.
 
 ### Corrigé
 
-- **L'espacement des tentatives ne tenait pas** : une fois l'interface déclarée
-  indisponible, la reconstruction suivante — qui rouvre le pilote à vide — levait
-  l'état dégradé et relançait la cadence rapide. Seul du son réellement délivré
-  lève désormais cet état.
-- **Changer d'interface repart d'une page blanche** : le compteur de
-  reconstructions muettes est remis à zéro au changement d'entrée et hors session.
-  Sans ça, une interface saine héritait du compteur d'une interface muette et
-  pouvait être déclarée indisponible au premier hoquet.
-- **L'énumération du système ne passe plus par le thread COM réservé à ASIO** :
-  la présence du matériel est lue avant d'y entrer, comme la liste des micros.
-- Commentaire de documentation rendu à sa fonction (`lost_input_device`).
+- **Une entrée débranchée ne coupe plus tout le son.** La sortie continue seule :
+  on entend toujours les autres, le studio dit que l'entrée a été débranchée, et la
+  capture repart d'elle-même au rebranchement.
+- **Une sortie débranchée ne bascule plus en silence** : le studio dit par où passe
+  le son, et y revient dès que la sortie choisie est de retour.
+- **Plus de faux « débranché » quand on branche autre chose.** Le système renumérote
+  ses périphériques à chaque branchement ; un périphérique est désormais retrouvé par
+  son nom exact s'il est le seul à le porter, et jamais choisi au hasard s'ils sont
+  plusieurs à s'appeler pareil.
+- **Rebrancher son interface ne fait plus quitter le studio.** Le détecteur de dérive
+  d'horloge mesurait la fréquence sur des périodes de silence et accusait à tort
+  l'interface d'avoir quitté le 48 kHz. Il ne juge plus que du son continu.
+- **Une interface qui s'ouvre mais ne délivre plus aucun son est enfin détectée.**
+  Au lieu de reconstruire ses flux indéfiniment — jusqu'à ignorer les commandes du
+  studio —, l'Audio Engine la déclare indisponible, espace ses tentatives et reste
+  répondant : on peut changer d'interface immédiatement.
+- **La liste des entrées dit ce qui est branché.** Une interface absente est affichée
+  « non branchée » et ne peut plus être choisie par erreur ; son nom reste visible.
+  L'Audio Engine n'affirme une absence que là où il sait reconnaître une présence.
+- **« Entrée rétablie » ne s'affiche plus à tort** : seul du son réellement délivré
+  vaut rétablissement.
+- Le nom de la sortie affiché par le studio suit la sortie réellement ouverte.
 
-## [0.6.4-5] — 2026-09-17
+### Interne
 
-Pré-release. **Une interface débranchée ne se fait plus passer pour disponible.**
-
-### Corrigé
-
-- **La liste des entrées proposait une interface débranchée** : un pilote ASIO
-  reste installé quand son interface part, donc il restait listé, et le choisir ne
-  donnait rien. Chaque périphérique dit maintenant s'il est branché — vérité prise
-  au SYSTÈME (Windows : WASAPI), jamais au pilote. Le studio l'affiche
-  « non branchée » et empêche de le choisir, sans jamais faire disparaître le nom.
-- **Même pendant une session** : la liste est servie depuis le cache (le pilote
-  mono-client ne doit pas être rechargé), mais le branchement, lui, est relu.
-- macOS inchangé : CoreAudio retire déjà les périphériques débranchés.
-
-## [0.6.4-4] — 2026-09-17
-
-Pré-release. **Une interface qui revient ne coupe plus la session, et une interface muette est enfin annoncée.**
-
-### Corrigé
-
-- **Rebrancher son interface coupait la session** avec « ton interface a quitté le
-  48 kHz », alors qu'elle était bien à 48 kHz. Le détecteur de dérive d'horloge
-  mesurait la fréquence sur une fenêtre traversée par la coupure — donc sur du
-  silence (54 Hz, puis 3343 Hz) — et la règle « jamais d'audio dégradé » arrêtait
-  la capture. Le détecteur ne juge plus que des fenêtres où le son a été délivré
-  sans discontinuité.
-- **Une interface qui s'ouvre mais reste muette n'était jamais signalée** : l'Audio
-  Engine reconstruisait ses flux toutes les 2 s sans fin (24 fois d'affilée dans la
-  recette du 17/09), saturait son propre verrou et ignorait les commandes du studio
-  — impossible d'en changer. Au bout de trois reconstructions sans un seul son,
-  l'interface est déclarée indisponible : le studio le dit, les tentatives
-  s'espacent, et l'Audio Engine reste répondant.
-- **« Entrée rétablie » n'est plus annoncée sur une simple réouverture de pilote** :
-  seul du son réellement délivré vaut rétablissement.
-
-## [0.6.4-3] — 2026-09-17
-
-Pré-release de DIAGNOSTIC. **Aucun comportement changé** : uniquement de quoi
-trancher, dans le journal, une panne qu'on ne savait pas nommer.
-
-### Diagnostic
-
-- **Interface débranchée en session (recette PC du 17/09)** : le pilote ASIO d'une
-  interface débranchée reste chargeable — il s'ouvre, annonce ses latences, et ne
-  délivre plus un seul callback. L'Audio Engine croyait donc avoir réussi sa
-  reconstruction et recommençait toutes les 2 s, sans fin, sans rien dire, en
-  saturant son propre verrou (commandes du studio ignorées).
-- Le journal compte désormais les **reconstructions consécutives restées muettes**,
-  et dit ce que le SYSTÈME pense du matériel (Windows : liste WASAPI, qui suit le
-  branchement USB réel) : matériel absent, ou matériel présent mais pilote muet.
-- Au démarrage, la liste des points audio vus par le système est journalisée.
-
-## [0.6.4-2] — 2026-09-17
-
-Pré-release. **Plus de faux « débranché » quand on branche ou débranche un autre périphérique.**
-
-### Corrigé
-
-- **Brancher ou débrancher un périphérique faisait croire à la perte d'un autre,
-  toujours branché** (Mac, Windows ASIO et WASAPI, micro du talkback). Le système
-  renumérote ses périphériques à chaque branchement, et l'Audio Engine rejetait
-  celui du musicien dès que son numéro changeait : faux « entrée débranchée »,
-  faux « sortie débranchée : le son passe par… » la même sortie. Un périphérique
-  est désormais retrouvé par son nom exact s'il est le seul à le porter ; s'il y
-  en a plusieurs du même nom, l'Audio Engine refuse plutôt que de choisir au hasard.
-- **Sortie choisie débranchée : le son reste sur la sortie annoncée.** Sur Mac, le
-  repli suivait la sortie du système : rebrancher un casque y envoyait le son
-  quelques secondes. Le repli se fait maintenant sur un périphérique précis, et si
-  celui-ci disparaît à son tour, le studio annonce le nouveau.
-
-## [0.6.4-1] — 2026-09-17
-
-Pré-release. **Un périphérique débranché en session ne coupe plus tout, et le studio le dit.**
-
-### Corrigé
-
-- **Débrancher le casque qui servait d'entrée coupait tout le son**, y compris
-  celui des autres musiciens, sans le moindre message. La sortie continue
-  désormais seule : on entend toujours les autres, le studio prévient que
-  l'entrée a été débranchée, et la capture repart d'elle-même quand elle revient.
-- **Une sortie choisie débranchée en session basculait sur la sortie du système
-  sans le dire.** Le studio l'indique, et le son revient sur la sortie choisie dès
-  qu'elle est rebranchée.
-- **Le nom de la sortie affiché par le studio pouvait rester figé** après un
-  changement de sortie : l'Audio Engine publie la sortie réellement ouverte.
-- Journal : libellés neutres pour la reconstruction des flux audio (plus de
-  « reset ASIO » sur Mac).
+- Journal : présence du matériel vue par le système, reconstructions restées muettes,
+  libellés neutres (plus de « reset ASIO » sur Mac).
+- Publication : une plateforme à la fois (les envois simultanés se marchaient dessus).
 
 ## [0.6.3] — 2026-09-16
 
