@@ -28,6 +28,10 @@ pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
+    /// Mesure, une fois au démarrage de la capture et sur un thread à part, le
+    /// retard réel d'un réveil à 2,5 ms — ce sur quoi le masquage anticipé
+    /// reposera (cf. `audio::wake_probe`). Ne touche à aucun étage audio.
+    pub wake_probe: bool,
 }
 
 impl BenchFlags {
@@ -64,6 +68,7 @@ impl BenchFlags {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
+                "wake-probe" => flags.wake_probe = on,
                 other => tracing::warn!(
                     target: "jamodio::bench",
                     flag = other,
@@ -97,6 +102,9 @@ impl BenchFlags {
         let mut active = Vec::new();
         if self.no_rtcp {
             active.push("no-rtcp");
+        }
+        if self.wake_probe {
+            active.push("wake-probe");
         }
         active
     }
@@ -139,6 +147,22 @@ mod tests {
     fn zero_espaces_et_casse_sont_tolerés() {
         assert!(BenchFlags::parse("  NO-RTCP=1  ").no_rtcp);
         assert!(!BenchFlags::parse("no-rtcp = 0").no_rtcp);
+    }
+
+    #[test]
+    fn la_sonde_de_reveil_sannonce_comme_les_autres() {
+        let flags = BenchFlags::parse("wake-probe = 1\n");
+        assert!(flags.wake_probe);
+        assert!(!flags.no_rtcp);
+        assert_eq!(flags.active(), vec!["wake-probe"]);
+    }
+
+    #[test]
+    fn plusieurs_interrupteurs_sont_tous_annonces() {
+        // Le journal doit nommer TOUT ce qui est détourné, sinon une mesure de
+        // banc reste interprétable de travers.
+        let flags = BenchFlags::parse("no-rtcp = 1\nwake-probe = 1\n");
+        assert_eq!(flags.active(), vec!["no-rtcp", "wake-probe"]);
     }
 
     /// Une faute de frappe ne doit jamais activer un réglage ni en cacher un.

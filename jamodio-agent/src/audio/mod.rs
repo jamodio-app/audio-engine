@@ -24,3 +24,6 @@ pub mod midi;
 /// 0.5.4-18 — écoute des réveils de veille Windows → re-init ASIO (no-op ailleurs).
 pub mod power_events;
 pub mod rt_priority;
+// 1.2a du chantier tampon — mesure la précision du réveil AVANT de choisir
+// comment le masquage attendra son échéance. Sous interrupteur de banc.
+pub mod wake_probe;

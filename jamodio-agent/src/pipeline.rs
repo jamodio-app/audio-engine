@@ -2434,6 +2434,11 @@ impl PipelineState {
         // perdues sans que rien ne le dise (14/09).
         let bench = crate::bench_flags::BenchFlags::load();
         bench.log();
+        // 1.2a — sonde de réveil : sur son propre thread, ~2 s, uniquement sous
+        // interrupteur. Elle ne traverse aucun étage audio ; elle dit seulement
+        // avec quel retard l'OS tient une échéance de 2,5 ms, ce dont dépend
+        // l'implémentation du masquage anticipé.
+        crate::audio::wake_probe::run_if_enabled(bench.wake_probe);
         // Lot V — tant qu'on joue, l'ordinateur ne s'endort pas : une veille en
         // pleine session est une panne audio (pilote ASIO dégradé au réveil).
         self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
