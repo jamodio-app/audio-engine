@@ -5162,6 +5162,9 @@ async fn recv_io_task(
     silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut silence_logged = false;
     let mut got_first = false;
+    // N13 — erreurs de réception qui S'ENCHAÎNENT (remis à zéro dès qu'un paquet
+    // passe). Une erreur isolée ne dit rien (cf. `recv_error_backoff`).
+    let mut consecutive_recv_errors: u32 = 0;
 
     // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
     let mut buf: Vec<u8> = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
@@ -5191,6 +5194,7 @@ async fn recv_io_task(
                             silence_logged = false;
                         }
                         activity.mark_packet(recv_instant);
+                        consecutive_recv_errors = 0;
                         // 1er paquet valide : comedia activé → on stoppe les punches.
                         if !got_first {
                             got_first = true;
@@ -5217,8 +5221,23 @@ async fn recv_io_task(
                     Ok(_) => {}
                     Err(e) => {
                         activity.mark_recv_error();
-                        tracing::warn!(target: "jamodio::recv", producer = %producer_id, error = %e, "UDP recv error");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                        // Une erreur isolée est journalisée (elle reste un fait) ;
+                        // une rafale ne l'est plus qu'au début, sinon le journal
+                        // devient illisible au moment précis où on le lit.
+                        if consecutive_recv_errors <= 3 {
+                            tracing::warn!(
+                                target: "jamodio::recv",
+                                producer = %producer_id,
+                                error = %e,
+                                consecutive = consecutive_recv_errors,
+                                "erreur de réception UDP"
+                            );
+                        }
+                        let wait = crate::recv_activity::recv_error_backoff(consecutive_recv_errors);
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
+                        }
                     }
                 }
             }
