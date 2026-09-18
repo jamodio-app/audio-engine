@@ -5,6 +5,8 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod audio;
+mod bench_flags;
+mod keep_awake;
 mod logging;
 #[cfg(target_os = "macos")]
 mod cf_string;

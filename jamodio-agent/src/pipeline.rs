@@ -682,6 +682,10 @@ pub struct CaptureStartedInfo {
 
 /// Holds all active pipeline components. Shared between WS handler and audio threads.
 pub struct PipelineState {
+    /// Lot V — demande « pas de veille » tenue pendant toute la session : prise
+    /// au démarrage de la capture, relâchée à son démontage. Portée par un objet
+    /// pour qu'aucun chemin de sortie (erreur, fermeture) ne la laisse en place.
+    keep_awake: Option<crate::keep_awake::KeepAwake>,
     pub mixer: Arc<AudioMixer>,
     /// CPAL streams must be kept alive — dropping them stops audio.
     ///
@@ -1311,6 +1315,7 @@ const CHANNELS: usize = 2;
 impl PipelineState {
     pub fn new(mixer: Arc<AudioMixer>) -> Self {
         Self {
+            keep_awake: None,
             mixer,
             capture_stream: None,
             playback_stream: None,
@@ -1861,6 +1866,8 @@ impl PipelineState {
         }
         // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
         self.uplink = None;
+        // Lot V — la session est finie : la machine peut se rendormir.
+        self.keep_awake = None;
         // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
         // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
         // le thread `voice_encode` termine en cascade (Disconnected). On lâche
@@ -2419,14 +2426,23 @@ impl PipelineState {
 
         // Voie B — rapports RTCP du flux instrument (pertes, gigue et aller-retour
         // UDP vus par le SFU), dans une tâche tokio hors du thread audio.
-        // Interrupteur de DIAGNOSTIC du banc (PROTOCOLE-BANC-LATENCE §8) :
-        // `JAMODIO_DIAG_NO_RTCP=1` coupe la tâche pour comparer, avec le même
-        // binaire et dans les mêmes conditions, l'envoi du son avec et sans RTCP.
-        // Jamais silencieux : chaque démarrage de capture le journalise.
-        self.uplink = if std::env::var("JAMODIO_DIAG_NO_RTCP").is_ok_and(|v| v == "1") {
+        // Interrupteur de DIAGNOSTIC du banc (PROTOCOLE-BANC-LATENCE §8) : le
+        // fichier `bench-flags`, à côté des journaux, coupe la tâche pour
+        // comparer avec le même binaire l'envoi du son avec et sans RTCP. Une
+        // variable d'environnement ne convenait pas : relancé depuis le studio,
+        // l'Audio Engine n'en héritait pas, et quatre sessions de banc ont été
+        // perdues sans que rien ne le dise (14/09).
+        let bench = crate::bench_flags::BenchFlags::load();
+        bench.log();
+        // Lot V — tant qu'on joue, l'ordinateur ne s'endort pas : une veille en
+        // pleine session est une panne audio (pilote ASIO dégradé au réveil).
+        self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
+            "Jamodio — session en cours",
+        ));
+        self.uplink = if bench.no_rtcp {
             tracing::warn!(
                 target: "jamodio::uplink",
-                "RTCP coupé pour diagnostic (JAMODIO_DIAG_NO_RTCP=1) : aucun rapport envoyé ni lu"
+                "RTCP coupé pour diagnostic (interrupteur de banc no-rtcp) : aucun rapport envoyé ni lu"
             );
             None
         } else {
