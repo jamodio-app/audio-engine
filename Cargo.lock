@@ -2644,6 +2644,7 @@ dependencies = [
  "tract-onnx",
  "tract-pulse",
  "webrtc-srtp",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

@@ -2184,6 +2184,14 @@ async fn audio_liveness_supervisor(
     let mut prev_out = 0u64;
     let mut last_progress = Instant::now();
     let mut last_reset_seen = reset_signal.request_count();
+    // Lot ASIO (chantier tampon) — le pilote qui demande un reset est un FAIT que
+    // le journal ne disait pas : le callback de messages ne peut rien écrire (thread
+    // du driver, potentiellement temps-réel — il se contente de compter et de
+    // notifier, cf. `audio::asio_reset`), et le superviseur n'en gardait aucune
+    // trace. Après coup, impossible de savoir si le pilote avait crié pendant un
+    // épisode. On journalise donc ICI, hors thread temps-réel, une fois par
+    // demande.
+    let mut last_reset_logged = last_reset_seen;
     let mut degraded = false;
     // Lot 0 (chantier robustesse ASIO, 17/09/2026) — nombre de reconstructions
     // consécutives qui N'ONT PAS ramené les callbacks. Un pilote ASIO débranché
@@ -2580,6 +2588,14 @@ async fn audio_liveness_supervisor(
         // Un kAsioResetRequest est-il arrivé depuis la dernière observation ?
         let reqs = reset_signal.request_count();
         let reset_requested = reqs != last_reset_seen;
+        if reqs != last_reset_logged {
+            tracing::warn!(
+                target: "jamodio::audio",
+                requests_total = reqs,
+                "le pilote ASIO a demandé un reset (kAsioResetRequest)"
+            );
+            last_reset_logged = reqs;
+        }
 
         // Session saine = la capture avance ET (la sortie avance OU il n'y a PAS de
         // sortie par design). Sans ce `|| !has_output`, une machine dont le playback
