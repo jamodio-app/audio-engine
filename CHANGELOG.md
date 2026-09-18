@@ -5,6 +5,32 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-1] — 2026-09-18 (pré-version de test)
+
+**Mesurer le tampon de réception avant d'y toucher.** Rien ne change au son : cette
+pré-version sert au banc du chantier « meilleure plateforme ».
+
+### Ajouté
+
+- **Ce que le tampon de réception fait vraiment**, par flux reçu : son remplissage
+  réel juste avant chaque arrivée (minimum et médiane), de quoi sa cible est faite
+  (gigue, plancher de glitch, filet réactif), la durée de silence qu'il a rendue,
+  l'audio jeté faute de place, les doublons, les sauts de numérotation, les paquets
+  non décodables et les erreurs de la socket réseau. Le journal les porte : le
+  rapport de bug les ramène du banc.
+- **Un interrupteur de banc par fichier** (`bench-flags`, à côté des journaux), lu à
+  chaque démarrage de capture et toujours journalisé — on sait enfin, sans le
+  supposer, quel réglage tournait pendant une mesure.
+- **Pas de veille pendant une session** : tant qu'une capture tourne, l'ordinateur ne
+  s'endort plus de lui-même (macOS et Windows), et la demande est relâchée à la
+  sortie du studio.
+
+### Modifié
+
+- La coupure RTCP de diagnostic passe par le fichier d'interrupteurs ; la variable
+  d'environnement `JAMODIO_DIAG_NO_RTCP` n'existe plus (relancé depuis le studio,
+  l'Audio Engine n'en héritait pas — quatre sessions de banc perdues le 14/09).
+
 ## [0.6.4] — 2026-09-18
 
 **La robustesse des périphériques audio.** Tout ce qui se passe quand une interface
