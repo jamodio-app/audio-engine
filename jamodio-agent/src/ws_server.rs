@@ -2192,6 +2192,9 @@ async fn audio_liveness_supervisor(
     // épisode. On journalise donc ICI, hors thread temps-réel, une fois par
     // demande.
     let mut last_reset_logged = last_reset_seen;
+    // Idem pour les signaux qui ne déclenchent AUCUNE action : on ne journalise
+    // que sur changement, donc une session saine n'ajoute pas une ligne.
+    let mut last_notices = crate::audio::asio_reset::driver_notices();
     let mut degraded = false;
     // Lot 0 (chantier robustesse ASIO, 17/09/2026) — nombre de reconstructions
     // consécutives qui N'ONT PAS ramené les callbacks. Un pilote ASIO débranché
@@ -2595,6 +2598,21 @@ async fn audio_liveness_supervisor(
                 "le pilote ASIO a demandé un reset (kAsioResetRequest)"
             );
             last_reset_logged = reqs;
+        }
+        {
+            let notices = crate::audio::asio_reset::driver_notices();
+            if notices != last_notices && !notices.is_quiet() {
+                tracing::warn!(
+                    target: "jamodio::audio",
+                    resync = notices.resync,
+                    latencies_changed = notices.latencies_changed,
+                    overload = notices.overload,
+                    sample_rate_changes = notices.sample_rate_changes,
+                    last_reported_rate_hz = notices.last_reported_rate_hz,
+                    "le pilote ASIO signale un incident (cumuls depuis le démarrage)"
+                );
+                last_notices = notices;
+            }
         }
 
         // Session saine = la capture avance ET (la sortie avance OU il n'y a PAS de

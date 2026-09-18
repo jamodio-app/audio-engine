@@ -503,6 +503,11 @@ impl AsioDuplexHost {
             driver.add_message_callback(move |sel| {
                 if matches!(sel, sys::AsioMessageSelectors::kAsioResetRequest) {
                     signal.signal();
+                } else {
+                    // Les autres messages ne déclenchent aucune action : ils sont
+                    // COMPTÉS (un atomique, sur le thread du pilote) et journalisés
+                    // à 1 Hz par le superviseur. Cf. `audio::asio_reset`.
+                    crate::audio::asio_reset::note_driver_message(sel);
                 }
             })
         };

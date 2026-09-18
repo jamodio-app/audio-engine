@@ -37,6 +37,78 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Les AUTRES signaux du pilote — ceux qu'on ne voyait pas
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `kAsioResetRequest` n'est pas la seule chose qu'un pilote sait dire. Il peut
+// aussi annoncer qu'il a PERDU des données (`kAsioResyncRequest`), que ses
+// latences ont changé, qu'il a décroché, ou que le sample rate a bougé. Le crate
+// `asio-sys` publié interceptait les trois premiers sans les transmettre et
+// envoyait le quatrième dans un `eprintln!` vers une sortie que personne ne lit :
+// après deux épisodes de son dégradé (18/09/2026), impossible de savoir si le
+// Focusrite avait crié. Notre copie patchée (`vendor/asio-sys`) les transmet.
+//
+// Comptés ici, en atomiques : le callback tourne sur le thread du pilote, il ne
+// fait donc QUE compter. La lecture et la journalisation sont à 1 Hz, dans le
+// superviseur de liveness, hors temps-réel. Aucune décision ne s'y appuie : ce
+// sont des FAITS pour le rapport de bug, pas un verdict.
+static DRIVER_RESYNC: AtomicU64 = AtomicU64::new(0);
+static DRIVER_LATENCIES_CHANGED: AtomicU64 = AtomicU64::new(0);
+static DRIVER_OVERLOAD: AtomicU64 = AtomicU64::new(0);
+
+/// Ce que le(s) pilote(s) ASIO ont signalé depuis le démarrage de l'agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverNotices {
+    /// « J'ai perdu des données » — le signal le plus intéressant pour un son sale.
+    pub resync: u64,
+    /// Les latences déclarées à l'ouverture ne sont plus les bonnes.
+    pub latencies_changed: u64,
+    /// Le pilote dit qu'il a décroché.
+    pub overload: u64,
+    /// Changements de sample rate annoncés, et dernier rate annoncé (Hz).
+    pub sample_rate_changes: u64,
+    pub last_reported_rate_hz: u32,
+}
+
+impl DriverNotices {
+    /// `true` si le pilote n'a jamais rien signalé — le cas nominal, pour lequel
+    /// le superviseur n'écrit aucune ligne.
+    pub fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Enregistre un message du pilote. Appelée depuis le thread du pilote : un
+/// incrément atomique, rien d'autre. `kAsioResetRequest` n'est PAS compté ici —
+/// il a son propre chemin (`ResetSignal`), qui déclenche une action.
+#[cfg(windows)]
+pub fn note_driver_message(selector: asio_sys::AsioMessageSelectors) {
+    use asio_sys::AsioMessageSelectors as Sel;
+    let counter = match selector {
+        Sel::kAsioResyncRequest => &DRIVER_RESYNC,
+        Sel::kAsioLatenciesChanged => &DRIVER_LATENCIES_CHANGED,
+        Sel::kAsioOverload => &DRIVER_OVERLOAD,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Instantané cumulé, pour le superviseur.
+pub fn driver_notices() -> DriverNotices {
+    #[cfg(windows)]
+    let (sample_rate_changes, last_reported_rate_hz) = asio_sys::sample_rate_change_report();
+    #[cfg(not(windows))]
+    let (sample_rate_changes, last_reported_rate_hz) = (0u64, 0u32);
+    DriverNotices {
+        resync: DRIVER_RESYNC.load(Ordering::Relaxed),
+        latencies_changed: DRIVER_LATENCIES_CHANGED.load(Ordering::Relaxed),
+        overload: DRIVER_OVERLOAD.load(Ordering::Relaxed),
+        sample_rate_changes,
+        last_reported_rate_hz,
+    }
+}
+
 /// Canal de signalisation entre le callback de message ASIO (thread du driver)
 /// et le superviseur de liveness. Clonable : une extrémité dans le callback,
 /// l'autre dans le superviseur.
@@ -136,6 +208,8 @@ pub fn register(device: &cpal::Device, signal: &ResetSignal) -> ResetCallbackGua
             if matches!(selector, asio_sys::AsioMessageSelectors::kAsioResetRequest) {
                 requests.fetch_add(1, Ordering::Relaxed);
                 notify.notify_one();
+            } else {
+                note_driver_message(selector);
             }
         });
         tracing::info!(
@@ -158,4 +232,50 @@ pub fn register(device: &cpal::Device, signal: &ResetSignal) -> ResetCallbackGua
 #[cfg(not(windows))]
 pub fn register(_device: &cpal::Device, _signal: &ResetSignal) -> ResetCallbackGuard {
     ResetCallbackGuard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn un_pilote_qui_na_rien_signale_reste_silencieux() {
+        // Le superviseur ne doit écrire AUCUNE ligne tant que le pilote n'a rien
+        // dit : c'est ce que garantit `is_quiet` — une session saine ne remplit
+        // pas le journal, et chaque ligne présente désigne un vrai incident.
+        assert!(DriverNotices::default().is_quiet());
+    }
+
+    #[test]
+    fn un_seul_signal_suffit_a_rompre_le_silence() {
+        for notices in [
+            DriverNotices {
+                resync: 1,
+                ..Default::default()
+            },
+            DriverNotices {
+                latencies_changed: 1,
+                ..Default::default()
+            },
+            DriverNotices {
+                overload: 1,
+                ..Default::default()
+            },
+            DriverNotices {
+                sample_rate_changes: 1,
+                last_reported_rate_hz: 44_100,
+                ..Default::default()
+            },
+        ] {
+            assert!(!notices.is_quiet(), "{notices:?} devrait être journalisé");
+        }
+    }
+
+    #[test]
+    fn hors_windows_aucun_signal_nest_inventé() {
+        // Pas d'ASIO hors Windows : l'instantané doit rester vide, jamais une
+        // valeur par défaut qui ressemblerait à une mesure.
+        #[cfg(not(windows))]
+        assert!(driver_notices().is_quiet());
+    }
 }

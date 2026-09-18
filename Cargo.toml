@@ -6,6 +6,10 @@ members = [
   "jamodio-au-host",
   "jamodio-vst3-host",
 ]
+# La copie patchée d'`asio-sys` (cf. `[patch.crates-io]` en fin de fichier) vit
+# dans l'arborescence mais n'est PAS un membre : elle n'est ni testée ni lintée
+# comme notre code, et `cargo test --workspace` ne doit pas la traverser.
+exclude = ["vendor/asio-sys"]
 
 # ── Isolation de voix (Lot 2) : les crates `tract` exécutent des passes de
 # génération de code coûteuses qui PANIQUENT sous le profil dev (opt-level 0 +
@@ -49,3 +53,19 @@ overflow-checks = false
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
+
+# ── Copie patchée d'`asio-sys` (Windows) ────────────────────────────────────
+# Un pilote ASIO a plusieurs façons de dire qu'il va mal ; le crate publié n'en
+# transmet qu'UNE (`kAsioResetRequest`) et jette les autres, dont
+# `kAsioResyncRequest` — « j'ai perdu des données ». Après deux épisodes de son
+# dégradé sur un Focusrite (18/09/2026), il était impossible de savoir APRÈS COUP
+# si le pilote avait signalé quoi que ce soit : par construction, pas par manque
+# de chance. La copie locale transmet ces messages ; elle ne change AUCUNE réponse
+# rendue au pilote. Diff complet et raisons : en-tête de
+# `vendor/asio-sys/src/bindings/mod.rs` (14 lignes retirées à l'amont).
+#
+# Redirection par CHEMIN (pas de dépôt git de plus) : elle s'applique à tout le
+# graphe, donc cpal utilise la même copie — c'est exactement ce qu'on veut, ses
+# callbacks ASIO et les nôtres partagent le même registre.
+[patch.crates-io]
+asio-sys = { path = "vendor/asio-sys" }
