@@ -1183,7 +1183,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let recv_streams: Vec<RecvStreamPerf> = pl
                 .recv_stream_states()
                 .into_iter()
-                .map(|st| RecvStreamPerf { producer_id: st.producer_id, kind: st.kind, silent_ms: st.silent_ms })
+                .map(|st| RecvStreamPerf {
+                    producer_id: st.producer_id,
+                    kind: st.kind,
+                    silent_ms: st.silent_ms,
+                    recv_errors: st.recv_errors,
+                })
                 .collect();
 
             // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
@@ -1454,26 +1459,41 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // les métriques réseau valent 0.0 (cf. drift.rs / jitter.rs).
             let peers: Vec<PeerPerf> = mixer_stats
                 .into_iter()
-                .map(|(producer_id, underruns, drift_drops, target_ms)| {
-                    let net = net_stats_map.get(&producer_id).copied().unwrap_or_default();
+                .map(|s| {
+                    let net = net_stats_map.get(&s.producer_id).copied().unwrap_or_default();
                     PeerPerf {
-                        producer_id,
+                        producer_id: s.producer_id,
                         drift_ppm: net.drift_ppm,
                         jitter_ms: net.jitter_ms,
                         jitter_tail_ms: net.jitter_tail_ms,
-                        buffer_target_ms: target_ms,
-                        underruns,
-                        drift_drops,
+                        buffer_target_ms: s.target_ms,
+                        underruns: s.underruns,
+                        drift_drops: s.drift_drops,
                         packets_expected: net.packets_expected,
                         packets_lost: net.packets_lost,
                         packets_late: net.packets_late,
                         concealed_frames: net.concealed_frames,
+                        target_jitter_ms: s.target_jitter_ms,
+                        target_glitch_ms: s.target_glitch_ms,
+                        target_reactive_ms: s.target_reactive_ms,
+                        fill_min_ms: s.fill_min_ms,
+                        fill_p50_ms: s.fill_p50_ms,
+                        zero_filled_ms: s.zero_filled_ms,
+                        overflow_ms: s.overflow_ms,
+                        packets_duplicate: net.packets_duplicate,
+                        packets_jump: net.packets_jump,
+                        decode_errors: net.decode_errors,
                     }
                 })
                 .collect();
 
             // Phase A — observabilité : log par peer de la gigue mesurée vs la
             // cible courante du buffer (calibration des Phases B/C). 1 Hz, debug.
+            //
+            // Lot 0 du chantier tampon : la ligne porte aussi DE QUOI la cible est
+            // faite et ce que le tampon a vraiment vécu (remplissage réel, silence
+            // rendu). C'est ce que le rapport de bug ramènera du banc : sans ces
+            // champs, on ne saurait pas quelle part de la cible est reprenable.
             for p in &peers {
                 tracing::debug!(
                     target: "jamodio::netstats",
@@ -1482,7 +1502,18 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     jitter_tail_ms = p.jitter_tail_ms,
                     drift_ppm = p.drift_ppm,
                     buffer_target_ms = p.buffer_target_ms,
+                    target_jitter_ms = p.target_jitter_ms,
+                    target_glitch_ms = p.target_glitch_ms,
+                    target_reactive_ms = p.target_reactive_ms,
+                    fill_min_ms = p.fill_min_ms,
+                    fill_p50_ms = p.fill_p50_ms,
+                    zero_filled_ms = p.zero_filled_ms,
+                    overflow_ms = p.overflow_ms,
                     underruns = p.underruns,
+                    packets_late = p.packets_late,
+                    packets_duplicate = p.packets_duplicate,
+                    packets_jump = p.packets_jump,
+                    decode_errors = p.decode_errors,
                     "peer net stats"
                 );
             }

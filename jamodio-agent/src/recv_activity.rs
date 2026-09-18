@@ -25,6 +25,10 @@ pub struct RecvActivity {
     /// Millisecondes entre `born` et le dernier paquet (0 = aucun paquet encore :
     /// le silence compte alors depuis la création du flux).
     last_packet_ms: AtomicU64,
+    /// Lot 0 (chantier tampon) — erreurs rendues par la socket UDP pour ce flux.
+    /// Chacune coûte aujourd'hui 10 ms d'attente avant la reprise : sans ce
+    /// compteur, on ne sait pas si ce chemin est emprunté en vrai (N13).
+    recv_errors: AtomicU64,
 }
 
 impl RecvActivity {
@@ -32,6 +36,7 @@ impl RecvActivity {
         Self {
             born,
             last_packet_ms: AtomicU64::new(0),
+            recv_errors: AtomicU64::new(0),
         }
     }
 
@@ -39,6 +44,16 @@ impl RecvActivity {
     pub fn mark_packet(&self, at: Instant) {
         let ms = at.saturating_duration_since(self.born).as_millis() as u64;
         self.last_packet_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// La socket a rendu une erreur de réception.
+    pub fn mark_recv_error(&self) {
+        self.recv_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumul des erreurs de réception depuis la création du flux.
+    pub fn recv_errors(&self) -> u64 {
+        self.recv_errors.load(Ordering::Relaxed)
     }
 
     /// Durée sans paquet à l'instant `now`, en ms.

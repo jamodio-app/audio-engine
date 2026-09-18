@@ -34,6 +34,19 @@ pub struct JitterBuffer {
     /// Nombre cumulé de samples les plus anciens jetés côté `push` quand le
     /// ring est plein (burst SFU + drift d'horloge). Reporting via getter.
     overflow_drops: u64,
+    /// Lot 0 (tampon) — cumul des samples de SILENCE rendus par `pull` : la fin
+    /// d'un bloc en sous-alimentation, puis tout le ré-amorçage. C'est la durée
+    /// que l'oreille perd. À ne pas confondre avec le silence RÉSEAU (aucun
+    /// paquet reçu), compté par le pipeline depuis la 0.6.3.
+    zero_filled_samples: u64,
+    /// Lot 0 (tampon) — remplissage relevé juste avant chaque `push`, en samples
+    /// interleaved. Anneau de taille fixe (zéro allocation), lu par la
+    /// télémétrie 1 Hz via `fill_stats()`.
+    fill_obs: [u32; FILL_OBS_LEN],
+    /// Nombre d'observations valides dans `fill_obs` (plafonné à sa taille).
+    fill_obs_len: usize,
+    /// Prochaine case à écrire dans `fill_obs`.
+    fill_obs_next: usize,
     /// Nombre cumulé de samples drainés côté `pull` quand le buffer s'est
     /// rempli durablement bien au-dessus de `target_samples` (drift drain
     /// pré-emptif pour borner la latence post-burst).
@@ -230,6 +243,17 @@ fn ms_f64_to_samples(ms: f64) -> usize {
     (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
 }
 
+/// Convertit un nombre de samples interleaved stéréo en ms.
+fn samples_to_ms_f64(samples: u64) -> f64 {
+    samples as f64 * 1000.0 / (SAMPLE_RATE * CHANNELS) as f64
+}
+
+/// Lot 0 (tampon) — profondeur de la fenêtre d'observation du remplissage :
+/// 512 arrivées ≈ 1,3 s à 400 paquets/s (trame Opus de 2,5 ms).
+/// CONSTANTE DE CALIBRATION : assez longue pour un minimum qui a du sens, assez
+/// courte pour suivre un changement de régime réseau.
+const FILL_OBS_LEN: usize = 512;
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -269,6 +293,10 @@ impl JitterBuffer {
             shrink_accum: 0.0,
             glitch_floor_samples: 0,
             glitch_calm_pulls: 0,
+            zero_filled_samples: 0,
+            fill_obs: [0; FILL_OBS_LEN],
+            fill_obs_len: 0,
+            fill_obs_next: 0,
         }
     }
 
@@ -329,6 +357,12 @@ impl JitterBuffer {
     /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
     /// audiblement moins violent qu'une coupure mid-paquet.
     pub fn push(&mut self, samples: &[f32]) {
+        // Lot 0 (tampon) — mesure prise AVANT d'écrire : c'est le creux réel
+        // laissé par la sortie entre deux arrivées. Le minimum de la fenêtre dit
+        // la marge qui n'a jamais servi (ce que la cible pourrait rendre), la
+        // médiane dit le régime. Vu ici, il porte la gigue du réseau ET
+        // l'irrégularité des callbacks : aucune ligne dans le callback.
+        self.record_fill_observation();
         // Phase C — en régime établi (primed) et pour les streams réseau, on
         // resample le flux entrant en continu pour tenir le remplissage sur la
         // cible (compensation de drift d'horloge sender↔nous). Hors régime
@@ -345,6 +379,15 @@ impl JitterBuffer {
         } else {
             self.push_to_ring(samples);
         }
+    }
+
+    /// Lot 0 — enregistre le remplissage courant dans la fenêtre glissante.
+    /// Zéro allocation : tableau de taille fixe écrit en anneau.
+    fn record_fill_observation(&mut self) {
+        let fill = self.consumer.occupied_len().min(u32::MAX as usize) as u32;
+        self.fill_obs[self.fill_obs_next] = fill;
+        self.fill_obs_next = (self.fill_obs_next + 1) % FILL_OBS_LEN;
+        self.fill_obs_len = (self.fill_obs_len + 1).min(FILL_OBS_LEN);
     }
 
     /// Écrit `data` dans le ring avec politique drop-oldest sur overflow.
@@ -433,6 +476,9 @@ impl JitterBuffer {
                 self.primed = true;
             } else {
                 output.fill(0.0);
+                // Lot 0 — le ré-amorçage est du silence rendu, au même titre que
+                // la fin d'un bloc en sous-alimentation : une addition entière.
+                self.zero_filled_samples += output.len() as u64;
                 return 0;
             }
         }
@@ -485,6 +531,7 @@ impl JitterBuffer {
                 self.conceal_fade_in_remaining = CONCEAL_FADE_SAMPLES;
             }
             output[available..].fill(0.0);
+            self.zero_filled_samples += (output.len() - available) as u64;
             self.underruns += 1;
             self.adapt_up();
             // C1 — un underrun pousse la pression (bornée) : tant qu'elle reste
@@ -610,6 +657,48 @@ impl JitterBuffer {
         self.overflow_drops
     }
 
+    /// Lot 0 — durée cumulée jetée à `push` faute de place (ring plein), en ms.
+    pub fn overflow_ms(&self) -> f64 {
+        samples_to_ms_f64(self.overflow_drops)
+    }
+
+    /// Lot 0 — durée cumulée de SILENCE rendue par `pull` (sous-alimentation et
+    /// ré-amorçage), en ms. Monotone, comme `underruns`.
+    pub fn zero_filled_ms(&self) -> f64 {
+        samples_to_ms_f64(self.zero_filled_samples)
+    }
+
+    /// Lot 0 — remplissage observé aux dernières arrivées : `(minimum, médiane)`
+    /// en ms. `None` tant qu'aucune arrivée n'a été observée.
+    ///
+    /// Le MINIMUM est la mesure qui décide du Lot 2 : c'est la marge que la
+    /// sortie n'a jamais consommée, donc ce que la cible pourrait rendre sans
+    /// créer un seul accroc de plus.
+    pub fn fill_stats(&self) -> Option<(f64, f64)> {
+        if self.fill_obs_len == 0 {
+            return None;
+        }
+        let obs = &self.fill_obs[..self.fill_obs_len];
+        let min = obs.iter().copied().min().unwrap_or(0);
+        let mut sorted: [u32; FILL_OBS_LEN] = [0; FILL_OBS_LEN];
+        sorted[..self.fill_obs_len].copy_from_slice(obs);
+        let median_slice = &mut sorted[..self.fill_obs_len];
+        median_slice.sort_unstable();
+        let median = median_slice[self.fill_obs_len / 2];
+        Some((samples_to_ms_f64(min as u64), samples_to_ms_f64(median as u64)))
+    }
+
+    /// Lot 0 — de quoi la cible est faite : `(plancher de gigue, plancher de
+    /// glitch, filet réactif)` en ms. Leur somme, bornée, donne `target_ms()` :
+    /// sans cette décomposition, on ne sait pas QUI tient le tampon en l'air.
+    pub fn target_parts_ms(&self) -> (f64, f64, f64) {
+        (
+            samples_to_ms_f64(self.floor_samples as u64),
+            samples_to_ms_f64(self.glitch_floor_samples as u64),
+            samples_to_ms_f64(self.reactive_extra_samples as u64),
+        )
+    }
+
     /// Cumul des samples drainés à `pull` quand le buffer dépassait 3× target
     /// (correction de drift / post-burst).
     pub fn drift_drops(&self) -> u64 {
@@ -712,6 +801,97 @@ impl JitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ══ Lot 0 du chantier tampon — les mesures qui décideront du Lot 2 ══
+    //
+    // Elles ne changent rien au son : ces tests vérifient qu'elles disent la
+    // vérité, car tout le chantier s'appuiera dessus.
+
+    /// Le silence RENDU est compté au sample près : d'abord le ré-amorçage
+    /// (aucun audio disponible), puis la fin du bloc en sous-alimentation.
+    #[test]
+    fn zero_filled_ms_counts_every_silent_sample() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        let block = 128; // samples interleaved
+
+        // Rien à jouer : tout le bloc est du silence de ré-amorçage.
+        let mut out = vec![0.0_f32; block];
+        assert_eq!(jb.pull(&mut out), 0);
+        let after_prime = jb.zero_filled_ms();
+        assert!(
+            (after_prime - samples_to_ms_f64(block as u64)).abs() < 1e-9,
+            "ré-amorçage : {after_prime} ms comptées pour {block} samples"
+        );
+
+        // Amorce, puis une sous-alimentation : le tampon rend `available`
+        // samples réels et complète le bloc en silence.
+        let target = 10 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![0.5_f32; target]);
+        let mut full = vec![0.0_f32; target];
+        assert_eq!(jb.pull(&mut full), target, "le bloc amorcé est servi en entier");
+        let before = jb.zero_filled_ms();
+
+        jb.push(&vec![0.5_f32; block / 2]);
+        let mut short = vec![0.0_f32; block];
+        jb.pull(&mut short);
+        let added = jb.zero_filled_ms() - before;
+        assert!(
+            added >= samples_to_ms_f64((block / 2) as u64) - 1e-9,
+            "la part manquante du bloc doit être comptée (ajouté {added} ms)"
+        );
+        assert_eq!(jb.underruns(), 1, "une seule sous-alimentation");
+    }
+
+    /// Le remplissage est relevé AVANT l'écriture : son minimum est la marge
+    /// que la sortie n'a jamais consommée — la mesure qui ouvre (ou ferme) le
+    /// Lot 2. Sans arrivée, il n'y a rien à dire : `None`.
+    #[test]
+    fn fill_stats_report_the_margin_left_before_each_arrival() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        assert!(jb.fill_stats().is_none(), "aucune arrivée : aucune mesure");
+
+        let chunk = 480; // 5 ms
+        jb.push(&vec![0.1_f32; chunk]); // relevé : ring vide
+        let (min, _) = jb.fill_stats().expect("une observation");
+        assert!(min.abs() < 1e-9, "la 1re arrivée voit un tampon vide");
+
+        // Trois arrivées sans aucune sortie : le remplissage monte, le minimum
+        // reste celui du tampon vide.
+        jb.push(&vec![0.1_f32; chunk]);
+        jb.push(&vec![0.1_f32; chunk]);
+        let (min, p50) = jb.fill_stats().expect("des observations");
+        assert!(min.abs() < 1e-9, "le minimum garde le creux le plus bas");
+        assert!(p50 > min, "la médiane suit le remplissage réel ({p50} ms)");
+    }
+
+    /// La cible est la somme bornée de ses trois parts : les publier permet de
+    /// dire QUI la tient en l'air (gigue, plancher de glitch, filet réactif).
+    #[test]
+    fn target_parts_add_up_to_the_target() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(4.0); // plancher = 1,0 × 4 + 3 = 7 ms
+
+        let (jitter_part, glitch_part, reactive_part) = jb.target_parts_ms();
+        assert!((jitter_part - 7.0).abs() < 0.05, "plancher de gigue : {jitter_part} ms");
+        assert_eq!(glitch_part, 0.0);
+        assert_eq!(reactive_part, 0.0);
+        assert_eq!(jb.target_ms(), 7);
+
+        // Une sous-alimentation monte le filet (+5 ms) et le plancher de glitch
+        // (+1 ms) : la somme doit se retrouver dans la cible.
+        let mut out = vec![0.0_f32; 128];
+        jb.pull(&mut out); // pas amorcé → underrun comptabilisé par adapt_up
+        let (jitter_part, glitch_part, reactive_part) = jb.target_parts_ms();
+        let sum = jitter_part + glitch_part + reactive_part;
+        assert!(
+            (sum - jb.target_ms() as f64).abs() <= 1.0,
+            "somme des parts {sum} ms vs cible {} ms",
+            jb.target_ms()
+        );
+    }
+
 
     /// Plus grand écart entre 2 samples interleaved consécutifs d'un même
     /// canal (= dérivée discrète par canal). Sur un signal continu cette

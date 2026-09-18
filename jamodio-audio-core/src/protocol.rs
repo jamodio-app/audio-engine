@@ -1264,6 +1264,42 @@ pub struct PeerPerf {
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     #[serde(rename = "concealedFrames")]
     pub concealed_frames: u64,
+    /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
+    /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
+    /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).
+    ///
+    /// Les trois parts de `bufferTargetMs` : plancher tiré de la gigue, plancher
+    /// de glitch persistant, filet réactif. Leur somme bornée = la cible.
+    #[serde(rename = "targetJitterMs")]
+    pub target_jitter_ms: f64,
+    #[serde(rename = "targetGlitchMs")]
+    pub target_glitch_ms: f64,
+    #[serde(rename = "targetReactiveMs")]
+    pub target_reactive_ms: f64,
+    /// Remplissage RÉEL relevé aux dernières arrivées (~1,3 s) : minimum et
+    /// médiane. Le minimum est la marge que la sortie n'a jamais consommée.
+    /// Absents tant qu'aucun paquet n'est arrivé.
+    #[serde(rename = "fillMinMs", skip_serializing_if = "Option::is_none")]
+    pub fill_min_ms: Option<f64>,
+    #[serde(rename = "fillP50Ms", skip_serializing_if = "Option::is_none")]
+    pub fill_p50_ms: Option<f64>,
+    /// Silence RENDU par le tampon (cumul) : sous-alimentations et ré-amorçages.
+    /// À ne pas confondre avec `recvStreams[].silentMs`, qui compte l'absence de
+    /// paquets reçus : un silence réseau produit les deux, un accroc de tampon
+    /// seulement celui-ci.
+    #[serde(rename = "zeroFilledMs")]
+    pub zero_filled_ms: f64,
+    /// Audio jeté à l'arrivée faute de place dans le tampon (cumul).
+    #[serde(rename = "overflowMs")]
+    pub overflow_ms: f64,
+    /// Paquets arrivés en double, et sauts de numérotation constatés.
+    #[serde(rename = "packetsDuplicate")]
+    pub packets_duplicate: u64,
+    #[serde(rename = "packetsJump")]
+    pub packets_jump: u64,
+    /// Paquets qu'Opus n'a pas su décoder.
+    #[serde(rename = "decodeErrors")]
+    pub decode_errors: u64,
 }
 
 /// Un flux reçu d'un pair, tel que l'Audio Engine le tient. Un flux silencieux reste
@@ -1276,6 +1312,9 @@ pub struct RecvStreamPerf {
     /// Durée sans paquet reçu (ms) ; depuis l'ajout du flux si aucun n'est arrivé.
     #[serde(rename = "silentMs")]
     pub silent_ms: u64,
+    /// Lot 0 (chantier tampon) — erreurs rendues par la socket UDP pour ce flux.
+    #[serde(rename = "recvErrors")]
+    pub recv_errors: u64,
 }
 
 /// Flux montant de l'instrument d'après le dernier Receiver Report du SFU.

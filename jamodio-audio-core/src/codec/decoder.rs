@@ -15,6 +15,10 @@ pub struct MusicDecoder {
     pcm_buf: Vec<i16>,
     f32_buf: Vec<f32>,
     log_count: u64,
+    /// Lot 0 (chantier tampon) — paquets qu'Opus n'a pas su décoder, cumulés.
+    /// Les journaux n'en gardaient qu'un sur 500 : sans compteur, on ne savait
+    /// pas si un accroc venait du réseau ou du décodage.
+    errors: u64,
 }
 
 /// Max Opus frame: 120ms at 48kHz = 5760 samples per channel.
@@ -35,7 +39,13 @@ impl MusicDecoder {
             pcm_buf: vec![0i16; max_samples_stereo],
             f32_buf: vec![0.0f32; max_samples_stereo],
             log_count: 0,
+            errors: 0,
         })
+    }
+
+    /// Lot 0 — cumul des paquets non décodables.
+    pub fn errors(&self) -> u64 {
+        self.errors
     }
 
     /// Decode an Opus packet into interleaved f32 stereo samples.
@@ -47,6 +57,7 @@ impl MusicDecoder {
                     tracing::warn!(target: "jamodio::decoder", bytes = opus_data.len(), error = ?e, "Packet::try_from failed");
                 }
                 self.log_count += 1;
+                self.errors += 1;
                 return None;
             }
         };
@@ -55,6 +66,7 @@ impl MusicDecoder {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(target: "jamodio::decoder", error = ?e, "MutSignals failed");
+                self.errors += 1;
                 return None;
             }
         };
@@ -65,6 +77,7 @@ impl MusicDecoder {
                     tracing::warn!(target: "jamodio::decoder", bytes = opus_data.len(), error = ?e, "decode failed");
                 }
                 self.log_count += 1;
+                self.errors += 1;
                 return None;
             }
         };

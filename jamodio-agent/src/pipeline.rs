@@ -990,6 +990,8 @@ pub struct RecvStreamState {
     pub kind: StreamKind,
     /// Durée sans paquet (ms) ; depuis la création si aucun paquet n'est arrivé.
     pub silent_ms: u64,
+    /// Lot 0 — erreurs rendues par la socket UDP pour ce flux (cumul).
+    pub recv_errors: u64,
 }
 
 /// Métriques de timing réseau mesurées par stream entrant, alimentées par les
@@ -1012,6 +1014,11 @@ pub struct ProducerNetStats {
     pub packets_late: u64,
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     pub concealed_frames: u64,
+    /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
+    /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
+    pub packets_duplicate: u64,
+    pub packets_jump: u64,
+    pub decode_errors: u64,
 }
 
 /// Sprint S1 — Handles perf partagés entre `PipelineState`, `encoder_thread`,
@@ -3270,6 +3277,7 @@ impl PipelineState {
                 producer_id: producer_id.clone(),
                 kind: stream.kind,
                 silent_ms: stream.activity.silent_ms(now),
+                recv_errors: stream.activity.recv_errors(),
             })
             .collect()
     }
@@ -5050,6 +5058,9 @@ fn decode_one_packet(
             packets_lost: counters.lost(),
             packets_late: counters.late,
             concealed_frames: st.concealed_frames,
+            packets_duplicate: counters.duplicate,
+            packets_jump: counters.jump,
+            decode_errors: st.decoder.errors(),
         };
         let mut map = net_stats_by_producer.lock();
         match map.get_mut(producer_id) {
@@ -5189,6 +5200,7 @@ async fn recv_io_task(
                     // len == 0 : RTCP filtré / échec SRTP (déjà loggé) → on réutilise buf.
                     Ok(_) => {}
                     Err(e) => {
+                        activity.mark_recv_error();
                         tracing::warn!(target: "jamodio::recv", producer = %producer_id, error = %e, "UDP recv error");
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }

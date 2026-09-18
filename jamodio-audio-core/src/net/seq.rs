@@ -52,6 +52,11 @@ pub struct SeqCounters {
     pub received: u64,
     /// Paquets reçus trop tard pour être joués.
     pub late: u64,
+    /// Lot 0 (chantier tampon) — paquets arrivés en double (même numéro déjà vu).
+    pub duplicate: u64,
+    /// Lot 0 — sauts de numérotation : un numéro trop loin pour être un retard,
+    /// tenu en quarantaine jusqu'à confirmation par le suivant.
+    pub jump: u64,
 }
 
 impl SeqCounters {
@@ -89,6 +94,7 @@ impl SeqTracker {
         };
         let ahead = seq.wrapping_sub(highest);
         if ahead == 0 {
+            self.counters.duplicate += 1;
             return Arrival::Duplicate;
         }
         if ahead < MAX_DROPOUT {
@@ -107,6 +113,7 @@ impl SeqTracker {
         if behind < MAX_MISORDER {
             let bit = 1u128 << behind;
             if self.history & bit != 0 {
+                self.counters.duplicate += 1;
                 return Arrival::Duplicate;
             }
             self.history |= bit;
@@ -118,6 +125,7 @@ impl SeqTracker {
             return self.start(seq);
         }
         self.resync_seq = Some(seq.wrapping_add(1));
+        self.counters.jump += 1;
         Arrival::Jump
     }
 
@@ -156,7 +164,9 @@ mod tests {
             SeqCounters {
                 expected: 3,
                 received: 3,
-                late: 0
+                late: 0,
+                duplicate: 0,
+                jump: 0
             }
         );
         assert_eq!(t.counters().lost(), 0);
@@ -192,7 +202,9 @@ mod tests {
             SeqCounters {
                 expected: 4,
                 received: 4,
-                late: 1
+                late: 1,
+                duplicate: 0,
+                jump: 0
             }
         );
         assert_eq!(t.counters().lost(), 0);
@@ -209,7 +221,9 @@ mod tests {
             SeqCounters {
                 expected: 2,
                 received: 2,
-                late: 0
+                late: 0,
+                duplicate: 2,
+                jump: 0
             }
         );
     }
@@ -263,7 +277,9 @@ mod tests {
             SeqCounters {
                 expected: 4,
                 received: 4,
-                late: 0
+                late: 0,
+                jump: 1,
+                duplicate: 0
             }
         );
     }
