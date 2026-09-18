@@ -5,6 +5,21 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-4] — 2026-09-18 (pré-version de test)
+
+**Le pilote audio peut enfin se faire entendre.** Aucun changement du son.
+
+### Ajouté
+
+- **Les signaux du pilote ASIO sont journalisés.** Une interface peut annoncer
+  qu'elle a perdu des données, que ses latences ont changé, qu'elle a décroché ou
+  que la fréquence d'échantillonnage a bougé. Ces messages étaient reçus puis
+  jetés par une bibliothèque tierce : après un épisode de son dégradé, rien dans
+  le rapport ne permettait de savoir si l'interface avait crié. C'est corrigé.
+  Une session saine n'ajoute aucune ligne ; chaque ligne présente désigne un
+  incident réel de l'interface. Rien n'en est déduit automatiquement : ce sont
+  des faits pour le diagnostic, pas un verdict.
+
 ## [0.6.5-3] — 2026-09-18 (pré-version de test)
 
 **Moins de trous, et un journal qui parle.** Premiers correctifs du chantier
