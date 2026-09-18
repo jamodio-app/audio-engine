@@ -5,6 +5,19 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-5] — 2026-09-18 (pré-version de test)
+
+**Un outil de banc, rien pour l'oreille.** Aucun changement du son.
+
+### Ajouté
+
+- **Sonde de réveil** (interrupteur de banc `wake-probe = 1`) : mesure pendant
+  deux secondes, au démarrage d'une capture, avec quel retard le système tient
+  une échéance de 2,5 ms — et compare, sous Windows, l'attente ordinaire à une
+  minuterie haute résolution. C'est ce chiffre qui décidera comment le masquage
+  des trous attendra son échéance, au lieu de le choisir sur réputation. Sans
+  l'interrupteur, elle ne s'exécute pas du tout.
+
 ## [0.6.5-4] — 2026-09-18 (pré-version de test)
 
 **Le pilote audio peut enfin se faire entendre.** Aucun changement du son.
