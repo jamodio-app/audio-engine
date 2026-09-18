@@ -84,7 +84,7 @@ fn platform_system() -> Arc<dyn PowerSystem> {
     }
     #[cfg(target_os = "windows")]
     {
-        Arc::new(windows::PowerRequest)
+        Arc::new(windows::PowerRequest::new())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -236,7 +236,7 @@ mod windows {
                 return Err("PowerSetRequest a échoué".into());
             }
             *self.handle.lock().unwrap() = Some(HandleHolder(handle));
-            Ok(handle as u64)
+            Ok(handle as usize as u64)
         }
 
         fn allow_sleep(&self, _token: u64) {

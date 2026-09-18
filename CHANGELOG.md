@@ -5,7 +5,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.6.5-1] — 2026-09-18 (pré-version de test)
+## [0.6.5-2] — 2026-09-18 (pré-version de test)
 
 **Mesurer le tampon de réception avant d'y toucher.** Rien ne change au son : cette
 pré-version sert au banc du chantier « meilleure plateforme ».
@@ -27,6 +27,8 @@ pré-version sert au banc du chantier « meilleure plateforme ».
 
 ### Modifié
 
+- La 0.6.5-1 ne se construisait pas sous Windows (le chemin Windows de l'anti-veille
+  n'est compilé que par la CI) : elle n'a jamais été diffusée.
 - La coupure RTCP de diagnostic passe par le fichier d'interrupteurs ; la variable
   d'environnement `JAMODIO_DIAG_NO_RTCP` n'existe plus (relancé depuis le studio,
   l'Audio Engine n'en héritait pas — quatre sessions de banc perdues le 14/09).
