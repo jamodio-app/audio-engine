@@ -5,6 +5,29 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-3] — 2026-09-18 (pré-version de test)
+
+**Moins de trous, et un journal qui parle.** Premiers correctifs du chantier
+« plus jamais de trou sec ». Le masquage des accrocs lui-même arrive à la
+pré-version suivante.
+
+### Corrigé
+
+- **Une erreur réseau isolée ne rend plus la réception aveugle pendant 10 ms.**
+  Sous Windows, un « port injoignable » revenu d'un envoi précédent faisait
+  échouer une RÉCEPTION, alors que rien n'était cassé : 21 fois en une seule
+  session de recette. La socket désactive désormais ce comportement hérité, et,
+  si une erreur survient quand même, l'attente ne monte que si les erreurs
+  s'enchaînent — la première ne coûte plus rien. Pendant ces 10 ms, les paquets
+  arrivaient sans être lus : c'était fabriquer l'accroc qu'on cherche à supprimer.
+
+### Ajouté
+
+- **Le journal dit quand le pilote ASIO demande un reset.** Après deux épisodes de
+  son dégradé, impossible de savoir après coup si le pilote avait signalé quelque
+  chose. C'est désormais daté dans le rapport. Aucun changement de comportement :
+  le reset était déjà honoré.
+
 ## [0.6.5-2] — 2026-09-18 (pré-version de test)
 
 **Mesurer le tampon de réception avant d'y toucher.** Rien ne change au son : cette
