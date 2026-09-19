@@ -4949,6 +4949,12 @@ struct DecodeState {
     next_deadline: Option<std::time::Instant>,
     /// Trames inventées d'affilée, remis à zéro dès qu'un vrai paquet arrive.
     consecutive_concealed: u32,
+    /// Lot 1.4 — échantillons restants de la rampe d'arrivée. Un musicien qui
+    /// rejoint ne doit pas ÉCLATER dans le casque des autres : ses premières
+    /// centaines de millisecondes montent en douceur. Appliqué ICI, sur le thread
+    /// de décodage, avant que le son entre dans le tampon — rien de nouveau dans
+    /// le callback audio.
+    fade_in_remaining: usize,
     pkt_count: u64,
     logged_large_jump: bool,
 }
@@ -4973,6 +4979,7 @@ impl DecodeState {
             concealed_underrun_frames: 0,
             next_deadline: None,
             consecutive_concealed: 0,
+            fade_in_remaining: JOIN_FADE_SAMPLES,
             pkt_count: 0,
             logged_large_jump: false,
         })
@@ -5007,6 +5014,32 @@ fn spawn_decode_thread(
         .name("audio-decode".into())
         .spawn(move || decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path))?;
     Ok(DecodeThread { tx, pool_rx, join })
+}
+
+/// Lot 1.4 — durée de la rampe d'arrivée d'un flux (ms). Assez long pour que
+/// l'entrée soit perçue comme une arrivée et non comme un claquement, assez
+/// court pour qu'on n'ait pas l'impression d'attendre le musicien.
+const JOIN_FADE_MS: usize = 300;
+const JOIN_FADE_SAMPLES: usize = JOIN_FADE_MS * 48_000 * 2 / 1000;
+
+/// Applique la rampe d'arrivée à un bloc décodé, EN PLACE, et rend ce qu'il reste
+/// de rampe. Fonction pure pour être testée sans réseau ni carte son.
+fn apply_join_fade(block: &mut [f32], remaining: usize) -> usize {
+    if remaining == 0 {
+        return 0;
+    }
+    let total = JOIN_FADE_SAMPLES as f32;
+    let mut left = remaining;
+    for s in block.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        // Position dans la rampe : 0 au tout premier échantillon du flux, 1 à la fin.
+        let done = JOIN_FADE_SAMPLES - left;
+        *s *= done as f32 / total;
+        left -= 1;
+    }
+    left
 }
 
 /// Durée d'une trame Opus, en `Duration` (miroir de `conceal::FRAME_MS`).
@@ -5300,7 +5333,15 @@ fn decode_one_packet(
     if let Some(pcm) = st.decoder.decode(payload) {
         let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
         recv_path.lock().observe(recv_path_ms);
-        mixer.push_samples(producer_id, pcm);
+        if st.fade_in_remaining > 0 {
+            // Lot 1.4 — copie le temps de la rampe seulement (les ~120 premiers
+            // blocs d'un flux), puis on repasse au push direct, sans copie.
+            let mut faded = pcm.to_vec();
+            st.fade_in_remaining = apply_join_fade(&mut faded, st.fade_in_remaining);
+            mixer.push_samples(producer_id, &faded);
+        } else {
+            mixer.push_samples(producer_id, pcm);
+        }
     }
 }
 
@@ -6059,6 +6100,43 @@ mod conceal_loop_tests {
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
         m.insert(Arc::from("peer-test"), state(now));
         m
+    }
+
+    #[test]
+    fn un_musicien_qui_arrive_monte_en_douceur() {
+        // Le tout premier bloc d'un flux doit démarrer près de zéro.
+        let mut bloc = vec![1.0_f32; 480];
+        let reste = apply_join_fade(&mut bloc, JOIN_FADE_SAMPLES);
+        assert!(bloc[0].abs() < 0.01, "premier échantillon ≈ 0, got {}", bloc[0]);
+        assert!(bloc[479] > bloc[0], "la rampe monte");
+        assert!(bloc[479] < 0.1, "et elle prend son temps, got {}", bloc[479]);
+        assert_eq!(reste, JOIN_FADE_SAMPLES - 480);
+    }
+
+    #[test]
+    fn la_rampe_finit_par_rendre_le_son_intact() {
+        let mut reste = JOIN_FADE_SAMPLES;
+        let mut dernier = 0.0_f32;
+        // On consomme toute la rampe par blocs de 480 échantillons.
+        while reste > 0 {
+            let mut bloc = vec![1.0_f32; 480];
+            reste = apply_join_fade(&mut bloc, reste);
+            dernier = bloc[bloc.len() - 1];
+        }
+        assert!(dernier > 0.99, "le son doit être intact à la fin, got {dernier}");
+        // Rampe finie : un bloc suivant n'est plus touché du tout.
+        let mut apres = vec![1.0_f32; 480];
+        assert_eq!(apply_join_fade(&mut apres, 0), 0);
+        assert!(apres.iter().all(|s| *s == 1.0), "plus aucune atténuation");
+    }
+
+    #[test]
+    fn une_rampe_plus_courte_que_le_bloc_ne_deborde_pas() {
+        // Fin de rampe : seuls les derniers échantillons sont atténués, le reste
+        // du bloc passe intact — et surtout, aucun débordement.
+        let mut bloc = vec![1.0_f32; 480];
+        assert_eq!(apply_join_fade(&mut bloc, 3), 0);
+        assert!(bloc[3] == 1.0, "au-delà de la rampe, le son est intact");
     }
 
     #[test]
