@@ -5,6 +5,36 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-7] — 2026-09-19 (pré-version de test)
+
+**La première qui change le son.** À écouter, pas seulement à installer.
+
+### Modifié
+
+- **Un paquet qui arrive en retard ne fait plus un trou.** Jusqu'ici, quand le
+  son d'un musicien arrivait trop tard, il n'y avait rien à jouer : la sortie
+  jouait du silence, et ça s'entendait comme un petit clic sec — environ un par
+  minute, même sur une bonne connexion. Le moteur fabrique maintenant la suite
+  plausible du son (quelques millisecondes, jamais plus de 7,5), avec des fondus
+  aux deux bords. Aucune milliseconde de latence ajoutée.
+- **Les bords d'un trou ne claquent plus**, sur les flux reçus comme sur le
+  retour casque. Le trou reste compté : un lien irrégulier continue d'être dit
+  irrégulier dans la bulle du lien, il ne s'entend simplement plus.
+- **Un musicien qui rejoint arrive en douceur** : ses trois premiers dixièmes de
+  seconde montent en rampe au lieu d'éclater dans le casque des autres.
+
+### Corrigé
+
+- Le « silence rendu » mesuré ne gonfle plus indéfiniment après le départ d'un
+  musicien : il comptait jusqu'à une seconde de silence par seconde, ce qui
+  faussait la mesure même que ce chantier doit trancher.
+
+### Ce qu'il faut écouter
+
+Les petits clics secs en cours de jeu doivent avoir disparu. Les **craquements**
+dus à une rafale de perte réseau (Wi-Fi), eux, ne sont pas concernés : ils
+étaient déjà masqués autrement.
+
 ## [0.6.5-6] — 2026-09-19 (pré-version de test)
 
 **Une première installation qui ne fait plus peur.**
