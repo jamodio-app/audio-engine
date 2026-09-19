@@ -5,6 +5,24 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-6] — 2026-09-19 (pré-version de test)
+
+**Une première installation qui ne fait plus peur.**
+
+### Corrigé
+
+- **Plus de fenêtres de plugins au premier lancement.** L'Audio Engine ouvrait
+  chaque plugin installé pour l'inventorier : ceux sous licence affichaient alors
+  leur propre fenêtre, sans que rien n'explique pourquoi. Chaque fenêtre fermée
+  sans être validée coûtait 30 secondes, puis le plugin disparaissait de la liste
+  — définitivement, pour un Audio Unit. Désormais, l'Audio Engine se contente de
+  **compter** les plugins au démarrage : c'est le studio qui propose de les
+  inventorier, en disant d'abord ce qui va se passer. Un utilisateur déjà
+  installé ne verra aucune différence.
+- **Un plugin qui n'a pas répondu n'est plus condamné pour toujours.** Il
+  retentera sa chance au prochain inventaire. Seuls les vrais plantages restent
+  écartés.
+
 ## [0.6.5-5] — 2026-09-18 (pré-version de test)
 
 **Un outil de banc, rien pour l'oreille.** Aucun changement du son.
