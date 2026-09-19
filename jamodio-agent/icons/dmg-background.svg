@@ -1,0 +1,43 @@
+<!-- Fond de la fenêtre du DMG macOS (540 × 420 = `windowSize` de tauri.conf.json).
+     Source éditable ; le PNG rendu à côté est ce que Tauri embarque.
+     Rendu : rsvg-convert -w 540 -h 420 dmg-background.svg -o dmg-background.png
+
+     Deux contraintes ont dicté le dessin :
+     1. Les libellés sous les icônes sont dessinés par le Finder, en clair ou en
+        sombre selon l'apparence du système : impossible de les rendre lisibles à
+        coup sûr sur un fond donné. Le fond dit donc tout lui-même — flèche et
+        mots — pour que ces libellés ne portent aucune information.
+     2. Une commande ne se copie pas depuis une image : la « voie rapide » vit
+        dans l'article de support, pas ici. Le fond y renvoie.
+
+     Zones réservées aux icônes du Finder : centres à (150, 200) et (390, 200),
+     ~128 px de côté → rien d'écrit entre y=130 et y=290 hors de la flèche. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="420" viewBox="0 0 540 420">
+  <defs>
+    <style>
+      .t  { font-family: 'Avenir Next', 'Helvetica Neue', Helvetica, sans-serif; fill: #0a0a0b; }
+      .m  { fill: #5f5c55; }
+      .ac { fill: #5e6e0a; }
+    </style>
+  </defs>
+
+  <rect width="540" height="420" fill="#f2f0eb"/>
+  <rect x="0" y="0" width="540" height="4" class="ac"/>
+
+  <text class="t" x="270" y="56" text-anchor="middle" font-size="21" font-weight="600">Jamodio Audio Engine</text>
+  <text class="t m" x="270" y="82" text-anchor="middle" font-size="14">Glisse l’app sur le dossier Applications</text>
+  <text class="t m" x="270" y="102" text-anchor="middle" font-size="12" font-style="italic">Drag the app onto the Applications folder</text>
+
+  <g class="ac">
+    <rect x="232" y="197" width="58" height="6" rx="3"/>
+    <path d="M292 200 L 276 188 L 276 212 Z"/>
+  </g>
+
+  <g>
+    <rect x="28" y="300" width="484" height="98" rx="10" fill="#e6e3dc"/>
+    <text class="t" x="48" y="325" font-size="12.5" font-weight="600">Au premier lancement, macOS bloque l’app : elle n’est pas signée Apple.</text>
+    <text class="t ac" x="48" y="347" font-size="12.5" font-weight="600">Réglages Système › Confidentialité et sécurité › « Ouvrir quand même »</text>
+    <text class="t m" x="48" y="369" font-size="11" font-style="italic">First launch is blocked — System Settings › Privacy &amp; Security › “Open Anyway”.</text>
+    <text class="t m" x="48" y="387" font-size="11">Pas à pas et voie rapide : jamodio.com/support</text>
+  </g>
+</svg>

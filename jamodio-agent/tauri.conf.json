@@ -48,17 +48,18 @@
       "frameworks": [],
       "infoPlist": "info.plist",
       "dmg": {
+        "background": "icons/dmg-background.png",
         "windowSize": {
-          "width": 460,
-          "height": 280
+          "width": 540,
+          "height": 420
         },
         "appPosition": {
-          "x": 120,
-          "y": 140
+          "x": 150,
+          "y": 200
         },
         "applicationFolderPosition": {
-          "x": 340,
-          "y": 140
+          "x": 390,
+          "y": 200
         }
       }
     },
