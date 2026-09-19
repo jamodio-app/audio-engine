@@ -39,6 +39,10 @@ pub struct JitterBuffer {
     /// que l'oreille perd. À ne pas confondre avec le silence RÉSEAU (aucun
     /// paquet reçu), compté par le pipeline depuis la 0.6.3.
     zero_filled_samples: u64,
+    /// Silence rendu D'AFFILÉE, remis à zéro dès qu'un bloc complet sort. Sert
+    /// uniquement à borner `zero_filled_samples` (cf.
+    /// `MAX_CONTINUOUS_ZERO_FILL_SAMPLES`).
+    continuous_zero_filled: u64,
     /// Lot 0 (tampon) — remplissage relevé juste avant chaque `push`, en samples
     /// interleaved. Anneau de taille fixe (zéro allocation), lu par la
     /// télémétrie 1 Hz via `fill_stats()`.
@@ -168,6 +172,19 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 /// Durée du fondu de concealment (entrée/sortie) autour d'un trou self-monitor.
 /// ~2 ms = assez pour tuer le clic, assez court pour rester transparent.
 const CONCEAL_FADE_MS: usize = 2;
+/// Au-delà de cette durée de silence CONTINU, on cesse de l'imputer au tampon.
+///
+/// `zeroFilledMs` répond à « combien de silence le tampon a-t-il rendu à la
+/// place du son ? ». Un trou de quelques dizaines de millisecondes, oui. Mais un
+/// pair qui part, ou qui se tait, laisse le tampon se vider puis se ré-amorcer
+/// indéfiniment : le compteur montait alors de 1 000 ms PAR SECONDE, sans
+/// qu'aucun accroc ne soit compté (le ré-amorçage n'est pas une
+/// sous-alimentation). Deux sessions de banc s'étaient ainsi retrouvées avec
+/// 6,2 s et 1,1 s de « silence rendu » qui n'étaient que la fin de la session.
+/// L'absence de flux est déjà mesurée, et mieux, par `recvStreams[].silentMs`.
+const MAX_CONTINUOUS_ZERO_FILL_MS: usize = 200;
+const MAX_CONTINUOUS_ZERO_FILL_SAMPLES: u64 =
+    (MAX_CONTINUOUS_ZERO_FILL_MS * SAMPLE_RATE * CHANNELS / 1000) as u64;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 /// Phase C — gain proportionnel du servo de drift (erreur de remplissage relative
 /// → écart de vitesse). Un simple P suffit : la correction stationnaire requise
@@ -294,6 +311,7 @@ impl JitterBuffer {
             glitch_floor_samples: 0,
             glitch_calm_pulls: 0,
             zero_filled_samples: 0,
+            continuous_zero_filled: 0,
             fill_obs: [0; FILL_OBS_LEN],
             fill_obs_len: 0,
             fill_obs_next: 0,
@@ -478,7 +496,8 @@ impl JitterBuffer {
                 output.fill(0.0);
                 // Lot 0 — le ré-amorçage est du silence rendu, au même titre que
                 // la fin d'un bloc en sous-alimentation : une addition entière.
-                self.zero_filled_samples += output.len() as u64;
+                // Lot 1.3 — bornée : au-delà, c'est un flux absent, pas un trou.
+                self.count_zero_filled(output.len() as u64);
                 return 0;
             }
         }
@@ -518,11 +537,20 @@ impl JitterBuffer {
             if available > 0 {
                 self.consumer.pop_slice(&mut output[..available]);
             }
-            // Chantier C — mode local : au lieu d'une coupure sèche (clic), on
-            // fond la fin du réel vers le silence et on armera un fondu
-            // d'entrée à la reprise → le trou (spike plugin) devient un bref
-            // creux lissé, ZÉRO craquement. La latence reste inchangée.
-            if self.local_mode {
+            // Au lieu d'une coupure sèche (clic), on fond la fin du réel vers le
+            // silence et on arme un fondu d'entrée à la reprise : le trou devient
+            // un bref creux lissé, ZÉRO craquement. La latence reste inchangée.
+            //
+            // Chantier C (07/2026) : d'abord réservé au retour casque, parce que
+            // son trou à lui (spike plugin) était le seul qu'on savait provoquer.
+            // Lot 1.1 (09/2026) : étendu aux flux RÉSEAU, où le même clic se
+            // produit pour la même raison — le tampon n'a plus rien à donner. Sur
+            // 28 minutes de banc, 30 accrocs par machine, chacun un clic sec.
+            //
+            // ⚠ Ce code tourne dans le callback audio. Ce n'est PAS un étage
+            // nouveau : même branche, même boucle, uniquement sur un accroc — le
+            // chemin nominal (`available >= needed`) ne le traverse jamais.
+            {
                 let n = CONCEAL_FADE_SAMPLES.min(available);
                 let start = available - n;
                 for (i, s) in output[start..available].iter_mut().enumerate() {
@@ -531,7 +559,7 @@ impl JitterBuffer {
                 self.conceal_fade_in_remaining = CONCEAL_FADE_SAMPLES;
             }
             output[available..].fill(0.0);
-            self.zero_filled_samples += (output.len() - available) as u64;
+            self.count_zero_filled((output.len() - available) as u64);
             self.underruns += 1;
             self.adapt_up();
             // C1 — un underrun pousse la pression (bornée) : tant qu'elle reste
@@ -551,7 +579,9 @@ impl JitterBuffer {
         // reprise), jamais sur le pull d'underrun lui-même (dont la tête est
         // l'audio d'AVANT le trou, déjà fondu en sortie). S'étale sur plusieurs
         // pulls si needed < fondu restant.
-        if self.local_mode && self.conceal_fade_in_remaining > 0 && pulled == needed {
+        // Lot 1.1 — le fondu d'entrée suit le fondu de sortie ci-dessus : il vaut
+        // donc pour les flux réseau comme pour le retour casque.
+        if self.conceal_fade_in_remaining > 0 && pulled == needed {
             let total = CONCEAL_FADE_SAMPLES;
             let n = self.conceal_fade_in_remaining.min(pulled);
             for (i, s) in output[..n].iter_mut().enumerate() {
@@ -672,6 +702,19 @@ impl JitterBuffer {
 
     /// Lot 0 — durée cumulée de SILENCE rendue par `pull` (sous-alimentation et
     /// ré-amorçage), en ms. Monotone, comme `underruns`.
+    /// Impute `n` échantillons de silence au tampon, tant que ce silence n'a pas
+    /// duré au point de ne plus rien vouloir dire (cf.
+    /// `MAX_CONTINUOUS_ZERO_FILL_SAMPLES`). Le compteur continu, lui, avance
+    /// toujours : c'est lui qui sait quand s'arrêter, et il ne repart qu'au
+    /// retour d'un vrai bloc.
+    fn count_zero_filled(&mut self, n: u64) {
+        if self.continuous_zero_filled < MAX_CONTINUOUS_ZERO_FILL_SAMPLES {
+            let room = MAX_CONTINUOUS_ZERO_FILL_SAMPLES - self.continuous_zero_filled;
+            self.zero_filled_samples += n.min(room);
+        }
+        self.continuous_zero_filled = self.continuous_zero_filled.saturating_add(n);
+    }
+
     pub fn zero_filled_ms(&self) -> f64 {
         samples_to_ms_f64(self.zero_filled_samples)
     }
@@ -768,6 +811,8 @@ impl JitterBuffer {
     /// (`local_mode`) garde son adaptation temporelle historique (`adapt_down`)
     /// — INTOUCHÉ (scope réseau uniquement).
     fn recover_after_full_pull(&mut self) {
+        // Le son coule de nouveau : le prochain trou repart d'un compteur neuf.
+        self.continuous_zero_filled = 0;
         self.underrun_pressure *= UNDERRUN_PRESSURE_LEAK;
         if self.local_mode {
             self.adapt_down();
@@ -1026,6 +1071,97 @@ mod tests {
             out[pulled - 1]
         );
         assert_eq!(jb.underruns(), 1);
+    }
+
+    /// Lot 1.3 — un pair qui part ne doit pas gonfler « le silence rendu ».
+    #[test]
+    fn un_flux_absent_narrete_pas_de_gonfler_le_silence_rendu() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let bloc = vec![0.0_f32; 480]; // 5 ms
+        let mut out = vec![0.0_f32; 480];
+        // Personne n'a jamais rien envoyé : que du ré-amorçage, indéfiniment.
+        for _ in 0..400 {
+            jb.pull(&mut out);
+        }
+        let rendu = jb.zero_filled_ms();
+        assert!(
+            rendu <= MAX_CONTINUOUS_ZERO_FILL_MS as f64,
+            "silence rendu borné à {MAX_CONTINUOUS_ZERO_FILL_MS} ms, got {rendu}"
+        );
+        let _ = bloc;
+    }
+
+    /// Mais un vrai trou, lui, reste compté en entier — et le compteur repart
+    /// à zéro quand le son revient.
+    #[test]
+    fn un_vrai_trou_reste_compte_et_le_compteur_repart() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t * 2]; // tire le double → trou de 5 ms
+        jb.pull(&mut out);
+        let apres_trou = jb.zero_filled_ms();
+        assert!(apres_trou > 0.0, "un vrai trou doit être compté");
+        assert!(apres_trou < MAX_CONTINUOUS_ZERO_FILL_MS as f64);
+        // Le son revient franchement : bloc complet servi → compteur continu à zéro.
+        jb.push(&vec![1.0_f32; t * 4]);
+        let mut plein = vec![0.0_f32; t];
+        assert_eq!(jb.pull(&mut plein), plein.len());
+        // Un nouveau trou est de nouveau compté pour ce qu'il vaut.
+        let mut encore = vec![0.0_f32; t * 8];
+        jb.pull(&mut encore);
+        assert!(
+            jb.zero_filled_ms() > apres_trou,
+            "après reprise, un nouveau trou doit s'ajouter"
+        );
+    }
+
+    /// Lot 1.1 — le même soin pour un flux RÉSEAU : c'est là que les 30 accrocs
+    /// par machine et par demi-heure produisaient un clic sec (banc du 18/09).
+    #[test]
+    fn un_flux_reseau_ne_coupe_plus_net_sur_un_accroc() {
+        let mut jb = JitterBuffer::new();
+        // PAS de set_local_mode : on est sur le chemin réseau, celui des pairs.
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t + 4800];
+        let pulled = jb.pull(&mut out);
+        assert!(pulled > 0 && pulled < out.len(), "underrun partiel attendu");
+        assert!(
+            out[pulled - 1].abs() < 0.15,
+            "la fin du réel doit être fondue vers 0, got {}",
+            out[pulled - 1]
+        );
+        assert_eq!(jb.underruns(), 1, "l'accroc reste COMPTÉ, même masqué");
+    }
+
+    /// Et la reprise ne claque pas non plus.
+    #[test]
+    fn un_flux_reseau_reprend_en_douceur_apres_un_accroc() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t + 4800];
+        jb.pull(&mut out); // underrun → fondu de sortie + fondu d'entrée armé
+        // Le son revient, à plein régime.
+        jb.push(&vec![1.0_f32; t * 4]);
+        let mut back = vec![0.0_f32; t];
+        let pulled = jb.pull(&mut back);
+        assert_eq!(pulled, back.len(), "la reprise doit servir le bloc entier");
+        assert!(
+            back[0].abs() < 0.15,
+            "la reprise doit démarrer bas (rampe), got {}",
+            back[0]
+        );
+        assert!(
+            back[back.len() - 1] > 0.9,
+            "et retrouver le plein régime, got {}",
+            back[back.len() - 1]
+        );
     }
 
     #[test]
