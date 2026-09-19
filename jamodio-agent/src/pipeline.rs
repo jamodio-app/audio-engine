@@ -1018,6 +1018,8 @@ pub struct ProducerNetStats {
     pub packets_late: u64,
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     pub concealed_frames: u64,
+    /// Lot 1.2 — masquages déclenchés à l'échéance (paquet en RETARD).
+    pub concealed_underrun_frames: u64,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -4935,8 +4937,18 @@ struct DecodeState {
     jitter: JitterEstimator,
     /// Place de chaque paquet dans le flux (ordre, trous, retards) + compteurs.
     seq: SeqTracker,
-    /// Trames de masquage (PLC) jouées depuis la création du flux.
+    /// Trames de masquage (PLC) jouées à l'ARRIVÉE d'un paquet qui révèle un trou.
     concealed_frames: u64,
+    /// Lot 1.2 — trames de masquage poussées À L'ÉCHÉANCE, sans attendre une
+    /// arrivée : le cas du paquet en RETARD, que le compteur ci-dessus ne voyait
+    /// pas (il faut un paquet pour le déclencher). Compté à part pour que la
+    /// mesure distingue « paquet perdu » de « paquet en retard ».
+    concealed_underrun_frames: u64,
+    /// Quand la prochaine trame est attendue. `None` tant qu'aucun paquet n'est
+    /// arrivé : on n'invente rien avant d'avoir entendu le flux une première fois.
+    next_deadline: Option<std::time::Instant>,
+    /// Trames inventées d'affilée, remis à zéro dès qu'un vrai paquet arrive.
+    consecutive_concealed: u32,
     pkt_count: u64,
     logged_large_jump: bool,
 }
@@ -4958,6 +4970,9 @@ impl DecodeState {
             jitter: JitterEstimator::new(),
             seq: SeqTracker::new(),
             concealed_frames: 0,
+            concealed_underrun_frames: 0,
+            next_deadline: None,
+            consecutive_concealed: 0,
             pkt_count: 0,
             logged_large_jump: false,
         })
@@ -4994,6 +5009,82 @@ fn spawn_decode_thread(
     Ok(DecodeThread { tx, pool_rx, join })
 }
 
+/// Durée d'une trame Opus, en `Duration` (miroir de `conceal::FRAME_MS`).
+const FRAME: std::time::Duration = std::time::Duration::from_micros(2_500);
+
+/// Combien attendre avant le prochain réveil : la plus proche échéance de trame,
+/// toutes sources confondues. Aucune source à surveiller = on dort franchement,
+/// un paquet nous réveillera.
+fn next_wait(
+    states: &HashMap<Arc<str>, DecodeState>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    let mut soonest: Option<f64> = None;
+    for st in states.values() {
+        let Some(deadline) = st.next_deadline else { continue };
+        let ms = deadline.saturating_duration_since(now).as_secs_f64() * 1000.0;
+        soonest = Some(soonest.map_or(ms, |s: f64| s.min(ms)));
+    }
+    match soonest {
+        None => std::time::Duration::from_millis(100),
+        Some(ms) => std::time::Duration::from_secs_f64(
+            jamodio_audio_core::mixer::conceal::sleep_until_deadline_ms(ms) / 1000.0,
+        ),
+    }
+}
+
+/// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
+///
+/// Tourne sur le thread de décodage, JAMAIS dans le callback audio : il ne fait
+/// que trouver des échantillons de plus dans son tampon, exactement comme si le
+/// paquet était arrivé.
+fn conceal_due_streams(
+    states: &mut HashMap<Arc<str>, DecodeState>,
+    mixer: &Arc<AudioMixer>,
+    now: std::time::Instant,
+) {
+    use jamodio_audio_core::mixer::conceal::{decide, Conceal};
+    for (id, st) in states.iter_mut() {
+        let Some(deadline) = st.next_deadline else { continue };
+        if now < deadline {
+            continue;
+        }
+        let late_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0;
+        // Flux inconnu du mixer (retiré entre-temps) : 0 ms, donc la décision se
+        // fait comme sur un tampon vide — et le push suivant ne trouvera personne.
+        let fill_ms = mixer.buffered_ms(id).unwrap_or(0.0);
+        match decide(late_ms, fill_ms, st.consecutive_concealed) {
+            Conceal::Wait => {}
+            Conceal::Frame => {
+                // Copie obligatoire avant push : `decode_loss()` rend une slice
+                // d'un buffer interne écrasé au décodage suivant (Sprint 3 BUG 7).
+                let plc: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
+                if let Some(plc) = plc {
+                    mixer.push_samples(id, &plc);
+                    // La place est prise : un retardataire sera écarté au lieu
+                    // d'être joué après sa remplaçante.
+                    st.seq.on_concealed();
+                    st.concealed_underrun_frames += 1;
+                    st.consecutive_concealed += 1;
+                }
+            }
+            Conceal::FadeToSilence => {
+                // On cesse d'inventer. Le tampon fond vers le silence tout seul,
+                // et on DÉSARME l'échéance : sans ça, un pair parti ferait tourner
+                // ce thread à 400 Hz pour rien. Le retour des paquets la réarme.
+                st.next_deadline = None;
+                continue;
+            }
+        }
+        // Quelle que soit la décision, la trame suivante est due une trame plus
+        // tard. Si l'échéance recalculée est DÉJÀ passée (thread déprogrammé
+        // longtemps), on repart de maintenant : la boucle ne rattrape pas un
+        // retard en tournant à vide.
+        let next = deadline + FRAME;
+        st.next_deadline = Some(if next > now { next } else { now + FRAME });
+    }
+}
+
 /// Boucle du thread de décodage RT. Promu en tête. Multiplexe tous les pairs.
 fn decode_rt_loop(
     rx: Receiver<DecodeMsg>,
@@ -5008,7 +5099,24 @@ fn decode_rt_loop(
 
     let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
 
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // Lot 1.2 — on n'attend plus un paquet indéfiniment : on attend jusqu'à
+        // la PROCHAINE ÉCHÉANCE. Sans ça, un paquet en retard ne réveille
+        // personne, le tampon se vide et la sortie joue du silence — le trou sec
+        // que ce chantier supprime. L'attente est bornée (cf. `conceal`), et la
+        // précision du réveil a été mesurée sur le PC de recette avant d'être
+        // choisie : 810 µs au p99 pour une trame de 2,5 ms (sonde `wake_probe`).
+        let wait = next_wait(&states, std::time::Instant::now());
+        let msg = match rx.recv_timeout(wait) {
+            Ok(msg) => Some(msg),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            // Tous les émetteurs partis : plus rien n'arrivera jamais.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        // Masquage AVANT de traiter le message : si l'échéance est passée, elle
+        // l'était déjà quand le paquet est entré dans la file.
+        conceal_due_streams(&mut states, &mixer, std::time::Instant::now());
+        let Some(msg) = msg else { continue };
         match msg {
             DecodeMsg::Shutdown => break,
             DecodeMsg::Remove { producer_id, epoch } => {
@@ -5113,6 +5221,15 @@ fn decode_one_packet(
         st.drift.observe(header.timestamp, recv_instant);
         st.jitter.observe(header.timestamp, recv_instant);
     }
+
+    // Lot 1.2 — un vrai paquet est passé : la trame suivante est attendue une
+    // trame après SON arrivée (pas après « maintenant » : le paquet a pu
+    // patienter dans la file). Et le compteur de trames inventées repart de zéro,
+    // puisqu'on a de nouveau de la vraie matière.
+    if matches!(arrival, Arrival::Start | Arrival::Next { .. }) {
+        st.next_deadline = Some(recv_instant + FRAME);
+        st.consecutive_concealed = 0;
+    }
     if st.pkt_count.is_multiple_of(40) {
         // ~10×/s (1 paquet sur 40). Chantier #1 — pilote le plancher du jitter
         // buffer avec la gigue de QUEUE (pire-cas récent, pas la moyenne), une fois
@@ -5131,6 +5248,7 @@ fn decode_one_packet(
             packets_lost: counters.lost(),
             packets_late: counters.late,
             concealed_frames: st.concealed_frames,
+            concealed_underrun_frames: st.concealed_underrun_frames,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -5920,5 +6038,128 @@ mod teardown_tests {
              (400 ms) — la fuite du hot-swap est de retour (run={running})"
         );
         eprintln!("OK: teardown réel → 0 callback fantôme (run={running})");
+    }
+}
+
+#[cfg(test)]
+mod conceal_loop_tests {
+    use super::*;
+    // `StreamKind` vient du protocole (cf. import du module).
+    use std::time::{Duration, Instant};
+
+    fn state(now: Instant) -> DecodeState {
+        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        // Un flux qui a déjà reçu un paquet : sans ça, rien n'est jamais masqué.
+        st.seq.on_packet(1000);
+        st.next_deadline = Some(now + FRAME);
+        st
+    }
+
+    fn states(now: Instant) -> HashMap<Arc<str>, DecodeState> {
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        m.insert(Arc::from("peer-test"), state(now));
+        m
+    }
+
+    #[test]
+    fn sans_aucun_flux_le_thread_dort_franchement() {
+        let empty: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        assert_eq!(next_wait(&empty, Instant::now()), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn lattente_suit_la_plus_proche_echeance() {
+        let now = Instant::now();
+        let st = states(now);
+        // Échéance à +2,5 ms → on attend ~2,5 ms, jamais plus.
+        let w = next_wait(&st, now);
+        assert!(w <= FRAME, "attente {w:?} au-delà d'une trame");
+        assert!(w > Duration::from_micros(2_000), "attente {w:?} trop courte");
+    }
+
+    #[test]
+    fn echeance_deja_passee_on_ne_dort_pas() {
+        let now = Instant::now();
+        let st = states(now - Duration::from_millis(50));
+        assert_eq!(next_wait(&st, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn un_tampon_qui_tient_ne_declenche_aucun_masquage() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        // 20 ms de matière dans le tampon : la sortie a de quoi jouer.
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
+        let now = Instant::now();
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 0, "rien à inventer");
+        assert_eq!(s.consecutive_concealed, 0);
+        assert!(s.next_deadline.is_some(), "l'échéance continue d'avancer");
+    }
+
+    #[test]
+    fn tampon_vide_et_echeance_passee_on_invente_une_trame() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 1);
+        assert_eq!(s.consecutive_concealed, 1);
+    }
+
+    /// Au plafond, on cesse d'inventer ET on désarme l'échéance.
+    ///
+    /// On amène le compteur au plafond directement plutôt que d'enchaîner les
+    /// échéances : chaque trame inventée remplit le tampon, et ici rien ne le
+    /// vide — dans la vraie vie, c'est le callback audio qui le consomme entre
+    /// deux échéances. Enchaîner ici testerait donc surtout l'absence de
+    /// callback. La chaîne complète est la matière du rejeu déterministe prévu
+    /// par le plan (traces synthétiques injectées dans le vrai tampon).
+    #[test]
+    fn au_plafond_on_cesse_dinventer_et_on_desarme() {
+        use jamodio_audio_core::mixer::conceal::MAX_CONSECUTIVE;
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = states(now - Duration::from_millis(10));
+        st.values_mut().next().unwrap().consecutive_concealed = MAX_CONSECUTIVE;
+        conceal_due_streams(&mut st, &mixer, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 0, "on n'invente plus au plafond");
+        assert!(
+            s.next_deadline.is_none(),
+            "échéance désarmée : un pair parti ne doit pas faire tourner ce thread à 400 Hz"
+        );
+    }
+
+    /// Un vrai paquet remet le compteur à zéro : on a de nouveau de la matière.
+    #[test]
+    fn une_trame_inventee_ne_bloque_pas_le_flux_quand_le_son_revient() {
+        let now = Instant::now();
+        let mut st = state(now);
+        st.consecutive_concealed = 2;
+        st.seq.on_concealed();
+        // Le paquet suivant arrive : place suivante, compteur remis à zéro.
+        let arrival = st.seq.on_packet(1002);
+        assert_eq!(arrival, Arrival::Next { missing: 0 });
+    }
+
+    #[test]
+    fn un_flux_jamais_entendu_nest_jamais_masque() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
+        m.insert(Arc::from("peer-test"), st);
+        conceal_due_streams(&mut m, &mixer, now);
+        // `on_concealed` ne fait rien avant le premier paquet : rien n'est inventé
+        // pour un flux dont on n'a jamais entendu la moindre trame.
+        assert_eq!(m.values().next().unwrap().seq.counters().expected, 0);
     }
 }

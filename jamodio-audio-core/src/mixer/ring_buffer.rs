@@ -592,6 +592,14 @@ impl JitterBuffer {
         self.consumer.occupied_len()
     }
 
+    /// Ce qu'il reste à jouer, en millisecondes — la même quantité que
+    /// [`Self::buffered`], dans l'unité où le masquage raisonne (`mixer::conceal`).
+    /// La conversion vit ici : ailleurs, elle supposerait connue la géométrie du
+    /// tampon (entrelacement stéréo), qui n'appartient qu'à lui.
+    pub fn buffered_ms(&self) -> f64 {
+        samples_to_ms_f64(self.consumer.occupied_len() as u64)
+    }
+
     pub fn target_ms(&self) -> usize {
         self.target_samples * 1000 / (SAMPLE_RATE * CHANNELS)
     }

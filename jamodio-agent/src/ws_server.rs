@@ -1473,6 +1473,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         packets_lost: net.packets_lost,
                         packets_late: net.packets_late,
                         concealed_frames: net.concealed_frames,
+                        concealed_underrun_frames: net.concealed_underrun_frames,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
                         target_reactive_ms: s.target_reactive_ms,

@@ -1285,6 +1285,14 @@ pub struct PeerPerf {
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     #[serde(rename = "concealedFrames")]
     pub concealed_frames: u64,
+    /// Lot 1.2 — trames de masquage poussées À L'ÉCHÉANCE, pour un paquet en
+    /// RETARD, sans attendre qu'une arrivée révèle le trou. Comptées à part de
+    /// `concealedFrames` (paquet perdu, découvert à l'arrivée) : les deux disent
+    /// des choses différentes du réseau, et c'est celle-ci qui chiffre le gain du
+    /// chantier. `underruns` continue de compter l'accroc, masqué ou non — un
+    /// lien irrégulier reste dit irrégulier même quand on ne l'entend plus.
+    #[serde(rename = "concealedUnderrunFrames")]
+    pub concealed_underrun_frames: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).

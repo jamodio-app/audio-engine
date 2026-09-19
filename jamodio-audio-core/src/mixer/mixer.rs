@@ -964,6 +964,21 @@ impl AudioMixer {
     ///
     /// C2.1 — clone l'Arc du flux cible sous le RwLock lecture, relâche, puis
     /// verrouille SA cellule (verrou court). Ne croise le callback que sur ce flux.
+    /// Ce qu'il reste à jouer dans le tampon de ce flux, en millisecondes.
+    ///
+    /// Lu par le thread de décodage à l'échéance d'une trame : un tampon qui tient
+    /// encore n'a besoin d'aucun masquage (cf. `mixer::conceal`). Même discipline
+    /// de verrous que `push_samples` (C2.1) — verrou lecture de la carte, clone de
+    /// l'Arc, verrou COURT de la cellule — donc aucun contact nouveau avec le
+    /// callback au-delà de ce que le push fait déjà.
+    ///
+    /// `None` = flux inconnu (pas encore `add_stream`, ou déjà retiré).
+    pub fn buffered_ms(&self, producer_id: &str) -> Option<f64> {
+        let cell = self.streams.read().get(producer_id).cloned()?;
+        let ms = cell.jitter.lock().buffered_ms();
+        Some(ms)
+    }
+
     pub fn push_samples(&self, producer_id: &str, samples: &[f32]) {
         let cell = self.streams.read().get(producer_id).cloned();
 
