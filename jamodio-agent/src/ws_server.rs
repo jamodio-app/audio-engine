@@ -3628,9 +3628,10 @@ async fn handle_message(
                         items: vec![],
                         scanning: true,
                         blocked: vec![],
+                        pending: 0,
                     }];
                 };
-                let (items, blocked_items, scanning) = pl.list_instrument_plugins();
+                let (items, blocked_items, scanning, pending) = pl.list_instrument_plugins();
                 let blocked = blocked_items
                     .iter()
                     .map(|b| {
@@ -3655,11 +3656,29 @@ async fn handle_message(
                         bp
                     })
                     .collect();
-                vec![AgentMessage::PluginList { items, scanning, blocked }]
+                vec![AgentMessage::PluginList { items, scanning, blocked, pending }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
+            }
+        }
+
+        // 0.6.5-x — « Inventorier » : le musicien a été prévenu que certains
+        // plugins ouvriront leur fenêtre de licence, et il a accepté. Seuls les
+        // items jamais vus sont ouverts (le cache sert le reste), contrairement
+        // à `RescanPlugins` qui reprend tout depuis zéro.
+        BrowserMessage::ScanNewPlugins => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                if let Some(pl) = lock_pipeline_wait(pipeline).await {
+                    pl.spawn_plugin_scan();
+                }
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0 }]
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
             }
         }
 
@@ -3672,11 +3691,11 @@ async fn handle_message(
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
                     pl.spawn_plugin_scan_forced();
                 }
-                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0 }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
             }
         }
 

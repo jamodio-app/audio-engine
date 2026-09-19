@@ -24,6 +24,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
 /// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
+/// Prédicat serde : un compteur à zéro ne part pas sur le fil. Le champ garde
+/// alors exactement la sémantique qu'il avait avant d'exister (absent = rien à
+/// signaler), donc aucun browser n'a besoin de le connaître pour rester juste.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 fn default_pulse_ratio() -> f64 {
     1.0
 }
@@ -319,6 +326,14 @@ pub enum BrowserMessage {
     /// AU blocklisté (empreinte absente → retenu à vie sinon) retente sa chance.
     /// L'agent répond `PluginList { scanning: true }` puis le browser repolle.
     RescanPlugins,
+    /// 0.6.5-x (19/09/2026) — inventorie les plugins JAMAIS vus, à la demande du
+    /// musicien. L'agent ne le fait plus tout seul au démarrage : instancier un
+    /// plugin, c'est le laisser ouvrir sa fenêtre de licence, et un nouvel
+    /// utilisateur en voyait surgir plusieurs sans explication. Le studio
+    /// prévient d'abord, puis envoie ceci. Différent de `RescanPlugins`, qui
+    /// reprend TOUT depuis zéro : ici, seuls les items inconnus sont ouverts.
+    /// L'agent répond `PluginList { scanning: true }` puis le browser repolle.
+    ScanNewPlugins,
     /// Sprint INSERT (S1) — charge un plugin sur la tranche instrument self.
     /// Réponse : `InstrumentPluginLoaded` ou `InstrumentPluginError`.
     /// Charge UN seul plugin à la fois côté MVP (1 slot) — un appel quand un
@@ -938,6 +953,12 @@ pub enum AgentMessage {
         scanning: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blocked: Vec<BlockedPlugin>,
+        /// 0.6.5-x — plugins découverts que l'agent n'a PAS ouverts (il ne le
+        /// fait plus de lui-même). > 0 ⇒ le studio propose de les inventorier,
+        /// en prévenant que certains demanderont leur licence. `0` ⇒ la liste
+        /// est complète. `#[serde(default)]` : rétro-compat browser antérieur.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pending: usize,
     },
     /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin` ET push
     /// automatique au connect WS si un plugin est déjà chargé (sync state

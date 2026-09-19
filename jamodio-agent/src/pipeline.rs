@@ -1162,6 +1162,10 @@ pub enum InputSource {
 pub struct ScanResult {
     pub plugins: Vec<PluginInfo>,
     pub blocked: Vec<crate::plugin_scan::session::BlockedItem>,
+    /// Plugins découverts que l'agent n'a PAS instanciés (inventaire du
+    /// démarrage). > 0 ⇒ le studio propose au musicien de les inventorier, en
+    /// le prévenant que certains ouvriront leur fenêtre de licence.
+    pub pending: usize,
 }
 
 /// État du scan plugin en background. Stocké dans `PipelineState`.
@@ -1501,6 +1505,46 @@ impl PipelineState {
         self.spawn_scan_inner(false);
     }
 
+    /// Démarrage de l'agent — INVENTAIRE SEUL : on lit le cache, on compte ce
+    /// qui reste à connaître, on n'instancie rien.
+    ///
+    /// Instancier un plugin, c'est le laisser ouvrir sa fenêtre de licence. Un
+    /// nouvel utilisateur en voyait plusieurs surgir dès la première
+    /// installation, sans explication, et chaque fenêtre non cliquée coûtait
+    /// 30 s puis condamnait le plugin (signalé le 19/09/2026). Un utilisateur
+    /// déjà installé ne voit aucune différence : son cache répond en quelques
+    /// millisecondes, comme avant. Le scan qui instancie est désormais demandé
+    /// par le musicien, prévenu de ce qui va se passer.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn spawn_plugin_inventory(&self) {
+        let cache = self.plugin_scan_cache.clone();
+        std::thread::Builder::new()
+            .name("plugin-inventory".into())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                let scan = crate::plugin_scan::run_cache_only();
+                tracing::info!(
+                    target: "jamodio::plugin",
+                    known = scan.plugins.len(),
+                    pending = scan.pending,
+                    blocked = scan.blocked.len(),
+                    elapsed_ms = t0.elapsed().as_millis(),
+                    "inventaire des plugins (aucune instanciation)"
+                );
+                *cache.lock() = PluginScanCache::Ready(ScanResult {
+                    plugins: scan.plugins,
+                    blocked: scan.blocked,
+                    pending: scan.pending,
+                });
+            })
+            .expect("spawn plugin-inventory thread");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub fn spawn_plugin_inventory(&self) {
+        // No-op : pas d'host plugin Linux pour l'instant.
+    }
+
     /// 0.5.11-4 — rescan FORCÉ demandé par l'utilisateur (bouton « Rescanner »).
     /// Repasse le cache en `Scanning` (l'UI réaffiche « Scan… » + repolle) puis
     /// relance un scan qui IGNORE le cache disque → les AU blocklistés à tort
@@ -1539,6 +1583,7 @@ impl PipelineState {
                 *cache.lock() = PluginScanCache::Ready(ScanResult {
                     plugins: scan.plugins,
                     blocked: scan.blocked,
+                    pending: scan.pending,
                 });
             })
             .expect("spawn plugin-scan thread");
@@ -1554,10 +1599,17 @@ impl PipelineState {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn list_instrument_plugins(
         &self,
-    ) -> (Vec<PluginInfo>, Vec<crate::plugin_scan::session::BlockedItem>, bool) {
+    ) -> (
+        Vec<PluginInfo>,
+        Vec<crate::plugin_scan::session::BlockedItem>,
+        bool,
+        usize,
+    ) {
         match &*self.plugin_scan_cache.lock() {
-            PluginScanCache::Scanning => (Vec::new(), Vec::new(), true),
-            PluginScanCache::Ready(r) => (r.plugins.clone(), r.blocked.clone(), false),
+            PluginScanCache::Scanning => (Vec::new(), Vec::new(), true, 0),
+            PluginScanCache::Ready(r) => {
+                (r.plugins.clone(), r.blocked.clone(), false, r.pending)
+            }
         }
     }
 
@@ -5301,6 +5353,7 @@ mod plugin_control_tests {
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Ready(ScanResult {
                 plugins,
                 blocked: Vec::new(),
+                pending: 0,
             }))),
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),

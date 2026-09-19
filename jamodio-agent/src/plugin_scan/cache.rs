@@ -131,7 +131,16 @@ pub fn reconcile(discovered: &[(String, Option<FileFingerprint>)], cache: &Cache
             }
         }
         if let Some(rec) = cache.blocked.iter().find(|b| b.item == *item) {
-            if fingerprints_match(rec.fingerprint, *fp) {
+            // Un DÉPASSEMENT DE DÉLAI n'est pas un plugin cassé (19/09/2026).
+            // Le cas courant, c'est un plugin sous licence qui a ouvert SA
+            // fenêtre et attend un clic : au premier lancement, l'utilisateur
+            // ferme ces fenêtres sans comprendre, et chaque plugin ainsi
+            // « condamné » l'était À VIE — un AU n'a pas d'empreinte fichier,
+            // donc plus rien ne pouvait lui rendre sa chance sauf un bump d'ABI.
+            // On ne retient donc que les vrais plantages ; un délai dépassé
+            // repart à l'inventaire suivant, qui est désormais demandé par le
+            // musicien et non plus lancé dans son dos.
+            if rec.reason == BlockReason::Crash && fingerprints_match(rec.fingerprint, *fp) {
                 plan.retained_blocked.push(BlockedItem {
                     item: item.clone(),
                     reason: rec.reason,
@@ -347,6 +356,47 @@ mod tests {
         let plan = reconcile(&discovered, &cache);
         assert_eq!(plan.to_scan, vec!["/a.vst3".to_string()]);
         assert!(plan.reused.is_empty());
+    }
+
+    /// Un plugin sous licence ouvre sa fenêtre et attend un clic : au premier
+    /// lancement, l'utilisateur la ferme sans comprendre → dépassement de délai.
+    /// Le condamner d'une session à l'autre, c'est le faire disparaître à vie
+    /// pour un AU (pas d'empreinte fichier). Il doit repartir à l'inventaire.
+    #[test]
+    fn un_depassement_de_delai_ne_condamne_pas_dune_session_a_lautre() {
+        let cache = cache_with(
+            vec![],
+            vec![BlockedRecord {
+                item: "au:aufx.Xpns.Xpns".into(),
+                fingerprint: None,
+                reason: BlockReason::Timeout,
+            }],
+        );
+        let discovered = vec![("au:aufx.Xpns.Xpns".to_string(), None)];
+        let plan = reconcile(&discovered, &cache);
+        assert_eq!(
+            plan.to_scan,
+            vec!["au:aufx.Xpns.Xpns".to_string()],
+            "un délai dépassé doit retenter sa chance"
+        );
+        assert!(plan.retained_blocked.is_empty());
+    }
+
+    /// Un vrai plantage, lui, reste retenu : rien n'a changé pour ce cas.
+    #[test]
+    fn un_plantage_reste_condamne_tant_que_le_fichier_ne_bouge_pas() {
+        let cache = cache_with(
+            vec![],
+            vec![BlockedRecord {
+                item: "au:aufx.Bad.Bad".into(),
+                fingerprint: None,
+                reason: BlockReason::Crash,
+            }],
+        );
+        let discovered = vec![("au:aufx.Bad.Bad".to_string(), None)];
+        let plan = reconcile(&discovered, &cache);
+        assert!(plan.to_scan.is_empty());
+        assert_eq!(plan.retained_blocked.len(), 1);
     }
 
     #[test]

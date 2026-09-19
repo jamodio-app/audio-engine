@@ -583,10 +583,16 @@ fn main() {
             // commandes d'état latché l'atteignent alors sans passer par le mutex
             // pipeline, donc sans pouvoir être perdues sur contention.
             let mut pipeline = PipelineState::new(mixer.clone());
-            // Sprint INSERT (S1.3) — lance le scan AU en background dès le
-            // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
-            // pas le menu FX avant plusieurs secondes → cache prêt à temps.
-            pipeline.spawn_plugin_scan();
+            // 19/09/2026 — INVENTAIRE seulement : on lit le cache, on compte ce
+            // qui reste à connaître, on n'ouvre aucun plugin. Instancier, c'est
+            // laisser chaque plugin sous licence ouvrir SA fenêtre : un nouvel
+            // utilisateur en voyait surgir plusieurs dès sa première
+            // installation, sans comprendre, et chacune non cliquée coûtait 30 s
+            // puis condamnait le plugin. Un utilisateur déjà installé ne voit
+            // aucune différence (son cache répond en quelques ms). Le scan qui
+            // ouvre vraiment les plugins est demandé depuis le studio, une fois
+            // le musicien prévenu (`ScanNewPlugins`).
+            pipeline.spawn_plugin_inventory();
             // Sprint S2.7 — Crée un port MIDI virtuel "Jamodio Virtual MIDI"
             // dans CoreMIDI. Apparaît comme destination dans toutes les apps
             // MIDI macOS (Logic, Ableton, GarageBand…). Évite à l'user
