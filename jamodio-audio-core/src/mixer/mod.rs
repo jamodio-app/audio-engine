@@ -1,5 +1,8 @@
 pub mod reference;
 pub mod ring_buffer;
+// Lot 1.2 du chantier tampon — décider de masquer un trou À L'ÉCHÉANCE,
+// au lieu de le découvrir quand un paquet arrive enfin.
+pub mod conceal;
 // Le module `mixer.rs` porte le même nom que son parent — clippy le
 // signale (`module_inception`), mais la structure est volontaire :
 // `crate::mixer::mixer::AudioMixer` reste l'API publique stable
