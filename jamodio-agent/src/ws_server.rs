@@ -1131,6 +1131,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let elapsed_secs = tick_now.duration_since(prev_tick).as_secs_f64();
             prev_tick = tick_now;
             let capturing_now = matches!(pl.state, AgentState::Capturing);
+            // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
+            // callback correspondant n'a pas encore tourné : on publie alors
+            // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
+            let input_block_frames =
+                Some(pl.perfstats.input_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
+            let output_block_frames =
+                Some(pl.perfstats.output_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
             let callback_deficit_in = capturing_now
                 .then(|| {
                     crate::machine_health::callback_deficit_per_sec(
@@ -1599,6 +1606,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // active = cold-start muet (watchdog). ≈370/s = sain.
                 capture_cb_per_sec,
                 output_cb_per_sec,
+                // 0.6.5-11 — taille de bloc livrée par l'OS (frames/canal).
+                input_block_frames,
+                output_block_frames,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,
@@ -1618,6 +1628,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 monitor_buffer_ms,
                 monitor_underruns,
                 edge_peak_ratio,
+                input_block_frames,
+                output_block_frames,
                 callback_deficit_in,
                 callback_deficit_out,
                 cpu_pct: machine_sample.cpu_pct,

@@ -1147,6 +1147,21 @@ pub enum AgentMessage {
         /// chiffre rassurant quand rien n'a été regardé. Cf. `edge_continuity`.
         #[serde(rename = "edgePeakRatio", skip_serializing_if = "Option::is_none")]
         edge_peak_ratio: Option<f32>,
+        /// Taille du bloc que le callback d'ENTRÉE livre d'un seul coup, en
+        /// frames PAR CANAL (48 kHz : 64 frames = 1,33 ms). C'est elle qui dit
+        /// combien de trames Opus un réveil produit, donc la rafale d'émission
+        /// possible. Absente tant que la capture n'a pas démarré : on ne publie
+        /// pas une taille qu'on n'a pas mesurée.
+        #[serde(rename = "inputBlockFrames", skip_serializing_if = "Option::is_none")]
+        input_block_frames: Option<u32>,
+        /// Idem pour la SORTIE — la taille que le callback consomme d'un seul
+        /// tirage. C'est le vrai seuil de survie du tampon de réception : en
+        /// dessous, le prochain tirage laisse un trou (cf. `mixer::conceal`).
+        /// Publiée depuis la 0.6.5-11, parce que le banc du 20/09/2026 s'est
+        /// conclu sans elle : le correctif du seuil de masquage dépendait de
+        /// cette valeur, et elle n'était lisible nulle part.
+        #[serde(rename = "outputBlockFrames", skip_serializing_if = "Option::is_none")]
+        output_block_frames: Option<u32>,
         /// Callbacks audio d'ENTRÉE manquants par seconde (attendus sur le temps
         /// écoulé − réellement servis) : chaque callback manquant est un bloc de
         /// son perdu. Absent hors capture ou tant que la taille de bloc est inconnue.
@@ -1558,6 +1573,59 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    /// Contrat wire — la taille de bloc livrée par l'OS doit être LISIBLE.
+    ///
+    /// Le banc du 20/09/2026 s'est conclu sans elle : le correctif du seuil de
+    /// masquage dépendait de la taille du bloc de sortie, et elle n'apparaissait
+    /// nulle part — ni dans perf-stats, ni dans les logs hors ligne `CRAQUEMENT`.
+    /// Absente = callback pas encore tourné ; jamais `0`, qui se lirait comme une
+    /// mesure.
+    #[test]
+    fn les_tailles_de_bloc_sont_publiees_et_absentes_si_non_mesurees() {
+        fn perfstats(input: Option<u32>, output: Option<u32>) -> serde_json::Value {
+            serde_json::to_value(AgentMessage::PerfStats {
+                timestamp_ms: 1,
+                plugin: None,
+                pipeline_latency_ms: PipelineLatency {
+                    count: 0,
+                    p50_ms: 0.0,
+                    p99_ms: 0.0,
+                    max_ms: 0.0,
+                    mean_ms: 0.0,
+                    drops_per_sec: 0,
+                },
+                peers: vec![],
+                output_peak: 0.0,
+                output_clip_pct: 0.0,
+                monitor_buffer_ms: 5,
+                monitor_underruns: 0,
+                edge_peak_ratio: None,
+                input_block_frames: input,
+                output_block_frames: output,
+                callback_deficit_in: None,
+                callback_deficit_out: None,
+                cpu_pct: None,
+                memory_pressure: None,
+                memory_load_pct: None,
+                net_interface: None,
+                uplink: None,
+                recv_streams: vec![],
+            })
+            .unwrap()
+        }
+
+        // Mesurées : ASIO 64 frames en entrée, CoreAudio 512 en sortie.
+        let v = perfstats(Some(64), Some(512));
+        assert_eq!(v["type"], "perf-stats");
+        assert_eq!(v["inputBlockFrames"], 64);
+        assert_eq!(v["outputBlockFrames"], 512);
+
+        // Pas encore mesurées : les clés sont ABSENTES, pas à zéro.
+        let v = perfstats(None, None);
+        assert!(v.get("inputBlockFrames").is_none(), "{v}");
+        assert!(v.get("outputBlockFrames").is_none(), "{v}");
     }
 
     // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent
