@@ -5,6 +5,26 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-11] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son.** Cette version sert à relever une valeur
+qui manquait, pas à corriger quoi que ce soit.
+
+### Ajouté
+
+- **La taille des blocs que la carte son nous livre est enfin lisible** dans le
+  rapport de bug. C'est elle qui dit combien la sortie consomme d'un seul coup,
+  donc combien la réserve doit contenir pour ne pas se vider entre deux. Le banc
+  du 20/09 s'est conclu sans cette valeur : côté PC on la connaissait par hasard,
+  côté Mac pas du tout — on jugeait un réglage sans voir ce dont il dépend. Elle
+  reste absente tant que la carte son n'a pas démarré, plutôt que d'afficher un
+  zéro qu'on lirait comme une mesure.
+
+### Ce qu'il faut faire
+
+Une session Mac ↔ PC, même courte, puis envoyer les rapports. Il n'y a **rien à
+écouter de particulier** : le son doit être exactement celui de la 0.6.5-10.
+
 ## [0.6.5-10] — 2026-09-20 (pré-version de test)
 
 **Le comblement des trous se déclenche enfin sur Mac.** Aucun changement côté
