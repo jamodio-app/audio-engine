@@ -5,6 +5,20 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-8] — 2026-09-20 (pré-version de test)
+
+**Une prise abîmée se verra, au lieu de se deviner.** Aucun changement du son.
+
+### Ajouté
+
+- **Contrôle de continuité de la prise.** Quand le son devient mauvais sans
+  raison apparente et qu'un simple redémarrage le répare, rien dans les journaux
+  ne permettait de distinguer les deux situations : même interface, même réglage,
+  mêmes latences. L'Audio Engine vérifie maintenant que le signal capté se
+  **recolle** d'un bloc au suivant, et le dit — une ligne dans le journal
+  uniquement si la prise est abîmée, un chiffre dans les mesures sinon. Une
+  session saine n'alourdit ni le journal ni le rapport.
+
 ## [0.6.5-7] — 2026-09-19 (pré-version de test)
 
 **La première qui change le son.** À écouter, pas seulement à installer.
