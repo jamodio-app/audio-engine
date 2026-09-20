@@ -5,6 +5,31 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-18] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son.**
+
+### Ce que la 0.6.5-17 a appris
+
+**Le son qui entre est parfaitement normal.** Sur 290 relevés, il ne dépasse
+jamais le niveau maximal — ni la carte son, ni son pilote, ni la conversion ne
+sont en cause. C'est donc notre programme qui fabrique le dépassement. Et sur
+les dernières secondes, alors que plus personne ne jouait, la sortie montait
+quand même : ce n'est pas une amplification du son capté, c'est du son
+inventé.
+
+### Ajouté
+
+- **Un repère au milieu du trajet**, pour couper en deux la portion où le
+  problème naît. Le son y est encore normal → le défaut est après ; il y est
+  déjà anormal → il est avant. Une seule session suffira à trancher.
+
+### Ce qu'il faut faire
+
+Jouer trois minutes sans plugin d'ampli, **et laisser tourner quelques secondes
+sans jouer avant de quitter** — c'est là que le défaut s'est montré la dernière
+fois.
+
 ## [0.6.5-17] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.**
