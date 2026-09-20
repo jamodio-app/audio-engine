@@ -5,6 +5,33 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-14] — 2026-09-20 (pré-version de test)
+
+**Celle-ci change le son** — les trois précédentes ne faisaient que mesurer.
+
+### Corrigé
+
+- **Le comblement des trous n'intervient plus trop tôt.** Il se déclenchait dès
+  que la réserve passait sous la durée d'un petit morceau de son — une valeur
+  choisie sans l'avoir mesurée. Résultat : dans près de six cas sur dix, le vrai
+  morceau arrivait juste après, et il était écarté au profit de celui qu'on
+  venait de fabriquer. La mesure l'a chiffré : **1,4 ms d'avance en moyenne,
+  jusqu'à 2,4 ms.** Le déclenchement suit maintenant ce que la carte son réclame
+  vraiment, avec juste la marge nécessaire pour ne pas arriver en retard.
+
+### Ce qu'il faut écouter
+
+C'est la version à écouter attentivement, dans les deux sens :
+
+1. **Aucun nouveau clic ni accroc** ne doit apparaître. C'est le risque de ce
+   réglage : en attendant davantage, on pourrait arriver trop tard. Si tu
+   entends quelque chose que tu n'entendais pas avant, dis-le — c'est le signal
+   qu'on est allé trop loin.
+2. Le reste doit être identique à la 0.6.5-13.
+
+**Installe-la sur les DEUX machines** : le Mac était resté en 0.6.4 à la session
+précédente, donc sans aucun comblement.
+
 ## [0.6.5-13] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.** La dernière avant réglage.
