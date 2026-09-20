@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-13] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son.** La dernière avant réglage.
+
+### Ce que la 0.6.5-12 a appris
+
+Le comblement des trous se déclenche **trop tôt dans deux tiers des cas** :
+33 fois sur 50, le vrai morceau de son est arrivé avant que la réserve ne
+s'épuise. On a donc fabriqué du son pour rien, et écarté le vrai.
+
+### Ajouté
+
+- **De combien on s'y est pris trop tôt.** Savoir que ça arrive ne dit pas quoi
+  corriger : deux réglages différents produisent le même chiffre. La marge
+  perdue — quelques fractions de milliseconde, ou beaucoup plus — désigne lequel
+  des deux est en cause.
+
+### Ce qu'il faut faire
+
+Une session Mac ↔ PC de 5 minutes en jouant des deux côtés, puis les rapports.
+**Rien à écouter** : le son est celui de la 0.6.5-12.
+
 ## [0.6.5-12] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.** Comme la précédente, cette version
