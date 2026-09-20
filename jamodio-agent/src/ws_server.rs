@@ -1134,6 +1134,20 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
             // callback correspondant n'a pas encore tourné : on publie alors
             // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
+            // Pic BRUT de l'entrée (avant plugin) + part d'échantillons au-delà
+            // de la pleine échelle. Remis à zéro à chaque fenêtre : c'est un pic
+            // PAR SECONDE, comme `outputPeak`.
+            let raw_peak = f32::from_bits(pl.perfstats.input_peak.swap(0, Ordering::Relaxed));
+            let raw_overs = pl.perfstats.input_over_samples.swap(0, Ordering::Relaxed);
+            let raw_total = pl.perfstats.input_total_samples.swap(0, Ordering::Relaxed);
+            let (input_peak, input_over_pct) = if raw_total > 0 {
+                (
+                    Some(raw_peak),
+                    Some(100.0 * raw_overs as f32 / raw_total as f32),
+                )
+            } else {
+                (None, None)
+            };
             let input_block_frames =
                 Some(pl.perfstats.input_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
             let output_block_frames =
@@ -1614,6 +1628,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // active = cold-start muet (watchdog). ≈370/s = sain.
                 capture_cb_per_sec,
                 output_cb_per_sec,
+                // 0.6.5-17 — ce que le pilote livre VRAIMENT, avant plugin.
+                input_peak,
+                input_over_pct,
                 // 0.6.5-11 — taille de bloc livrée par l'OS (frames/canal).
                 input_block_frames,
                 output_block_frames,
@@ -1636,6 +1653,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 monitor_buffer_ms,
                 monitor_underruns,
                 edge_peak_ratio,
+                input_peak,
+                input_over_pct,
                 input_block_frames,
                 output_block_frames,
                 callback_deficit_in,

@@ -1048,6 +1048,18 @@ pub struct PerfHandles {
     /// saine d'une prise « horrible » que rien d'autre ne différenciait
     /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
     /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
+    /// Pic ABSOLU du signal capté, tel que le pilote nous le livre — avant
+    /// remap, plugin, gain d'envoi et limiteur. `output_peak` ne peut pas
+    /// répondre à la question posée le 20/09/2026 (« d'où vient un signal à 7
+    /// fois la pleine échelle ? ») : il est mesuré APRÈS le plugin, donc un
+    /// simulateur d'ampli chargé masque complètement ce qui entre.
+    ///
+    /// Avec `input_over_samples`, il sépare deux causes qui n'ont rien à voir :
+    /// un niveau d'entrée trop fort (beaucoup d'échantillons au-dessus) d'une
+    /// pluie d'impulsions isolées (pic très haut, presque aucun dépassement).
+    pub input_peak: Arc<std::sync::atomic::AtomicU32>,
+    pub input_over_samples: Arc<std::sync::atomic::AtomicU64>,
+    pub input_total_samples: Arc<std::sync::atomic::AtomicU64>,
     pub edge_blocks: Arc<std::sync::atomic::AtomicU64>,
     pub edge_peaks: Arc<std::sync::atomic::AtomicU64>,
     /// Part attendue par pur hasard (%), qui dépend de la taille du bloc.
@@ -1144,6 +1156,9 @@ impl PerfHandles {
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
         Self {
+            input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            input_over_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             edge_blocks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             edge_peaks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             edge_chance_pct: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -3932,6 +3947,28 @@ fn capture_stage_loop(
                 // La prise se recolle-t-elle d'un bloc au suivant ? Trois
                 // soustractions par BLOC (750/s), sur le buffer BRUT du pilote,
                 // avant toute transformation — et hors du callback audio.
+                // Pic BRUT, au même endroit et sur le même buffer que la
+                // rugosité : ce que le pilote livre, avant toute transformation.
+                // Trois comparaisons par échantillon, hors du callback audio.
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut peak = 0.0f32;
+                    let mut overs = 0u64;
+                    for v in &samples {
+                        let a = v.abs();
+                        if a > peak {
+                            peak = a;
+                        }
+                        if a > 1.0 {
+                            overs += 1;
+                        }
+                    }
+                    perfstats.input_peak.fetch_max(peak.to_bits(), Relaxed);
+                    perfstats.input_over_samples.fetch_add(overs, Relaxed);
+                    perfstats
+                        .input_total_samples
+                        .fetch_add(samples.len() as u64, Relaxed);
+                }
                 edge_continuity.observe(&samples, channels_in);
                 {
                     use std::sync::atomic::Ordering::Relaxed;
