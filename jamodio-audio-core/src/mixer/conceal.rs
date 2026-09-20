@@ -44,21 +44,50 @@ pub enum Conceal {
     FadeToSilence,
 }
 
+/// Bornes du délai de grâce accordé à un paquet en retard. Le plancher évite
+/// qu'un lien exceptionnellement régulier nous fasse inventer au moindre
+/// frémissement ; le plafond évite qu'une estimation de gigue emballée désarme
+/// le masquage pour de bon.
+const GRACE_MIN_MS: f64 = 1.0;
+const GRACE_MAX_MS: f64 = 10.0;
+
 /// Décision à l'échéance d'une trame.
 ///
 /// - `late_by_ms` : retard sur l'échéance attendue. Négatif = pas encore l'heure.
 /// - `fill_ms`    : ce qu'il reste à jouer dans le tampon de CE flux.
+/// - `jitter_tail_ms` : pire retard récemment mesuré SUR CE LIEN, ou `None` tant
+///   que la mesure n'est pas chaude.
 /// - `consecutive`: trames de masquage déjà poussées d'affilée pour ce flux.
 ///
-/// Un tampon qui tient au moins une trame n'a besoin de rien : la sortie a de
-/// quoi jouer pendant que le paquet finit d'arriver. C'est le cas le plus
-/// fréquent, et c'est celui où il ne faut surtout pas inventer — le paquet en
-/// retard arrivera, et sa trame inventée aurait pris sa place.
-pub fn decide(late_by_ms: f64, fill_ms: f64, consecutive: u32) -> Conceal {
+/// Trois raisons d'attendre plutôt que d'inventer, dans cet ordre :
+///
+/// 1. **On ne connaît pas encore le lien** (`jitter_tail_ms == None`). Inventer
+///    sans savoir ce que ce réseau fait d'habitude, c'est deviner.
+/// 2. **Le paquet est en retard, mais pas plus que d'habitude.** C'est la leçon
+///    du banc du 19/09/2026 : avec la seule condition « le tampon contient moins
+///    d'une trame », le masquage a tiré **59 fois sur 74 alors qu'aucun trou
+///    n'existait** — le paquet arrivait juste après et se faisait écarter, sa
+///    place ayant été prise. On n'invente donc qu'au-delà du pire retard que ce
+///    lien produit déjà.
+/// 3. **Le tampon tient encore une trame.** La sortie a de quoi jouer pendant
+///    que le paquet finit d'arriver.
+pub fn decide(
+    late_by_ms: f64,
+    fill_ms: f64,
+    jitter_tail_ms: Option<f64>,
+    consecutive: u32,
+) -> Conceal {
     // Une mesure non finie (NaN, infini) fait ATTENDRE : on n'invente pas du son
-    // sur la foi d'une horloge folle. C'est aussi ce qui rend la comparaison
-    // suivante sûre — elle ne voit plus que des nombres.
+    // sur la foi d'une horloge folle. C'est aussi ce qui rend les comparaisons
+    // suivantes sûres — elles ne voient plus que des nombres.
     if !late_by_ms.is_finite() || late_by_ms < 0.0 {
+        return Conceal::Wait;
+    }
+    let Some(tail) = jitter_tail_ms.filter(|t| t.is_finite()) else {
+        return Conceal::Wait;
+    };
+    let grace = tail.clamp(GRACE_MIN_MS, GRACE_MAX_MS);
+    if late_by_ms < grace {
         return Conceal::Wait;
     }
     if fill_ms >= FRAME_MS {
@@ -90,33 +119,63 @@ pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// Gigue typique du banc : ~2,5 ms de queue.
+    const TAIL: Option<f64> = Some(2.5);
+
     #[test]
     fn avant_lecheance_on_ninvente_rien() {
-        assert_eq!(decide(-1.0, 0.0, 0), Conceal::Wait);
-        assert_eq!(decide(-0.001, 0.0, 2), Conceal::Wait);
+        assert_eq!(decide(-1.0, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(-0.001, 0.0, TAIL, 2), Conceal::Wait);
+    }
+
+    /// Le correctif du 20/09 : un paquet à peine en retard arrive encore.
+    #[test]
+    fn un_retard_ordinaire_ne_declenche_rien() {
+        // 1 ms de retard sur un lien dont la queue de gigue vaut 2,5 ms : le
+        // paquet est encore en vol, et inventer lui volerait sa place.
+        assert_eq!(decide(1.0, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(2.49, 0.0, TAIL, 0), Conceal::Wait);
+        // Au-delà du pire retard connu du lien, on n'attend plus.
+        assert_eq!(decide(2.5, 0.0, TAIL, 0), Conceal::Frame);
+    }
+
+    #[test]
+    fn tant_quon_ne_connait_pas_le_lien_on_ninvente_pas() {
+        assert_eq!(decide(50.0, 0.0, None, 0), Conceal::Wait);
+        assert_eq!(decide(50.0, 0.0, Some(f64::NAN), 0), Conceal::Wait);
+    }
+
+    #[test]
+    fn la_grace_reste_dans_des_bornes_raisonnables() {
+        // Lien exceptionnellement régulier : on accorde quand même 1 ms.
+        assert_eq!(decide(0.5, 0.0, Some(0.01), 0), Conceal::Wait);
+        assert_eq!(decide(1.0, 0.0, Some(0.01), 0), Conceal::Frame);
+        // Estimation emballée : la grâce est plafonnée, le masquage reste possible.
+        assert_eq!(decide(9.9, 0.0, Some(500.0), 0), Conceal::Wait);
+        assert_eq!(decide(10.0, 0.0, Some(500.0), 0), Conceal::Frame);
     }
 
     #[test]
     fn un_tampon_qui_tient_une_trame_na_besoin_de_rien() {
         // Le paquet est en retard, mais la sortie a de quoi jouer : inventer
         // maintenant volerait sa place au paquet qui arrive.
-        assert_eq!(decide(0.5, FRAME_MS, 0), Conceal::Wait);
-        assert_eq!(decide(50.0, 12.0, 0), Conceal::Wait);
+        assert_eq!(decide(5.0, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(50.0, 12.0, TAIL, 0), Conceal::Wait);
     }
 
     #[test]
     fn echeance_depassee_et_tampon_vide_on_masque() {
-        assert_eq!(decide(0.0, 0.0, 0), Conceal::Frame);
-        assert_eq!(decide(0.1, 2.49, 0), Conceal::Frame);
+        assert_eq!(decide(2.5, 0.0, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(3.0, 2.49, TAIL, 0), Conceal::Frame);
     }
 
     #[test]
     fn au_dela_de_trois_trames_on_fond_vers_le_silence() {
         for n in 0..MAX_CONSECUTIVE {
-            assert_eq!(decide(1.0, 0.0, n), Conceal::Frame, "n={n}");
+            assert_eq!(decide(5.0, 0.0, TAIL, n), Conceal::Frame, "n={n}");
         }
-        assert_eq!(decide(1.0, 0.0, MAX_CONSECUTIVE), Conceal::FadeToSilence);
-        assert_eq!(decide(1.0, 0.0, 99), Conceal::FadeToSilence);
+        assert_eq!(decide(5.0, 0.0, TAIL, MAX_CONSECUTIVE), Conceal::FadeToSilence);
+        assert_eq!(decide(5.0, 0.0, TAIL, 99), Conceal::FadeToSilence);
     }
 
     /// 7,5 ms : c'est la durée qu'on s'autorise à inventer, pas une de plus.
@@ -127,10 +186,10 @@ mod tests {
 
     #[test]
     fn une_mesure_de_temps_absurde_fait_attendre_pas_masquer() {
-        assert_eq!(decide(f64::NAN, 0.0, 0), Conceal::Wait);
-        assert_eq!(decide(f64::NEG_INFINITY, 0.0, 0), Conceal::Wait);
+        assert_eq!(decide(f64::NAN, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(f64::NEG_INFINITY, 0.0, TAIL, 0), Conceal::Wait);
         // Un retard « infini » n'est pas un retard mesuré : on attend aussi.
-        assert_eq!(decide(f64::INFINITY, 0.0, 0), Conceal::Wait);
+        assert_eq!(decide(f64::INFINITY, 0.0, TAIL, 0), Conceal::Wait);
     }
 
     #[test]

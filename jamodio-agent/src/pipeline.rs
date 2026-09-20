@@ -5111,7 +5111,11 @@ fn conceal_due_streams(
         // Flux inconnu du mixer (retiré entre-temps) : 0 ms, donc la décision se
         // fait comme sur un tampon vide — et le push suivant ne trouvera personne.
         let fill_ms = mixer.buffered_ms(id).unwrap_or(0.0);
-        match decide(late_ms, fill_ms, st.consecutive_concealed) {
+        // Le pire retard que CE lien produit déjà : en deçà, le paquet est encore
+        // en vol. `None` tant que la mesure n'est pas chaude — on n'invente pas
+        // sans connaître le réseau.
+        let tail = st.jitter.is_warm().then(|| st.jitter.jitter_tail_ms());
+        match decide(late_ms, fill_ms, tail, st.consecutive_concealed) {
             Conceal::Wait => {}
             Conceal::Frame => {
                 // Copie obligatoire avant push : `decode_loss()` rend une slice
@@ -6113,9 +6117,28 @@ mod conceal_loop_tests {
     // `StreamKind` vient du protocole (cf. import du module).
     use std::time::{Duration, Instant};
 
+    /// Un flux déjà entendu ET dont on connaît la régularité : les deux
+    /// conditions sans lesquelles on n'invente jamais rien.
     fn state(now: Instant) -> DecodeState {
         let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
-        // Un flux qui a déjà reçu un paquet : sans ça, rien n'est jamais masqué.
+        st.seq.on_packet(1000);
+        // Chauffe l'estimateur de gigue avec un flux parfaitement régulier
+        // (120 paquets de 2,5 ms) : au-delà du warmup, la queue de gigue est
+        // connue et vaut ~0, donc la grâce tombe à son plancher d'1 ms.
+        let t0 = now - Duration::from_millis(400);
+        for i in 0..120u32 {
+            st.jitter
+                .observe(i * 120, t0 + Duration::from_micros(2_500 * u64::from(i)));
+        }
+        assert!(st.jitter.is_warm(), "le montage doit connaître le lien");
+        st.next_deadline = Some(now + FRAME);
+        st
+    }
+
+    /// Le montage inverse : un flux entendu, mais dont on ne connaît pas encore
+    /// la régularité.
+    fn state_lien_inconnu(now: Instant) -> DecodeState {
+        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
         st.seq.on_packet(1000);
         st.next_deadline = Some(now + FRAME);
         st
@@ -6212,6 +6235,26 @@ mod conceal_loop_tests {
         let s = st.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 1);
         assert_eq!(s.consecutive_concealed, 1);
+    }
+
+    /// Correctif du 20/09 — la leçon du banc : sur 74 masquages, 59 avaient tiré
+    /// à vide, le paquet arrivant juste après et se faisant écarter. On n'invente
+    /// plus tant qu'on ne connaît pas la régularité du lien.
+    #[test]
+    fn sans_connaitre_le_lien_on_ninvente_rien() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        let mut st = state_lien_inconnu(now);
+        st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
+        m.insert(Arc::from("peer-test"), st);
+        conceal_due_streams(&mut m, &mixer, now);
+        assert_eq!(
+            m.values().next().unwrap().concealed_underrun_frames,
+            0,
+            "lien inconnu : on attend, on n'invente pas"
+        );
     }
 
     /// Au plafond, on cesse d'inventer ET on désarme l'échéance.
