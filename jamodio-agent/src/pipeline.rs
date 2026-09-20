@@ -1036,8 +1036,10 @@ pub struct PerfHandles {
     /// saine d'une prise « horrible » que rien d'autre ne différenciait
     /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
     /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
-    pub edges_seen: Arc<std::sync::atomic::AtomicU64>,
-    pub edges_rough: Arc<std::sync::atomic::AtomicU64>,
+    pub edge_blocks: Arc<std::sync::atomic::AtomicU64>,
+    pub edge_peaks: Arc<std::sync::atomic::AtomicU64>,
+    /// Part attendue par pur hasard (%), qui dépend de la taille du bloc.
+    pub edge_chance_pct: Arc<std::sync::atomic::AtomicU32>,
     pub plugin_latency: Arc<Mutex<Histogram>>,
     /// End-to-end CAPTURE_in → ENCODE_send. Inclut le temps en file dans les
     /// ringbufs entre stages (S3) — c'est la VRAIE latence pipeline ressentie.
@@ -1130,8 +1132,9 @@ impl PerfHandles {
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
         Self {
-            edges_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            edges_rough: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            edge_blocks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            edge_peaks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            edge_chance_pct: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             pipeline_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
@@ -3920,9 +3923,12 @@ fn capture_stage_loop(
                 {
                     use std::sync::atomic::Ordering::Relaxed;
                     let w = edge_continuity.drain();
-                    if w.edges > 0 {
-                        perfstats.edges_seen.fetch_add(w.edges, Relaxed);
-                        perfstats.edges_rough.fetch_add(w.rough, Relaxed);
+                    if w.blocks > 0 {
+                        perfstats.edge_blocks.fetch_add(w.blocks, Relaxed);
+                        perfstats.edge_peaks.fetch_add(w.peak_at_edge, Relaxed);
+                        perfstats
+                            .edge_chance_pct
+                            .store(w.chance_pct.to_bits(), Relaxed);
                     }
                 }
 

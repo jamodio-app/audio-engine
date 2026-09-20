@@ -1139,15 +1139,14 @@ pub enum AgentMessage {
         monitor_buffer_ms: usize,
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
-        /// 0.6.5-8 — part des bords de blocs où le signal capté ne se recolle
-        /// PAS (%). Sur une prise saine : 0. Le 19/09/2026, une prise jugée
-        /// « horrible » et une prise parfaite ne se distinguaient par AUCUNE
-        /// autre mesure — même pilote, même buffer, mêmes latences déclarées.
-        /// Absent hors capture : on ne publie pas un zéro qui ressemblerait à
-        /// « tout va bien » alors que rien n'a été regardé. Cf.
-        /// `edge_continuity`.
-        #[serde(rename = "edgeRoughPct", skip_serializing_if = "Option::is_none")]
-        edge_rough_pct: Option<f32>,
+        /// 0.6.5-10 — la rugosité du signal capté se groupe-t-elle au BORD des
+        /// blocs ? Rapport à ce que le hasard donnerait : **1 = rien à
+        /// signaler**, 2 et plus = elle se groupe là où elle ne devrait pas.
+        /// Calibré sur l'enregistrement du 19/09/2026 : prise abîmée 2,3×,
+        /// signal sain 1,0 à 1,3×. Absent hors capture : on ne publie pas un
+        /// chiffre rassurant quand rien n'a été regardé. Cf. `edge_continuity`.
+        #[serde(rename = "edgePeakRatio", skip_serializing_if = "Option::is_none")]
+        edge_peak_ratio: Option<f32>,
         /// Callbacks audio d'ENTRÉE manquants par seconde (attendus sur le temps
         /// écoulé − réellement servis) : chaque callback manquant est un bloc de
         /// son perdu. Absent hors capture ou tant que la taille de bloc est inconnue.

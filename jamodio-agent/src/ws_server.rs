@@ -1195,25 +1195,28 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // Une ligne SEULEMENT si la prise est abîmée : une session saine
             // n'ajoute rien au journal. Le pourcentage, lui, part dans les
             // perf-stats de la même seconde.
-            let edge_rough_pct = {
-                let seen = pl.perfstats.edges_seen.swap(0, Ordering::Relaxed);
-                let rough = pl.perfstats.edges_rough.swap(0, Ordering::Relaxed);
-                if seen == 0 {
+            let edge_peak_ratio = {
+                let blocks = pl.perfstats.edge_blocks.swap(0, Ordering::Relaxed);
+                let peaks = pl.perfstats.edge_peaks.swap(0, Ordering::Relaxed);
+                let chance =
+                    f32::from_bits(pl.perfstats.edge_chance_pct.load(Ordering::Relaxed));
+                if blocks == 0 || chance <= 0.0 {
                     None
                 } else {
-                    let pct = 100.0 * rough as f32 / seen as f32;
-                    // 2 % = très au-dessus de ce qu'une prise saine produit (0),
-                    // et très en dessous de ce qu'une prise abîmée donne (~25 %
-                    // mesuré le 19/09). CONSTANTE DE CALIBRATION.
-                    if pct > 2.0 {
+                    let ratio = (100.0 * peaks as f32 / blocks as f32) / chance;
+                    // Calibré sur l'enregistrement du 19/09 : prise abîmée 2,3×
+                    // le hasard, signal sain 1,0 à 1,3×. 1,8 sépare les deux avec
+                    // de la marge des deux côtés. CONSTANTE DE CALIBRATION.
+                    if ratio > 1.8 {
                         tracing::warn!(
                             target: "jamodio::audio",
-                            rough_pct = pct,
-                            edges = seen,
-                            "PRISE ABÎMÉE : le signal capté ne se recolle pas d'un bloc au suivant"
+                            ratio,
+                            blocks,
+                            chance_pct = chance,
+                            "PRISE ABÎMÉE : la rugosité du signal capté se groupe au bord des blocs"
                         );
                     }
-                    Some(pct)
+                    Some(ratio)
                 }
             };
 
@@ -1601,7 +1604,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
-                edge_rough_pct,
+                edge_peak_ratio,
                 "perfstats snapshot"
             );
 
@@ -1614,7 +1617,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
-                edge_rough_pct,
+                edge_peak_ratio,
                 callback_deficit_in,
                 callback_deficit_out,
                 cpu_pct: machine_sample.cpu_pct,
