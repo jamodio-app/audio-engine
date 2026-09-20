@@ -1312,10 +1312,29 @@ pub struct PeerPerf {
     /// RETARD, sans attendre qu'une arrivée révèle le trou. Comptées à part de
     /// `concealedFrames` (paquet perdu, découvert à l'arrivée) : les deux disent
     /// des choses différentes du réseau, et c'est celle-ci qui chiffre le gain du
-    /// chantier. `underruns` continue de compter l'accroc, masqué ou non — un
-    /// lien irrégulier reste dit irrégulier même quand on ne l'entend plus.
+    /// chantier.
+    ///
+    /// ⚠ `underruns` ne compte PAS l'accroc masqué. Le plan du chantier
+    /// l'annonçait, le code fait l'inverse et c'est LUI qui a raison : le
+    /// compteur n'est incrémenté que là où le tampon rend vraiment du silence
+    /// (`ring_buffer.rs`, branche `available < needed`), au même endroit que
+    /// `zeroFilledMs`. `underruns` = ce que le musicien SUBIT, ce que la bulle
+    /// du lien appelle une coupure. Un trou évité par masquage se lit ici, pas
+    /// là-bas. Confondre les deux a coûté une analyse fausse le 20/09/2026.
     #[serde(rename = "concealedUnderrunFrames")]
     pub concealed_underrun_frames: u64,
+    /// Parmi les trames ci-dessus, celles inventées alors que le vrai paquet
+    /// allait arriver À TEMPS : le tampon tenait encore assez pour le jouer à sa
+    /// place (cf. `conceal::was_premature`). Chacune est donc du son extrapolé
+    /// substitué à de la vraie matière, **et** un paquet légitime écarté.
+    ///
+    /// Zéro = tous les masquages ont bouché un trou réel. Un chiffre proche de
+    /// `concealedUnderrunFrames` = on invente trop tôt, et le réglage du délai
+    /// de grâce est à revoir. Sans ce compteur, les deux cas sont
+    /// indiscernables : un masquage utile et un masquage de trop laissent la
+    /// même trace (une trame inventée, aucun accroc).
+    #[serde(rename = "concealedPrematureFrames")]
+    pub concealed_premature_frames: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).

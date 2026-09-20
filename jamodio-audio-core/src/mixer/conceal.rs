@@ -136,12 +136,67 @@ pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
     next_deadline_in_ms.min(MAX_SLEEP_MS)
 }
 
+/// Le masquage qu'on vient de faire était-il PRÉMATURÉ ?
+///
+/// La question posée au banc du 20/09/2026 : sur les trames inventées, combien
+/// l'ont été alors que le vrai paquet allait arriver à temps ? Le compteur
+/// `underruns` ne pouvait pas y répondre — il ne compte que les trous
+/// RÉELLEMENT rendus, donc un masquage réussi et un masquage inutile ont la
+/// même signature (une trame inventée, aucun accroc).
+///
+/// On compare ce que le tampon pouvait encore tenir À L'INSTANT du masquage
+/// (`fill_ms_at_conceal`) au temps qu'a réellement mis le paquet à arriver
+/// ensuite (`arrival_delay_ms`) :
+/// - le paquet arrive AVANT que le tampon ne se vide → il aurait été joué à sa
+///   place, on a inventé pour rien **et** on lui a volé sa place ;
+/// - il arrive après → le trou aurait été réel, le masquage a fait son travail.
+///
+/// Une mesure non finie ne prouve rien : on ne compte pas un prématuré qu'on
+/// n'a pas établi.
+pub fn was_premature(fill_ms_at_conceal: f64, arrival_delay_ms: f64) -> bool {
+    if !fill_ms_at_conceal.is_finite() || !arrival_delay_ms.is_finite() {
+        return false;
+    }
+    if arrival_delay_ms < 0.0 {
+        return false;
+    }
+    arrival_delay_ms < fill_ms_at_conceal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Gigue typique du banc : ~2,5 ms de queue.
     const TAIL: Option<f64> = Some(2.5);
+
+    /// Le masquage prématuré, celui qu'on cherche à compter.
+    #[test]
+    fn un_paquet_qui_arrive_avant_que_le_tampon_se_vide_prouve_un_masquage_de_trop() {
+        // Le tampon tenait encore 4 ms ; le paquet est arrivé 1,5 ms après le
+        // masquage. Il aurait été joué à sa place.
+        assert!(was_premature(4.0, 1.5));
+        // Il arrive après que le tampon se soit vidé : le trou était réel.
+        assert!(!was_premature(4.0, 4.0));
+        assert!(!was_premature(4.0, 9.0));
+    }
+
+    #[test]
+    fn un_tampon_vide_ne_produit_jamais_de_premature() {
+        // Rien à tenir : aucun délai d'arrivée ne peut être « à temps ».
+        assert!(!was_premature(0.0, 0.0));
+        assert!(!was_premature(0.0, 0.5));
+    }
+
+    #[test]
+    fn une_mesure_absurde_ne_compte_pas_un_premature() {
+        // On ne compte pas ce qu'on n'a pas établi.
+        assert!(!was_premature(f64::NAN, 1.0));
+        assert!(!was_premature(4.0, f64::NAN));
+        assert!(!was_premature(f64::INFINITY, 1.0));
+        // Horloge à l'envers (paquet horodaté avant le masquage) : on s'abstient.
+        assert!(!was_premature(4.0, -1.0));
+    }
 
     #[test]
     fn avant_lecheance_on_ninvente_rien() {
