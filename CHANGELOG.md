@@ -5,6 +5,32 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-17] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son.**
+
+### Ce que la session du 20/09 a appris
+
+Le grésillement n'est ni le réseau, ni le serveur, ni la carte son : **le son
+qui entre dépasse six à sept fois le niveau maximal**, et sature la protection
+de sortie. Un simulateur d'ampli le ramenait à un niveau normal ; le jour où il
+s'est déchargé — en rejoignant une jam session — le défaut est devenu audible.
+C'est aussi pour ça que relancer l'agent « réparait » : on revenait dans un
+studio où le plugin se rechargeait.
+
+### Ajouté
+
+- **Le niveau du son tel qu'il entre**, mesuré avant tout traitement. Jusqu'ici
+  le seul repère était pris APRÈS les plugins : un ampli simulé le ramenait
+  sous le seuil et masquait tout. Cette mesure dira si c'est un niveau d'entrée
+  trop fort ou de brefs pics isolés — deux causes qui n'ont rien à voir et ne se
+  corrigent pas au même endroit.
+
+### Ce qu'il faut faire
+
+Jouer **sans plugin d'ampli chargé**, quelques minutes, puis envoyer le rapport.
+C'est dans cette configuration que le défaut se montre.
+
 ## [0.6.5-16] — 2026-09-20 (pré-version de test)
 
 **Celle-ci change le son.** Une revue de code a trouvé la cause de ce que les
