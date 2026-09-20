@@ -51,6 +51,14 @@ pub enum Conceal {
 const GRACE_MIN_MS: f64 = 1.0;
 const GRACE_MAX_MS: f64 = 10.0;
 
+/// Imprécision du réveil du thread de décodage, à couvrir en plus du bloc de
+/// sortie. Mesurée par la sonde 1.2a sur le PC (thread promu MMCSS) : 396 µs
+/// médians, 810 µs au p99, 1,06 ms au pire. On retient 0,5 ms — au-dessus du
+/// cas courant, sous le p99 : les rares réveils plus tardifs sont rattrapés au
+/// suivant, alors qu'un seuil calé sur le pire cas ferait inventer trop tôt en
+/// permanence.
+const WAKE_SLACK_MS: f64 = 0.5;
+
 /// Décision à l'échéance d'une trame.
 ///
 /// - `late_by_ms` : retard sur l'échéance attendue. Négatif = pas encore l'heure.
@@ -96,18 +104,24 @@ pub fn decide(
     if late_by_ms < grace {
         return Conceal::Wait;
     }
-    // Combien le tampon doit contenir pour survivre au prochain tirage : la
-    // taille du bloc que le callback de SORTIE consomme d'un coup, jamais moins
-    // d'une trame.
+    // Combien le tampon doit contenir pour survivre jusqu'au prochain examen :
+    // ce que le callback de SORTIE consomme d'un coup, plus l'imprécision du
+    // réveil. Rien de plus — chaque dixième de milliseconde au-dessus fait
+    // inventer alors que le vrai paquet était en route.
     //
-    // Première version : « une trame ». Faux, et mesuré faux au banc du
-    // 20/09/2026 : côté Mac, le callback CoreAudio consomme des blocs bien plus
-    // gros que 2,5 ms. Le tampon paraissait suffisant à l'instant du regard et
-    // se vidait entre deux — **13 accrocs, zéro masquage déclenché**. Côté
-    // Windows/ASIO (64 frames = 1,33 ms), le plancher d'une trame continue de
-    // s'appliquer, donc rien ne change là-bas.
-    let survival_ms = if output_block_ms.is_finite() {
-        output_block_ms.max(FRAME_MS)
+    // Deux erreurs successives ont mené ici, toutes deux mesurées :
+    // - « une trame Opus » (2,5 ms). Choisi sans mesure. Au banc du 20/09/2026,
+    //   **22 masquages sur 38 étaient prématurés** — le paquet arrivait avant
+    //   que le tampon ne se vide, avec 1,41 ms de rab en moyenne et jusqu'à
+    //   2,40 ms, soit presque le seuil entier.
+    // - `max(bloc, FRAME_MS)`. Le plancher d'une trame gardait le défaut
+    //   partout où le bloc est plus petit — c'est-à-dire sur nos deux
+    //   plateformes, qui livrent 64 frames (1,33 ms).
+    //
+    // `FRAME_MS` ne reste que comme repli quand la taille du bloc n'a pas été
+    // mesurée : on ne devine pas un seuil plus court que ce qu'on sait.
+    let survival_ms = if output_block_ms.is_finite() && output_block_ms > 0.0 {
+        output_block_ms + WAKE_SLACK_MS
     } else {
         FRAME_MS
     };
@@ -241,31 +255,41 @@ mod tests {
         assert_eq!(decide(2.5, 0.0, FRAME_MS, TAIL, 0), Conceal::Frame);
     }
 
-    /// Correctif du 20/09 — le seuil de survie est la taille du bloc de SORTIE.
+    /// Le seuil de survie est la taille du bloc de SORTIE, plus l'imprécision
+    /// du réveil — et rien de plus.
     #[test]
     fn un_gros_bloc_de_sortie_exige_un_tampon_plus_garni() {
-        // CoreAudio, 512 frames = 10,7 ms consommés d'un coup : 5 ms dans le
-        // tampon ne survivront pas au prochain tirage, même si c'est « plus
-        // d'une trame ».
+        // 512 frames = 10,7 ms consommés d'un coup : 5 ms dans le tampon ne
+        // survivront pas au prochain tirage, même si c'est « plus d'une trame ».
         assert_eq!(decide(5.0, 5.0, 10.7, TAIL, 0), Conceal::Frame);
-        // Au-delà du bloc de sortie, en revanche, on laisse le paquet arriver.
-        assert_eq!(decide(5.0, 11.0, 10.7, TAIL, 0), Conceal::Wait);
+        // Au-delà du bloc PLUS la marge de réveil, on laisse le paquet arriver.
+        assert_eq!(decide(5.0, 10.7 + WAKE_SLACK_MS + 0.1, 10.7, TAIL, 0), Conceal::Wait);
+        // Juste en dessous, le prochain tirage n'est pas garanti : on masque.
+        assert_eq!(decide(5.0, 10.7 + WAKE_SLACK_MS - 0.1, 10.7, TAIL, 0), Conceal::Frame);
     }
 
+    /// Correctif du 20/09 — un petit bloc descend BIEN sous la durée d'une
+    /// trame. Le plancher `FRAME_MS` qui existait ici faisait inventer alors
+    /// que le paquet arrivait : 22 masquages prématurés sur 38 au banc.
     #[test]
-    fn un_petit_bloc_de_sortie_ne_descend_pas_sous_une_trame() {
-        // ASIO, 64 frames = 1,33 ms : le plancher d'une trame s'applique, donc
-        // le comportement Windows ne change pas.
-        assert_eq!(decide(5.0, 2.0, 1.33, TAIL, 0), Conceal::Frame);
-        assert_eq!(decide(5.0, 2.6, 1.33, TAIL, 0), Conceal::Wait);
+    fn un_petit_bloc_de_sortie_descend_sous_une_trame() {
+        // ASIO/CoreAudio, 64 frames = 1,33 ms. Seuil = 1,83 ms.
+        let bloc = 64.0 * 1000.0 / 48_000.0;
+        // 2 ms de tampon : l'ancienne règle masquait (2 < 2,5), la nouvelle
+        // attend — et c'est ce qu'il fallait faire.
+        assert_eq!(decide(5.0, 2.0, bloc, TAIL, 0), Conceal::Wait);
+        // En dessous du bloc + marge, en revanche, le trou est certain.
+        assert_eq!(decide(5.0, 1.5, bloc, TAIL, 0), Conceal::Frame);
     }
 
     #[test]
     fn une_taille_de_bloc_inconnue_retombe_sur_la_trame() {
-        // Sortie pas encore démarrée (0) ou mesure absurde : on ne devine pas.
+        // Sortie pas encore démarrée (0) ou mesure absurde : on ne devine pas un
+        // seuil plus court que ce qu'on sait, on garde la prudence d'une trame.
         assert_eq!(decide(5.0, 2.0, 0.0, TAIL, 0), Conceal::Frame);
         assert_eq!(decide(5.0, 2.6, 0.0, TAIL, 0), Conceal::Wait);
         assert_eq!(decide(5.0, 2.6, f64::NAN, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(5.0, 2.0, -1.0, TAIL, 0), Conceal::Frame);
     }
 
     #[test]
@@ -285,10 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn un_tampon_qui_tient_une_trame_na_besoin_de_rien() {
+    fn un_tampon_qui_tient_jusquau_prochain_tirage_na_besoin_de_rien() {
         // Le paquet est en retard, mais la sortie a de quoi jouer : inventer
         // maintenant volerait sa place au paquet qui arrive.
-        assert_eq!(decide(5.0, FRAME_MS, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(5.0, FRAME_MS + WAKE_SLACK_MS, FRAME_MS, TAIL, 0), Conceal::Wait);
         assert_eq!(decide(50.0, 12.0, FRAME_MS, TAIL, 0), Conceal::Wait);
     }
 
