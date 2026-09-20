@@ -99,9 +99,12 @@ const WAKE_SLACK_MS: f64 = 0.5;
 ///    place ayant été prise. On n'invente donc qu'au-delà du pire retard que ce
 ///    lien produit déjà.
 /// 3. **Le tampon survit au prochain tirage de la sortie.** La sortie a de quoi
-///    jouer pendant que le paquet finit d'arriver. Ce seuil vaut la taille du
-///    bloc de sortie, jamais moins d'une trame : le mesurer en trames a coûté
-///    13 accrocs et zéro masquage au banc Mac du 20/09/2026.
+///    jouer pendant que le paquet finit d'arriver. Ce seuil vaut exactement la
+///    taille du bloc de sortie plus la marge de réveil — il n'y a PAS de
+///    plancher à une trame : en mettre un faisait inventer trop tôt partout où
+///    le bloc est plus petit, c'est-à-dire sur nos deux plateformes (22
+///    masquages prématurés sur 38, banc du 20/09/2026). `FRAME_MS` ne sert que
+///    de repli quand la taille du bloc n'a pas été mesurée.
 pub fn decide(
     late_by_ms: f64,
     fill_ms: f64,
@@ -162,10 +165,21 @@ pub fn decide(
 /// (sonde `wake_probe`, 19/09/2026).
 pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
     const MAX_SLEEP_MS: f64 = 5.0;
-    if !next_deadline_in_ms.is_finite() || next_deadline_in_ms <= 0.0 {
-        return 0.0;
+    /// Plancher de sommeil. Une échéance déjà dépassée rendait `0`, ce qui
+    /// n'était sans danger que tant que la boucle réarmait l'échéance à chaque
+    /// examen — le défaut même qu'on vient de corriger. Sans plancher, un
+    /// retard qu'on laisse courir ferait tourner le thread de décodage sans
+    /// pause, à priorité audio (MMCSS « Pro Audio » / QoS USER_INTERACTIVE) :
+    /// il volerait le CPU au callback et transformerait une excursion réseau
+    /// en accroc local.
+    ///
+    /// 0,5 ms n'ajoute AUCUNE latence au chemin nominal : `recv_timeout` rend
+    /// la main dès qu'un paquet arrive, il ne dort pas jusqu'au bout.
+    const MIN_SLEEP_MS: f64 = 0.5;
+    if !next_deadline_in_ms.is_finite() {
+        return MIN_SLEEP_MS;
     }
-    next_deadline_in_ms.min(MAX_SLEEP_MS)
+    next_deadline_in_ms.clamp(MIN_SLEEP_MS, MAX_SLEEP_MS)
 }
 
 /// Le masquage qu'on vient de faire était-il PRÉMATURÉ ?
@@ -373,13 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn lattente_ne_descend_jamais_a_zero() {
+        // Échéance dépassée : on dort quand même un peu. Sans ce plancher, la
+        // boucle tournerait sans pause à priorité audio tant que le retard
+        // court (c'est-à-dire pendant toute une excursion réseau).
+        assert_eq!(sleep_until_deadline_ms(0.0), 0.5);
+        assert_eq!(sleep_until_deadline_ms(-12.0), 0.5);
+        assert_eq!(sleep_until_deadline_ms(0.1), 0.5);
+        assert_eq!(sleep_until_deadline_ms(f64::NAN), 0.5);
+        // Une échéance à venir reste respectée.
+        assert_eq!(sleep_until_deadline_ms(2.5), 2.5);
+    }
+
+    #[test]
     fn lattente_est_bornee_pour_que_la_boucle_respire() {
         assert_eq!(sleep_until_deadline_ms(1.2), 1.2);
         assert_eq!(sleep_until_deadline_ms(50.0), 5.0);
-        // Échéance déjà passée, ou absurde → on ne dort pas.
-        assert_eq!(sleep_until_deadline_ms(0.0), 0.0);
-        assert_eq!(sleep_until_deadline_ms(-3.0), 0.0);
-        assert_eq!(sleep_until_deadline_ms(f64::NAN), 0.0);
-        assert_eq!(sleep_until_deadline_ms(f64::INFINITY), 0.0);
+        // Une mesure absurde ne fait pas tourner la boucle sans pause.
+        assert_eq!(sleep_until_deadline_ms(f64::INFINITY), 0.5);
     }
 }

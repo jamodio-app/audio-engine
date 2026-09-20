@@ -1027,10 +1027,11 @@ pub struct ProducerNetStats {
     pub concealed_premature_margin_ms: f64,
     pub concealed_premature_margin_max_ms: f64,
     /// Pourquoi on a renoncé à masquer, compté par raison.
+    pub wait_not_due: u64,
     pub wait_link_unknown: u64,
     pub wait_within_grace: u64,
     pub wait_buffer_holds: u64,
-    pub wait_deadline_unarmed: u64,
+    pub deadline_disarmed: u64,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -5012,12 +5013,15 @@ struct DecodeState {
     /// part jamais et un masquage qui n'a rien à faire laissent la même trace
     /// (zéro trame inventée) : sans ces compteurs on ne peut pas dire laquelle
     /// des conditions s'y oppose. Le banc du 20/09 est resté bloqué là.
+    /// Mesure de temps inexploitable (horloge qui déraille) : le masquage se
+    /// désarme, et sans ce compteur ça ne se verrait nulle part.
+    wait_not_due: u64,
     wait_link_unknown: u64,
     wait_within_grace: u64,
     wait_buffer_holds: u64,
-    /// Échéance non armée : on n'a même pas consulté la décision. Arrive avant
-    /// le premier paquet du flux, et après le plafond de trames consécutives.
-    wait_deadline_unarmed: u64,
+    /// Nombre de fois où l'on a DÉSARMÉ l'échéance — plafond de masquage
+    /// atteint, ou flux tari. Un événement, pas un tour de boucle.
+    deadline_disarmed: u64,
     /// Lot 1.4 — échantillons restants de la rampe d'arrivée. Un musicien qui
     /// rejoint ne doit pas ÉCLATER dans le casque des autres : ses premières
     /// centaines de millisecondes montent en douceur. Appliqué ICI, sur le thread
@@ -5050,10 +5054,11 @@ impl DecodeState {
             concealed_premature_frames: 0,
             concealed_premature_margin_ms: 0.0,
             concealed_premature_margin_max_ms: 0.0,
+            wait_not_due: 0,
             wait_link_unknown: 0,
             wait_within_grace: 0,
             wait_buffer_holds: 0,
-            wait_deadline_unarmed: 0,
+            deadline_disarmed: 0,
             next_deadline: None,
             consecutive_concealed: 0,
             fade_in_remaining: JOIN_FADE_SAMPLES,
@@ -5103,6 +5108,13 @@ fn spawn_decode_thread(
 /// l'entrée soit perçue comme une arrivée et non comme un claquement, assez
 /// court pour qu'on n'ait pas l'impression d'attendre le musicien.
 const JOIN_FADE_MS: usize = 300;
+/// Au-delà de ce retard, le paquet attendu n'est plus « en retard » : le flux
+/// est tari (talkback coupé, pair parti). On désarme l'échéance plutôt que de
+/// tenir le thread de décodage éveillé pour un son qui ne viendra pas ;
+/// l'arrivée d'un paquet la réarme. Large devant le plafond de masquage
+/// (7,5 ms) et devant toute excursion réseau plausible.
+const STALE_MS: f64 = 200.0;
+
 const JOIN_FADE_SAMPLES: usize = JOIN_FADE_MS * 48_000 * 2 / 1000;
 
 /// Applique la rampe d'arrivée à un bloc décodé, EN PLACE, et rend ce qu'il reste
@@ -5170,10 +5182,11 @@ fn conceal_due_streams(
 ) {
     use jamodio_audio_core::mixer::conceal::{decide, Conceal, Wait};
     for (id, st) in states.iter_mut() {
-        let Some(deadline) = st.next_deadline else {
-            st.wait_deadline_unarmed += 1;
-            continue;
-        };
+        // Pas d'échéance armée : il n'y a rien à décider. On ne compte rien ici —
+        // ce serait compter des tours de boucle (jusqu'à 400/s par flux muet) et
+        // non des événements, ce qui écraserait les autres raisons à l'analyse.
+        // Ce sont les DÉSARMEMENTS qui sont comptés, là où ils ont lieu.
+        let Some(deadline) = st.next_deadline else { continue };
         if now < deadline {
             continue;
         }
@@ -5186,12 +5199,40 @@ fn conceal_due_streams(
         // sans connaître le réseau.
         let tail = st.jitter.is_warm().then(|| st.jitter.jitter_tail_ms());
         match decide(late_ms, fill_ms, output_block_ms, tail, st.consecutive_concealed) {
-            Conceal::Wait(why) => match why {
-                Wait::NotDue => {}
-                Wait::LinkUnknown => st.wait_link_unknown += 1,
-                Wait::WithinGrace => st.wait_within_grace += 1,
-                Wait::BufferHolds => st.wait_buffer_holds += 1,
-            },
+            Conceal::Wait(why) => {
+                match why {
+                    Wait::NotDue => st.wait_not_due += 1,
+                    Wait::LinkUnknown => st.wait_link_unknown += 1,
+                    Wait::WithinGrace => st.wait_within_grace += 1,
+                    Wait::BufferHolds => st.wait_buffer_holds += 1,
+                }
+                // ⚠ L'ÉCHÉANCE NE BOUGE PAS. C'est tout le correctif du
+                // 20/09/2026 : on la réarmait à chaque examen, y compris quand
+                // on n'avait rien masqué, si bien que le retard du paquet
+                // attendu repartait de zéro à chaque coup d'œil. Sur un lien
+                // régulier, `late_ms` ne dépassait donc jamais la précision du
+                // réveil (~0,4 ms), restait sous le délai de grâce, et le
+                // masquage ne partait JAMAIS — 11 accrocs rendus côté Mac avec
+                // `concealedUnderrunFrames = 0`, alors que c'était exactement
+                // le cas qu'il devait traiter. En prime, il ne se déclenchait
+                // que lorsque le thread était déprogrammé au-delà de la grâce,
+                // donc au hasard : d'où les 58 à 67 % de masquages prématurés.
+                //
+                // Le retard court maintenant jusqu'à ce qu'il justifie d'agir.
+                // La boucle ne s'emballe pas pour autant : `sleep_until_deadline_ms`
+                // impose un plancher de sommeil.
+                //
+                // Au-delà de `STALE_MS`, ce n'est plus un retard mais un flux
+                // tari (talkback coupé, pair parti) : on désarme, et l'arrivée
+                // d'un paquet réarmera. Sans cette borne, un flux muet dont on
+                // n'a jamais appris la régularité tiendrait ce thread éveillé
+                // au plancher pendant toute la session.
+                if late_ms > STALE_MS {
+                    st.next_deadline = None;
+                    st.deadline_disarmed += 1;
+                }
+                continue;
+            }
             Conceal::Frame => {
                 // Copie obligatoire avant push : `decode_loss()` rend une slice
                 // d'un buffer interne écrasé au décodage suivant (Sprint 3 BUG 7).
@@ -5215,13 +5256,14 @@ fn conceal_due_streams(
                 // et on DÉSARME l'échéance : sans ça, un pair parti ferait tourner
                 // ce thread à 400 Hz pour rien. Le retour des paquets la réarme.
                 st.next_deadline = None;
+                st.deadline_disarmed += 1;
                 continue;
             }
         }
-        // Quelle que soit la décision, la trame suivante est due une trame plus
-        // tard. Si l'échéance recalculée est DÉJÀ passée (thread déprogrammé
-        // longtemps), on repart de maintenant : la boucle ne rattrape pas un
-        // retard en tournant à vide.
+        // On n'arrive ici QU'APRÈS avoir masqué : la place du paquet attendu est
+        // prise, donc la suivante est due une trame plus tard. Si l'échéance
+        // recalculée est déjà passée (thread déprogrammé longtemps), on repart de
+        // maintenant plutôt que de rattraper le retard en inventant à la chaîne.
         let next = deadline + FRAME;
         st.next_deadline = Some(if next > now { next } else { now + FRAME });
     }
@@ -5403,10 +5445,11 @@ fn decode_one_packet(
             concealed_premature_frames: st.concealed_premature_frames,
             concealed_premature_margin_ms: st.concealed_premature_margin_ms,
             concealed_premature_margin_max_ms: st.concealed_premature_margin_max_ms,
+            wait_not_due: st.wait_not_due,
             wait_link_unknown: st.wait_link_unknown,
             wait_within_grace: st.wait_within_grace,
             wait_buffer_holds: st.wait_buffer_holds,
-            wait_deadline_unarmed: st.wait_deadline_unarmed,
+            deadline_disarmed: st.deadline_disarmed,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -6323,11 +6366,16 @@ mod conceal_loop_tests {
         assert!(w > Duration::from_micros(2_000), "attente {w:?} trop courte");
     }
 
+    /// Échéance dépassée : on dort le MINIMUM, jamais zéro. Un retard qu'on
+    /// laisse courir (c'est désormais le cas) ferait sinon tourner ce thread
+    /// sans pause, à priorité audio, au détriment du callback.
     #[test]
-    fn echeance_deja_passee_on_ne_dort_pas() {
+    fn echeance_deja_passee_on_dort_le_minimum() {
         let now = Instant::now();
         let st = states(now - Duration::from_millis(50));
-        assert_eq!(next_wait(&st, now), Duration::ZERO);
+        let w = next_wait(&st, now);
+        assert!(w > Duration::ZERO, "jamais de boucle sans pause");
+        assert_eq!(w, Duration::from_secs_f64(0.0005));
     }
 
     #[test]
@@ -6478,7 +6526,7 @@ mod conceal_loop_tests {
         assert_eq!(s.wait_buffer_holds, 1);
         assert_eq!(s.wait_within_grace, 0);
         assert_eq!(s.wait_link_unknown, 0);
-        assert_eq!(s.wait_deadline_unarmed, 0);
+        assert_eq!(s.deadline_disarmed, 0);
 
         // Lien encore inconnu : autre raison, même absence de masquage.
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
@@ -6491,18 +6539,103 @@ mod conceal_loop_tests {
         assert_eq!(s.wait_buffer_holds, 0);
     }
 
-    /// Une échéance non armée ne consulte même pas la décision — et ça se voit.
+    /// Une échéance non armée ne consulte pas la décision et ne compte RIEN :
+    /// compter ici serait compter des tours de boucle (jusqu'à 400/s par flux
+    /// muet), ce qui écraserait les vraies raisons à l'analyse.
     #[test]
-    fn une_echeance_non_armee_se_compte_a_part() {
+    fn une_echeance_non_armee_ne_compte_aucun_tour_de_boucle() {
         let mixer = Arc::new(AudioMixer::new());
         mixer.add_stream("peer-test", StreamKind::Instrument);
         let now = Instant::now();
         let mut st = states(now);
         st.values_mut().next().unwrap().next_deadline = None;
-        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        for _ in 0..50 {
+            conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        }
         let s = st.values().next().unwrap();
-        assert_eq!(s.wait_deadline_unarmed, 1);
+        assert_eq!(s.deadline_disarmed, 0, "on n'a rien désarmé ici");
         assert_eq!(s.wait_buffer_holds, 0, "la décision n'a pas été consultée");
+        assert_eq!(s.wait_within_grace, 0);
+    }
+
+    /// LE correctif du 20/09 : renoncer ne doit PAS remettre le retard à zéro.
+    ///
+    /// Avant, l'échéance était réarmée d'une trame à chaque examen : sur un lien
+    /// régulier, le retard ne dépassait jamais la précision du réveil, restait
+    /// sous le délai de grâce, et le masquage ne partait jamais — 11 accrocs
+    /// rendus côté Mac avec zéro trame inventée.
+    #[test]
+    fn renoncer_ne_remet_pas_le_retard_a_zero() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        // Tampon confortable : la première décision sera « le tampon tient ».
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
+        let now = Instant::now();
+        let mut st = states(now);
+        let echeance = st.values().next().unwrap().next_deadline;
+
+        // Examen 2 ms après l'échéance (au-delà du délai de grâce, qui vaut ici
+        // son plancher d'1 ms) : on renonce parce que le tampon tient.
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now + FRAME + Duration::from_millis(2));
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_buffer_holds, 1);
+        assert_eq!(
+            s.next_deadline, echeance,
+            "l'échéance ne doit PAS bouger : c'est ce qui laisse le retard courir"
+        );
+        assert_eq!(s.concealed_underrun_frames, 0);
+    }
+
+    /// Et le retard qui court finit par déclencher le masquage — ce que
+    /// l'ancienne boucle ne pouvait pas faire.
+    /// Le scénario EXACT du bug : un premier coup d'œil trop tôt ne doit pas
+    /// désamorcer le suivant.
+    #[test]
+    fn un_retard_qui_court_finit_par_declencher_le_masquage() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        // 1 ms de matière : sous le seuil de survie. Seul le retard décidera.
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 2]);
+        let now = Instant::now();
+        let mut st = states(now);
+
+        // Premier examen, 0,5 ms après l'échéance : sous le délai de grâce
+        // (1 ms ici), le paquet est sans doute encore en vol → on attend.
+        conceal_due_streams(
+            &mut st, &mixer, BLOC_ASIO_MS,
+            now + FRAME + Duration::from_micros(500),
+        );
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_within_grace, 1);
+        assert_eq!(s.concealed_underrun_frames, 0);
+
+        // Second examen, 2 ms après la MÊME échéance. C'est ici que l'ancienne
+        // boucle échouait : elle avait réarmé l'échéance au premier passage, le
+        // retard repartait de zéro et restait éternellement sous la grâce.
+        conceal_due_streams(
+            &mut st, &mixer, BLOC_ASIO_MS,
+            now + FRAME + Duration::from_millis(2),
+        );
+        let s = st.values().next().unwrap();
+        assert_eq!(
+            s.concealed_underrun_frames, 1,
+            "le retard a couru jusqu'à justifier le masquage"
+        );
+    }
+
+    /// Un flux tari ne tient pas le thread éveillé indéfiniment.
+    #[test]
+    fn un_flux_tari_desarme_son_echeance() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 100 * 2]);
+        let now = Instant::now();
+        let mut st = states(now);
+        // Bien au-delà de STALE_MS : plus personne n'envoie rien.
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now + Duration::from_millis(500));
+        let s = st.values().next().unwrap();
+        assert!(s.next_deadline.is_none(), "échéance désarmée");
+        assert_eq!(s.deadline_disarmed, 1);
     }
 
     /// Un paquet à peine en retard : on attend, et la raison le dit.

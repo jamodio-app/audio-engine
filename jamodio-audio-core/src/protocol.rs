@@ -1348,8 +1348,10 @@ pub struct PeerPerf {
     /// `linkUnknown` : la régularité du lien n'est pas encore connue.
     /// `withinGrace` : le paquet est en retard, mais pas plus que d'habitude.
     /// `bufferHolds` : le tampon tient jusqu'au prochain tirage.
-    /// `deadlineUnarmed` : aucune échéance armée — la décision n'a même pas été
-    /// consultée (avant le premier paquet, ou après le plafond de trames).
+    /// `notDue` : mesure de temps inexploitable (horloge qui déraille).
+    /// `deadlineDisarmed` : nombre de fois où l'échéance a été DÉSARMÉE —
+    /// plafond de masquage atteint, ou flux tari (talkback coupé, pair parti).
+    /// Un événement, pas un tour de boucle.
     ///
     /// Un masquage qui ne part JAMAIS et un masquage qui n'a rien à faire
     /// laissent la même trace : zéro trame inventée. Ces quatre compteurs sont
@@ -1361,8 +1363,10 @@ pub struct PeerPerf {
     pub wait_within_grace: u64,
     #[serde(rename = "concealWaitBufferHolds")]
     pub wait_buffer_holds: u64,
-    #[serde(rename = "concealWaitDeadlineUnarmed")]
-    pub wait_deadline_unarmed: u64,
+    #[serde(rename = "concealWaitNotDue")]
+    pub wait_not_due: u64,
+    #[serde(rename = "concealDeadlineDisarmed")]
+    pub deadline_disarmed: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).
