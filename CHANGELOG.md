@@ -5,6 +5,35 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-16] — 2026-09-20 (pré-version de test)
+
+**Celle-ci change le son.** Une revue de code a trouvé la cause de ce que les
+mesures n'expliquaient pas.
+
+### Corrigé
+
+- **Le comblement des trous ne partait presque jamais quand il fallait — et
+  partait au hasard le reste du temps.** En attendant un morceau de son qui
+  tardait, le programme remettait son chronomètre à zéro chaque fois qu'il
+  regardait. Il croyait donc n'attendre que depuis un instant, alors que
+  l'attente durait. Résultat : sur une liaison régulière il concluait
+  indéfiniment « ça va arriver » pendant que la réserve se vidait, et le trou
+  s'entendait. C'est ce qui expliquait les accrocs du Mac malgré une liaison
+  impeccable — et, du même coup, pourquoi près de deux comblements sur trois
+  survenaient trop tôt : ils ne se déclenchaient que sur un hoquet du système,
+  jamais au bon moment.
+
+### Ce qu'il faut écouter
+
+**La version à écouter attentivement, dans les deux sens.**
+
+1. Les **clics et accrocs doivent diminuer** — c'est l'effet attendu, surtout
+   côté Mac où le comblement ne fonctionnait pas du tout.
+2. **Aucun artefact nouveau** : pas de son tenu ou étrange là où il y avait un
+   trou. Si tu entends quelque chose d'inhabituel, dis-le.
+
+**Installe-la sur les deux machines.**
+
 ## [0.6.5-15] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son** par rapport à la 0.6.5-14.
