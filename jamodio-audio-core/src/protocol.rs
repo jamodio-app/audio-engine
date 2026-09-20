@@ -1344,6 +1344,25 @@ pub struct PeerPerf {
     pub concealed_premature_margin_ms: f64,
     #[serde(rename = "concealedPrematureMarginMaxMs")]
     pub concealed_premature_margin_max_ms: f64,
+    /// POURQUOI le masquage n'est pas parti, compté par raison (cumuls).
+    /// `linkUnknown` : la régularité du lien n'est pas encore connue.
+    /// `withinGrace` : le paquet est en retard, mais pas plus que d'habitude.
+    /// `bufferHolds` : le tampon tient jusqu'au prochain tirage.
+    /// `deadlineUnarmed` : aucune échéance armée — la décision n'a même pas été
+    /// consultée (avant le premier paquet, ou après le plafond de trames).
+    ///
+    /// Un masquage qui ne part JAMAIS et un masquage qui n'a rien à faire
+    /// laissent la même trace : zéro trame inventée. Ces quatre compteurs sont
+    /// la seule façon de les distinguer — le diagnostic du 20/09/2026 est resté
+    /// bloqué faute de les avoir.
+    #[serde(rename = "concealWaitLinkUnknown")]
+    pub wait_link_unknown: u64,
+    #[serde(rename = "concealWaitWithinGrace")]
+    pub wait_within_grace: u64,
+    #[serde(rename = "concealWaitBufferHolds")]
+    pub wait_buffer_holds: u64,
+    #[serde(rename = "concealWaitDeadlineUnarmed")]
+    pub wait_deadline_unarmed: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).

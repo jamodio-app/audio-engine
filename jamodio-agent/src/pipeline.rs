@@ -1026,6 +1026,11 @@ pub struct ProducerNetStats {
     /// Somme et pire des marges gâchées (ms) sur ces trames-là.
     pub concealed_premature_margin_ms: f64,
     pub concealed_premature_margin_max_ms: f64,
+    /// Pourquoi on a renoncé à masquer, compté par raison.
+    pub wait_link_unknown: u64,
+    pub wait_within_grace: u64,
+    pub wait_buffer_holds: u64,
+    pub wait_deadline_unarmed: u64,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -5003,6 +5008,16 @@ struct DecodeState {
     /// bouger.
     concealed_premature_margin_ms: f64,
     concealed_premature_margin_max_ms: f64,
+    /// POURQUOI on a renoncé à masquer, compté par raison. Un masquage qui ne
+    /// part jamais et un masquage qui n'a rien à faire laissent la même trace
+    /// (zéro trame inventée) : sans ces compteurs on ne peut pas dire laquelle
+    /// des conditions s'y oppose. Le banc du 20/09 est resté bloqué là.
+    wait_link_unknown: u64,
+    wait_within_grace: u64,
+    wait_buffer_holds: u64,
+    /// Échéance non armée : on n'a même pas consulté la décision. Arrive avant
+    /// le premier paquet du flux, et après le plafond de trames consécutives.
+    wait_deadline_unarmed: u64,
     /// Lot 1.4 — échantillons restants de la rampe d'arrivée. Un musicien qui
     /// rejoint ne doit pas ÉCLATER dans le casque des autres : ses premières
     /// centaines de millisecondes montent en douceur. Appliqué ICI, sur le thread
@@ -5035,6 +5050,10 @@ impl DecodeState {
             concealed_premature_frames: 0,
             concealed_premature_margin_ms: 0.0,
             concealed_premature_margin_max_ms: 0.0,
+            wait_link_unknown: 0,
+            wait_within_grace: 0,
+            wait_buffer_holds: 0,
+            wait_deadline_unarmed: 0,
             next_deadline: None,
             consecutive_concealed: 0,
             fade_in_remaining: JOIN_FADE_SAMPLES,
@@ -5149,9 +5168,12 @@ fn conceal_due_streams(
     output_block_ms: f64,
     now: std::time::Instant,
 ) {
-    use jamodio_audio_core::mixer::conceal::{decide, Conceal};
+    use jamodio_audio_core::mixer::conceal::{decide, Conceal, Wait};
     for (id, st) in states.iter_mut() {
-        let Some(deadline) = st.next_deadline else { continue };
+        let Some(deadline) = st.next_deadline else {
+            st.wait_deadline_unarmed += 1;
+            continue;
+        };
         if now < deadline {
             continue;
         }
@@ -5164,7 +5186,12 @@ fn conceal_due_streams(
         // sans connaître le réseau.
         let tail = st.jitter.is_warm().then(|| st.jitter.jitter_tail_ms());
         match decide(late_ms, fill_ms, output_block_ms, tail, st.consecutive_concealed) {
-            Conceal::Wait => {}
+            Conceal::Wait(why) => match why {
+                Wait::NotDue => {}
+                Wait::LinkUnknown => st.wait_link_unknown += 1,
+                Wait::WithinGrace => st.wait_within_grace += 1,
+                Wait::BufferHolds => st.wait_buffer_holds += 1,
+            },
             Conceal::Frame => {
                 // Copie obligatoire avant push : `decode_loss()` rend une slice
                 // d'un buffer interne écrasé au décodage suivant (Sprint 3 BUG 7).
@@ -5376,6 +5403,10 @@ fn decode_one_packet(
             concealed_premature_frames: st.concealed_premature_frames,
             concealed_premature_margin_ms: st.concealed_premature_margin_ms,
             concealed_premature_margin_max_ms: st.concealed_premature_margin_max_ms,
+            wait_link_unknown: st.wait_link_unknown,
+            wait_within_grace: st.wait_within_grace,
+            wait_buffer_holds: st.wait_buffer_holds,
+            wait_deadline_unarmed: st.wait_deadline_unarmed,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -6428,6 +6459,64 @@ mod conceal_loop_tests {
         assert_eq!(s.concealed_underrun_frames, 0, "le tampon tenait");
         assert!(s.last_conceal.is_none());
         assert_eq!(s.concealed_premature_frames, 0);
+    }
+
+    /// Le renoncement se compte par RAISON : c'est ce qui manquait au banc du
+    /// 20/09, où le Mac accumulait des accrocs avec zéro masquage sans qu'on
+    /// puisse dire laquelle des conditions s'y opposait.
+    #[test]
+    fn on_compte_pourquoi_on_renonce_a_masquer() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+
+        // Tampon confortable : la raison est « le tampon tient ».
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_buffer_holds, 1);
+        assert_eq!(s.wait_within_grace, 0);
+        assert_eq!(s.wait_link_unknown, 0);
+        assert_eq!(s.wait_deadline_unarmed, 0);
+
+        // Lien encore inconnu : autre raison, même absence de masquage.
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        let mut inconnu = state_lien_inconnu(now);
+        inconnu.next_deadline = Some(now - Duration::from_millis(10));
+        m.insert(Arc::from("peer-test"), inconnu);
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        let s = m.values().next().unwrap();
+        assert_eq!(s.wait_link_unknown, 1);
+        assert_eq!(s.wait_buffer_holds, 0);
+    }
+
+    /// Une échéance non armée ne consulte même pas la décision — et ça se voit.
+    #[test]
+    fn une_echeance_non_armee_se_compte_a_part() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = states(now);
+        st.values_mut().next().unwrap().next_deadline = None;
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_deadline_unarmed, 1);
+        assert_eq!(s.wait_buffer_holds, 0, "la décision n'a pas été consultée");
+    }
+
+    /// Un paquet à peine en retard : on attend, et la raison le dit.
+    #[test]
+    fn un_retard_ordinaire_se_compte_comme_tel() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        // Échéance dépassée de 0,5 ms seulement : sous le délai de grâce.
+        let mut st = states(now - Duration::from_micros(500) - FRAME);
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_within_grace, 1);
+        assert_eq!(s.concealed_underrun_frames, 0);
     }
 
     /// Au plafond, on cesse d'inventer ET on désarme l'échéance.
