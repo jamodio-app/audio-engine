@@ -5,6 +5,26 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-15] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son** par rapport à la 0.6.5-14.
+
+### Ajouté
+
+- **Savoir pourquoi le comblement des trous ne se déclenche pas.** Sur le Mac,
+  la session précédente a rendu 11 accrocs sans qu'il intervienne une seule
+  fois, alors que la liaison était impeccable. Le problème : ne rien faire
+  parce qu'il n'y a rien à faire et ne rien faire alors qu'il faudrait agir
+  laissent la même trace. Chaque renoncement est désormais compté avec sa
+  raison.
+
+### C'est la version à utiliser pour toute session de test
+
+Elle rassemble tout ce qui précède : plus de clic sec au bord d'un trou,
+comblement réglé, correctif réseau Windows, veille neutralisée, et toutes les
+mesures. **Tout le monde doit être sur la MÊME version** — une session où une
+machine est restée en arrière ne mesure qu'un côté du lien.
+
 ## [0.6.5-14] — 2026-09-20 (pré-version de test)
 
 **Celle-ci change le son** — les trois précédentes ne faisaient que mesurer.
