@@ -3279,6 +3279,7 @@ impl PipelineState {
                     self.mixer.clone(),
                     self.perfstats.net_stats_by_producer.clone(),
                     self.perfstats.recv_path.clone(),
+                    self.perfstats.output_frames.clone(),
                 )
                 .map_err(|e| format!("spawn decode thread: {}", e))?,
             );
@@ -5033,6 +5034,10 @@ fn spawn_decode_thread(
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
+    // Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
+    // et non la durée d'une trame, qui dit combien le tampon doit contenir pour
+    // survivre au prochain tirage (cf. `conceal_due_streams`).
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> std::io::Result<DecodeThread> {
     // Data MPSC : N io tasks → 1 thread. 256 = large (décode ≫ arrivée).
     let (tx, rx) = bounded::<DecodeMsg>(256);
@@ -5043,7 +5048,9 @@ fn spawn_decode_thread(
     }
     let join = std::thread::Builder::new()
         .name("audio-decode".into())
-        .spawn(move || decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path))?;
+        .spawn(move || {
+            decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path, output_frames)
+        })?;
     Ok(DecodeThread { tx, pool_rx, join })
 }
 
@@ -5097,6 +5104,14 @@ fn next_wait(
     }
 }
 
+/// Durée que le callback de SORTIE consomme d'un seul tirage. C'est le vrai
+/// seuil de survie du tampon : en dessous, le prochain tirage laisse un trou,
+/// quelle que soit la durée d'une trame. `0` tant que la sortie n'a pas démarré.
+fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
+    let frames = output_frames.load(std::sync::atomic::Ordering::Relaxed);
+    f64::from(frames) * 1000.0 / 48_000.0
+}
+
 /// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
 ///
 /// Tourne sur le thread de décodage, JAMAIS dans le callback audio : il ne fait
@@ -5105,6 +5120,7 @@ fn next_wait(
 fn conceal_due_streams(
     states: &mut HashMap<Arc<str>, DecodeState>,
     mixer: &Arc<AudioMixer>,
+    output_block_ms: f64,
     now: std::time::Instant,
 ) {
     use jamodio_audio_core::mixer::conceal::{decide, Conceal};
@@ -5121,7 +5137,7 @@ fn conceal_due_streams(
         // en vol. `None` tant que la mesure n'est pas chaude — on n'invente pas
         // sans connaître le réseau.
         let tail = st.jitter.is_warm().then(|| st.jitter.jitter_tail_ms());
-        match decide(late_ms, fill_ms, tail, st.consecutive_concealed) {
+        match decide(late_ms, fill_ms, output_block_ms, tail, st.consecutive_concealed) {
             Conceal::Wait => {}
             Conceal::Frame => {
                 // Copie obligatoire avant push : `decode_loss()` rend une slice
@@ -5160,6 +5176,7 @@ fn decode_rt_loop(
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
+    output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
     // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
@@ -5183,7 +5200,12 @@ fn decode_rt_loop(
         };
         // Masquage AVANT de traiter le message : si l'échéance est passée, elle
         // l'était déjà quand le paquet est entré dans la file.
-        conceal_due_streams(&mut states, &mixer, std::time::Instant::now());
+        conceal_due_streams(
+            &mut states,
+            &mixer,
+            output_block_ms(&output_frames),
+            std::time::Instant::now(),
+        );
         let Some(msg) = msg else { continue };
         match msg {
             DecodeMsg::Shutdown => break,
@@ -6123,6 +6145,13 @@ mod conceal_loop_tests {
     // `StreamKind` vient du protocole (cf. import du module).
     use std::time::{Duration, Instant};
 
+    /// Bloc de sortie ASIO, 64 frames : 1,33 ms, sous le plancher d'une trame.
+    /// Le seuil de survie y vaut donc exactement une trame — c'est le
+    /// comportement qui existait avant le correctif du 20/09.
+    const BLOC_ASIO_MS: f64 = 64.0 * 1000.0 / 48_000.0;
+    /// Bloc de sortie CoreAudio, 512 frames : 10,7 ms tirés d'un seul coup.
+    const BLOC_COREAUDIO_MS: f64 = 512.0 * 1000.0 / 48_000.0;
+
     /// Un flux déjà entendu ET dont on connaît la régularité : les deux
     /// conditions sans lesquelles on n'invente jamais rien.
     fn state(now: Instant) -> DecodeState {
@@ -6224,7 +6253,7 @@ mod conceal_loop_tests {
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
-        conceal_due_streams(&mut st, &mixer, now);
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
         let s = st.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 0, "rien à inventer");
         assert_eq!(s.consecutive_concealed, 0);
@@ -6237,7 +6266,7 @@ mod conceal_loop_tests {
         mixer.add_stream("peer-test", StreamKind::Instrument);
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
-        conceal_due_streams(&mut st, &mixer, now);
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
         let s = st.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 1);
         assert_eq!(s.consecutive_concealed, 1);
@@ -6255,12 +6284,61 @@ mod conceal_loop_tests {
         let mut st = state_lien_inconnu(now);
         st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
         m.insert(Arc::from("peer-test"), st);
-        conceal_due_streams(&mut m, &mixer, now);
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
         assert_eq!(
             m.values().next().unwrap().concealed_underrun_frames,
             0,
             "lien inconnu : on attend, on n'invente pas"
         );
+    }
+
+    /// Correctif du 20/09 — le banc Mac : **13 accrocs, zéro masquage**. Le
+    /// tampon contenait « plus d'une trame » à l'instant du regard et se vidait
+    /// quand même entre deux tirages du callback CoreAudio. Le seuil de survie
+    /// est la taille du bloc de SORTIE, pas la durée d'une trame.
+    #[test]
+    fn un_tampon_sous_le_bloc_de_sortie_declenche_le_masquage() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        // 5 ms de matière : deux trames, mais moins que les 10,7 ms que le
+        // callback CoreAudio consomme d'un seul tirage.
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 5 * 2]);
+        let now = Instant::now();
+
+        // Petit bloc (ASIO) : le tampon tient, on n'invente rien.
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        assert_eq!(
+            st.values().next().unwrap().concealed_underrun_frames,
+            0,
+            "1,33 ms par tirage : 5 ms de tampon survivent largement"
+        );
+
+        // Même tampon, gros bloc (CoreAudio) : il ne survivra pas au tirage.
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, BLOC_COREAUDIO_MS, now);
+        assert_eq!(
+            st.values().next().unwrap().concealed_underrun_frames,
+            1,
+            "10,7 ms par tirage : 5 ms de tampon laissent un trou"
+        );
+    }
+
+    /// La taille du bloc se lit en frames PAR CANAL : c'est cette unité, et pas
+    /// le nombre d'échantillons entrelacés, qui donne la durée.
+    #[test]
+    fn la_taille_du_bloc_de_sortie_se_lit_en_millisecondes() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let frames = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            output_block_ms(&frames),
+            0.0,
+            "sortie pas démarrée : aucune taille connue"
+        );
+        frames.store(512, Ordering::Relaxed);
+        assert!((output_block_ms(&frames) - BLOC_COREAUDIO_MS).abs() < 1e-9);
+        frames.store(64, Ordering::Relaxed);
+        assert!((output_block_ms(&frames) - BLOC_ASIO_MS).abs() < 1e-9);
     }
 
     /// Au plafond, on cesse d'inventer ET on désarme l'échéance.
@@ -6279,7 +6357,7 @@ mod conceal_loop_tests {
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
         st.values_mut().next().unwrap().consecutive_concealed = MAX_CONSECUTIVE;
-        conceal_due_streams(&mut st, &mixer, now);
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
         let s = st.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 0, "on n'invente plus au plafond");
         assert!(
@@ -6309,7 +6387,7 @@ mod conceal_loop_tests {
         let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
         st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
         m.insert(Arc::from("peer-test"), st);
-        conceal_due_streams(&mut m, &mixer, now);
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
         // `on_concealed` ne fait rien avant le premier paquet : rien n'est inventé
         // pour un flux dont on n'a jamais entendu la moindre trame.
         assert_eq!(m.values().next().unwrap().seq.counters().expected, 0);

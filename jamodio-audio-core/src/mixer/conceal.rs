@@ -55,6 +55,9 @@ const GRACE_MAX_MS: f64 = 10.0;
 ///
 /// - `late_by_ms` : retard sur l'échéance attendue. Négatif = pas encore l'heure.
 /// - `fill_ms`    : ce qu'il reste à jouer dans le tampon de CE flux.
+/// - `output_block_ms` : durée que le callback de SORTIE consomme d'un seul
+///   tirage. `0` (ou non finie) tant qu'on ne la connaît pas : on retombe alors
+///   sur la durée d'une trame.
 /// - `jitter_tail_ms` : pire retard récemment mesuré SUR CE LIEN, ou `None` tant
 ///   que la mesure n'est pas chaude.
 /// - `consecutive`: trames de masquage déjà poussées d'affilée pour ce flux.
@@ -69,11 +72,14 @@ const GRACE_MAX_MS: f64 = 10.0;
 ///    n'existait** — le paquet arrivait juste après et se faisait écarter, sa
 ///    place ayant été prise. On n'invente donc qu'au-delà du pire retard que ce
 ///    lien produit déjà.
-/// 3. **Le tampon tient encore une trame.** La sortie a de quoi jouer pendant
-///    que le paquet finit d'arriver.
+/// 3. **Le tampon survit au prochain tirage de la sortie.** La sortie a de quoi
+///    jouer pendant que le paquet finit d'arriver. Ce seuil vaut la taille du
+///    bloc de sortie, jamais moins d'une trame : le mesurer en trames a coûté
+///    13 accrocs et zéro masquage au banc Mac du 20/09/2026.
 pub fn decide(
     late_by_ms: f64,
     fill_ms: f64,
+    output_block_ms: f64,
     jitter_tail_ms: Option<f64>,
     consecutive: u32,
 ) -> Conceal {
@@ -90,7 +96,22 @@ pub fn decide(
     if late_by_ms < grace {
         return Conceal::Wait;
     }
-    if fill_ms >= FRAME_MS {
+    // Combien le tampon doit contenir pour survivre au prochain tirage : la
+    // taille du bloc que le callback de SORTIE consomme d'un coup, jamais moins
+    // d'une trame.
+    //
+    // Première version : « une trame ». Faux, et mesuré faux au banc du
+    // 20/09/2026 : côté Mac, le callback CoreAudio consomme des blocs bien plus
+    // gros que 2,5 ms. Le tampon paraissait suffisant à l'instant du regard et
+    // se vidait entre deux — **13 accrocs, zéro masquage déclenché**. Côté
+    // Windows/ASIO (64 frames = 1,33 ms), le plancher d'une trame continue de
+    // s'appliquer, donc rien ne change là-bas.
+    let survival_ms = if output_block_ms.is_finite() {
+        output_block_ms.max(FRAME_MS)
+    } else {
+        FRAME_MS
+    };
+    if fill_ms >= survival_ms {
         return Conceal::Wait;
     }
     if consecutive >= MAX_CONSECUTIVE {
@@ -124,8 +145,8 @@ mod tests {
 
     #[test]
     fn avant_lecheance_on_ninvente_rien() {
-        assert_eq!(decide(-1.0, 0.0, TAIL, 0), Conceal::Wait);
-        assert_eq!(decide(-0.001, 0.0, TAIL, 2), Conceal::Wait);
+        assert_eq!(decide(-1.0, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(-0.001, 0.0, FRAME_MS, TAIL, 2), Conceal::Wait);
     }
 
     /// Le correctif du 20/09 : un paquet à peine en retard arrive encore.
@@ -133,49 +154,76 @@ mod tests {
     fn un_retard_ordinaire_ne_declenche_rien() {
         // 1 ms de retard sur un lien dont la queue de gigue vaut 2,5 ms : le
         // paquet est encore en vol, et inventer lui volerait sa place.
-        assert_eq!(decide(1.0, 0.0, TAIL, 0), Conceal::Wait);
-        assert_eq!(decide(2.49, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(1.0, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(2.49, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
         // Au-delà du pire retard connu du lien, on n'attend plus.
-        assert_eq!(decide(2.5, 0.0, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(2.5, 0.0, FRAME_MS, TAIL, 0), Conceal::Frame);
+    }
+
+    /// Correctif du 20/09 — le seuil de survie est la taille du bloc de SORTIE.
+    #[test]
+    fn un_gros_bloc_de_sortie_exige_un_tampon_plus_garni() {
+        // CoreAudio, 512 frames = 10,7 ms consommés d'un coup : 5 ms dans le
+        // tampon ne survivront pas au prochain tirage, même si c'est « plus
+        // d'une trame ».
+        assert_eq!(decide(5.0, 5.0, 10.7, TAIL, 0), Conceal::Frame);
+        // Au-delà du bloc de sortie, en revanche, on laisse le paquet arriver.
+        assert_eq!(decide(5.0, 11.0, 10.7, TAIL, 0), Conceal::Wait);
+    }
+
+    #[test]
+    fn un_petit_bloc_de_sortie_ne_descend_pas_sous_une_trame() {
+        // ASIO, 64 frames = 1,33 ms : le plancher d'une trame s'applique, donc
+        // le comportement Windows ne change pas.
+        assert_eq!(decide(5.0, 2.0, 1.33, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(5.0, 2.6, 1.33, TAIL, 0), Conceal::Wait);
+    }
+
+    #[test]
+    fn une_taille_de_bloc_inconnue_retombe_sur_la_trame() {
+        // Sortie pas encore démarrée (0) ou mesure absurde : on ne devine pas.
+        assert_eq!(decide(5.0, 2.0, 0.0, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(5.0, 2.6, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(5.0, 2.6, f64::NAN, TAIL, 0), Conceal::Wait);
     }
 
     #[test]
     fn tant_quon_ne_connait_pas_le_lien_on_ninvente_pas() {
-        assert_eq!(decide(50.0, 0.0, None, 0), Conceal::Wait);
-        assert_eq!(decide(50.0, 0.0, Some(f64::NAN), 0), Conceal::Wait);
+        assert_eq!(decide(50.0, 0.0, FRAME_MS, None, 0), Conceal::Wait);
+        assert_eq!(decide(50.0, 0.0, FRAME_MS, Some(f64::NAN), 0), Conceal::Wait);
     }
 
     #[test]
     fn la_grace_reste_dans_des_bornes_raisonnables() {
         // Lien exceptionnellement régulier : on accorde quand même 1 ms.
-        assert_eq!(decide(0.5, 0.0, Some(0.01), 0), Conceal::Wait);
-        assert_eq!(decide(1.0, 0.0, Some(0.01), 0), Conceal::Frame);
+        assert_eq!(decide(0.5, 0.0, FRAME_MS, Some(0.01), 0), Conceal::Wait);
+        assert_eq!(decide(1.0, 0.0, FRAME_MS, Some(0.01), 0), Conceal::Frame);
         // Estimation emballée : la grâce est plafonnée, le masquage reste possible.
-        assert_eq!(decide(9.9, 0.0, Some(500.0), 0), Conceal::Wait);
-        assert_eq!(decide(10.0, 0.0, Some(500.0), 0), Conceal::Frame);
+        assert_eq!(decide(9.9, 0.0, FRAME_MS, Some(500.0), 0), Conceal::Wait);
+        assert_eq!(decide(10.0, 0.0, FRAME_MS, Some(500.0), 0), Conceal::Frame);
     }
 
     #[test]
     fn un_tampon_qui_tient_une_trame_na_besoin_de_rien() {
         // Le paquet est en retard, mais la sortie a de quoi jouer : inventer
         // maintenant volerait sa place au paquet qui arrive.
-        assert_eq!(decide(5.0, FRAME_MS, TAIL, 0), Conceal::Wait);
-        assert_eq!(decide(50.0, 12.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(5.0, FRAME_MS, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(50.0, 12.0, FRAME_MS, TAIL, 0), Conceal::Wait);
     }
 
     #[test]
     fn echeance_depassee_et_tampon_vide_on_masque() {
-        assert_eq!(decide(2.5, 0.0, TAIL, 0), Conceal::Frame);
-        assert_eq!(decide(3.0, 2.49, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(2.5, 0.0, FRAME_MS, TAIL, 0), Conceal::Frame);
+        assert_eq!(decide(3.0, 2.49, FRAME_MS, TAIL, 0), Conceal::Frame);
     }
 
     #[test]
     fn au_dela_de_trois_trames_on_fond_vers_le_silence() {
         for n in 0..MAX_CONSECUTIVE {
-            assert_eq!(decide(5.0, 0.0, TAIL, n), Conceal::Frame, "n={n}");
+            assert_eq!(decide(5.0, 0.0, FRAME_MS, TAIL, n), Conceal::Frame, "n={n}");
         }
-        assert_eq!(decide(5.0, 0.0, TAIL, MAX_CONSECUTIVE), Conceal::FadeToSilence);
-        assert_eq!(decide(5.0, 0.0, TAIL, 99), Conceal::FadeToSilence);
+        assert_eq!(decide(5.0, 0.0, FRAME_MS, TAIL, MAX_CONSECUTIVE), Conceal::FadeToSilence);
+        assert_eq!(decide(5.0, 0.0, FRAME_MS, TAIL, 99), Conceal::FadeToSilence);
     }
 
     /// 7,5 ms : c'est la durée qu'on s'autorise à inventer, pas une de plus.
@@ -186,10 +234,10 @@ mod tests {
 
     #[test]
     fn une_mesure_de_temps_absurde_fait_attendre_pas_masquer() {
-        assert_eq!(decide(f64::NAN, 0.0, TAIL, 0), Conceal::Wait);
-        assert_eq!(decide(f64::NEG_INFINITY, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(f64::NAN, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(f64::NEG_INFINITY, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
         // Un retard « infini » n'est pas un retard mesuré : on attend aussi.
-        assert_eq!(decide(f64::INFINITY, 0.0, TAIL, 0), Conceal::Wait);
+        assert_eq!(decide(f64::INFINITY, 0.0, FRAME_MS, TAIL, 0), Conceal::Wait);
     }
 
     #[test]
