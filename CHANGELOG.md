@@ -5,6 +5,25 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-12] — 2026-09-20 (pré-version de test)
+
+**Mesure seule : rien ne change au son.** Comme la précédente, cette version
+sert à répondre à une question, pas à corriger.
+
+### Ajouté
+
+- **On saura enfin si le comblement des trous se déclenche trop tôt.** Quand il
+  fabrique du son, il retient ce qu'il restait à jouer dans la réserve ; si le
+  vrai morceau de son arrive avant que cette réserve ne s'épuise, c'est qu'il
+  aurait suffi d'attendre — et on l'a remplacé pour rien. Jusqu'ici, un
+  comblement utile et un comblement inutile laissaient exactement la même trace :
+  impossible de les distinguer, donc impossible de régler.
+
+### Ce qu'il faut faire
+
+Une session Mac ↔ PC, en jouant normalement, puis envoyer les rapports. **Rien
+à écouter de particulier** : le son doit être celui de la 0.6.5-11.
+
 ## [0.6.5-11] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.** Cette version sert à relever une valeur
