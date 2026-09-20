@@ -1058,6 +1058,9 @@ pub struct PerfHandles {
     /// un niveau d'entrée trop fort (beaucoup d'échantillons au-dessus) d'une
     /// pluie d'impulsions isolées (pic très haut, presque aucun dépassement).
     pub input_peak: Arc<std::sync::atomic::AtomicU32>,
+    /// Pic du bloc à l'ARRIVÉE dans `process_stage` — entre la capture et le
+    /// limiteur. Encadre le trajet où le signal se met à dépasser.
+    pub process_in_peak: Arc<std::sync::atomic::AtomicU32>,
     pub input_over_samples: Arc<std::sync::atomic::AtomicU64>,
     pub input_total_samples: Arc<std::sync::atomic::AtomicU64>,
     pub edge_blocks: Arc<std::sync::atomic::AtomicU64>,
@@ -1157,6 +1160,7 @@ impl PerfHandles {
         const HISTOGRAM_CAPACITY: usize = 512;
         Self {
             input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            process_in_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             input_over_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             input_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             edge_blocks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -4210,6 +4214,23 @@ fn process_stage_loop(
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok((t_block_start, mut stereo)) => {
+                // Pic du bloc À SON ARRIVÉE dans cet étage, avant quoi que ce
+                // soit. Encadre exactement le trajet où un signal borné à 1,0 à
+                // la capture ressort à 6,3 au limiteur (banc du 20/09/2026,
+                // entrée silencieuse et sortie qui fabrique du son). Si ce pic
+                // vaut déjà 6, le défaut est dans la capture ou le transport
+                // entre les deux étages ; s'il vaut 1, il est ici.
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut peak = 0.0f32;
+                    for v in stereo.iter() {
+                        let a = v.abs();
+                        if a > peak {
+                            peak = a;
+                        }
+                    }
+                    perfstats.process_in_peak.fetch_max(peak.to_bits(), Relaxed);
+                }
                 // v0.4.8 — timer "traitement pur" du process_stage : démarre
                 // ici (= après pop ringbuf), s'arrête juste avant le send.
                 let t_stage_start = std::time::Instant::now();

@@ -1138,6 +1138,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // de la pleine échelle. Remis à zéro à chaque fenêtre : c'est un pic
             // PAR SECONDE, comme `outputPeak`.
             let raw_peak = f32::from_bits(pl.perfstats.input_peak.swap(0, Ordering::Relaxed));
+            let proc_in_peak =
+                f32::from_bits(pl.perfstats.process_in_peak.swap(0, Ordering::Relaxed));
             let raw_overs = pl.perfstats.input_over_samples.swap(0, Ordering::Relaxed);
             let raw_total = pl.perfstats.input_total_samples.swap(0, Ordering::Relaxed);
             let (input_peak, input_over_pct) = if raw_total > 0 {
@@ -1631,6 +1633,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // 0.6.5-17 — ce que le pilote livre VRAIMENT, avant plugin.
                 input_peak,
                 input_over_pct,
+                // 0.6.5-18 — le même bloc à l'arrivée dans process_stage : borne
+                // l'endroit où le signal se met à dépasser.
+                process_in_peak = proc_in_peak,
                 // 0.6.5-11 — taille de bloc livrée par l'OS (frames/canal).
                 input_block_frames,
                 output_block_frames,
