@@ -1031,6 +1031,13 @@ pub struct ProducerNetStats {
 /// `recv_task`, et le CPAL capture callback. `Clone` cheap (Arc).
 #[derive(Clone)]
 pub struct PerfHandles {
+    /// Continuité du signal capté au BORD des blocs livrés par le pilote —
+    /// la seule chose qu'on ne mesurait pas, et celle qui distinguait une prise
+    /// saine d'une prise « horrible » que rien d'autre ne différenciait
+    /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
+    /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
+    pub edges_seen: Arc<std::sync::atomic::AtomicU64>,
+    pub edges_rough: Arc<std::sync::atomic::AtomicU64>,
     pub plugin_latency: Arc<Mutex<Histogram>>,
     /// End-to-end CAPTURE_in → ENCODE_send. Inclut le temps en file dans les
     /// ringbufs entre stages (S3) — c'est la VRAIE latence pipeline ressentie.
@@ -1123,6 +1130,8 @@ impl PerfHandles {
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
         Self {
+            edges_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            edges_rough: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             pipeline_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
@@ -3822,6 +3831,9 @@ fn capture_stage_loop(
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
+    // Continuité au bord des blocs (cf. `edge_continuity`). Vit sur CE thread :
+    // le callback audio n'en sait rien.
+    let mut edge_continuity = jamodio_audio_core::edge_continuity::EdgeContinuity::new();
     // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
     // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
     // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
@@ -3901,6 +3913,19 @@ fn capture_stage_loop(
                         }
                     }
                 }
+                // La prise se recolle-t-elle d'un bloc au suivant ? Trois
+                // soustractions par BLOC (750/s), sur le buffer BRUT du pilote,
+                // avant toute transformation — et hors du callback audio.
+                edge_continuity.observe(&samples, channels_in);
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let w = edge_continuity.drain();
+                    if w.edges > 0 {
+                        perfstats.edges_seen.fetch_add(w.edges, Relaxed);
+                        perfstats.edges_rough.fetch_add(w.rough, Relaxed);
+                    }
+                }
+
                 // Timestamp début pipeline INSTRUMENT : posé APRÈS le tap voix
                 // pour que le coût voix reste invisible aux métriques instrument.
                 let t_block_start = std::time::Instant::now();

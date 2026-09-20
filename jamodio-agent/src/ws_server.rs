@@ -1191,6 +1191,32 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 })
                 .collect();
 
+            // ── Continuité de la prise au bord des blocs (cf. `edge_continuity`) ─
+            // Une ligne SEULEMENT si la prise est abîmée : une session saine
+            // n'ajoute rien au journal. Le pourcentage, lui, part dans les
+            // perf-stats de la même seconde.
+            let edge_rough_pct = {
+                let seen = pl.perfstats.edges_seen.swap(0, Ordering::Relaxed);
+                let rough = pl.perfstats.edges_rough.swap(0, Ordering::Relaxed);
+                if seen == 0 {
+                    None
+                } else {
+                    let pct = 100.0 * rough as f32 / seen as f32;
+                    // 2 % = très au-dessus de ce qu'une prise saine produit (0),
+                    // et très en dessous de ce qu'une prise abîmée donne (~25 %
+                    // mesuré le 19/09). CONSTANTE DE CALIBRATION.
+                    if pct > 2.0 {
+                        tracing::warn!(
+                            target: "jamodio::audio",
+                            rough_pct = pct,
+                            edges = seen,
+                            "PRISE ABÎMÉE : le signal capté ne se recolle pas d'un bloc au suivant"
+                        );
+                    }
+                    Some(pct)
+                }
+            };
+
             // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
             // en RETARD par le driver/l'OS (`late_blocks`) vs blocs dont NOTRE
@@ -1575,6 +1601,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
+                edge_rough_pct,
                 "perfstats snapshot"
             );
 
@@ -1587,6 +1614,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
+                edge_rough_pct,
                 callback_deficit_in,
                 callback_deficit_out,
                 cpu_pct: machine_sample.cpu_pct,
