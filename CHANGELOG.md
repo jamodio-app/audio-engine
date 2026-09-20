@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-10] — 2026-09-20 (pré-version de test)
+
+**Le comblement des trous se déclenche enfin sur Mac.** Aucun changement côté
+Windows.
+
+### Corrigé
+
+- **Sur Mac, le comblement ne partait jamais.** Au banc du 20/09, la version
+  précédente a divisé les accrocs par cinq sur PC (16 → 3) et n'a rien changé
+  sur Mac : 13 accrocs, pas un seul comblement. En cause, la façon dont on
+  jugeait qu'il restait « de quoi jouer » : on la mesurait en trames de son,
+  alors que la carte son du Mac puise dans la réserve par paquets bien plus
+  gros. La réserve semblait suffisante au moment du regard et se vidait entre
+  deux — un trou que personne ne venait boucher. On mesure désormais avec la
+  taille réelle des paquets que réclame la carte son.
+
+### Ce qu'il faut écouter
+
+Sur **Mac**, les petits clics secs en cours de jeu doivent avoir disparu, sans
+qu'aucun nouvel artefact n'apparaisse. Sur **PC**, rien ne doit changer par
+rapport à la 0.6.5-9 : c'est la vérification qui compte autant que l'autre.
+
 ## [0.6.5-9] — 2026-09-20 (pré-version de test)
 
 **La version à écouter** : elle rassemble tout ce qui précède, avec une
