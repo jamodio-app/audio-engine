@@ -1023,6 +1023,9 @@ pub struct ProducerNetStats {
     /// Parmi les précédentes, celles inventées alors que le paquet allait
     /// arriver à temps (cf. `conceal::was_premature`).
     pub concealed_premature_frames: u64,
+    /// Somme et pire des marges gâchées (ms) sur ces trames-là.
+    pub concealed_premature_margin_ms: f64,
+    pub concealed_premature_margin_max_ms: f64,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -4994,6 +4997,12 @@ struct DecodeState {
     /// ne compte que les trous RÉELLEMENT rendus) : sans ce compteur, on ne
     /// peut pas distinguer les deux.
     concealed_premature_frames: u64,
+    /// Somme des marges gâchées (ms) sur ces trames-là, et la pire d'entre
+    /// elles. Le compte seul dit QU'ON tire trop tôt ; ces deux-ci disent DE
+    /// COMBIEN, donc lequel du seuil de survie ou du délai de grâce il faut
+    /// bouger.
+    concealed_premature_margin_ms: f64,
+    concealed_premature_margin_max_ms: f64,
     /// Lot 1.4 — échantillons restants de la rampe d'arrivée. Un musicien qui
     /// rejoint ne doit pas ÉCLATER dans le casque des autres : ses premières
     /// centaines de millisecondes montent en douceur. Appliqué ICI, sur le thread
@@ -5024,6 +5033,8 @@ impl DecodeState {
             concealed_underrun_frames: 0,
             last_conceal: None,
             concealed_premature_frames: 0,
+            concealed_premature_margin_ms: 0.0,
+            concealed_premature_margin_max_ms: 0.0,
             next_deadline: None,
             consecutive_concealed: 0,
             fade_in_remaining: JOIN_FADE_SAMPLES,
@@ -5363,6 +5374,8 @@ fn decode_one_packet(
             concealed_frames: st.concealed_frames,
             concealed_underrun_frames: st.concealed_underrun_frames,
             concealed_premature_frames: st.concealed_premature_frames,
+            concealed_premature_margin_ms: st.concealed_premature_margin_ms,
+            concealed_premature_margin_max_ms: st.concealed_premature_margin_max_ms,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -5405,8 +5418,13 @@ fn decode_one_packet(
             // `underruns` ne sait pas poser.
             if let Some((at, fill_ms)) = st.last_conceal.take() {
                 let delay_ms = recv_instant.saturating_duration_since(at).as_secs_f64() * 1000.0;
-                if jamodio_audio_core::mixer::conceal::was_premature(fill_ms, delay_ms) {
+                if let Some(margin) =
+                    jamodio_audio_core::mixer::conceal::premature_margin_ms(fill_ms, delay_ms)
+                {
                     st.concealed_premature_frames += 1;
+                    st.concealed_premature_margin_ms += margin;
+                    st.concealed_premature_margin_max_ms =
+                        st.concealed_premature_margin_max_ms.max(margin);
                 }
             }
             return;

@@ -1511,6 +1511,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         concealed_frames: net.concealed_frames,
                         concealed_underrun_frames: net.concealed_underrun_frames,
                         concealed_premature_frames: net.concealed_premature_frames,
+                        concealed_premature_margin_ms: net.concealed_premature_margin_ms,
+                        concealed_premature_margin_max_ms: net.concealed_premature_margin_max_ms,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
                         target_reactive_ms: s.target_reactive_ms,

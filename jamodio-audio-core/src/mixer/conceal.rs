@@ -154,13 +154,26 @@ pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
 /// Une mesure non finie ne prouve rien : on ne compte pas un prématuré qu'on
 /// n'a pas établi.
 pub fn was_premature(fill_ms_at_conceal: f64, arrival_delay_ms: f64) -> bool {
+    premature_margin_ms(fill_ms_at_conceal, arrival_delay_ms).is_some()
+}
+
+/// DE COMBIEN le masquage était-il prématuré ? `None` s'il ne l'était pas.
+///
+/// C'est la marge qu'on n'a pas su attendre : le tampon tenait encore
+/// `fill_ms_at_conceal`, le paquet est arrivé au bout de `arrival_delay_ms`, il
+/// restait donc cette différence de rab. Savoir COMBIEN décide du réglage :
+/// quelques dizaines de microsecondes se rattrapent en avançant le seuil de
+/// survie ; plusieurs millisecondes veulent dire que le délai de grâce est trop
+/// court. Sans ce chiffre, on ne saurait pas lequel des deux toucher — et on
+/// réglerait au jugé.
+pub fn premature_margin_ms(fill_ms_at_conceal: f64, arrival_delay_ms: f64) -> Option<f64> {
     if !fill_ms_at_conceal.is_finite() || !arrival_delay_ms.is_finite() {
-        return false;
+        return None;
     }
-    if arrival_delay_ms < 0.0 {
-        return false;
+    if arrival_delay_ms < 0.0 || arrival_delay_ms >= fill_ms_at_conceal {
+        return None;
     }
-    arrival_delay_ms < fill_ms_at_conceal
+    Some(fill_ms_at_conceal - arrival_delay_ms)
 }
 
 #[cfg(test)]
@@ -179,6 +192,19 @@ mod tests {
         // Il arrive après que le tampon se soit vidé : le trou était réel.
         assert!(!was_premature(4.0, 4.0));
         assert!(!was_premature(4.0, 9.0));
+    }
+
+    #[test]
+    fn la_marge_dit_de_combien_on_a_tire_trop_tot() {
+        // Le tampon tenait 4 ms, le paquet est arrivé au bout de 1,5 ms :
+        // il restait 2,5 ms de rab.
+        assert_eq!(premature_margin_ms(4.0, 1.5), Some(2.5));
+        // Pile à la limite : pas prématuré, donc pas de marge.
+        assert_eq!(premature_margin_ms(4.0, 4.0), None);
+        assert_eq!(premature_margin_ms(4.0, 9.0), None);
+        // Mesure inexploitable : on ne fabrique pas une marge.
+        assert_eq!(premature_margin_ms(f64::NAN, 1.0), None);
+        assert_eq!(premature_margin_ms(4.0, -1.0), None);
     }
 
     #[test]

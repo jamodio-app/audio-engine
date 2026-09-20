@@ -1335,6 +1335,15 @@ pub struct PeerPerf {
     /// même trace (une trame inventée, aucun accroc).
     #[serde(rename = "concealedPrematureFrames")]
     pub concealed_premature_frames: u64,
+    /// De COMBIEN on a tiré trop tôt : somme des marges gâchées sur les trames
+    /// ci-dessus, et la pire d'entre elles (ms). Le compte dit qu'on invente
+    /// trop tôt ; ces deux-ci disent lequel du seuil de survie ou du délai de
+    /// grâce il faut bouger, et de combien. Quelques dizaines de microsecondes
+    /// par trame ne se règlent pas de la même façon que deux millisecondes.
+    #[serde(rename = "concealedPrematureMarginMs")]
+    pub concealed_premature_margin_ms: f64,
+    #[serde(rename = "concealedPrematureMarginMaxMs")]
+    pub concealed_premature_margin_max_ms: f64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).
