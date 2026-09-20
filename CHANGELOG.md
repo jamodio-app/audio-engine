@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-9] — 2026-09-20 (pré-version de test)
+
+**La version à écouter** : elle rassemble tout ce qui précède, avec une
+correction importante.
+
+### Corrigé
+
+- **Le comblement des trous ne se déclenche plus pour rien.** Introduit la
+  veille, il fabriquait du son dès qu'un paquet avait une fraction de
+  milliseconde de retard — alors que le paquet arrivait juste après et se
+  retrouvait écarté. Sur une session de sept minutes, il s'était déclenché
+  74 fois pour 8 trous réels, parfois plusieurs fois de suite : de quoi
+  s'entendre. Il attend désormais que le retard dépasse ce que le lien produit
+  déjà d'habitude, et ne fabrique rien tant qu'il ne connaît pas ce lien.
+
+### Ce qu'il faut écouter
+
+Les **petits clics secs** en cours de jeu doivent avoir disparu, **sans** que de
+nouveaux artefacts apparaissent. Si tu entends encore quelque chose d'inhabituel,
+c'est que le réglage reste trop sensible — dis-le, le chiffre correspondant est
+dans le rapport.
+
 ## [0.6.5-8] — 2026-09-20 (pré-version de test)
 
 **Une prise abîmée se verra, au lieu de se deviner.** Aucun changement du son.
