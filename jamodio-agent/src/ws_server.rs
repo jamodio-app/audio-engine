@@ -1662,6 +1662,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 monitor_buffer_ms,
                 monitor_underruns,
                 edge_peak_ratio,
+                // 0.6.5-19 — de quoi recouper une ligne à elle seule (énigme du
+                // 21/09/2026 : pic à 6,5 et zéro dépassement sur la même ligne,
+                // ce qu'aucun chemin de code n'explique). Compteurs BRUTS de la
+                // fenêtre, et l'identité de qui écrit : si deux agents tournent,
+                // leurs lignes se distinguent.
+                output_clip_samples = clip_samples,
+                output_total_samples = total_samples,
+                input_over_samples = raw_overs,
+                input_total_samples = raw_total,
+                pid = std::process::id(),
                 "perfstats snapshot"
             );
 

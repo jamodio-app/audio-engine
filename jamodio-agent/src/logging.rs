@@ -121,6 +121,7 @@ pub fn init() -> WorkerGuard {
         arch = std::env::consts::ARCH,
         log_dir = %dir.display(),
         version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
         "Jamodio Audio Engine starting"
     );
 
