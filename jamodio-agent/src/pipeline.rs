@@ -5049,6 +5049,12 @@ struct DecodeState {
     /// Quand la prochaine trame est attendue. `None` tant qu'aucun paquet n'est
     /// arrivé : on n'invente rien avant d'avoir entendu le flux une première fois.
     next_deadline: Option<std::time::Instant>,
+    /// Quand revenir examiner ce flux, l'échéance une fois passée. `None` =
+    /// dès que possible. Posé à chaque renoncement : la raison de l'attente dit
+    /// jusqu'à quand elle vaut (cf. `conceal::recheck_in_ms`), et revenir avant
+    /// ne ferait que reconduire la même attente. Remis à `None` à chaque fois
+    /// que l'échéance change — il ne vaut que pour CETTE échéance.
+    next_check: Option<std::time::Instant>,
     /// Trames inventées d'affilée, remis à zéro dès qu'un vrai paquet arrive.
     consecutive_concealed: u32,
     /// Dernier masquage à l'échéance : quand, et ce que le tampon tenait encore
@@ -5118,6 +5124,7 @@ impl DecodeState {
             wait_buffer_holds: 0,
             deadline_disarmed: 0,
             next_deadline: None,
+            next_check: None,
             consecutive_concealed: 0,
             fade_in_remaining: JOIN_FADE_SAMPLES,
             pkt_count: 0,
@@ -5198,9 +5205,10 @@ fn apply_join_fade(block: &mut [f32], remaining: usize) -> usize {
 /// Durée d'une trame Opus, en `Duration` (miroir de `conceal::FRAME_MS`).
 const FRAME: std::time::Duration = std::time::Duration::from_micros(2_500);
 
-/// Combien attendre avant le prochain réveil : la plus proche échéance de trame,
-/// toutes sources confondues. Aucune source à surveiller = on dort franchement,
-/// un paquet nous réveillera.
+/// Combien attendre avant le prochain réveil : le plus proche examen utile,
+/// toutes sources confondues — l'échéance de trame, ou plus tard si une attente
+/// en cours ne peut pas changer d'ici là. Aucune source à surveiller = on dort
+/// franchement, un paquet nous réveillera.
 fn next_wait(
     states: &HashMap<Arc<str>, DecodeState>,
     now: std::time::Instant,
@@ -5208,7 +5216,8 @@ fn next_wait(
     let mut soonest: Option<f64> = None;
     for st in states.values() {
         let Some(deadline) = st.next_deadline else { continue };
-        let ms = deadline.saturating_duration_since(now).as_secs_f64() * 1000.0;
+        let wake = st.next_check.map_or(deadline, |c| c.max(deadline));
+        let ms = wake.saturating_duration_since(now).as_secs_f64() * 1000.0;
         soonest = Some(soonest.map_or(ms, |s: f64| s.min(ms)));
     }
     match soonest {
@@ -5238,14 +5247,14 @@ fn conceal_due_streams(
     output_block_ms: f64,
     now: std::time::Instant,
 ) {
-    use jamodio_audio_core::mixer::conceal::{decide, Conceal, Wait};
+    use jamodio_audio_core::mixer::conceal::{decide, recheck_in_ms, Conceal, Wait};
     for (id, st) in states.iter_mut() {
         // Pas d'échéance armée : il n'y a rien à décider. On ne compte rien ici —
         // ce serait compter des tours de boucle (jusqu'à 400/s par flux muet) et
         // non des événements, ce qui écraserait les autres raisons à l'analyse.
         // Ce sont les DÉSARMEMENTS qui sont comptés, là où ils ont lieu.
         let Some(deadline) = st.next_deadline else { continue };
-        if now < deadline {
+        if now < deadline || st.next_check.is_some_and(|c| now < c) {
             continue;
         }
         let late_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0;
@@ -5277,8 +5286,9 @@ fn conceal_due_streams(
                 // donc au hasard : d'où les 58 à 67 % de masquages prématurés.
                 //
                 // Le retard court maintenant jusqu'à ce qu'il justifie d'agir.
-                // La boucle ne s'emballe pas pour autant : `sleep_until_deadline_ms`
-                // impose un plancher de sommeil.
+                // La boucle ne s'emballe pas pour autant : on ne revient qu'à
+                // l'instant où la raison d'attendre peut changer (`next_check`,
+                // ci-dessous), et `sleep_until_deadline_ms` impose un plancher.
                 //
                 // Au-delà de `STALE_MS`, ce n'est plus un retard mais un flux
                 // tari (talkback coupé, pair parti) : on désarme, et l'arrivée
@@ -5287,7 +5297,15 @@ fn conceal_due_streams(
                 // au plancher pendant toute la session.
                 if late_ms > STALE_MS {
                     st.next_deadline = None;
+                    st.next_check = None;
                     st.deadline_disarmed += 1;
+                } else {
+                    // Revenir quand la raison d'attendre peut avoir changé, pas
+                    // avant : sinon le thread se réveille au plancher (0,5 ms)
+                    // pour reconduire la même attente, et prend chaque fois le
+                    // verrou du tampon que le callback de sortie tire.
+                    st.next_check = recheck_in_ms(why, late_ms, fill_ms, output_block_ms, tail)
+                        .map(|ms| now + std::time::Duration::from_secs_f64(ms / 1000.0));
                 }
                 continue;
             }
@@ -5314,6 +5332,7 @@ fn conceal_due_streams(
                 // et on DÉSARME l'échéance : sans ça, un pair parti ferait tourner
                 // ce thread à 400 Hz pour rien. Le retour des paquets la réarme.
                 st.next_deadline = None;
+                st.next_check = None;
                 st.deadline_disarmed += 1;
                 continue;
             }
@@ -5324,6 +5343,7 @@ fn conceal_due_streams(
         // maintenant plutôt que de rattraper le retard en inventant à la chaîne.
         let next = deadline + FRAME;
         st.next_deadline = Some(if next > now { next } else { now + FRAME });
+        st.next_check = None;
     }
 }
 
@@ -5479,6 +5499,7 @@ fn decode_one_packet(
         // retardataire à attendre, il n'y a plus rien à juger.
         st.last_conceal = None;
         st.next_deadline = Some(recv_instant + FRAME);
+        st.next_check = None;
         st.consecutive_concealed = 0;
     }
     if st.pkt_count.is_multiple_of(40) {
@@ -6449,6 +6470,93 @@ mod conceal_loop_tests {
         assert_eq!(s.concealed_underrun_frames, 0, "rien à inventer");
         assert_eq!(s.consecutive_concealed, 0);
         assert!(s.next_deadline.is_some(), "l'échéance continue d'avancer");
+    }
+
+    /// Un vrai paquet Opus (2,5 ms de silence) numéroté `seq`, tel qu'il sort
+    /// du réseau.
+    fn paquet(seq: u16) -> Vec<u8> {
+        let enc = MusicEncoder::new().expect("encodeur Opus");
+        let pcm = vec![0.0f32; enc.frame_size() * 2];
+        let mut out = vec![0u8; 1500];
+        let n = enc.encode(&pcm, &mut out).expect("encodage");
+        let header = RtpHeader {
+            payload_type: 111,
+            sequence: seq,
+            timestamp: u32::from(seq) * 120,
+            ssrc: 1,
+            marker: false,
+        };
+        rtp::build_packet(&header, &out[..n])
+    }
+
+    fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
+        let stats = Arc::new(Mutex::new(HashMap::new()));
+        let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
+        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path);
+    }
+
+    // ─── M2 (21/09/2026) : ne revenir que quand l'attente peut changer ─────
+
+    /// Avant M2, un flux dans sa grâce était réexaminé à chaque réveil
+    /// (≥ 0,5 ms) pour reconduire la même attente : ~1 600 réveils/s sur deux
+    /// flux. Il ne l'est plus qu'une fois la grâce écoulée.
+    #[test]
+    fn une_attente_dans_la_grace_ne_revient_qu_a_sa_fin() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = states(now);
+        st.values_mut().next().unwrap().next_deadline = Some(now - Duration::from_micros(300));
+
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.wait_within_grace, 1);
+        let rdv = s.next_check.expect("un rendez-vous est posé");
+        assert!(rdv > now, "on ne revient pas tout de suite");
+
+        // Réveil avant la fin de la grâce (un autre flux, un paquet ailleurs) :
+        // ce flux n'est pas réexaminé.
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now + Duration::from_micros(200));
+        assert_eq!(st.values().next().unwrap().wait_within_grace, 1, "aucun examen inutile");
+
+        // La grâce écoulée, tampon vide : on masque, ni avant, ni après.
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, rdv);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 1, "masquage pile à la fin de la grâce");
+        assert!(s.next_check.is_none(), "le rendez-vous ne survit pas à l'échéance suivante");
+    }
+
+    #[test]
+    fn un_tampon_garni_laisse_dormir_le_thread() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        // Au-delà de la cible du tampon, qui ne joue pas avant d'être amorcé :
+        // ce qui compte ici est ce que `buffered_ms` rapporte.
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
+        let now = Instant::now();
+        let mut st = states(now);
+        st.values_mut().next().unwrap().next_deadline = Some(now - Duration::from_millis(5));
+
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        assert_eq!(st.values().next().unwrap().wait_buffer_holds, 1);
+        // Avant M2 : 0,5 ms (plancher). Le tampon tient plusieurs ms : on dort
+        // jusqu'au plafond de sommeil.
+        let attente = next_wait(&st, now);
+        assert!(attente >= Duration::from_micros(4_900), "attente {attente:?}");
+    }
+
+    #[test]
+    fn un_paquet_qui_arrive_efface_le_rendez_vous() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = state(now);
+        st.next_deadline = Some(now - Duration::from_micros(300));
+        st.next_check = Some(now + Duration::from_millis(3));
+
+        recevoir(&mut st, &mixer, 1001, now);
+        assert!(st.next_check.is_none(), "nouvelle échéance, nouveau jugement");
+        assert_eq!(st.next_deadline, Some(now + FRAME));
     }
 
     #[test]

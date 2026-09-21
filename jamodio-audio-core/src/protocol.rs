@@ -1369,6 +1369,11 @@ pub struct PeerPerf {
     /// plafond de masquage atteint, ou flux tari (talkback coupé, pair parti).
     /// Un événement, pas un tour de boucle.
     ///
+    /// Les quatre raisons comptent des EXAMENS : un par échéance, puis un à
+    /// chaque instant où l'attente pouvait changer (fin de la grâce, tampon
+    /// près du seuil — agent ≥ 0.6.5-19). Avant, chaque réveil du thread
+    /// (≥ 0,5 ms) en comptait un : les valeurs antérieures ne se comparent pas.
+    ///
     /// Un masquage qui ne part JAMAIS et un masquage qui n'a rien à faire
     /// laissent la même trace : zéro trame inventée. Ces quatre compteurs sont
     /// la seule façon de les distinguer — le diagnostic du 20/09/2026 est resté

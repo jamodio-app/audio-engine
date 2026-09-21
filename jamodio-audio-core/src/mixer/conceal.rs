@@ -121,7 +121,7 @@ pub fn decide(
     let Some(tail) = jitter_tail_ms.filter(|t| t.is_finite()) else {
         return Conceal::Wait(Wait::LinkUnknown);
     };
-    let grace = tail.clamp(GRACE_MIN_MS, GRACE_MAX_MS);
+    let grace = grace_ms(tail);
     if late_by_ms < grace {
         return Conceal::Wait(Wait::WithinGrace);
     }
@@ -141,18 +141,79 @@ pub fn decide(
     //
     // `FRAME_MS` ne reste que comme repli quand la taille du bloc n'a pas été
     // mesurée : on ne devine pas un seuil plus court que ce qu'on sait.
-    let survival_ms = if output_block_ms.is_finite() && output_block_ms > 0.0 {
-        output_block_ms + WAKE_SLACK_MS
-    } else {
-        FRAME_MS
-    };
-    if fill_ms >= survival_ms {
+    if fill_ms >= survival_ms(output_block_ms) {
         return Conceal::Wait(Wait::BufferHolds);
     }
     if consecutive >= MAX_CONSECUTIVE {
         return Conceal::FadeToSilence;
     }
     Conceal::Frame
+}
+
+/// Délai de grâce accordé à un paquet en retard sur CE lien.
+fn grace_ms(jitter_tail_ms: f64) -> f64 {
+    jitter_tail_ms.clamp(GRACE_MIN_MS, GRACE_MAX_MS)
+}
+
+/// Ce qu'un tirage de la sortie consomme d'un coup ; repli sur une trame tant
+/// que la taille du bloc n'a pas été mesurée.
+fn output_draw_ms(output_block_ms: f64) -> f64 {
+    if output_block_ms.is_finite() && output_block_ms > 0.0 {
+        output_block_ms
+    } else {
+        FRAME_MS
+    }
+}
+
+/// Seuil de survie du tampon (cf. `decide`, point 3).
+fn survival_ms(output_block_ms: f64) -> f64 {
+    if output_block_ms.is_finite() && output_block_ms > 0.0 {
+        output_block_ms + WAKE_SLACK_MS
+    } else {
+        FRAME_MS
+    }
+}
+
+/// Dans combien de temps la décision `why` peut-elle CHANGER, faute de paquet ?
+///
+/// Un paquet qui arrive réveille le thread de toute façon ; cette fonction ne
+/// répond que pour le cas où rien n'arrive. Avant elle, le thread revenait
+/// examiner le flux toutes les 0,5 ms (le plancher de sommeil) : ~1 600 réveils
+/// par seconde sur deux flux, dont plus de 99,9 % pour reconduire la même
+/// attente (session du 21/09/2026). Or la réponse se calcule :
+///
+/// - `WithinGrace` : la grâce finit à une heure connue ;
+/// - `BufferHolds` : le tampon ne peut pas passer sous le seuil de survie
+///   avant `fill − seuil − un tirage`. La sortie consomme au rythme du temps,
+///   mais PAR BLOCS : un tirage peut tomber tout de suite, d'où le bloc retiré
+///   — c'est ce qui garantit qu'on ne se réveille jamais APRÈS le premier
+///   instant où masquer devient possible ;
+/// - `LinkUnknown` : seule l'arrivée de paquets peut le lever ; on repasse à la
+///   trame suivante, sans plus ;
+/// - `NotDue` : l'échéance elle-même dit quand revenir — `None`.
+///
+/// Le résultat n'est jamais négatif ; le plancher de sommeil s'applique ensuite
+/// (`sleep_until_deadline_ms`). Une mesure non finie rend `0` : on revient au
+/// plus tôt plutôt que de dormir sur une horloge folle.
+pub fn recheck_in_ms(
+    why: Wait,
+    late_by_ms: f64,
+    fill_ms: f64,
+    output_block_ms: f64,
+    jitter_tail_ms: Option<f64>,
+) -> Option<f64> {
+    let ms = match why {
+        Wait::NotDue => return None,
+        Wait::LinkUnknown => FRAME_MS,
+        Wait::WithinGrace => match jitter_tail_ms {
+            Some(tail) if tail.is_finite() => grace_ms(tail) - late_by_ms,
+            _ => 0.0,
+        },
+        Wait::BufferHolds => {
+            fill_ms - survival_ms(output_block_ms) - output_draw_ms(output_block_ms)
+        }
+    };
+    Some(if ms.is_finite() { ms.max(0.0) } else { 0.0 })
 }
 
 /// Combien de temps dormir avant la prochaine échéance, bornée pour que la
@@ -405,5 +466,73 @@ mod tests {
         assert_eq!(sleep_until_deadline_ms(50.0), 5.0);
         // Une mesure absurde ne fait pas tourner la boucle sans pause.
         assert_eq!(sleep_until_deadline_ms(f64::INFINITY), 0.5);
+    }
+
+    // ─── Quand revenir examiner un flux (M2, 21/09/2026) ────────────────
+
+    const BLOC: f64 = 64.0 * 1000.0 / 48_000.0; // 1,33 ms, nos deux plateformes
+
+    #[test]
+    fn pendant_la_grace_on_revient_pile_a_sa_fin() {
+        // Grâce = 2,5 ms (TAIL), 0,5 ms déjà écoulée : rien ne peut changer avant 2 ms.
+        let r = recheck_in_ms(Wait::WithinGrace, 0.5, 0.0, BLOC, TAIL).unwrap();
+        assert!((r - 2.0).abs() < 1e-9, "{r}");
+        // Et la décision prise à cet instant n'est plus « dans la grâce ».
+        assert_ne!(decide(0.5 + r, 0.0, BLOC, TAIL, 0), Conceal::Wait(Wait::WithinGrace));
+    }
+
+    #[test]
+    fn un_tampon_garni_laisse_dormir_ce_quil_tient_moins_un_tirage() {
+        // 6 ms en stock, seuil 1,83 ms, un tirage de 1,33 ms peut tomber tout de suite.
+        let r = recheck_in_ms(Wait::BufferHolds, 5.0, 6.0, BLOC, TAIL).unwrap();
+        assert!((r - (6.0 - (BLOC + 0.5) - BLOC)).abs() < 1e-9, "{r}");
+    }
+
+    /// LA garantie : quel que soit l'instant où tombent les tirages de la
+    /// sortie, le tampon ne passe JAMAIS sous le seuil de survie avant l'heure
+    /// du prochain examen. Sinon, dormir plus longtemps ferait masquer plus tard
+    /// qu'avant — c'est-à-dire laisser passer un trou.
+    #[test]
+    fn on_ne_se_reveille_jamais_apres_le_moment_ou_masquer_devient_possible() {
+        let seuil = BLOC + 0.5;
+        for fill0 in [1.9, 2.5, 3.2, 4.0, 6.0, 9.7, 15.0] {
+            let r = recheck_in_ms(Wait::BufferHolds, 3.0, fill0, BLOC, TAIL).unwrap();
+            for phase_pct in 0..100 {
+                // Premier tirage à `phase` ms, puis un tirage par bloc.
+                let phase = BLOC * phase_pct as f64 / 100.0;
+                let mut t = 0.0;
+                while t < r {
+                    let tirages = if t < phase { 0.0 } else { ((t - phase) / BLOC).floor() + 1.0 };
+                    let fill = fill0 - tirages * BLOC;
+                    assert!(
+                        fill >= seuil - 1e-9,
+                        "fill0={fill0} phase={phase:.2} t={t:.2} : tampon {fill:.2} sous le seuil avant le réveil ({r:.2} ms)"
+                    );
+                    t += 0.01;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn un_tampon_deja_au_seuil_fait_revenir_au_plus_tot() {
+        assert_eq!(recheck_in_ms(Wait::BufferHolds, 3.0, BLOC + 0.6, BLOC, TAIL), Some(0.0));
+    }
+
+    #[test]
+    fn un_lien_inconnu_se_reexamine_a_la_trame_suivante() {
+        assert_eq!(recheck_in_ms(Wait::LinkUnknown, 1.0, 0.0, BLOC, None), Some(FRAME_MS));
+    }
+
+    #[test]
+    fn avant_lecheance_cest_lecheance_qui_dit_quand_revenir() {
+        assert_eq!(recheck_in_ms(Wait::NotDue, -1.0, 0.0, BLOC, TAIL), None);
+    }
+
+    #[test]
+    fn une_mesure_absurde_fait_revenir_au_plus_tot() {
+        assert_eq!(recheck_in_ms(Wait::WithinGrace, f64::NAN, 0.0, BLOC, TAIL), Some(0.0));
+        assert_eq!(recheck_in_ms(Wait::BufferHolds, 3.0, f64::INFINITY, BLOC, TAIL), Some(0.0));
+        assert_eq!(recheck_in_ms(Wait::WithinGrace, 0.5, 0.0, BLOC, Some(f64::NAN)), Some(0.0));
     }
 }
