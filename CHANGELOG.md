@@ -5,6 +5,28 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-20] — 2026-09-21 (pré-version de test)
+
+**Corrections de la revue de code. Le son ne change pas, sauf une chose à
+surveiller : la carte son s'ouvre différemment sous Windows.**
+
+### Corrigé
+
+- **Windows (ASIO) : la carte son est préparée en une seule fois** à
+  l'ouverture, au lieu de quatre créations et trois libérations successives.
+  C'est ce que demandent les pilotes. Si la carte refuse de s'ouvrir avec
+  cette version, le dire et repasser en 0.6.5-19.
+- **Windows (ASIO) : les messages du pilote sont comptés sans verrou ni
+  allocation** sur son fil, qui peut être le fil audio.
+- **Plus de tri sous le verrou que la carte son utilise**, et plus
+  d'allocation par trame sur le fil de réception.
+- **Le jugement d'un masquage « de trop »** ne se fait plus que sur le paquet
+  qui a réellement été remplacé.
+- **Un cache de plugins illisible** est signalé dans le journal au lieu de
+  vider la liste en silence.
+- Interrupteurs de banc mal écrits signalés, commentaires remis d'accord avec
+  le code, code mort retiré.
+
 ## [0.6.5-19] — 2026-09-21 (pré-version de test)
 
 **Le masquage change : moins de son inventé, et un thread qui dort.**
