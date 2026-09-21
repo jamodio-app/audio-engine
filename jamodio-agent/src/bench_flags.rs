@@ -22,15 +22,25 @@ use std::path::PathBuf;
 /// Nom du fichier, dans le dossier des journaux (`logging::log_dir`).
 pub const BENCH_FLAGS_FILE: &str = "bench-flags";
 
+/// Ce qui, dans le fichier, n'a pas pu être lu tel quel — toujours journalisé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineIssue {
+    /// Ligne non vide, non commentée, sans `=` : ignorée.
+    MissingEquals { line: String },
+    /// Clé déjà vue plus haut : la dernière valeur l'emporte.
+    DuplicateKey { key: String },
+}
+
 /// Les interrupteurs lus pour cette capture.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
-    /// Mesure, une fois au démarrage de la capture et sur un thread à part, le
-    /// retard réel d'un réveil à 2,5 ms — ce sur quoi le masquage anticipé
-    /// reposera (cf. `audio::wake_probe`). Ne touche à aucun étage audio.
+    /// Mesure, sur un thread à part, le retard réel d'un réveil à 2,5 ms — ce
+    /// sur quoi le masquage anticipé reposera (cf. `audio::wake_probe`). Relancée
+    /// à CHAQUE démarrage de capture tant que l'interrupteur est posé. Ne touche
+    /// à aucun étage audio.
     pub wake_probe: bool,
 }
 
@@ -61,10 +71,27 @@ impl BenchFlags {
 
     /// Analyse le contenu. Une clé inconnue ou une valeur autre que `1` laisse
     /// le comportement normal : un banc ne doit jamais dépendre d'une faute de
-    /// frappe silencieuse, d'où la trace.
+    /// frappe silencieuse, d'où la trace. Même règle pour une ligne sans `=`
+    /// (ignorée) et une clé posée deux fois (la DERNIÈRE valeur l'emporte) :
+    /// les deux sont signalées.
     pub fn parse(contents: &str) -> Self {
+        let (entries, issues) = Self::entries(contents);
+        for issue in issues {
+            match issue {
+                LineIssue::MissingEquals { line } => tracing::warn!(
+                    target: "jamodio::bench",
+                    line = line,
+                    "ligne d'interrupteur de banc sans « = » — ignorée"
+                ),
+                LineIssue::DuplicateKey { key } => tracing::warn!(
+                    target: "jamodio::bench",
+                    flag = key,
+                    "interrupteur de banc posé plusieurs fois — la dernière valeur l'emporte"
+                ),
+            }
+        }
         let mut flags = Self::default();
-        for (key, value) in Self::entries(contents) {
+        for (key, value) in entries {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
@@ -87,14 +114,27 @@ impl BenchFlags {
         flags
     }
 
-    fn entries(contents: &str) -> BTreeMap<String, String> {
-        contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-            .collect()
+    /// Paires clé → valeur (clé en minuscules), et ce qui n'a pas pu être lu
+    /// tel quel. Fonction pure : c'est elle que les tests vérifient.
+    fn entries(contents: &str) -> (BTreeMap<String, String>, Vec<LineIssue>) {
+        let mut entries = BTreeMap::new();
+        let mut issues = Vec::new();
+        for line in contents.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                issues.push(LineIssue::MissingEquals {
+                    line: line.to_string(),
+                });
+                continue;
+            };
+            let key = k.trim().to_ascii_lowercase();
+            if entries.insert(key.clone(), v.trim().to_string()).is_some() {
+                issues.push(LineIssue::DuplicateKey { key });
+            }
+        }
+        (entries, issues)
     }
 
     /// Ce qui est actif, pour le journal. Vide = rien n'est détourné.
@@ -163,6 +203,39 @@ mod tests {
         // banc reste interprétable de travers.
         let flags = BenchFlags::parse("no-rtcp = 1\nwake-probe = 1\n");
         assert_eq!(flags.active(), vec!["no-rtcp", "wake-probe"]);
+    }
+
+    #[test]
+    fn une_ligne_sans_egal_est_signalee_et_ignoree() {
+        let (entries, issues) = BenchFlags::entries("no-rtcp\nwake-probe = 1\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            issues,
+            vec![LineIssue::MissingEquals {
+                line: "no-rtcp".to_string()
+            }]
+        );
+        let flags = BenchFlags::parse("no-rtcp\n");
+        assert!(!flags.no_rtcp, "une ligne sans « = » n'active rien");
+    }
+
+    #[test]
+    fn une_cle_en_double_est_signalee_et_la_derniere_gagne() {
+        let (entries, issues) = BenchFlags::entries("no-rtcp = 1\nNO-RTCP = 0\n");
+        assert_eq!(entries.get("no-rtcp").map(String::as_str), Some("0"));
+        assert_eq!(
+            issues,
+            vec![LineIssue::DuplicateKey {
+                key: "no-rtcp".to_string()
+            }]
+        );
+        assert!(!BenchFlags::parse("no-rtcp = 1\nno-rtcp = 0\n").no_rtcp);
+    }
+
+    #[test]
+    fn un_fichier_propre_ne_signale_rien() {
+        let (_, issues) = BenchFlags::entries("# commentaire\n\nno-rtcp = 1\nwake-probe = 0\n");
+        assert!(issues.is_empty());
     }
 
     /// Une faute de frappe ne doit jamais activer un réglage ni en cacher un.

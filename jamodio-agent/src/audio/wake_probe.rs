@@ -22,9 +22,9 @@
 //! # Ce qu'elle ne fait pas
 //!
 //! Elle ne tourne QUE sous interrupteur de banc (`wake-probe = 1`), sur un thread
-//! à part, pendant environ deux secondes, une seule fois au démarrage d'une
-//! capture. Aucune session normale ne l'exécute, et elle ne touche à aucun étage
-//! audio. Le thread est promu comme le thread de décodage — c'est sa précision à
+//! à part, pendant environ deux secondes, à CHAQUE démarrage de capture tant que
+//! l'interrupteur est posé (le fichier est relu à chaque capture). Aucune session
+//! normale ne l'exécute, et elle ne touche à aucun étage audio. Le thread est promu comme le thread de décodage — c'est sa précision à
 //! LUI qui nous intéresse, pas celle d'un thread quelconque.
 
 use std::time::{Duration, Instant};
@@ -85,6 +85,11 @@ fn measure(mut wait: impl FnMut(Duration)) -> Overshoot {
         );
         // Échéances ancrées sur la précédente (comme le fera le masquage), pas
         // sur « maintenant » : sinon le retard se dilue au lieu de se voir.
+        // Conséquence à garder en tête en lisant les centiles : UN réveil en
+        // retard de R produit plusieurs échantillons décroissants (R, R − 2,5 ms,
+        // R − 5 ms…, les attentes suivantes étant déjà échues), jusqu'à ce que
+        // la série rattrape l'échéance. p95/p99 mesurent donc un retard CUMULÉ
+        // (combien de temps on reste derrière la grille), pas des réveils isolés.
         deadline += FRAME;
     }
     summarize(raw)

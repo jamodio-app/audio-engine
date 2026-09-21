@@ -51,8 +51,10 @@ pub struct RecvActivity {
     /// le silence compte alors depuis la création du flux).
     last_packet_ms: AtomicU64,
     /// Lot 0 (chantier tampon) — erreurs rendues par la socket UDP pour ce flux.
-    /// Chacune coûte aujourd'hui 10 ms d'attente avant la reprise : sans ce
-    /// compteur, on ne sait pas si ce chemin est emprunté en vrai (N13).
+    /// Une erreur isolée ne coûte aucune attente ; des erreurs CONSÉCUTIVES
+    /// coûtent 1, 2, 4, 8 puis 10 ms plafonnés avant la reprise (cf.
+    /// `recv_error_backoff`). Sans ce compteur, on ne sait pas si ce chemin est
+    /// emprunté en vrai (N13).
     recv_errors: AtomicU64,
 }
 
