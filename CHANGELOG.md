@@ -5,6 +5,16 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-23] — 2026-09-21 (pré-version de test)
+
+### Corrigé
+
+- **Micro ou casque rebranché en pleine session (Mac)** : l'Audio Engine le
+  reprend une fois pour toutes. Avant, il le rouvrait toutes les 3 secondes
+  sans fin (le son se coupait à chaque fois, le studio affichait « ta machine
+  sature ») et l'avis « entrée débranchée » ne disparaissait jamais. Défaut
+  présent depuis la 0.6.4.
+
 ## [0.6.5-22] — 2026-09-21 (pré-version de test)
 
 **Le grésillement du PC a trouvé sa cause, hors de Jamodio. Cette version
