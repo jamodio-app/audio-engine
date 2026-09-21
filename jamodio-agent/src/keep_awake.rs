@@ -26,6 +26,10 @@ pub trait PowerSystem: Send + Sync + 'static {
     fn prevent_sleep(&self, reason: &str) -> Result<u64, String>;
     /// Relâche la demande identifiée par `token`.
     fn allow_sleep(&self, token: u64);
+    /// Nom de la demande posée, tel que le système la connaît. Le journal dit
+    /// CE QUI est demandé, pas un effet supposé : selon la machine, la demande
+    /// n'écarte pas toute veille (cf. la veille moderne Windows plus bas).
+    fn request_kind(&self) -> &'static str;
 }
 
 /// Demande en cours. Relâchée à la destruction.
@@ -40,7 +44,12 @@ impl KeepAwake {
     pub fn acquire(system: Arc<dyn PowerSystem>, reason: &str) -> Self {
         let token = match system.prevent_sleep(reason) {
             Ok(token) => {
-                tracing::info!(target: "jamodio::power", reason, "veille empêchée pendant la session");
+                tracing::info!(
+                    target: "jamodio::power",
+                    reason,
+                    request = system.request_kind(),
+                    "demande de maintien éveillé posée pour la session"
+                );
                 Some(token)
             }
             Err(e) => {
@@ -71,7 +80,11 @@ impl Drop for KeepAwake {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             self.system.allow_sleep(token);
-            tracing::info!(target: "jamodio::power", "veille de nouveau autorisée");
+            tracing::info!(
+                target: "jamodio::power",
+                request = self.system.request_kind(),
+                "demande de maintien éveillé relâchée"
+            );
         }
     }
 }
@@ -103,6 +116,9 @@ impl PowerSystem for UnsupportedPower {
         Err("veille non gérée sur cette plateforme".into())
     }
     fn allow_sleep(&self, _token: u64) {}
+    fn request_kind(&self) -> &'static str {
+        "aucune"
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -177,6 +193,10 @@ mod macos {
                 tracing::warn!(target: "jamodio::power", status, "IOPMAssertionRelease a échoué");
             }
         }
+
+        fn request_kind(&self) -> &'static str {
+            ASSERTION_TYPE
+        }
     }
 }
 
@@ -248,6 +268,14 @@ mod windows {
                 }
             }
         }
+
+        /// `PowerRequestSystemRequired` écarte la veille par inactivité. Sur une
+        /// machine en veille moderne (S0ix), elle n'empêche probablement PAS
+        /// l'entrée en veille à l'extinction de l'écran — non vérifié (banc BV) :
+        /// le journal nomme donc la demande, sans promettre son effet.
+        fn request_kind(&self) -> &'static str {
+            "PowerRequestSystemRequired"
+        }
     }
 }
 
@@ -279,6 +307,9 @@ mod tests {
         }
         fn allow_sleep(&self, _token: u64) {
             self.held.fetch_sub(1, Ordering::SeqCst);
+        }
+        fn request_kind(&self) -> &'static str {
+            "faux système"
         }
     }
 
