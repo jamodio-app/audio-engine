@@ -22,8 +22,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 // ─── Browser → Agent ───────────────────────────────────
 
-/// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
-/// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
 /// Prédicat serde : un compteur à zéro ne part pas sur le fil. Le champ garde
 /// alors exactement la sémantique qu'il avait avant d'exister (absent = rien à
 /// signaler), donc aucun browser n'a besoin de le connaître pour rester juste.
@@ -31,6 +29,8 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
+/// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
 fn default_pulse_ratio() -> f64 {
     1.0
 }

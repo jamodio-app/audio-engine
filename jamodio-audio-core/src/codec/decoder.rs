@@ -97,10 +97,27 @@ impl MusicDecoder {
     }
 
     /// Decode a lost packet (PLC). Uses actual frame size, not max.
+    ///
+    /// Un échec compte dans `errors()` et se trace (échantillonné) comme pour un
+    /// paquet : l'appelant saute alors la trame, et sans ça ce saut ne laissait
+    /// aucune trace (revue du 21/09/2026).
     pub fn decode_loss(&mut self) -> Option<&[f32]> {
         let stereo_len = self.actual_frame * 2;
-        let signals = MutSignals::try_from(&mut self.pcm_buf[..stereo_len]).ok()?;
-        let decoded = self.decoder.decode(None, signals, false).ok()?;
+        let decoded = match MutSignals::try_from(&mut self.pcm_buf[..stereo_len])
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|signals| {
+                self.decoder.decode(None, signals, false).map_err(|e| format!("{e:?}"))
+            }) {
+            Ok(n) => n,
+            Err(error) => {
+                if self.log_count.is_multiple_of(500) {
+                    tracing::warn!(target: "jamodio::decoder", %error, "decode_loss (PLC) failed");
+                }
+                self.log_count += 1;
+                self.errors += 1;
+                return None;
+            }
+        };
         let n = decoded * 2;
         for i in 0..n {
             self.f32_buf[i] = self.pcm_buf[i] as f32 / 32768.0;

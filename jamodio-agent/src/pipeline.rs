@@ -1043,11 +1043,6 @@ pub struct ProducerNetStats {
 /// `recv_task`, et le CPAL capture callback. `Clone` cheap (Arc).
 #[derive(Clone)]
 pub struct PerfHandles {
-    /// Continuité du signal capté au BORD des blocs livrés par le pilote —
-    /// la seule chose qu'on ne mesurait pas, et celle qui distinguait une prise
-    /// saine d'une prise « horrible » que rien d'autre ne différenciait
-    /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
-    /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
     /// Pic ABSOLU du signal capté, tel que le pilote nous le livre — avant
     /// remap, plugin, gain d'envoi et limiteur. `output_peak` ne peut pas
     /// répondre à la question posée le 20/09/2026 (« d'où vient un signal à 7
@@ -1063,6 +1058,11 @@ pub struct PerfHandles {
     pub process_in_peak: Arc<std::sync::atomic::AtomicU32>,
     pub input_over_samples: Arc<std::sync::atomic::AtomicU64>,
     pub input_total_samples: Arc<std::sync::atomic::AtomicU64>,
+    /// Continuité du signal capté au BORD des blocs livrés par le pilote —
+    /// la seule chose qu'on ne mesurait pas, et celle qui distinguait une prise
+    /// saine d'une prise « horrible » que rien d'autre ne différenciait
+    /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
+    /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
     pub edge_blocks: Arc<std::sync::atomic::AtomicU64>,
     pub edge_peaks: Arc<std::sync::atomic::AtomicU64>,
     /// Part attendue par pur hasard (%), qui dépend de la taille du bloc.
@@ -5044,6 +5044,19 @@ enum DecodeMsg {
     Shutdown,
 }
 
+/// Le dernier masquage à l'échéance, tel qu'il faut le connaître pour juger
+/// son retardataire.
+#[derive(Debug, Clone, Copy)]
+struct LastConceal {
+    at: std::time::Instant,
+    fill_ms: f64,
+    /// Numéro de la place comblée : seul CE paquet peut dire si ce masquage
+    /// était de trop. Un autre retardataire (place plus ancienne d'une série
+    /// de masquages, ou paquet simplement déréordonné qui n'a jamais été
+    /// remplacé) n'a rien à en dire (revue du 21/09/2026).
+    slot: u16,
+}
+
 /// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
 struct DecodeState {
     /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
@@ -5071,11 +5084,13 @@ struct DecodeState {
     next_check: Option<std::time::Instant>,
     /// Trames inventées d'affilée, remis à zéro dès qu'un vrai paquet arrive.
     consecutive_concealed: u32,
-    /// Dernier masquage à l'échéance : quand, et ce que le tampon tenait encore
-    /// à cet instant. Sert à juger APRÈS COUP si le vrai paquet serait arrivé à
-    /// temps (cf. `conceal::was_premature`). `None` tant qu'on n'a rien inventé
-    /// depuis la dernière arrivée.
-    last_conceal: Option<(std::time::Instant, f64)>,
+    /// Tampon de travail de la rampe d'entrée (cf. `apply_join_fade`).
+    fade_scratch: Vec<f32>,
+    /// Dernier masquage à l'échéance : quand, ce que le tampon tenait encore à
+    /// cet instant, et QUELLE place il a prise. Sert à juger APRÈS COUP si le
+    /// vrai paquet serait arrivé à temps (cf. `conceal::was_premature`). `None`
+    /// tant qu'on n'a rien inventé depuis la dernière arrivée.
+    last_conceal: Option<LastConceal>,
     /// Trames inventées alors que le paquet allait arriver à temps. Un masquage
     /// utile et un masquage de trop ont la même signature sur `underruns` (qui
     /// ne compte que les trous RÉELLEMENT rendus) : sans ce compteur, on ne
@@ -5091,8 +5106,9 @@ struct DecodeState {
     /// part jamais et un masquage qui n'a rien à faire laissent la même trace
     /// (zéro trame inventée) : sans ces compteurs on ne peut pas dire laquelle
     /// des conditions s'y oppose. Le banc du 20/09 est resté bloqué là.
-    /// Mesure de temps inexploitable (horloge qui déraille) : le masquage se
-    /// désarme, et sans ce compteur ça ne se verrait nulle part.
+    /// `wait_not_due` : mesure de temps inexploitable (horloge qui déraille) —
+    /// on attend au lieu d'inventer, et sans ce compteur ça ne se verrait nulle
+    /// part. Chaque compteur compte des EXAMENS (cf. `conceal::recheck_in_ms`).
     wait_not_due: u64,
     wait_link_unknown: u64,
     wait_within_grace: u64,
@@ -5140,6 +5156,7 @@ impl DecodeState {
             next_deadline: None,
             next_check: None,
             consecutive_concealed: 0,
+            fade_scratch: Vec::new(),
             fade_in_remaining: JOIN_FADE_SAMPLES,
             pkt_count: 0,
             logged_large_jump: false,
@@ -5324,19 +5341,27 @@ fn conceal_due_streams(
                 continue;
             }
             Conceal::Frame => {
-                // Copie obligatoire avant push : `decode_loss()` rend une slice
-                // d'un buffer interne écrasé au décodage suivant (Sprint 3 BUG 7).
-                let plc: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
-                if let Some(plc) = plc {
-                    mixer.push_samples(id, &plc);
+                // `decode_loss()` rend une slice d'un buffer interne écrasé au
+                // décodage suivant (Sprint 3 BUG 7) : on la pousse tout de suite
+                // — `push_samples` la recopie dans le tampon — plutôt que d'en
+                // allouer une copie à chaque trame sur ce thread.
+                let pushed = match st.decoder.decode_loss() {
+                    Some(plc) => {
+                        mixer.push_samples(id, plc);
+                        true
+                    }
+                    None => false,
+                };
+                if pushed {
                     // Ce que le tampon tenait À CET INSTANT : c'est la seule
                     // façon de juger après coup si le vrai paquet serait arrivé
                     // à temps. Écrasé à chaque masquage — on juge le dernier,
                     // celui qui précède immédiatement l'arrivée.
-                    st.last_conceal = Some((now, fill_ms));
-                    // La place est prise : un retardataire sera écarté au lieu
-                    // d'être joué après sa remplaçante.
                     st.seq.on_concealed();
+                    st.last_conceal = st.seq.highest().map(|slot| LastConceal { at: now, fill_ms, slot });
+                    // (`on_concealed` ci-dessus : la place est prise, un
+                    // retardataire sera écarté au lieu d'être joué après sa
+                    // remplaçante.)
                     st.concealed_underrun_frames += 1;
                     st.consecutive_concealed += 1;
                 }
@@ -5611,11 +5636,9 @@ fn decode_one_packet(
             const PLC_MAX_FRAMES: u16 = 3;
             if (1..=PLC_MAX_GAP).contains(&missing) {
                 for _ in 0..missing.min(PLC_MAX_FRAMES) {
-                    // Copie obligatoire avant push : decode_loss() rend une slice
-                    // d'un buffer interne écrasé au decode suivant (Sprint 3 BUG 7).
-                    let plc_owned: Option<Vec<f32>> = st.decoder.decode_loss().map(|s| s.to_vec());
-                    if let Some(plc) = plc_owned {
-                        mixer.push_samples(producer_id, &plc);
+                    // Poussée immédiate, sans copie : cf. le masquage à l'échéance.
+                    if let Some(plc) = st.decoder.decode_loss() {
+                        mixer.push_samples(producer_id, plc);
                         st.concealed_frames += 1;
                     }
                 }
@@ -5628,10 +5651,11 @@ fn decode_one_packet(
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
-            if let Some((at, fill_ms)) = st.last_conceal.take() {
-                let delay_ms = recv_instant.saturating_duration_since(at).as_secs_f64() * 1000.0;
+            if let Some(lc) = st.last_conceal.filter(|lc| lc.slot == header.sequence) {
+                st.last_conceal = None;
+                let delay_ms = recv_instant.saturating_duration_since(lc.at).as_secs_f64() * 1000.0;
                 if let Some(margin) =
-                    jamodio_audio_core::mixer::conceal::premature_margin_ms(fill_ms, delay_ms)
+                    jamodio_audio_core::mixer::conceal::premature_margin_ms(lc.fill_ms, delay_ms)
                 {
                     st.concealed_premature_frames += 1;
                     st.concealed_premature_margin_ms += margin;
@@ -5657,11 +5681,13 @@ fn decode_one_packet(
         let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
         recv_path.lock().observe(recv_path_ms);
         if st.fade_in_remaining > 0 {
-            // Lot 1.4 — copie le temps de la rampe seulement (les ~120 premiers
-            // blocs d'un flux), puis on repasse au push direct, sans copie.
-            let mut faded = pcm.to_vec();
-            st.fade_in_remaining = apply_join_fade(&mut faded, st.fade_in_remaining);
-            mixer.push_samples(producer_id, &faded);
+            // Lot 1.4 — la rampe s'applique à une copie, dans un tampon de
+            // travail gardé par le flux (aucune allocation une fois sa taille
+            // atteinte), le temps des ~120 premiers blocs ; ensuite push direct.
+            st.fade_scratch.clear();
+            st.fade_scratch.extend_from_slice(pcm);
+            st.fade_in_remaining = apply_join_fade(&mut st.fade_scratch, st.fade_in_remaining);
+            mixer.push_samples(producer_id, &st.fade_scratch);
         } else {
             mixer.push_samples(producer_id, pcm);
         }
@@ -6824,9 +6850,10 @@ mod conceal_loop_tests {
         conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
         let s = st.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 1);
-        let (at, fill) = s.last_conceal.expect("le masquage doit être retenu");
-        assert_eq!(at, now);
-        assert!((fill - 1.0).abs() < 0.1, "tampon retenu = {fill} ms");
+        let lc = s.last_conceal.expect("le masquage doit être retenu");
+        assert_eq!(lc.at, now);
+        assert!((lc.fill_ms - 1.0).abs() < 0.1, "tampon retenu = {} ms", lc.fill_ms);
+        assert_eq!(lc.slot, 1001, "la place comblée est celle attendue après 1000");
     }
 
     /// Sans masquage en attente, rien n'est retenu — donc rien ne sera compté
@@ -7016,13 +7043,47 @@ mod conceal_loop_tests {
     /// Un vrai paquet remet le compteur à zéro : on a de nouveau de la matière.
     #[test]
     fn une_trame_inventee_ne_bloque_pas_le_flux_quand_le_son_revient() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
         let now = Instant::now();
         let mut st = state(now);
         st.consecutive_concealed = 2;
         st.seq.on_concealed();
-        // Le paquet suivant arrive : place suivante, compteur remis à zéro.
-        let arrival = st.seq.on_packet(1002);
-        assert_eq!(arrival, Arrival::Next { missing: 0 });
+        // Le paquet suivant arrive : place suivante, décodé, compteur remis à zéro.
+        recevoir(&mut st, &mixer, 1002, now);
+        assert_eq!(st.seq.counters().late, 0, "pris à sa place, pas écarté");
+        assert_eq!(st.consecutive_concealed, 0, "de la vraie matière : on repart de zéro");
+        assert!(mixer.buffered_ms("peer-test").unwrap() > 0.0);
+    }
+
+    /// Seul le retardataire de LA place comblée juge le masquage. Un paquet plus
+    /// ancien d'une série, ou déréordonné, ne compte pas un prématuré à tort.
+    #[test]
+    fn seul_le_paquet_remplace_juge_son_masquage() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = state(now);
+        // Deux masquages d'affilée : places 1001 puis 1002.
+        st.next_deadline = Some(now - Duration::from_millis(10));
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        m.insert(Arc::from("peer-test"), st);
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        // La sortie a joué la trame inventée : tampon de nouveau vide.
+        mixer.remove_stream("peer-test");
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let later = now + Duration::from_millis(10);
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, later);
+        let mut st = m.remove("peer-test").unwrap();
+        assert_eq!(st.concealed_underrun_frames, 2);
+        assert_eq!(st.last_conceal.map(|lc| lc.slot), Some(1002));
+
+        // 1001 arrive en retard : écarté, mais il n'a rien à dire du masquage de 1002.
+        recevoir(&mut st, &mixer, 1001, later);
+        assert!(st.last_conceal.is_some(), "le jugement de 1002 reste en attente");
+        // 1002 arrive : c'est lui qui juge.
+        recevoir(&mut st, &mixer, 1002, later);
+        assert!(st.last_conceal.is_none(), "jugé par son propre retardataire");
     }
 
     #[test]

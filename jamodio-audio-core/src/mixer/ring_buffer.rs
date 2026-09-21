@@ -271,6 +271,28 @@ fn samples_to_ms_f64(samples: u64) -> f64 {
 /// courte pour suivre un changement de régime réseau.
 const FILL_OBS_LEN: usize = 512;
 
+/// Observations de remplissage copiées sous verrou, pour être exploitées après
+/// (cf. `JitterBuffer::fill_snapshot`).
+#[derive(Clone, Copy)]
+pub struct FillSnapshot {
+    obs: [u32; FILL_OBS_LEN],
+    len: usize,
+}
+
+impl FillSnapshot {
+    /// `(minimum, médiane)` en ms ; `None` sans observation.
+    pub fn stats(mut self) -> Option<(f64, f64)> {
+        if self.len == 0 {
+            return None;
+        }
+        let obs = &mut self.obs[..self.len];
+        let min = obs.iter().copied().min().unwrap_or(0);
+        obs.sort_unstable();
+        let median = obs[self.len / 2];
+        Some((samples_to_ms_f64(min as u64), samples_to_ms_f64(median as u64)))
+    }
+}
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -700,8 +722,6 @@ impl JitterBuffer {
         samples_to_ms_f64(self.overflow_drops)
     }
 
-    /// Lot 0 — durée cumulée de SILENCE rendue par `pull` (sous-alimentation et
-    /// ré-amorçage), en ms. Monotone, comme `underruns`.
     /// Impute `n` échantillons de silence au tampon, tant que ce silence n'a pas
     /// duré au point de ne plus rien vouloir dire (cf.
     /// `MAX_CONTINUOUS_ZERO_FILL_SAMPLES`). Le compteur continu, lui, avance
@@ -715,6 +735,8 @@ impl JitterBuffer {
         self.continuous_zero_filled = self.continuous_zero_filled.saturating_add(n);
     }
 
+    /// Lot 0 — durée cumulée de SILENCE rendue par `pull` (sous-alimentation et
+    /// ré-amorçage), en ms. Monotone, comme `underruns`.
     pub fn zero_filled_ms(&self) -> f64 {
         samples_to_ms_f64(self.zero_filled_samples)
     }
@@ -726,17 +748,18 @@ impl JitterBuffer {
     /// sortie n'a jamais consommée, donc ce que la cible pourrait rendre sans
     /// créer un seul accroc de plus.
     pub fn fill_stats(&self) -> Option<(f64, f64)> {
-        if self.fill_obs_len == 0 {
-            return None;
+        self.fill_snapshot().stats()
+    }
+
+    /// Copie brute des observations de remplissage, à calculer HORS du verrou :
+    /// ce tampon est tiré par le callback de sortie sous le même verrou, et le
+    /// tri de 512 valeurs n'a rien à faire pendant qu'on le tient (revue du
+    /// 21/09/2026). Une copie de 2 Ko, rien de plus.
+    pub fn fill_snapshot(&self) -> FillSnapshot {
+        FillSnapshot {
+            obs: self.fill_obs,
+            len: self.fill_obs_len,
         }
-        let obs = &self.fill_obs[..self.fill_obs_len];
-        let min = obs.iter().copied().min().unwrap_or(0);
-        let mut sorted: [u32; FILL_OBS_LEN] = [0; FILL_OBS_LEN];
-        sorted[..self.fill_obs_len].copy_from_slice(obs);
-        let median_slice = &mut sorted[..self.fill_obs_len];
-        median_slice.sort_unstable();
-        let median = median_slice[self.fill_obs_len / 2];
-        Some((samples_to_ms_f64(min as u64), samples_to_ms_f64(median as u64)))
     }
 
     /// Lot 0 — de quoi la cible est faite : `(plancher de gigue, plancher de
@@ -1078,8 +1101,7 @@ mod tests {
     fn un_flux_absent_narrete_pas_de_gonfler_le_silence_rendu() {
         let mut jb = JitterBuffer::new();
         jb.set_target_ms(5);
-        let bloc = vec![0.0_f32; 480]; // 5 ms
-        let mut out = vec![0.0_f32; 480];
+        let mut out = vec![0.0_f32; 480]; // 5 ms
         // Personne n'a jamais rien envoyé : que du ré-amorçage, indéfiniment.
         for _ in 0..400 {
             jb.pull(&mut out);
@@ -1089,7 +1111,6 @@ mod tests {
             rendu <= MAX_CONTINUOUS_ZERO_FILL_MS as f64,
             "silence rendu borné à {MAX_CONTINUOUS_ZERO_FILL_MS} ms, got {rendu}"
         );
-        let _ = bloc;
     }
 
     /// Mais un vrai trou, lui, reste compté en entier — et le compteur repart

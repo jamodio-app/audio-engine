@@ -94,6 +94,13 @@ impl SeqTracker {
         self.counters
     }
 
+    /// Place courante du flux (dernier numéro reçu ou comblé), `None` avant le
+    /// premier paquet. Après `on_concealed`, c'est la place que la trame
+    /// inventée vient de prendre.
+    pub fn highest(&self) -> Option<u16> {
+        self.highest
+    }
+
     /// Classe le paquet `seq` et met à jour les compteurs.
     pub fn on_packet(&mut self, seq: u16) -> Arrival {
         let Some(highest) = self.highest else {
@@ -171,7 +178,10 @@ impl SeqTracker {
         // qu'on l'a remplie nous-mêmes.
         self.history <<= 1;
         self.concealed = (self.concealed << 1) | 1;
-        self.resync_seq = None;
+        // `resync_seq` n'est PAS touché : une quarantaine de saut en cours attend
+        // la confirmation du NOUVEAU flux, qu'une trame inventée sur l'ancien ne
+        // change en rien. L'effacer ici retardait la reprise d'un paquet à chaque
+        // masquage (revue du 21/09/2026).
         self.counters.expected += 1;
     }
 
@@ -402,5 +412,17 @@ mod tests {
         );
         // L'historique est reparti : l'ancien paquet 0 est hors fenêtre → saut.
         assert_eq!(t.on_packet(0), Arrival::Jump);
+    }
+
+    #[test]
+    fn une_trame_inventee_ne_retarde_pas_la_reprise_apres_un_saut() {
+        let mut t = SeqTracker::new();
+        assert_eq!(t.on_packet(100), Arrival::Start);
+        // Saut : 5000 est mis en quarantaine, 5001 le confirmera.
+        assert_eq!(t.on_packet(5000), Arrival::Jump);
+        // Entre-temps, l'échéance de l'ancien flux fait inventer une trame.
+        t.on_concealed();
+        // Le paquet de confirmation redémarre le flux, sans attendre un de plus.
+        assert_eq!(t.on_packet(5001), Arrival::Start);
     }
 }

@@ -396,16 +396,6 @@ impl MixScratch {
     }
 }
 
-/// Mixes N remote audio streams into a single stereo output.
-/// Each stream has its own jitter buffer and volume control.
-///
-/// C2.1 (verrouillage FIN par flux) — l'état interne est protégé par des verrous
-/// FINS (interior mutability), donc toutes les méthodes sont `&self` : le mixer
-/// est partagé via un simple `Arc<AudioMixer>` SANS `Mutex` externe. Le callback
-/// de sortie ne tient JAMAIS un verrou couvrant tous les flux : il clone les
-/// `Arc<StreamCell>` sous le RwLock lecture (µs), relâche, puis verrouille chaque
-/// cellule une par une (pull COURT). Le décodage (`push_samples`) et le callback
-/// ne se croisent plus que sur le MÊME flux → fenêtre de contention ms → µs.
 /// Lot 0 (chantier tampon) — ce qu'un flux reçu dit de lui-même à la télémétrie
 /// 1 Hz. Les trois parts de la cible et le remplissage réel sont les mesures qui
 /// décideront s'il y a des ms à reprendre au tampon (porte du Lot 2).
@@ -428,6 +418,16 @@ pub struct StreamPerfSnapshot {
     pub overflow_ms: f64,
 }
 
+/// Mixes N remote audio streams into a single stereo output.
+/// Each stream has its own jitter buffer and volume control.
+///
+/// C2.1 (verrouillage FIN par flux) — l'état interne est protégé par des verrous
+/// FINS (interior mutability), donc toutes les méthodes sont `&self` : le mixer
+/// est partagé via un simple `Arc<AudioMixer>` SANS `Mutex` externe. Le callback
+/// de sortie ne tient JAMAIS un verrou couvrant tous les flux : il clone les
+/// `Arc<StreamCell>` sous le RwLock lecture (µs), relâche, puis verrouille chaque
+/// cellule une par une (pull COURT). Le décodage (`push_samples`) et le callback
+/// ne se croisent plus que sur le MÊME flux → fenêtre de contention ms → µs.
 pub struct AudioMixer {
     /// Registre des flux. RwLock : LU par le callback (clone des Arc) ET le
     /// décodage (clone de l'Arc cible) ; ÉCRIT seulement à l'add/remove/reset
@@ -957,20 +957,14 @@ impl AudioMixer {
         }
     }
 
-    /// Push decoded samples into a stream's jitter buffer.
-    ///
-    /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).
-    /// On rate-limit le warn sur l'INCRÉMENT de `overflow_drops`.
-    ///
-    /// C2.1 — clone l'Arc du flux cible sous le RwLock lecture, relâche, puis
-    /// verrouille SA cellule (verrou court). Ne croise le callback que sur ce flux.
     /// Ce qu'il reste à jouer dans le tampon de ce flux, en millisecondes.
     ///
     /// Lu par le thread de décodage à l'échéance d'une trame : un tampon qui tient
     /// encore n'a besoin d'aucun masquage (cf. `mixer::conceal`). Même discipline
     /// de verrous que `push_samples` (C2.1) — verrou lecture de la carte, clone de
-    /// l'Arc, verrou COURT de la cellule — donc aucun contact nouveau avec le
-    /// callback au-delà de ce que le push fait déjà.
+    /// l'Arc, verrou COURT de la cellule (une lecture). Sa fréquence est bornée
+    /// par le thread de décodage, qui ne réexamine un flux qu'au moment où
+    /// l'attente peut changer (`conceal::recheck_in_ms`).
     ///
     /// `None` = flux inconnu (pas encore `add_stream`, ou déjà retiré).
     pub fn buffered_ms(&self, producer_id: &str) -> Option<f64> {
@@ -979,6 +973,13 @@ impl AudioMixer {
         Some(ms)
     }
 
+    /// Push decoded samples into a stream's jitter buffer.
+    ///
+    /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).
+    /// On rate-limit le warn sur l'INCRÉMENT de `overflow_drops`.
+    ///
+    /// C2.1 — clone l'Arc du flux cible sous le RwLock lecture, relâche, puis
+    /// verrouille SA cellule (verrou court). Ne croise le callback que sur ce flux.
     pub fn push_samples(&self, producer_id: &str, samples: &[f32]) {
         let cell = self.streams.read().get(producer_id).cloned();
 
@@ -1327,21 +1328,33 @@ impl AudioMixer {
         map.values()
             .filter(|cell| cell.id != SELF_MONITOR_ID)
             .map(|cell| {
-                let jitter = cell.jitter.lock();
-                let (target_jitter_ms, target_glitch_ms, target_reactive_ms) = jitter.target_parts_ms();
-                let fill = jitter.fill_stats();
+                // Le verrou de la cellule est celui que le callback de sortie
+                // prend à chaque tirage : on n'y fait que des lectures et une
+                // copie, le calcul (tri) se fait une fois le verrou rendu.
+                let (snap, fill_obs) = {
+                    let jitter = cell.jitter.lock();
+                    let (target_jitter_ms, target_glitch_ms, target_reactive_ms) =
+                        jitter.target_parts_ms();
+                    let snap = StreamPerfSnapshot {
+                        producer_id: cell.id.clone(),
+                        underruns: jitter.underruns(),
+                        drift_drops: jitter.drift_drops(),
+                        target_ms: jitter.target_ms(),
+                        target_jitter_ms,
+                        target_glitch_ms,
+                        target_reactive_ms,
+                        fill_min_ms: None,
+                        fill_p50_ms: None,
+                        zero_filled_ms: jitter.zero_filled_ms(),
+                        overflow_ms: jitter.overflow_ms(),
+                    };
+                    (snap, jitter.fill_snapshot())
+                };
+                let fill = fill_obs.stats();
                 StreamPerfSnapshot {
-                    producer_id: cell.id.clone(),
-                    underruns: jitter.underruns(),
-                    drift_drops: jitter.drift_drops(),
-                    target_ms: jitter.target_ms(),
-                    target_jitter_ms,
-                    target_glitch_ms,
-                    target_reactive_ms,
                     fill_min_ms: fill.map(|(min, _)| min),
                     fill_p50_ms: fill.map(|(_, p50)| p50),
-                    zero_filled_ms: jitter.zero_filled_ms(),
-                    overflow_ms: jitter.overflow_ms(),
+                    ..snap
                 }
             })
             .collect()
