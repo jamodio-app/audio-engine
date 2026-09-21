@@ -3478,6 +3478,16 @@ enum VoiceControl {
 /// `start_capture`) ; un index hors plage retomberait sur Default par sécurité.
 ///
 /// Sortie : un `Vec<f32>` de longueur `frames × 2` (interleaved stéréo).
+/// Le canal physique qui porte l'instrument (à gauche pour une paire), résolu
+/// comme `remap_to_stereo` : une sélection hors plage retombe sur le défaut.
+fn followed_channel(sel: ChannelSel, channels_in: usize) -> usize {
+    match sel {
+        ChannelSel::Mono(i) if (i as usize) < channels_in => i as usize,
+        ChannelSel::StereoPair(s) if (s as usize + 1) < channels_in => s as usize,
+        _ => 0,
+    }
+}
+
 fn remap_to_stereo(src: &[f32], channels_in: usize, sel: ChannelSel) -> Vec<f32> {
     if channels_in == 0 {
         return Vec::new();
@@ -3869,6 +3879,10 @@ fn capture_stage_loop(
     // Continuité au bord des blocs (cf. `edge_continuity`). Vit sur CE thread :
     // le callback audio n'en sait rien.
     let mut edge_continuity = jamodio_audio_core::edge_continuity::EdgeContinuity::new();
+    // Le canal suivi est celui que le musicien joue (même résolution que
+    // `remap_to_stereo`) : sur une interface à plusieurs entrées, le canal 0
+    // peut être vide, et une entrée vide ne dit rien de la prise.
+    let edge_channel = followed_channel(channel_sel, channels_in);
     // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
     // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
     // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
@@ -3948,12 +3962,9 @@ fn capture_stage_loop(
                         }
                     }
                 }
-                // La prise se recolle-t-elle d'un bloc au suivant ? Trois
-                // soustractions par BLOC (750/s), sur le buffer BRUT du pilote,
-                // avant toute transformation — et hors du callback audio.
                 // Pic BRUT, au même endroit et sur le même buffer que la
                 // rugosité : ce que le pilote livre, avant toute transformation.
-                // Trois comparaisons par échantillon, hors du callback audio.
+                // Deux comparaisons par échantillon, hors du callback audio.
                 {
                     use std::sync::atomic::Ordering::Relaxed;
                     let mut peak = 0.0f32;
@@ -3973,7 +3984,10 @@ fn capture_stage_loop(
                         .input_total_samples
                         .fetch_add(samples.len() as u64, Relaxed);
                 }
-                edge_continuity.observe(&samples, channels_in);
+                // La prise se recolle-t-elle d'un bloc au suivant ? Sur le
+                // buffer BRUT du pilote, sur le canal que le musicien joue, hors
+                // du callback audio.
+                edge_continuity.observe(&samples, channels_in, edge_channel);
                 {
                     use std::sync::atomic::Ordering::Relaxed;
                     let w = edge_continuity.drain();
@@ -5987,11 +6001,21 @@ mod plugin_control_tests {
 // ═══════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod remap_tests {
-    use super::{extract_channel_mono, remap_to_stereo, ChannelSel};
+    use super::{extract_channel_mono, followed_channel, remap_to_stereo, ChannelSel};
 
     // Bloc 3 canaux × 2 frames : frame0 = [10,20,30], frame1 = [11,21,31].
     fn block_3ch() -> Vec<f32> {
         vec![10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
+    }
+
+    #[test]
+    fn le_canal_suivi_est_celui_que_lon_joue() {
+        assert_eq!(followed_channel(ChannelSel::Mono(2), 4), 2);
+        assert_eq!(followed_channel(ChannelSel::StereoPair(2), 4), 2);
+        assert_eq!(followed_channel(ChannelSel::Default, 4), 0);
+        // Hors plage : même repli que `remap_to_stereo`, jamais un index fou.
+        assert_eq!(followed_channel(ChannelSel::Mono(7), 4), 0);
+        assert_eq!(followed_channel(ChannelSel::StereoPair(3), 4), 0);
     }
 
     #[test]

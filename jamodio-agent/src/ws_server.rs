@@ -1022,6 +1022,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     });
 
     let perfstats_pipeline = handle.pipeline.clone();
+    let perfstats_armed = levels_armed.clone();
     let perfstats_tx = out_tx.clone();
     let perfstats_start = Instant::now();
     let perfstats_task = tokio::spawn(async move {
@@ -1033,6 +1034,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // (son dashboard utilise GetStats, pull non-destructif), donc gater
         // sur !is_internal ne change rien à son affichage et garantit un seul
         // flusher pendant les sessions (toujours pilotées par le client externe).
+        // Les connexions externes non promues sont écartées dans la boucle
+        // (`perfstats_armed`), comme pour les mètres VU.
         if is_internal {
             return;
         }
@@ -1084,6 +1087,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         let mut runaway_windows: u32 = 0;
         loop {
             interval.tick().await;
+            // Même règle que les mètres VU : la lecture est DESTRUCTIVE (swap(0)
+            // des atomiques, vidage des histogrammes), donc UN SEUL lecteur — le
+            // client promu. Sans ce garde, tout onglet ou sonde qui gardait son
+            // WS ouvert plus d'une seconde lançait sa propre boucle et volait la
+            // moitié des fenêtres (revue du 21/09/2026) : mesures faussées,
+            // détection de surcharge sur demi-fenêtres, lignes « perfstats
+            // snapshot » en double dans le journal.
+            if !perfstats_armed.load(Ordering::Relaxed) {
+                continue;
+            }
             // Relevé système HORS du verrou pipeline (appels système de quelques µs).
             let machine_sample = machine.sample();
             if net_tick.is_multiple_of(NET_INTERFACE_EVERY_TICKS) {
@@ -1229,7 +1242,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     let ratio = (100.0 * peaks as f32 / blocks as f32) / chance;
                     // Calibré sur l'enregistrement du 19/09 : prise abîmée 2,3×
                     // le hasard, signal sain 1,0 à 1,3×. 1,8 sépare les deux avec
-                    // de la marge des deux côtés. CONSTANTE DE CALIBRATION.
+                    // de la marge des deux côtés. CONSTANTE DE CALIBRATION —
+                    // établie avec la première version du calcul (base ≈ 0,87 sur
+                    // un signal sain, silence compté au bord) ; le calcul corrigé
+                    // du 21/09/2026 lit 1,0 sur un bruit franc et ne juge plus le
+                    // silence. À recalibrer sur la prochaine prise abîmée.
                     if ratio > 1.8 {
                         tracing::warn!(
                             target: "jamodio::audio",

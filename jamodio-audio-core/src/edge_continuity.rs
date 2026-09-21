@@ -32,7 +32,12 @@
 //!   ne vit que dans la QUEUE de la distribution.
 //!
 //! Calibration sur données réelles (stem du 19/09) : prise abîmée **25,5 %**,
-//! période saine 11-14 %, hasard 10,9 %.
+//! période saine 11-14 %, hasard 10,9 %. Chiffres obtenus avec la première
+//! version du calcul, qui décalait les positions d'une frame et comptait 6
+//! positions de bord pour un hasard annoncé de 7 (rapport ≈ 0,87 sur un signal
+//! sain au lieu de 1) ; corrigé le 21/09/2026, le hasard vaut désormais
+//! exactement `2·TOLERANCE / n` (9,4 % à 64 frames). Seuil d'alerte à
+//! recalibrer sur une prise réelle.
 //!
 //! # Ce que ça coûte
 //!
@@ -74,6 +79,14 @@ impl EdgeStats {
     }
 }
 
+/// Rugosité en deçà de laquelle un bloc n'est pas jugé : sous ~−100 dBFS, il
+/// n'y a que du silence numérique ou le dernier bit du convertisseur. Sur de
+/// tels blocs, le maximum est une ÉGALITÉ entre dizaines de positions, et la
+/// première gagnait — c'est-à-dire le bord : le silence lisait 9,1 fois le
+/// hasard, un bruit de ±1 LSB 24 bits 2,2 fois (revue du 21/09/2026), assez
+/// pour déclencher l'alerte sans rien d'abîmé.
+const ROUGHNESS_FLOOR: f32 = 1e-5;
+
 /// Observe la rugosité au bord des blocs d'un flux capté.
 #[derive(Debug, Default)]
 pub struct EdgeContinuity {
@@ -90,45 +103,69 @@ impl EdgeContinuity {
         Self::default()
     }
 
-    /// Examine un bloc INTERLEAVÉ de `channels` canaux. Seul le premier canal
-    /// est suivi : une rugosité de transport les touche tous.
-    pub fn observe(&mut self, block: &[f32], channels: usize) {
-        if channels == 0 {
+    /// Examine le canal `channel` d'un bloc INTERLEAVÉ de `channels` canaux —
+    /// le canal que le musicien a choisi, pas le premier venu : sur une
+    /// interface à plusieurs entrées, le premier canal peut être vide.
+    ///
+    /// # Où tombent les positions
+    ///
+    /// La rugosité en `c` vaut |x[c−1] − 2·x[c] + x[c+1]|. Dans un bloc de `n`
+    /// frames, on la calcule pour `c = −1 … n−2` : `c = −1` est la DERNIÈRE
+    /// frame du bloc précédent, qu'on ne pouvait pas juger sans celui-ci ; la
+    /// dernière frame du bloc courant le sera au bloc suivant. Chaque position
+    /// est donc jugée exactement une fois, et le bord (entre `n−1` et `0`) est
+    /// au milieu de la fenêtre, symétrique : `TOLERANCE` positions de chaque
+    /// côté. Le hasard vaut `2·TOLERANCE / n`.
+    pub fn observe(&mut self, block: &[f32], channels: usize, channel: usize) {
+        if channels == 0 || channel >= channels {
             return;
         }
         let frames = block.len() / channels;
+        let at = |f: usize| block[f * channels + channel];
         // Il faut de quoi placer un pic ailleurs qu'au bord pour que la mesure
-        // ait un sens.
+        // ait un sens. Un bloc trop court coupe la continuité : sans ça, le bloc
+        // suivant enjamberait un raccord fictif et compterait un pic au bord.
         if frames < 4 * TOLERANCE {
+            self.tail = None;
             return;
         }
-        let at = |f: usize| block[f * channels];
 
         if let Some((a, b)) = self.tail {
-            // Rugosité en chaque frame : |x[k-1] − 2·x[k] + x[k+1]|. Les deux
-            // premières enjambent le bord grâce à la queue du bloc précédent.
             let mut best = f32::NEG_INFINITY;
-            let mut best_k = 0usize;
-            for k in 0..frames - 1 {
-                let (p, c, n) = match k {
-                    0 => (a, b, at(0)),
-                    1 => (b, at(0), at(1)),
-                    _ => (at(k - 2), at(k - 1), at(k)),
+            let mut best_r = 0usize;
+            let mut tie = false;
+            // `r` = position modulo le bloc : n−1 pour la frame d'avant le bord.
+            for c in -1i64..=(frames as i64 - 2) {
+                let (p, x, n) = match c {
+                    -1 => (a, b, at(0)),
+                    0 => (b, at(0), at(1)),
+                    _ => {
+                        let c = c as usize;
+                        (at(c - 1), at(c), at(c + 1))
+                    }
                 };
-                let r = (p - 2.0 * c + n).abs();
-                if r > best {
-                    best = r;
-                    best_k = k;
+                let v = (p - 2.0 * x + n).abs();
+                let r = if c < 0 { frames - 1 } else { c as usize };
+                if v > best {
+                    best = v;
+                    best_r = r;
+                    tie = false;
+                } else if v == best {
+                    tie = true;
                 }
             }
-            // `best_k` compte depuis le bord : 0 = juste au bord. La fin du bloc
-            // est le bord du SUIVANT, donc elle compte aussi.
-            let d = best_k.min(frames.saturating_sub(best_k));
-            if d <= TOLERANCE {
-                self.peak_at_edge += 1;
+            // Un bloc sans relief, ou dont le maximum est partagé, ne dit rien
+            // de l'endroit où la rugosité se groupe : on ne le juge pas.
+            if best.is_finite() && best >= ROUGHNESS_FLOOR && !tie {
+                // Distance au bord en positions : 1 pour les deux frames qui le
+                // touchent (r = n−1 et r = 0), 2 pour les suivantes…
+                let d = (best_r + 1).min(frames - best_r);
+                if d <= TOLERANCE {
+                    self.peak_at_edge += 1;
+                }
+                self.blocks += 1;
+                self.chance_pct = 100.0 * (2 * TOLERANCE) as f32 / frames as f32;
             }
-            self.blocks += 1;
-            self.chance_pct = 100.0 * (2 * TOLERANCE + 1) as f32 / frames as f32;
         }
         self.tail = Some((at(frames - 2), at(frames - 1)));
     }
@@ -163,7 +200,7 @@ mod tests {
     fn un_signal_sain_reste_au_niveau_du_hasard() {
         let mut e = EdgeContinuity::new();
         for b in 0..400 {
-            e.observe(&bloc_sinus(64, (b * 64) as f32), 1);
+            e.observe(&bloc_sinus(64, (b * 64) as f32), 1, 0);
         }
         let r = e.stats().edge_peak_ratio().unwrap();
         assert!(r < 2.0, "signal continu : rapport au hasard {r}, attendu ~1");
@@ -175,7 +212,7 @@ mod tests {
         for b in 0..400 {
             let mut v = bloc_sinus(64, (b * 64) as f32);
             v[0] += 0.5; // une impulsion pile au bord, à chaque bloc
-            e.observe(&v, 1);
+            e.observe(&v, 1, 0);
         }
         let r = e.stats().edge_peak_ratio().unwrap();
         assert!(r > 5.0, "rugosité groupée au bord : rapport {r}, attendu très grand");
@@ -188,7 +225,7 @@ mod tests {
         for b in 0..400 {
             let mut v = bloc_sinus(64, (b * 64) as f32);
             v[32] += 0.5;
-            e.observe(&v, 1);
+            e.observe(&v, 1, 0);
         }
         let r = e.stats().edge_peak_ratio().unwrap();
         assert!(r < 1.0, "pic au milieu : rapport {r}, ne doit PAS accuser le bord");
@@ -201,8 +238,8 @@ mod tests {
         // Un bloc trop court pour qu'un pic puisse tomber ailleurs qu'au bord
         // ne produit aucune mesure plutôt qu'une mesure trompeuse.
         let mut e2 = EdgeContinuity::new();
-        e2.observe(&[0.1; 8], 1);
-        e2.observe(&[0.1; 8], 1);
+        e2.observe(&[0.1; 8], 1, 0);
+        e2.observe(&[0.1; 8], 1, 0);
         assert_eq!(e2.stats().blocks, 0);
     }
 
@@ -210,11 +247,11 @@ mod tests {
     fn le_hasard_depend_de_la_taille_du_bloc() {
         let mut petit = EdgeContinuity::new();
         for b in 0..50 {
-            petit.observe(&bloc_sinus(64, (b * 64) as f32), 1);
+            petit.observe(&bloc_sinus(64, (b * 64) as f32), 1, 0);
         }
         let mut grand = EdgeContinuity::new();
         for b in 0..50 {
-            grand.observe(&bloc_sinus(512, (b * 512) as f32), 1);
+            grand.observe(&bloc_sinus(512, (b * 512) as f32), 1, 0);
         }
         assert!(
             petit.stats().chance_pct > grand.stats().chance_pct,
@@ -223,33 +260,112 @@ mod tests {
     }
 
     #[test]
-    fn multicanal_le_premier_canal_est_suivi() {
-        let mut e = EdgeContinuity::new();
+    fn multicanal_seul_le_canal_choisi_est_suivi() {
+        // Instrument sur l'entrée 3 d'une interface à 4 canaux ; les autres
+        // portent une impulsion au bord de chaque bloc. Seul le canal choisi
+        // doit compter — avant le 21/09, on suivait toujours le canal 0.
+        let mut choisi = EdgeContinuity::new();
+        let mut premier = EdgeContinuity::new();
         for b in 0..200 {
             let mono = bloc_sinus(64, (b * 64) as f32);
             let mut inter = Vec::with_capacity(64 * 4);
             for (i, s) in mono.iter().enumerate() {
-                inter.push(*s);
-                for c in 1..4 {
-                    inter.push(if (i + c) % 2 == 0 { 0.9 } else { -0.9 });
+                for c in 0..4 {
+                    let parasite = if i == 0 { 0.5 } else { 0.01 * ((i * 7 + c) % 5) as f32 };
+                    inter.push(if c == 2 { *s } else { parasite });
                 }
             }
-            e.observe(&inter, 4);
+            choisi.observe(&inter, 4, 2);
+            premier.observe(&inter, 4, 0);
+        }
+        let r = choisi.stats().edge_peak_ratio().unwrap();
+        assert!(r < 2.0, "le canal choisi est sain : {r}");
+        let r0 = premier.stats().edge_peak_ratio().unwrap();
+        assert!(r0 > 5.0, "et le canal 0 abîmé est bien vu quand c'est lui qu'on suit : {r0}");
+    }
+
+    #[test]
+    fn un_canal_hors_plage_ne_mesure_rien() {
+        let mut e = EdgeContinuity::new();
+        for b in 0..10 {
+            e.observe(&bloc_sinus(128, (b * 64) as f32), 2, 2);
+        }
+        assert_eq!(e.stats().edge_peak_ratio(), None);
+    }
+
+    /// Revue du 21/09/2026 : le silence numérique lisait 9,1 fois le hasard.
+    #[test]
+    fn le_silence_ne_crie_pas_au_loup() {
+        let mut e = EdgeContinuity::new();
+        for _ in 0..500 {
+            e.observe(&[0.0; 64], 1, 0);
+        }
+        assert_eq!(e.stats().edge_peak_ratio(), None, "rien à juger, aucun chiffre");
+    }
+
+    /// … et un bruit de ±1 LSB 24 bits, 2,2 fois.
+    #[test]
+    fn le_dernier_bit_du_convertisseur_ne_crie_pas_au_loup() {
+        const LSB: f32 = 1.0 / 8_388_608.0;
+        let mut graine = 12345u32;
+        let mut e = EdgeContinuity::new();
+        for _ in 0..500 {
+            let bloc: Vec<f32> = (0..64)
+                .map(|_| {
+                    graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((graine >> 30) as f32 - 1.0) * LSB
+                })
+                .collect();
+            e.observe(&bloc, 1, 0);
+        }
+        assert_eq!(e.stats().edge_peak_ratio(), None);
+    }
+
+    /// La base : sur un bruit franc, le pic tombe n'importe où — rapport ≈ 1,
+    /// et non plus ≈ 0,87 comme avec le décalage d'une frame.
+    #[test]
+    fn un_bruit_franc_lit_le_hasard() {
+        let mut graine = 987_654_321u32;
+        let mut e = EdgeContinuity::new();
+        for _ in 0..20_000 {
+            let bloc: Vec<f32> = (0..64)
+                .map(|_| {
+                    graine = graine.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (graine as f32 / u32::MAX as f32 - 0.5) * 0.2
+                })
+                .collect();
+            e.observe(&bloc, 1, 0);
         }
         let r = e.stats().edge_peak_ratio().unwrap();
-        assert!(r < 2.0, "le bruit des autres canaux ne doit pas compter : {r}");
+        assert!((0.9..1.1).contains(&r), "bruit blanc : rapport {r}, attendu ≈ 1");
+    }
+
+    #[test]
+    fn un_bloc_trop_court_coupe_la_continuite() {
+        let mut e = EdgeContinuity::new();
+        e.observe(&bloc_sinus(64, 0.0), 1, 0);
+        e.observe(&[0.9; 8], 1, 0); // bloc trop court : ignoré…
+        // … et le suivant ne doit pas être raccordé au bloc d'avant.
+        e.observe(&bloc_sinus(64, 64.0), 1, 0);
+        assert_eq!(e.stats().blocks, 0, "pas de raccord fictif après un bloc ignoré");
     }
 
     #[test]
     fn drain_rend_la_fenetre_sans_casser_la_continuite() {
         let mut e = EdgeContinuity::new();
         for b in 0..100 {
-            e.observe(&bloc_sinus(64, (b * 64) as f32), 1);
+            e.observe(&bloc_sinus(64, (b * 64) as f32), 1, 0);
         }
         let w = e.drain();
-        assert_eq!(w.blocks, 99);
+        // 99 raccords, moins les rares blocs d'une sinusoïde lisse dont le
+        // maximum est une égalité exacte (non jugés, par construction).
+        assert!((95..=99).contains(&w.blocks), "{}", w.blocks);
         assert_eq!(e.stats().blocks, 0);
-        e.observe(&bloc_sinus(64, 6400.0), 1);
+        // Un bloc au maximum sans ambiguïté : il n'est jugé que si la queue du
+        // bloc d'avant le drain a survécu.
+        let mut v = bloc_sinus(64, 6400.0);
+        v[32] += 0.5;
+        e.observe(&v, 1, 0);
         assert_eq!(e.stats().blocks, 1, "la continuité n'est pas rompue par le drain");
     }
 }
