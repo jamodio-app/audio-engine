@@ -5,6 +5,35 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-22] — 2026-09-21 (pré-version de test)
+
+**Le grésillement du PC a trouvé sa cause, hors de Jamodio. Cette version
+rend le journal lisible et corrige ce que la revue de code a relevé.**
+
+### Ce que la 0.6.5-21 a appris
+
+- Les blocages de ~14 ms du son sur le PC de test viennent d'un **pilote Intel
+  du PC** (Management Engine Interface), qui occupe un cœur du processeur
+  pendant ~13 ms et bloque le son USB. Trouvé par une trace Windows. Ni
+  Jamodio, ni la carte son n'en sont la cause : la carte ne perd aucun
+  échantillon pendant le blocage (mesuré sur près de 3 heures).
+
+### Corrigé
+
+- Le journal n'écrit plus une ligne d'alerte chaque seconde (erreur de la
+  0.6.5-21) : seules les vraies anomalies y figurent.
+- Un cache de plugins illisible est signalé au studio, qui le dit au musicien.
+- Corrections de la revue de code : aucun tri sous le verrou de la carte son,
+  aucune allocation par trame à la réception, jugement exact des masquages
+  « de trop », reprise d'un flux après un saut sans retard.
+
+### Ajouté (mesure)
+
+- Le niveau réel de la sortie casque (ce qu'on entend), en plus de ce qu'on
+  envoie.
+- Messages du journal renommés selon ce qu'ils mesurent : « CALLBACK AUDIO
+  IRRÉGULIER » et « RUGOSITÉ AU BORD DES BLOCS ÉLEVÉE ».
+
 ## [0.6.5-21] — 2026-09-21 (pré-version de mesure)
 
 **Tout ce que contient la 0.6.5-20, plus une mesure pour comprendre le
