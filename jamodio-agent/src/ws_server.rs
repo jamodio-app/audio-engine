@@ -1280,9 +1280,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         worst_work_us = cbh.worst_work_us,
                         budget_us = crate::audio::callback_health::block_budget_us(frames, 48_000),
                         buffer_frames = frames,
+                        // 0.6.5-21 — ce que le pilote a annoncé (moitié de
+                        // tampon, position, rafales) : cf. `record_switch`.
+                        index_repeats = cbh.index_repeats,
+                        position_irregular = cbh.position_irregular,
+                        position_worst_dev = cbh.position_worst_dev,
+                        position_missing = cbh.position_missing,
+                        burst_blocks = cbh.burst_blocks,
                         // Le snapshot perfstats de la MÊME seconde porte déjà
                         // plugin_name / pipeline_p99 / drops : on ne duplique pas.
-                        "CRAQUEMENT : blocs audio en retard et/ou hors budget sur la dernière seconde"
+                        "CRAQUEMENT : blocs audio en retard, hors budget, ou bascules irrégulières du pilote sur la dernière seconde"
                     );
                 }
             }
