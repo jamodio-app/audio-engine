@@ -10,7 +10,11 @@
 //! 3. **Priming** (create dummy → start → ~120 ms → stop → dispose) : arme l'ADC des
 //!    interfaces récalcitrantes qui ne délivrent rien au
 //!    1ᵉʳ start à froid (le wedge « entrée figée au réveil de veille »).
-//! 4. **Un seul** `ASIOCreateBuffers(in+out)` + **un seul** `ASIOStart` (pas de churn).
+//! 4. **Un seul** `ASIOCreateBuffers(in+out)` + **un seul** `ASIOStart` (pas de churn)
+//!    pour l'ouverture réelle — via `Driver::prepare_duplex_streams` (copie patchée
+//!    d'`asio-sys`), pas le chaînage `prepare_input_stream` → `prepare_output_stream`
+//!    qui crée l'entrée seule, la dispose, puis recrée in+out. Le priming (point 3)
+//!    fait son propre create/dispose, avant.
 //! 5. **Start-timeout** : on attend le 1ᵉʳ callback ; s'il n'arrive pas, on le signale.
 //! 6. Conversions **tous formats** natifs ASIO : Int16 / Int24 / Int32 / Float32 (LSB).
 //!
@@ -183,10 +187,7 @@ fn snap_buffer_size(desired: i32, min: i32, max: i32, pref: i32, gran: i32) -> i
 /// l'horloge/DMA le temps de la réchauffe. Best-effort (les erreurs sont ignorées :
 /// l'ouverture réelle qui suit reste tentée).
 fn prime(driver: &sys::Driver, n_in: usize, n_out: usize, size: i32) {
-    if let Ok(streams) = driver
-        .prepare_input_stream(None, n_in, Some(size))
-        .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(size)))
-    {
+    if let Ok(streams) = driver.prepare_duplex_streams(n_in, n_out, Some(size)) {
         let _ = driver.start();
         std::thread::sleep(Duration::from_millis(PRIME_MS));
         let _ = driver.stop();
@@ -341,8 +342,7 @@ impl AsioDuplexHost {
 
         // 5) Ouverture réelle : UN seul ASIOCreateBuffers(in+out).
         let asio_streams = driver
-            .prepare_input_stream(None, n_in, Some(size))
-            .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(size)))
+            .prepare_duplex_streams(n_in, n_out, Some(size))
             .map_err(|e| format!("create_buffers(in+out): {e:?}"))?;
         let buffer_size = asio_streams
             .input
@@ -498,16 +498,15 @@ impl AsioDuplexHost {
         };
 
         // Message callback : honore kAsioResetRequest (signale le superviseur).
+        // `asio-sys` n'appelle les callbacks enregistrés QUE pour ce sélecteur ;
+        // les messages sans action (resync, latences, surcharge) sont comptés
+        // dans `asio-sys` même et lus à 1 Hz par le superviseur (cf.
+        // `audio::asio_reset::driver_notices`).
         let msg_id = {
             let signal = reset_signal.clone();
             driver.add_message_callback(move |sel| {
                 if matches!(sel, sys::AsioMessageSelectors::kAsioResetRequest) {
                     signal.signal();
-                } else {
-                    // Les autres messages ne déclenchent aucune action : ils sont
-                    // COMPTÉS (un atomique, sur le thread du pilote) et journalisés
-                    // à 1 Hz par le superviseur. Cf. `audio::asio_reset`.
-                    crate::audio::asio_reset::note_driver_message(sel);
                 }
             })
         };

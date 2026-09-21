@@ -60,9 +60,12 @@ overflow-checks = false
 # `kAsioResyncRequest` — « j'ai perdu des données ». Après deux épisodes de son
 # dégradé sur un Focusrite (18/09/2026), il était impossible de savoir APRÈS COUP
 # si le pilote avait signalé quoi que ce soit : par construction, pas par manque
-# de chance. La copie locale transmet ces messages ; elle ne change AUCUNE réponse
-# rendue au pilote. Diff complet et raisons : en-tête de
-# `vendor/asio-sys/src/bindings/mod.rs` (14 lignes retirées à l'amont).
+# de chance. La copie locale COMPTE ces messages (atomiques, sans verrou ni
+# allocation sur le thread du pilote). Seules les réponses rendues au pilote
+# pour `kAsioOverload` changent : déclaré supporté ET acquitté (0 → 1 dans les
+# deux cas), sans quoi le pilote ne signale pas ses surcharges. Diff complet et
+# raisons : en-tête de `vendor/asio-sys/src/bindings/mod.rs` (8 lignes retirées
+# à l'amont).
 #
 # Redirection par CHEMIN (pas de dépôt git de plus) : elle s'applique à tout le
 # graphe, donc cpal utilise la même copie — c'est exactement ce qu'on veut, ses

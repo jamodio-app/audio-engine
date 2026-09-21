@@ -12,20 +12,36 @@
 //
 // CE QUI EST CHANGÉ, et RIEN D'AUTRE :
 //   1. `kAsioResyncRequest` (« perte de données non fatale »),
-//      `kAsioLatenciesChanged` et `kAsioOverload` sont transmis aux callbacks
-//      enregistrés, exactement comme `kAsioResetRequest` l'était déjà ;
-//   2. `kAsioOverload` est déclaré supporté auprès du pilote (sans ça il ne
-//      prend même pas la peine de nous le dire) ;
+//      `kAsioLatenciesChanged` et `kAsioOverload` sont COMPTÉS dans des
+//      atomiques statiques, lisibles par l'hôte (`driver_message_counts`). Le
+//      pilote nous appelle depuis SON thread, à traiter comme temps-réel : un
+//      incrément atomique, rien d'autre — ni verrou (`MESSAGE_CALLBACKS`), ni
+//      allocation, ni appel aux callbacks enregistrés. `kAsioResetRequest`
+//      garde son chemin d'origine (callbacks enregistrés), inchangé ;
+//   2. `kAsioOverload` est déclaré supporté auprès du pilote (voir plus bas) ;
 //   3. `sample_rate_did_change` alimente deux compteurs atomiques lisibles par
 //      l'hôte (`sample_rate_change_report`) au lieu d'un `eprintln!` perdu ;
-//   4. `AsioMessageSelectors` dérive `Clone, Copy` (enum sans champ) pour
-//      pouvoir être transmis à plusieurs callbacks.
+//   4. `Driver::prepare_duplex_streams` : entrée ET sortie créées par UN SEUL
+//      `ASIOCreateBuffers`. Le chaînage d'origine `prepare_input_stream` →
+//      `prepare_output_stream` crée l'entrée seule, la dispose, puis recrée
+//      entrée+sortie : deux cycles create/dispose de pilote pour un seul flux ;
+//   5. `create_buffers` rend `AsioError::InvalidBufferSize` au lieu de
+//      `panic!` quand le pilote annonce une taille préférée ≤ 0 (une panique
+//      sur le thread COM de l'hôte, pour une réponse de pilote, n'est pas une
+//      erreur exploitable).
 //
-// Les réponses rendues au pilote sont INCHANGÉES : ce patch ne modifie aucun
-// comportement du protocole ASIO, il rend visible ce qui était déjà reçu.
+// RÉPONSES RENDUES AU PILOTE — deux changent, toutes deux pour `kAsioOverload` :
+//   - `kAsioSelectorSupported` interrogé sur `kAsioOverload` : 0 → 1 ;
+//   - le message `kAsioOverload` lui-même : 0 (fourre-tout « inconnu ») → 1.
+//   Pourquoi : un pilote qui n'a pas vu l'hôte déclarer le sélecteur ne prend
+//   même pas la peine d'annoncer ses surcharges, et c'est un signal utile au
+//   diagnostic des craquements. Ce que ça nous coûte quand il arrive : un
+//   incrément atomique (point 1). Toutes les autres réponses sont identiques à
+//   l'amont.
 //
-// ⚠ À REPORTER lors d'une montée de version d'`asio-sys` (cf. `deny.toml` et le
-//   bloc `[patch.crates-io]` du Cargo.toml du workspace).
+// ⚠ À REPORTER lors d'une montée de version d'`asio-sys` : la redirection vit
+//   dans le bloc `[patch.crates-io]` du Cargo.toml du workspace ; le diff se
+//   retrouve par `diff -u` contre le crate publié (registre cargo local).
 
 pub mod asio_import;
 #[macro_use]
@@ -237,7 +253,7 @@ static ASIO_CALLBACKS: AsioCallbacks = AsioCallbacks {
 /// This is a direct copy of the asioMessage selectors
 /// inside ASIO SDK.
 #[rustfmt::skip]
-#[derive(Debug, Clone, Copy, FromPrimitive)]
+#[derive(Debug, FromPrimitive)]
 #[repr(C)]
 pub enum AsioMessageSelectors {
     kAsioSelectorSupported = 1, // selector in <value>, returns 1L if supported,
@@ -555,11 +571,10 @@ impl Driver {
 
         // Retrieve the available buffer sizes.
         let buffer_sizes = asio_get_buffer_sizes()?;
+        // PATCH JAMODIO — l'amont faisait `panic!` ici (sur le thread COM de
+        // l'hôte). Une réponse aberrante du pilote est une ERREUR explicite.
         if buffer_sizes.pref <= 0 {
-            panic!(
-                "`ASIOGetBufferSize` produced unusable preferred buffer size of {}",
-                buffer_sizes.pref,
-            );
+            return Err(AsioError::InvalidBufferSize);
         }
 
         let buffer_size = match buffer_size {
@@ -707,6 +722,33 @@ impl Driver {
         let input_buffer_infos = input.map(|input| input.buffer_infos).unwrap_or_default();
         let output_buffer_infos = prepare_buffer_infos(false, num_channels);
         self.create_streams(input_buffer_infos, output_buffer_infos, buffer_size)
+    }
+
+    /// PATCH JAMODIO — prépare l'entrée ET la sortie par UN SEUL
+    /// `ASIOCreateBuffers(in+out)`.
+    ///
+    /// Le chaînage `prepare_input_stream(None, …)` → `prepare_output_stream(s.input, …)`
+    /// crée d'abord l'entrée seule, puis la dispose et recrée entrée+sortie : deux
+    /// cycles create/dispose de pilote pour un seul flux duplex. Ici, un seul.
+    ///
+    /// `n_in` et `n_out` doivent être tous deux > 0 (c'est un flux duplex) ;
+    /// sinon `AsioError::InvalidInput`, sans rien demander au pilote.
+    ///
+    /// `buffer_size` : comme `prepare_input_stream` (None = taille préférée).
+    pub fn prepare_duplex_streams(
+        &self,
+        n_in: usize,
+        n_out: usize,
+        buffer_size: Option<i32>,
+    ) -> Result<AsioStreams, AsioError> {
+        if n_in == 0 || n_out == 0 {
+            return Err(AsioError::InvalidInput);
+        }
+        self.create_streams(
+            prepare_buffer_infos(true, n_in),
+            prepare_buffer_infos(false, n_out),
+            buffer_size,
+        )
     }
 
     /// Releases buffers allocations.
@@ -975,13 +1017,9 @@ fn _channel_name_to_utf8(bytes: &[c_char]) -> std::borrow::Cow<'_, str> {
     unsafe { CStr::from_ptr(bytes.as_ptr()).to_string_lossy() }
 }
 
-/// Indicates the stream sample rate has changed.
-///
-/// TODO: Provide some way of allowing CPAL to handle this.
-/// PATCH JAMODIO — voir l'en-tête du fichier.
-/// Nombre de changements de sample rate annoncés par le(s) pilote(s), et dernier
-/// rate annoncé (Hz, tronqué). Un pilote qui re-cadence en cours de session
-/// dégrade capture ET sortie d'un coup : le fait doit être lisible.
+// PATCH JAMODIO — nombre de changements de sample rate annoncés par le(s)
+// pilote(s), et dernier rate annoncé (Hz, tronqué). Un pilote qui re-cadence en
+// cours de session dégrade capture ET sortie d'un coup : le fait doit être lisible.
 static SAMPLE_RATE_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_REPORTED_RATE_HZ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -995,6 +1033,10 @@ pub fn sample_rate_change_report() -> (u64, u32) {
     )
 }
 
+/// Indicates the stream sample rate has changed.
+///
+/// TODO: Provide some way of allowing CPAL to handle this.
+/// PATCH JAMODIO — voir l'en-tête du fichier.
 extern "C" fn sample_rate_did_change(s_rate: c_double) {
     // PATCH JAMODIO — appelé depuis le thread du pilote : deux écritures
     // atomiques, rien d'autre (surtout pas d'E/S comme le `eprintln!` d'origine).
@@ -1003,17 +1045,36 @@ extern "C" fn sample_rate_did_change(s_rate: c_double) {
     LAST_REPORTED_RATE_HZ.store(s_rate as u32, Ordering::Relaxed);
 }
 
-/// PATCH JAMODIO — transmet `selector` à tous les callbacks enregistrés.
-/// Extrait du bras `kAsioResetRequest` d'origine, mot pour mot : le verrou est
-/// relâché AVANT d'appeler quoi que ce soit (un callback ne doit pas pouvoir
-/// bloquer le registre).
-fn fan_out_to_callbacks(selector: AsioMessageSelectors) {
-    let callbacks: Vec<_> = {
-        let lock = MESSAGE_CALLBACKS.lock().unwrap();
-        lock.iter().map(|(_, cb)| cb.0.clone()).collect()
-    };
-    for cb in callbacks {
-        cb(selector);
+// PATCH JAMODIO — messages du pilote qui ne demandent AUCUNE action de l'hôte,
+// comptés depuis le démarrage du processus. `asio_message` les incrémente sur le
+// thread du pilote (à traiter comme temps-réel) : un `fetch_add`, pas de verrou,
+// pas d'allocation, pas d'appel aux callbacks enregistrés.
+static RESYNC_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATENCIES_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OVERLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// PATCH JAMODIO — cumuls, depuis le démarrage du processus, des messages
+/// `kAsioResyncRequest`, `kAsioLatenciesChanged` et `kAsioOverload` reçus du
+/// pilote. Lecture sans verrou et NON destructive (même contrat que
+/// `sample_rate_change_report`) : plusieurs lecteurs peuvent comparer des
+/// instantanés successifs sans se voler de compte.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriverMessageCounts {
+    /// `kAsioResyncRequest` — « perte de données non fatale ».
+    pub resync_requests: u64,
+    /// `kAsioLatenciesChanged` — les latences déclarées ne sont plus les bonnes.
+    pub latencies_changed: u64,
+    /// `kAsioOverload` — le pilote a détecté une surcharge.
+    pub overloads: u64,
+}
+
+/// PATCH JAMODIO — instantané des cumuls (voir `DriverMessageCounts`).
+pub fn driver_message_counts() -> DriverMessageCounts {
+    use std::sync::atomic::Ordering;
+    DriverMessageCounts {
+        resync_requests: RESYNC_REQUESTS.load(Ordering::Relaxed),
+        latencies_changed: LATENCIES_CHANGED.load(Ordering::Relaxed),
+        overloads: OVERLOADS.load(Ordering::Relaxed),
     }
 }
 
@@ -1037,7 +1098,8 @@ extern "C" fn asio_message(
                 | Some(AsioMessageSelectors::kAsioSupportsTimeCode)
                 | Some(AsioMessageSelectors::kAsioSupportsInputMonitor)
                 // PATCH JAMODIO — sans cette ligne, un pilote qui détecte une
-                // surcharge ne prend même pas la peine de nous le dire.
+                // surcharge ne prend même pas la peine de nous le dire. Réponse
+                // changée (0 → 1) : cf. en-tête du fichier.
                 | Some(AsioMessageSelectors::kAsioOverload) => 1,
                 _ => 0,
             }
@@ -1049,9 +1111,15 @@ extern "C" fn asio_message(
             // the driver is done by completely destruct it. I.e. ASIOStop(), ASIODisposeBuffers(),
             // Destruction. Afterwards you initialize the driver again.
 
-            // PATCH JAMODIO — extrait tel quel dans `fan_out_to_callbacks`,
-            // pour que les autres messages suivent EXACTEMENT le même chemin.
-            fan_out_to_callbacks(AsioMessageSelectors::kAsioResetRequest);
+            // Get the list of active message callbacks.
+            let callbacks: Vec<_> = {
+                let lock = MESSAGE_CALLBACKS.lock().unwrap();
+                lock.iter().map(|(_, cb)| cb.0.clone()).collect()
+            };
+            // Release lock and call them.
+            for cb in callbacks {
+                cb(AsioMessageSelectors::kAsioResetRequest);
+            }
 
             1
         }
@@ -1064,9 +1132,9 @@ extern "C" fn asio_message(
             // However a driver can issue it in other situations, too.
             //
             // PATCH JAMODIO — c'est LE message qui dit « j'ai perdu des données ».
-            // Il était reçu puis jeté. Il est maintenant transmis à l'hôte, qui le
-            // compte (aucune action sur le pilote : la réponse reste « 1 »).
-            fan_out_to_callbacks(AsioMessageSelectors::kAsioResyncRequest);
+            // Il était reçu puis jeté. Il est maintenant compté (un atomique),
+            // lisible par l'hôte ; aucune action sur le pilote : la réponse reste « 1 ».
+            RESYNC_REQUESTS.fetch_add(1, Ordering::Relaxed);
             1
         }
 
@@ -1077,8 +1145,8 @@ extern "C" fn asio_message(
             //
             // PATCH JAMODIO — nos latences déclarées (ASIOGetLatencies, lues UNE
             // fois à l'ouverture) deviennent fausses quand ce message arrive : la
-            // latence annoncée au musicien ne serait plus la bonne. Transmis.
-            fan_out_to_callbacks(AsioMessageSelectors::kAsioLatenciesChanged);
+            // latence annoncée au musicien ne serait plus la bonne. Compté.
+            LATENCIES_CHANGED.fetch_add(1, Ordering::Relaxed);
             1
         }
 
@@ -1102,10 +1170,11 @@ extern "C" fn asio_message(
             1
         }
 
-        // PATCH JAMODIO — le pilote dit qu'il a décroché. Aucun bras n'existait :
-        // le message tombait dans le fourre-tout ci-dessous.
+        // PATCH JAMODIO — le pilote signale une surcharge. Aucun bras n'existait :
+        // le message tombait dans le fourre-tout ci-dessous (réponse 0). Compté,
+        // réponse 1 — l'un des deux changements de réponse listés en en-tête.
         Some(AsioMessageSelectors::kAsioOverload) => {
-            fan_out_to_callbacks(AsioMessageSelectors::kAsioOverload);
+            OVERLOADS.fetch_add(1, Ordering::Relaxed);
             1
         }
 
@@ -1210,4 +1279,32 @@ fn check_type_sizes() {
         std::mem::size_of::<AsioTime>(),
         std::mem::size_of::<ai::ASIOTime>()
     );
+}
+
+// PATCH JAMODIO — le contrat des messages comptés : un incrément par message, et
+// les SEULES réponses changées vis-à-vis de l'amont (cf. en-tête) sont celles de
+// `kAsioOverload`. Un seul test : les compteurs sont des statiques de processus.
+#[test]
+fn driver_messages_are_counted_and_overload_is_declared() {
+    let call = |selector: AsioMessageSelectors, value: c_long| {
+        asio_message(selector as c_long, value, null_mut(), null_mut())
+    };
+    let before = driver_message_counts();
+
+    assert_eq!(call(AsioMessageSelectors::kAsioResyncRequest, 0), 1);
+    assert_eq!(call(AsioMessageSelectors::kAsioLatenciesChanged, 0), 1);
+    assert_eq!(call(AsioMessageSelectors::kAsioOverload, 0), 1);
+    assert_eq!(call(AsioMessageSelectors::kAsioOverload, 0), 1);
+
+    let after = driver_message_counts();
+    assert_eq!(after.resync_requests - before.resync_requests, 1);
+    assert_eq!(after.latencies_changed - before.latencies_changed, 1);
+    assert_eq!(after.overloads - before.overloads, 2);
+
+    // Déclaré supporté (0 → 1 vis-à-vis de l'amont).
+    let overload = AsioMessageSelectors::kAsioOverload as c_long;
+    assert_eq!(call(AsioMessageSelectors::kAsioSelectorSupported, overload), 1);
+    // Inchangé : un sélecteur que l'amont ne déclarait pas reste non supporté.
+    let buffer_size_change = AsioMessageSelectors::kAsioBufferSizeChange as c_long;
+    assert_eq!(call(AsioMessageSelectors::kAsioSelectorSupported, buffer_size_change), 0);
 }

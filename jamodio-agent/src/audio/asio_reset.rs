@@ -19,12 +19,12 @@
 //!
 //! # Ce que fait ce module
 //!
-//! `cpal` expose `Device::as_inner() → DeviceInner::Asio(_)` dont le champ
-//! `driver: Arc<asio_sys::Driver>` est `pub`. `asio_sys` étant le MÊME crate que
-//! celui lié par cpal (version unifiée par Cargo), on se branche sur le registre
-//! global de callbacks via `Driver::add_message_callback` — sans forker cpal.
+//! L'hôte ASIO single-owner (`audio::asio_host::AsioDuplexHost`, seul chemin
+//! ASIO sous Windows) enregistre lui-même un callback de message sur le driver
+//! qu'il possède (`Driver::add_message_callback`, registre global d'`asio-sys`).
+//! Ce module fournit le canal entre ce callback et le superviseur.
 //!
-//! Le callback tourne sur le thread du driver (potentiellement temps-réel) : il
+//! Le callback tourne sur le thread du driver (à traiter comme temps-réel) : il
 //! ne fait donc QUE signaler (incrément atomique + `Notify`). Le reset réel
 //! (séquence ASIO complète) est exécuté en différé, sur le thread COM-STA, par
 //! `ws_server::audio_liveness_supervisor` dès réception du signal — au moment où
@@ -47,15 +47,14 @@ use tokio::sync::Notify;
 // `asio-sys` publié interceptait les trois premiers sans les transmettre et
 // envoyait le quatrième dans un `eprintln!` vers une sortie que personne ne lit :
 // après deux épisodes de son dégradé (18/09/2026), impossible de savoir si le
-// Focusrite avait crié. Notre copie patchée (`vendor/asio-sys`) les transmet.
+// Focusrite avait crié. Notre copie patchée (`vendor/asio-sys`) les compte.
 //
-// Comptés ici, en atomiques : le callback tourne sur le thread du pilote, il ne
-// fait donc QUE compter. La lecture et la journalisation sont à 1 Hz, dans le
-// superviseur de liveness, hors temps-réel. Aucune décision ne s'y appuie : ce
-// sont des FAITS pour le rapport de bug, pas un verdict.
-static DRIVER_RESYNC: AtomicU64 = AtomicU64::new(0);
-static DRIVER_LATENCIES_CHANGED: AtomicU64 = AtomicU64::new(0);
-static DRIVER_OVERLOAD: AtomicU64 = AtomicU64::new(0);
+// Comptés DANS `asio-sys`, en atomiques statiques (`asio_sys::driver_message_counts`,
+// `asio_sys::sample_rate_change_report`) : le pilote nous appelle depuis son
+// thread, qui ne doit subir ni verrou ni allocation — un incrément, rien d'autre.
+// La lecture et la journalisation sont à 1 Hz, dans le superviseur de liveness,
+// hors temps-réel. Aucune décision ne s'y appuie : ce sont des FAITS pour le
+// rapport de bug, pas un verdict.
 
 /// Ce que le(s) pilote(s) ASIO ont signalé depuis le démarrage de l'agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -79,34 +78,25 @@ impl DriverNotices {
     }
 }
 
-/// Enregistre un message du pilote. Appelée depuis le thread du pilote : un
-/// incrément atomique, rien d'autre. `kAsioResetRequest` n'est PAS compté ici —
-/// il a son propre chemin (`ResetSignal`), qui déclenche une action.
+/// Instantané cumulé (depuis le démarrage de l'agent), pour le superviseur.
+/// Lecture sans verrou et non destructive des compteurs d'`asio-sys`.
 #[cfg(windows)]
-pub fn note_driver_message(selector: asio_sys::AsioMessageSelectors) {
-    use asio_sys::AsioMessageSelectors as Sel;
-    let counter = match selector {
-        Sel::kAsioResyncRequest => &DRIVER_RESYNC,
-        Sel::kAsioLatenciesChanged => &DRIVER_LATENCIES_CHANGED,
-        Sel::kAsioOverload => &DRIVER_OVERLOAD,
-        _ => return,
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Instantané cumulé, pour le superviseur.
 pub fn driver_notices() -> DriverNotices {
-    #[cfg(windows)]
+    let counts = asio_sys::driver_message_counts();
     let (sample_rate_changes, last_reported_rate_hz) = asio_sys::sample_rate_change_report();
-    #[cfg(not(windows))]
-    let (sample_rate_changes, last_reported_rate_hz) = (0u64, 0u32);
     DriverNotices {
-        resync: DRIVER_RESYNC.load(Ordering::Relaxed),
-        latencies_changed: DRIVER_LATENCIES_CHANGED.load(Ordering::Relaxed),
-        overload: DRIVER_OVERLOAD.load(Ordering::Relaxed),
+        resync: counts.resync_requests,
+        latencies_changed: counts.latencies_changed,
+        overload: counts.overloads,
         sample_rate_changes,
         last_reported_rate_hz,
     }
+}
+
+/// Hors Windows : pas d'ASIO, donc rien à signaler — jamais une valeur inventée.
+#[cfg(not(windows))]
+pub fn driver_notices() -> DriverNotices {
+    DriverNotices::default()
 }
 
 /// Canal de signalisation entre le callback de message ASIO (thread du driver)
@@ -135,9 +125,11 @@ impl ResetSignal {
     }
 
     /// Signale un `kAsioResetRequest` (incrément atomique + réveil du superviseur).
-    /// Appelable depuis un callback de message ASIO enregistré directement via
-    /// `asio-sys` (host single-owner), sans passer par un `cpal::Device`. Sûr sur le
-    /// thread du driver : aucune allocation, aucun verrou bloquant.
+    /// Appelé par le callback de message qu'`AsioDuplexHost` enregistre sur son
+    /// driver. Sur le thread du driver, le coût est : un incrément atomique, et
+    /// `Notify::notify_one` (quelques opérations atomiques, sans allocation ; il
+    /// peut prendre brièvement le verrou interne de `Notify` si une tâche est en
+    /// attente — rare : un par reset demandé, jamais par bloc audio).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // appelé uniquement côté ASIO (Windows)
     pub fn signal(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
@@ -156,80 +148,18 @@ impl Default for ResetSignal {
     }
 }
 
-/// Garde RAII de l'enregistrement du callback de message ASIO.
+/// Garde du callback de reset posé sur le chemin cpal — aujourd'hui toujours vide.
 ///
-/// À la destruction, retire le callback du registre global d'`asio-sys` pour ne
-/// pas accumuler de closures périmées (qui se déclencheraient à chaque reset des
-/// drivers suivants). Volontairement détenu via un `Weak` : tenir une référence
-/// forte sur le `Driver` empêcherait l'`ASIOExit` au drop des streams (last ref)
-/// — exactement la ré-initialisation qu'on cherche à provoquer. Le garde doit
-/// donc être droppé AVANT les streams (tant que cpal tient encore le driver
-/// vivant), ce que garantit l'ordre de fermeture dans `pipeline.rs`.
-#[cfg(windows)]
-pub struct ResetCallbackGuard {
-    weak_driver: Option<std::sync::Weak<asio_sys::Driver>>,
-    cb_id: Option<asio_sys::MessageCallbackId>,
-}
-
-#[cfg(windows)]
-impl Drop for ResetCallbackGuard {
-    fn drop(&mut self) {
-        if let (Some(weak), Some(id)) = (self.weak_driver.take(), self.cb_id.take()) {
-            // `upgrade()` réussit tant que cpal tient encore le driver (streams
-            // pas encore droppés). `remove_message_callback` ne touche que le
-            // registre global (le `&self` n'est pas utilisé) — la ref forte
-            // temporaire est relâchée aussitôt, sans empêcher l'`ASIOExit`.
-            if let Some(driver) = weak.upgrade() {
-                driver.remove_message_callback(id);
-            }
-        }
-    }
-}
-
-/// Variante no-op hors Windows (pas d'ASIO).
-#[cfg(not(windows))]
+/// Sous Windows, ASIO passe EXCLUSIVEMENT par `AsioDuplexHost` (cf.
+/// `pipeline::asio_host_enabled` : dès que l'hôte actif est ASIO, la branche cpal
+/// n'est jamais atteinte), et ce host enregistre lui-même son callback de message.
+/// Le chemin cpal ne sert donc qu'à CoreAudio et WASAPI, qui n'ont pas de
+/// handshake de reset : il n'y a rien à enregistrer. Le type et `register`
+/// subsistent uniquement parce que `pipeline.rs` les tient encore dans
+/// `BuiltDuplex::Cpal` ; les retirer demande de toucher ce fichier.
 pub struct ResetCallbackGuard;
 
-/// Enregistre le callback `kAsioResetRequest` sur le driver ASIO sous-jacent au
-/// `cpal::Device` fourni, si — et seulement si — le host actif est ASIO.
-///
-/// À appeler sur le thread COM-STA (le device ASIO y est résolu/ouvert). Le
-/// garde rendu doit être conservé tant que le stream vit, et droppé avant lui.
-#[cfg(windows)]
-pub fn register(device: &cpal::Device, signal: &ResetSignal) -> ResetCallbackGuard {
-    use cpal::platform::DeviceInner;
-    // WASAPI (ou tout host non-ASIO) ne souffre pas du wedge de reset → no-op.
-    if let DeviceInner::Asio(asio_dev) = device.as_inner() {
-        let requests = signal.requests.clone();
-        let notify = signal.notify.clone();
-        let cb_id = asio_dev.driver.add_message_callback(move |selector| {
-            // Thread du driver, potentiellement temps-réel : aucune allocation,
-            // aucun verrou bloquant, aucun appel ASIO ré-entrant. On signale.
-            if matches!(selector, asio_sys::AsioMessageSelectors::kAsioResetRequest) {
-                requests.fetch_add(1, Ordering::Relaxed);
-                notify.notify_one();
-            } else {
-                note_driver_message(selector);
-            }
-        });
-        tracing::info!(
-            target: "jamodio::audio",
-            "callback de reset ASIO enregistré (kAsioResetRequest honoré)"
-        );
-        ResetCallbackGuard {
-            weak_driver: Some(Arc::downgrade(&asio_dev.driver)),
-            cb_id: Some(cb_id),
-        }
-    } else {
-        ResetCallbackGuard {
-            weak_driver: None,
-            cb_id: None,
-        }
-    }
-}
-
-/// Hors Windows : aucun ASIO, garde vide.
-#[cfg(not(windows))]
+/// No-op : voir `ResetCallbackGuard` — le chemin cpal n'est jamais ASIO.
 pub fn register(_device: &cpal::Device, _signal: &ResetSignal) -> ResetCallbackGuard {
     ResetCallbackGuard
 }

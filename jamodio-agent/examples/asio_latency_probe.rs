@@ -278,9 +278,8 @@ mod probe {
         name: &str,
         label: &str,
     ) {
-        let streams = driver
-            .prepare_input_stream(None, n_in, Some(size))
-            .and_then(|s| driver.prepare_output_stream(s.input, n_out, Some(size)));
+        // Un seul ASIOCreateBuffers(in+out), comme l'agent (`AsioDuplexHost`).
+        let streams = driver.prepare_duplex_streams(n_in, n_out, Some(size));
         let streams = match streams {
             Ok(streams) => streams,
             Err(e) => {
