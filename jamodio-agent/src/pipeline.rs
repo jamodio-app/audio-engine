@@ -5363,77 +5363,34 @@ fn decode_rt_loop(
     let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
 
     loop {
-        // Lot 1.2 — on n'attend plus un paquet indéfiniment : on attend jusqu'à
-        // la PROCHAINE ÉCHÉANCE. Sans ça, un paquet en retard ne réveille
+        // Lot 1.2 — on n'attend plus un paquet indéfiniment : on attend jusqu'au
+        // PROCHAIN EXAMEN UTILE. Sans ça, un paquet en retard ne réveille
         // personne, le tampon se vide et la sortie joue du silence — le trou sec
-        // que ce chantier supprime. L'attente est bornée (cf. `conceal`), et la
-        // précision du réveil a été mesurée sur le PC de recette avant d'être
-        // choisie : 810 µs au p99 pour une trame de 2,5 ms (sonde `wake_probe`).
+        // que ce chantier supprime.
         let wait = next_wait(&states, std::time::Instant::now());
-        let msg = match rx.recv_timeout(wait) {
-            Ok(msg) => Some(msg),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+        match rx.recv_timeout(wait) {
+            Ok(msg) => {
+                if handle_decode_msg(msg, &mut states, &pool_tx, &mixer, &net_stats_by_producer, &recv_path).is_break() {
+                    break;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             // Tous les émetteurs partis : plus rien n'arrivera jamais.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        };
-        // Masquage AVANT de traiter le message : si l'échéance est passée, elle
-        // l'était déjà quand le paquet est entré dans la file.
-        conceal_due_streams(
+        }
+        if drain_then_conceal(
+            &rx,
             &mut states,
+            &pool_tx,
             &mixer,
+            &net_stats_by_producer,
+            &recv_path,
             output_block_ms(&output_frames),
-            std::time::Instant::now(),
-        );
-        let Some(msg) = msg else { continue };
-        match msg {
-            DecodeMsg::Shutdown => break,
-            DecodeMsg::Remove { producer_id, epoch } => {
-                // N'honore le Remove que pour la génération courante : un Remove
-                // d'une ancienne connexion (re-add même producer) ne doit PAS
-                // supprimer le stream re-créé par la nouvelle génération.
-                if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
-                    states.remove(&producer_id);
-                    mixer.remove_stream(&producer_id);
-                    // Sans ça, un peer disparu laisserait un ppm fantôme dans la
-                    // map → PerfStats continuerait à mentionner ce peer mort.
-                    net_stats_by_producer.lock().remove(&*producer_id);
-                }
-            }
-            DecodeMsg::Packet { producer_id, epoch, recv_instant, buf, kind } => {
-                // (Re)création de l'état + du stream mixer selon la génération.
-                let needs_create = match states.get(&producer_id) {
-                    Some(st) if st.epoch == epoch => false,
-                    // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
-                    // traîne après un re-add) → ignoré.
-                    Some(st) if st.epoch > epoch => {
-                        let _ = pool_tx.try_send(buf);
-                        continue;
-                    }
-                    // Génération plus RÉCENTE que l'état présent → l'ancienne est
-                    // supersédée : on retire son stream avant d'en recréer un.
-                    Some(_) => {
-                        mixer.remove_stream(&producer_id);
-                        true
-                    }
-                    None => true,
-                };
-                if needs_create {
-                    match DecodeState::new(&producer_id, epoch) {
-                        Some(st) => {
-                            mixer.add_stream(&producer_id, kind);
-                            states.insert(producer_id.clone(), st);
-                        }
-                        None => {
-                            let _ = pool_tx.try_send(buf);
-                            continue;
-                        }
-                    }
-                }
-                let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
-                decode_one_packet(st, &producer_id, recv_instant, &buf, &mixer, &net_stats_by_producer, &recv_path);
-                // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
-                let _ = pool_tx.try_send(buf);
-            }
+            std::time::Instant::now,
+        )
+        .is_break()
+        {
+            break;
         }
     }
 
@@ -5450,6 +5407,94 @@ fn decode_rt_loop(
             ns.remove(&**id);
         }
     }
+}
+
+/// Après chaque réveil : traiter TOUT ce qui est déjà arrivé, PUIS décider de
+/// masquer, à l'heure d'après ce vidage (`now` est lu une fois la file vide).
+///
+/// M0 (21/09/2026) — avant, la décision passait avant le message reçu, et sans
+/// regarder le reste de la file : un paquet déjà là — voire déjà dans la main —
+/// était remplacé par une trame inventée, puis écarté comme « en retard ». La
+/// marge maximale mesurée au banc (2,40 ms, soit le seuil de l'époque) était la
+/// signature de ce cas. La file est bornée, le vidage aussi.
+#[allow(clippy::too_many_arguments)]
+fn drain_then_conceal(
+    rx: &Receiver<DecodeMsg>,
+    states: &mut HashMap<Arc<str>, DecodeState>,
+    pool_tx: &Sender<Vec<u8>>,
+    mixer: &Arc<AudioMixer>,
+    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: &Arc<Mutex<Histogram>>,
+    output_block_ms: f64,
+    now: impl Fn() -> std::time::Instant,
+) -> std::ops::ControlFlow<()> {
+    while let Ok(msg) = rx.try_recv() {
+        handle_decode_msg(msg, states, pool_tx, mixer, net_stats_by_producer, recv_path)?;
+    }
+    conceal_due_streams(states, mixer, output_block_ms, now());
+    std::ops::ControlFlow::Continue(())
+}
+
+/// Traite UN message du thread de décodage. `Break` = arrêt demandé.
+fn handle_decode_msg(
+    msg: DecodeMsg,
+    states: &mut HashMap<Arc<str>, DecodeState>,
+    pool_tx: &Sender<Vec<u8>>,
+    mixer: &Arc<AudioMixer>,
+    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    recv_path: &Arc<Mutex<Histogram>>,
+) -> std::ops::ControlFlow<()> {
+    match msg {
+        DecodeMsg::Shutdown => return std::ops::ControlFlow::Break(()),
+        DecodeMsg::Remove { producer_id, epoch } => {
+            // N'honore le Remove que pour la génération courante : un Remove
+            // d'une ancienne connexion (re-add même producer) ne doit PAS
+            // supprimer le stream re-créé par la nouvelle génération.
+            if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
+                states.remove(&producer_id);
+                mixer.remove_stream(&producer_id);
+                // Sans ça, un peer disparu laisserait un ppm fantôme dans la
+                // map → PerfStats continuerait à mentionner ce peer mort.
+                net_stats_by_producer.lock().remove(&*producer_id);
+            }
+        }
+        DecodeMsg::Packet { producer_id, epoch, recv_instant, buf, kind } => {
+            // (Re)création de l'état + du stream mixer selon la génération.
+            let needs_create = match states.get(&producer_id) {
+                Some(st) if st.epoch == epoch => false,
+                // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
+                // traîne après un re-add) → ignoré.
+                Some(st) if st.epoch > epoch => {
+                    let _ = pool_tx.try_send(buf);
+                    return std::ops::ControlFlow::Continue(());
+                }
+                // Génération plus RÉCENTE que l'état présent → l'ancienne est
+                // supersédée : on retire son stream avant d'en recréer un.
+                Some(_) => {
+                    mixer.remove_stream(&producer_id);
+                    true
+                }
+                None => true,
+            };
+            if needs_create {
+                match DecodeState::new(&producer_id, epoch) {
+                    Some(st) => {
+                        mixer.add_stream(&producer_id, kind);
+                        states.insert(producer_id.clone(), st);
+                    }
+                    None => {
+                        let _ = pool_tx.try_send(buf);
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                }
+            }
+            let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
+            decode_one_packet(st, &producer_id, recv_instant, &buf, mixer, net_stats_by_producer, recv_path);
+            // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
+            let _ = pool_tx.try_send(buf);
+        }
+    }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
@@ -6493,6 +6538,107 @@ mod conceal_loop_tests {
         let stats = Arc::new(Mutex::new(HashMap::new()));
         let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
         decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path);
+    }
+
+    // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
+
+    struct Banc {
+        mixer: Arc<AudioMixer>,
+        states: HashMap<Arc<str>, DecodeState>,
+        tx: Sender<DecodeMsg>,
+        rx: Receiver<DecodeMsg>,
+        pool_tx: Sender<Vec<u8>>,
+        _pool_rx: Receiver<Vec<u8>>,
+        stats: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+        recv_path: Arc<Mutex<Histogram>>,
+    }
+
+    /// Un flux connu, tampon VIDE, échéance dépassée bien au-delà de la grâce :
+    /// sans rien d'autre, on masquerait.
+    fn banc(now: Instant) -> Banc {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let mut st = state(now);
+        st.next_deadline = Some(now - Duration::from_millis(10));
+        let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        states.insert(Arc::from("peer-test"), st);
+        let (tx, rx) = bounded(64);
+        let (pool_tx, pool_rx) = bounded(64);
+        Banc {
+            mixer,
+            states,
+            tx,
+            rx,
+            pool_tx,
+            _pool_rx: pool_rx,
+            stats: Arc::new(Mutex::new(HashMap::new())),
+            recv_path: Arc::new(Mutex::new(Histogram::new(16))),
+        }
+    }
+
+    fn passe(b: &mut Banc, now: Instant) -> std::ops::ControlFlow<()> {
+        drain_then_conceal(
+            &b.rx, &mut b.states, &b.pool_tx, &b.mixer, &b.stats, &b.recv_path, BLOC_ASIO_MS,
+            || now,
+        )
+    }
+
+    fn envoyer(b: &Banc, seq: u16, recv_instant: Instant) {
+        b.tx.send(DecodeMsg::Packet {
+            producer_id: Arc::from("peer-test"),
+            epoch: 1,
+            recv_instant,
+            buf: paquet(seq),
+            kind: StreamKind::Instrument,
+        })
+        .unwrap();
+    }
+
+    /// LE cas du banc : le paquet attendu est déjà dans la file quand le thread
+    /// se réveille en retard. Avant M0, on inventait une trame, puis on jetait
+    /// le vrai paquet comme « en retard » — un masquage prématuré sur deux
+    /// plateformes, et le son inventé à la place du vrai.
+    #[test]
+    fn un_paquet_deja_dans_la_file_nest_jamais_remplace() {
+        let now = Instant::now();
+        let mut b = banc(now);
+        envoyer(&b, 1001, now - Duration::from_millis(1));
+
+        assert!(passe(&mut b, now).is_continue());
+        let s = b.states.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 0, "rien d'inventé : le vrai paquet était là");
+        assert_eq!(s.seq.counters().late, 0, "et il n'a pas été écarté");
+        assert!(b.mixer.buffered_ms("peer-test").unwrap() > 0.0, "il est dans le tampon");
+    }
+
+    #[test]
+    fn toute_la_file_passe_pas_seulement_le_premier() {
+        let now = Instant::now();
+        let mut b = banc(now);
+        for (i, seq) in (1001..=1004).enumerate() {
+            envoyer(&b, seq, now - Duration::from_micros(4_000 - 1_000 * i as u64));
+        }
+        assert!(passe(&mut b, now).is_continue());
+        let s = b.states.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 0);
+        assert!(b.rx.is_empty(), "la file est vidée avant la décision");
+    }
+
+    #[test]
+    fn sans_rien_dans_la_file_le_masquage_part_toujours() {
+        // Le contrôle : M0 ne doit pas désarmer le masquage d'un vrai retard.
+        let now = Instant::now();
+        let mut b = banc(now);
+        assert!(passe(&mut b, now).is_continue());
+        assert_eq!(b.states.values().next().unwrap().concealed_underrun_frames, 1);
+    }
+
+    #[test]
+    fn un_arret_dans_la_file_arrete_la_boucle() {
+        let now = Instant::now();
+        let mut b = banc(now);
+        b.tx.send(DecodeMsg::Shutdown).unwrap();
+        assert!(passe(&mut b, now).is_break());
     }
 
     // ─── M2 (21/09/2026) : ne revenir que quand l'attente peut changer ─────
