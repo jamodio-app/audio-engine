@@ -2341,6 +2341,9 @@ async fn audio_liveness_supervisor(
     let mut last_default_out: Option<String> = None;
     let mut last_default_check = Instant::now();
     let mut last_lost_device_check = Instant::now();
+    // Entrée perdue rouverte, en attente de la preuve que du son est livré
+    // (cf. `device_loss::lost_input_step`) : l'instant de la réouverture.
+    let mut input_rebuilt_at: Option<Instant> = None;
     // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE DE RATE (déterministe). On
     // déduit le rate RÉEL du driver de son débit de callbacks
     // (`cb_per_sec × frames_livrés_par_callback`) et on le confronte au 48 kHz
@@ -2684,20 +2687,47 @@ async fn audio_liveness_supervisor(
         // fermée PAR NATURE — ni flatline ni reconstruction tant que l'entrée n'est
         // pas revenue (sinon on couperait la réception en boucle). Au retour, une
         // reconstruction complète relance la capture.
+        if lost_input.is_none() {
+            // Plus rien à confirmer (entrée revenue, ou autre entrée choisie).
+            input_rebuilt_at = None;
+        }
         if let Some(id) = lost_input {
             if output_outlives_input {
-                if last_lost_device_check.elapsed() >= LOST_DEVICE_POLL {
-                    last_lost_device_check = Instant::now();
-                    if device_present(DeviceKind::Input, id).await {
-                        tracing::info!(target: "jamodio::ws", "entrée revenue — reconstruction des flux audio");
-                        let repaired = repair_audio_streams(&pipeline).await;
-                        if let Err(e) = &repaired {
-                            tracing::warn!(target: "jamodio::ws", error = %e, "entrée revenue mais reconstruction échouée — nouvel essai au prochain sondage");
-                            pipeline.lock().await.keep_listening_without_input();
-                        }
-                        last_repair = Some(Instant::now());
-                        last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
+                let cap_now = {
+                    let pl = pipeline.lock().await;
+                    pl.perfstats.capture_callbacks.load(Ordering::Relaxed)
+                };
+                let step = crate::device_loss::lost_input_step(
+                    input_rebuilt_at.map(|t| t.elapsed()),
+                    cap_now > prev_cap,
+                    last_lost_device_check.elapsed() >= LOST_DEVICE_POLL,
+                );
+                match step {
+                    crate::device_loss::LostInputStep::InputBack => {
+                        // Du son est livré depuis la réouverture : l'entrée est
+                        // revenue pour de bon. Le navigateur en est prévenu
+                        // (`InputRestored`), et la boucle reprend son cours normal.
+                        tracing::info!(target: "jamodio::ws", "entrée revenue — capture de nouveau délivrée");
+                        input_rebuilt_at = None;
+                        pipeline.lock().await.note_input_back();
                     }
+                    crate::device_loss::LostInputStep::ProbeAndRebuild => {
+                        last_lost_device_check = Instant::now();
+                        input_rebuilt_at = None;
+                        if device_present(DeviceKind::Input, id).await {
+                            tracing::info!(target: "jamodio::ws", "entrée revenue — reconstruction des flux audio");
+                            match repair_audio_streams(&pipeline).await {
+                                Ok(()) => input_rebuilt_at = Some(Instant::now()),
+                                Err(e) => {
+                                    tracing::warn!(target: "jamodio::ws", error = %e, "entrée revenue mais reconstruction échouée — nouvel essai au prochain sondage");
+                                    pipeline.lock().await.keep_listening_without_input();
+                                }
+                            }
+                            last_repair = Some(Instant::now());
+                            last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
+                        }
+                    }
+                    crate::device_loss::LostInputStep::Wait => {}
                 }
                 let pl = pipeline.lock().await;
                 prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
