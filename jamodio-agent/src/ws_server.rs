@@ -3739,9 +3739,11 @@ async fn handle_message(
                         scanning: true,
                         blocked: vec![],
                         pending: 0,
+                        cache_unreadable: false,
                     }];
                 };
-                let (items, blocked_items, scanning, pending) = pl.list_instrument_plugins();
+                let (scan, scanning) = pl.list_instrument_plugins();
+                let crate::pipeline::ScanResult { plugins: items, blocked: blocked_items, pending, cache_unreadable } = scan;
                 let blocked = blocked_items
                     .iter()
                     .map(|b| {
@@ -3766,11 +3768,11 @@ async fn handle_message(
                         bp
                     })
                     .collect();
-                vec![AgentMessage::PluginList { items, scanning, blocked, pending }]
+                vec![AgentMessage::PluginList { items, scanning, blocked, pending, cache_unreadable }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
         }
 
@@ -3784,11 +3786,11 @@ async fn handle_message(
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
                     pl.spawn_plugin_scan();
                 }
-                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0 }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
         }
 
@@ -3801,11 +3803,11 @@ async fn handle_message(
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
                     pl.spawn_plugin_scan_forced();
                 }
-                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0 }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0 }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
         }
 

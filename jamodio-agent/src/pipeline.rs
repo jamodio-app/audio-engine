@@ -1197,6 +1197,8 @@ pub struct ScanResult {
     /// démarrage). > 0 ⇒ le studio propose au musicien de les inventorier, en
     /// le prévenant que certains ouvriront leur fenêtre de licence.
     pub pending: usize,
+    /// Cf. `plugin_scan::FullScan::cache_unreadable`.
+    pub cache_unreadable: bool,
 }
 
 /// État du scan plugin en background. Stocké dans `PipelineState`.
@@ -1565,6 +1567,7 @@ impl PipelineState {
                     plugins: scan.plugins,
                     blocked: scan.blocked,
                     pending: scan.pending,
+                    cache_unreadable: scan.cache_unreadable,
                 });
             })
             .expect("spawn plugin-inventory thread");
@@ -1614,6 +1617,7 @@ impl PipelineState {
                     plugins: scan.plugins,
                     blocked: scan.blocked,
                     pending: scan.pending,
+                    cache_unreadable: scan.cache_unreadable,
                 });
             })
             .expect("spawn plugin-scan thread");
@@ -1624,22 +1628,13 @@ impl PipelineState {
     }
 
     /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
-    /// Retourne (plugins sains, blocklist, scanning). `scanning=true` ⇒ scan
-    /// encore en cours (le browser repolle).
+    /// Rend l'état courant du scan et `scanning` : `true` ⇒ scan encore en cours
+    /// (le browser repolle), le résultat est alors vide.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn list_instrument_plugins(
-        &self,
-    ) -> (
-        Vec<PluginInfo>,
-        Vec<crate::plugin_scan::session::BlockedItem>,
-        bool,
-        usize,
-    ) {
+    pub fn list_instrument_plugins(&self) -> (ScanResult, bool) {
         match &*self.plugin_scan_cache.lock() {
-            PluginScanCache::Scanning => (Vec::new(), Vec::new(), true, 0),
-            PluginScanCache::Ready(r) => {
-                (r.plugins.clone(), r.blocked.clone(), false, r.pending)
-            }
+            PluginScanCache::Scanning => (ScanResult::default(), true),
+            PluginScanCache::Ready(r) => (r.clone(), false),
         }
     }
 
@@ -5838,6 +5833,7 @@ mod plugin_control_tests {
                 plugins,
                 blocked: Vec::new(),
                 pending: 0,
+                cache_unreadable: false,
             }))),
             instrument_plugin_info: Arc::new(Mutex::new(None)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(64))),

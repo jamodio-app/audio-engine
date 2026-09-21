@@ -29,6 +29,11 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// Même règle que `is_zero`, pour un drapeau.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
 /// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
 fn default_pulse_ratio() -> f64 {
@@ -959,6 +964,12 @@ pub enum AgentMessage {
         /// est complète. `#[serde(default)]` : rétro-compat browser antérieur.
         #[serde(default, skip_serializing_if = "is_zero")]
         pending: usize,
+        /// 0.6.5-x (21/09/2026) — le cache de scan de l'agent existait mais n'a
+        /// pas pu être relu : les plugins qu'il connaissait sont tous repassés
+        /// « à inventorier ». Le studio le DIT (sinon la liste se vide sans
+        /// cause). Absent du fil quand `false` : rétro-compatible.
+        #[serde(rename = "cacheUnreadable", default, skip_serializing_if = "is_false")]
+        cache_unreadable: bool,
     },
     /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin` ET push
     /// automatique au connect WS si un plugin est déjà chargé (sync state
@@ -1631,6 +1642,24 @@ mod blocked_plugin_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 21/09/2026 — un cache de plugins illisible se DIT au studio ; absent du
+    /// fil sinon (un browser antérieur ne voit aucune différence).
+    #[test]
+    fn plugin_list_porte_le_cache_illisible_seulement_quand_il_l_est() {
+        let msg = |cache_unreadable| AgentMessage::PluginList {
+            items: vec![],
+            scanning: false,
+            blocked: vec![],
+            pending: 3,
+            cache_unreadable,
+        };
+        let oui = serde_json::to_value(msg(true)).unwrap();
+        assert_eq!(oui["cacheUnreadable"], serde_json::json!(true));
+        assert_eq!(oui["pending"], serde_json::json!(3));
+        let non = serde_json::to_value(msg(false)).unwrap();
+        assert!(non.get("cacheUnreadable").is_none(), "{non}");
+    }
 
     // Contrat wire avec le browser (groupe.js / studio-settings-modal.js) :
     // `restart` et `relaunch-now` doivent rester stables (kebab-case du tag
