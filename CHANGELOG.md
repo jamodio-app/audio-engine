@@ -80,6 +80,10 @@ de correction » ont diminué.
 
 **Mesure seule : rien ne change au son.**
 
+> ⚠ **Rectificatif (21/09)** : la conclusion ci-dessous est FAUSSE. Les « dépassements » venaient d'une
+> erreur de lecture du journal (une valeur minuscule, écrite `6.5e-5`, lue « 6,5 »). Aucun son n'a été
+> inventé ni amplifié. Voir la 0.6.5-21 pour la piste réelle du grésillement.
+
 ### Ce que la 0.6.5-17 a appris
 
 **Le son qui entre est parfaitement normal.** Sur 290 relevés, il ne dépasse
@@ -104,6 +108,10 @@ fois.
 ## [0.6.5-17] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.**
+
+> ⚠ **Rectificatif (21/09)** : les « six à sept fois le niveau maximal » ci-dessous n'ont jamais existé.
+> C'était une erreur de lecture du journal (une valeur minuscule, écrite `6.5e-5`, lue « 6,5 »). Voir la
+> 0.6.5-21 pour la piste réelle du grésillement.
 
 ### Ce que la session du 20/09 a appris
 
