@@ -880,6 +880,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let m = &pl.mixer;
                 (m.take_stream_levels(), m.take_bus_levels())
             };
+            // Ce que le musicien ENTEND, pour le journal 1 Hz (`heard_peak`) : la
+            // même lecture que le VU MASTER, aucune mesure de plus dans le callback.
+            pl.perfstats.heard_peak.fetch_max(
+                bus.master.peak_l.max(bus.master.peak_r).to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // input_rms (instrument self post-plugin) alimente le VU d'entrée
             // browser ; midi_active (Note ON dans les ~200 dernières ms) est conservé
             // par back-compat du protocole. Ces 2 valeurs sont reset entre les
@@ -1153,6 +1159,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let raw_peak = f32::from_bits(pl.perfstats.input_peak.swap(0, Ordering::Relaxed));
             let proc_in_peak =
                 f32::from_bits(pl.perfstats.process_in_peak.swap(0, Ordering::Relaxed));
+            let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
             let raw_overs = pl.perfstats.input_over_samples.swap(0, Ordering::Relaxed);
             let raw_total = pl.perfstats.input_total_samples.swap(0, Ordering::Relaxed);
             let (input_peak, input_over_pct) = if raw_total > 0 {
@@ -1253,14 +1260,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                             ratio,
                             blocks,
                             chance_pct = chance,
-                            "PRISE ABÎMÉE : la rugosité du signal capté se groupe au bord des blocs"
+                            "RUGOSITÉ AU BORD DES BLOCS ÉLEVÉE : le pic de rugosité du signal capté tombe au bord des blocs plus souvent que le hasard"
                         );
                     }
                     Some(ratio)
                 }
             };
 
-            // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
+            // ── Irrégularités du callback audio (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
             // en RETARD par le driver/l'OS (`late_blocks`) vs blocs dont NOTRE
             // traitement a débordé (`over_budget_blocks`). On draine à chaque
@@ -1289,7 +1296,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         burst_blocks = cbh.burst_blocks,
                         // Le snapshot perfstats de la MÊME seconde porte déjà
                         // plugin_name / pipeline_p99 / drops : on ne duplique pas.
-                        "CRAQUEMENT : blocs audio en retard, hors budget, ou bascules irrégulières du pilote sur la dernière seconde"
+                        "CALLBACK AUDIO IRRÉGULIER : bloc en retard, hors budget, ou bascule irrégulière du pilote sur la dernière seconde"
                     );
                 }
             }
@@ -1660,6 +1667,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // 0.6.5-18 — le même bloc à l'arrivée dans process_stage : borne
                 // l'endroit où le signal se met à dépasser.
                 process_in_peak = proc_in_peak,
+                // 0.6.5-22 — la sortie casque (ce qu'on ENTEND) ; `output_peak`
+                // plus bas est ce qu'on ENVOIE.
+                heard_peak,
                 // 0.6.5-11 — taille de bloc livrée par l'OS (frames/canal).
                 input_block_frames,
                 output_block_frames,

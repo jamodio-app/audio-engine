@@ -1,4 +1,4 @@
-//! Santé du callback audio temps-réel — diagnostic des CRAQUEMENTS.
+//! Santé du callback audio temps-réel — ses irrégularités, mesurées (ligne « CALLBACK AUDIO IRRÉGULIER »).
 //!
 //! # Pourquoi
 //!
@@ -72,13 +72,14 @@ pub struct CallbackHealth {
     /// Bascules sans position valide (pilote qui ne la fournit pas).
     position_missing: AtomicU64,
     /// Bascules arrivées en rafale : moins de `BURST_GAP_US` après la
-    /// précédente — le pilote rattrape. Le régime sain (bimodal ~945/~2300 µs,
-    /// cf. `late_threshold_us`) n'en produit pas.
+    /// précédente. Mesure seule : c'est aussi un régime SAIN chez certains
+    /// pilotes (~250/s sur la Focusrite, 21/09/2026), donc jamais une anomalie
+    /// en soi — on la lit en comparant avant/après un gel.
     burst_blocks: AtomicU64,
 }
 
-/// En deçà, deux bascules sont « en rafale » : bien sous le mode court sain
-/// (~945 µs mesurés, 64 frames à 48 kHz), là où seul un rattrapage les place.
+/// En deçà, deux bascules sont « en rafale ». Seuil de MESURE, pas d'alerte : la
+/// Focusrite en produit ~250/s en régime sain (cf. `burst_blocks`).
 pub const BURST_GAP_US: u64 = 300;
 
 /// État PRIVÉ du callback (un seul thread l'écrit) : la bascule précédente.
@@ -106,12 +107,16 @@ pub struct CallbackHealthWindow {
 impl CallbackHealthWindow {
     /// `true` si aucun bloc n'a été en retard ni hors budget — le cas nominal,
     /// pour lequel on ne journalise RIEN.
+    ///
+    /// Les bascules en rafale (`burst_blocks`) n'y figurent PAS : la Focusrite en
+    /// livre ~250 par seconde en régime sain (mesuré sur 10 207 s le 21/09/2026),
+    /// et les compter comme anomalie écrivait une ligne CHAQUE seconde. Elles
+    /// restent mesurées et portées par la ligne quand une vraie anomalie l'ouvre.
     pub fn is_clean(&self) -> bool {
         self.late_blocks == 0
             && self.over_budget_blocks == 0
             && self.index_repeats == 0
             && self.position_irregular == 0
-            && self.burst_blocks == 0
     }
 }
 
@@ -396,7 +401,8 @@ mod tests {
         }
         let w = h.drain();
         assert_eq!(w.burst_blocks, 5);
-        assert!(!w.is_clean());
+        // Le gel, lui, salit la fenêtre (bloc en retard) ; la rafale seule non.
+        assert!(w.is_clean(), "record_switch seul ne compte pas le retard : c'est record_block");
     }
 
     #[test]
@@ -409,5 +415,21 @@ mod tests {
         let w = h.drain();
         assert_eq!(w.position_missing, 4);
         assert!(w.is_clean(), "l'absence de position n'est pas une anomalie de flux");
+    }
+
+    /// Régression du 21/09/2026 : la 0.6.5-21 écrivait une ligne par seconde,
+    /// parce que les rafales — régime sain de la Focusrite — salissaient la fenêtre.
+    #[test]
+    fn des_rafales_seules_ne_font_pas_une_seconde_anormale() {
+        let h = CallbackHealth::new();
+        let mut t = SwitchTracker::default();
+        for i in 0..750i64 {
+            let gap = if i % 3 == 0 { 40 } else { 1900 };
+            h.record_block(Some(gap), 80, 1333, 2666);
+            h.record_switch(&mut t, (i % 2) as usize, Some(i * 64), 64, Some(gap));
+        }
+        let w = h.drain();
+        assert_eq!(w.burst_blocks, 250);
+        assert!(w.is_clean(), "régime sain : aucune ligne");
     }
 }

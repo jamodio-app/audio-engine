@@ -1042,6 +1042,12 @@ pub struct PerfHandles {
     /// Pic du bloc à l'ARRIVÉE dans `process_stage` — entre la capture et le
     /// limiteur. Encadre le trajet où le signal se met à dépasser.
     pub process_in_peak: Arc<std::sync::atomic::AtomicU32>,
+    /// Pic de la SORTIE casque (bus master, post master/clamp) — ce que le
+    /// musicien ENTEND. `output_peak`, malgré son nom, mesure ce qu'il ENVOIE
+    /// aux autres : le 21/09/2026, un larsen saturait le casque pendant que
+    /// `output_peak` lisait −65 dB, et le journal n'en disait rien. Alimenté par
+    /// la lecture 10 Hz des VU (hors callback), lu et remis à zéro à 1 Hz.
+    pub heard_peak: Arc<std::sync::atomic::AtomicU32>,
     pub input_over_samples: Arc<std::sync::atomic::AtomicU64>,
     pub input_total_samples: Arc<std::sync::atomic::AtomicU64>,
     /// Continuité du signal capté au BORD des blocs livrés par le pilote —
@@ -1130,7 +1136,7 @@ pub struct PerfHandles {
     /// ne pas crier au loup sur les transitoires inaudibles (batterie/piano).
     pub output_clip_samples: Arc<std::sync::atomic::AtomicU64>,
     pub output_total_samples: Arc<std::sync::atomic::AtomicU64>,
-    /// Diagnostic des CRAQUEMENTS — blocs audio servis en RETARD par le driver/l'OS
+    /// Irrégularités du callback audio — blocs servis en RETARD par le driver/l'OS
     /// ou dont NOTRE traitement a dépassé le budget du bloc. Alimenté depuis le
     /// callback temps-réel (atomiques seuls), drainé à 1 Hz par `perfstats_task`
     /// qui ne journalise QUE les fenêtres dégradées — une session saine n'ajoute
@@ -1147,6 +1153,7 @@ impl PerfHandles {
         Self {
             input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             process_in_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             input_over_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             input_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             edge_blocks: Arc::new(std::sync::atomic::AtomicU64::new(0)),

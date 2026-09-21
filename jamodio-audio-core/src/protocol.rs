@@ -1680,7 +1680,7 @@ mod tests {
     ///
     /// Le banc du 20/09/2026 s'est conclu sans elle : le correctif du seuil de
     /// masquage dépendait de la taille du bloc de sortie, et elle n'apparaissait
-    /// nulle part — ni dans perf-stats, ni dans les logs hors ligne `CRAQUEMENT`.
+    /// nulle part — ni dans perf-stats, ni dans les logs hors ligne `CALLBACK AUDIO IRRÉGULIER`.
     /// Absente = callback pas encore tourné ; jamais `0`, qui se lirait comme une
     /// mesure.
     #[test]
