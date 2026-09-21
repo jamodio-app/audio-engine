@@ -5,6 +5,24 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-21] — 2026-09-21 (pré-version de mesure)
+
+**Tout ce que contient la 0.6.5-20, plus une mesure pour comprendre le
+grésillement du PC.**
+
+### Ajouté (mesure)
+
+- **Ce que le pilote de la carte son annonce à chaque paquet** : quelle moitié
+  de son tampon lire, et où il en est dans le flux. Deux fois, un blocage de
+  14 ms du pilote a été suivi d'un grésillement jusqu'au redémarrage du moteur.
+  Cette mesure dira, au prochain blocage, si le pilote se met ensuite à nous
+  désigner le mauvais tampon. Rien ne change au son.
+
+### Sécurité
+
+- Bibliothèque des tampons audio mise à jour (faille publiée ce jour, sans
+  effet sur nos données, mais corrigée à la racine).
+
 ## [0.6.5-20] — 2026-09-21 (pré-version de test)
 
 **Corrections de la revue de code. Le son ne change pas, sauf une chose à
