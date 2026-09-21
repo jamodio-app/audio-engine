@@ -148,22 +148,6 @@ impl Default for ResetSignal {
     }
 }
 
-/// Garde du callback de reset posé sur le chemin cpal — aujourd'hui toujours vide.
-///
-/// Sous Windows, ASIO passe EXCLUSIVEMENT par `AsioDuplexHost` (cf.
-/// `pipeline::asio_host_enabled` : dès que l'hôte actif est ASIO, la branche cpal
-/// n'est jamais atteinte), et ce host enregistre lui-même son callback de message.
-/// Le chemin cpal ne sert donc qu'à CoreAudio et WASAPI, qui n'ont pas de
-/// handshake de reset : il n'y a rien à enregistrer. Le type et `register`
-/// subsistent uniquement parce que `pipeline.rs` les tient encore dans
-/// `BuiltDuplex::Cpal` ; les retirer demande de toucher ce fichier.
-pub struct ResetCallbackGuard;
-
-/// No-op : voir `ResetCallbackGuard` — le chemin cpal n'est jamais ASIO.
-pub fn register(_device: &cpal::Device, _signal: &ResetSignal) -> ResetCallbackGuard {
-    ResetCallbackGuard
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
