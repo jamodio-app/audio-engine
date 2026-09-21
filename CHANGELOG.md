@@ -5,6 +5,37 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-19] — 2026-09-21 (pré-version de test)
+
+**Le masquage change : moins de son inventé, et un thread qui dort.**
+
+### Corrigé
+
+- **Un paquet déjà arrivé n'est plus jamais remplacé par du son inventé.** Au
+  réveil, le moteur décidait de masquer avant de regarder les paquets arrivés
+  entre-temps : il inventait un son pour un paquet qu'il avait déjà, puis le
+  jetait. C'était une cause directe des corrections qu'on entendait.
+- **La mesure « prise abîmée »** suit maintenant l'entrée que le musicien joue
+  (et plus toujours la première), ne donne plus de fausse alerte sur le silence,
+  et lit 1 sur un signal sain.
+- **Les mesures ne sont plus partagées entre plusieurs onglets** : seul
+  l'onglet qui pilote le moteur les lit.
+
+### Amélioré
+
+- **Le thread de réception se réveille deux fois moins.** Quand un paquet a un
+  peu de retard, on sait jusqu'à quand attendre : il dort jusque-là au lieu de
+  vérifier toutes les 0,5 ms. Le masquage part au même instant qu'avant.
+
+### Ajouté (mesure)
+
+- Chaque relevé porte ses compteurs bruts et le numéro de processus du moteur.
+
+### Ce qu'il faut faire
+
+Une session normale, à deux, trois minutes au moins. Dire si les « sensations
+de correction » ont diminué.
+
 ## [0.6.5-18] — 2026-09-20 (pré-version de test)
 
 **Mesure seule : rien ne change au son.**
