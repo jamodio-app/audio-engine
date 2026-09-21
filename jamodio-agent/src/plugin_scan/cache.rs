@@ -65,7 +65,7 @@ struct BlockedRecord {
 }
 
 /// Contenu sérialisé du fichier cache.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheFile {
     scanner_abi: u32,
@@ -257,28 +257,46 @@ fn base_data_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/jamodio")
 }
 
-fn cache_path() -> PathBuf {
+/// Chemin du cache disque (journalisé par l'appelant quand il est illisible).
+pub fn cache_path() -> PathBuf {
     data_dir().join(CACHE_FILENAME)
 }
 
-/// Charge le cache. Absent/corrompu/ABI périmé → cache vide (tout sera
-/// rescanné) : jamais d'erreur propagée, le scan doit toujours pouvoir tourner.
-pub fn load() -> CacheFile {
-    let path = cache_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return CacheFile::default();
-    };
-    match serde_json::from_slice::<CacheFile>(&bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "jamodio::plugin",
-                error = %e,
-                "cache de scan illisible — rescan complet"
-            );
-            CacheFile::default()
+/// Le cache existe mais n'a pas pu être lu. Distinct de « absent » (première
+/// installation, cas normal) : ici, des plugins CONNUS vont disparaître de la
+/// liste jusqu'au prochain inventaire, et la cause doit être dite.
+#[derive(Debug)]
+pub enum CacheLoadError {
+    /// Lecture refusée ou en échec (permissions, disque, verrou…).
+    Io(std::io::Error),
+    /// Fichier lu mais contenu inexploitable (tronqué, corrompu, format inconnu).
+    Parse(serde_json::Error),
+}
+
+impl std::fmt::Display for CacheLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheLoadError::Io(e) => write!(f, "lecture impossible : {e}"),
+            CacheLoadError::Parse(e) => write!(f, "contenu inexploitable : {e}"),
         }
     }
+}
+
+/// Charge le cache. Absent → cache vide (`Ok`, tout est à inventorier : c'est
+/// la première installation). Présent mais illisible → `Err` : l'appelant
+/// décide (et DIT) ce qu'il fait des plugins que ce cache connaissait. Un ABI
+/// périmé n'est pas une erreur : `reconcile` le traite (tout rescanner).
+pub fn load() -> Result<CacheFile, CacheLoadError> {
+    load_from(&cache_path())
+}
+
+fn load_from(path: &Path) -> Result<CacheFile, CacheLoadError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CacheFile::default()),
+        Err(e) => return Err(CacheLoadError::Io(e)),
+    };
+    serde_json::from_slice::<CacheFile>(&bytes).map_err(CacheLoadError::Parse)
 }
 
 /// Écrit le cache de façon atomique (temp + rename) pour ne jamais laisser un
@@ -323,6 +341,62 @@ mod tests {
 
     fn cache_with(entries: Vec<CacheEntry>, blocked: Vec<BlockedRecord>) -> CacheFile {
         CacheFile { scanner_abi: SCANNER_ABI, entries, blocked }
+    }
+
+    /// Dossier temporaire propre à un test (pas de dépendance `tempfile`).
+    fn scratch_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jamodio-plugin-cache-{}-{test}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        dir
+    }
+
+    #[test]
+    fn un_cache_absent_est_une_premiere_installation_pas_une_erreur() {
+        let dir = scratch_dir("absent");
+        let loaded = load_from(&dir.join(CACHE_FILENAME)).expect("absent = Ok");
+        assert_eq!(loaded, CacheFile::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_corrompu_est_une_erreur_dite_pas_un_cache_vide() {
+        let dir = scratch_dir("corrompu");
+        let path = dir.join(CACHE_FILENAME);
+        std::fs::write(&path, b"{ tronque").unwrap();
+        assert!(matches!(load_from(&path), Err(CacheLoadError::Parse(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_illisible_est_une_erreur_dite_pas_un_cache_vide() {
+        // Un DOSSIER à la place du fichier : `read` échoue pour une autre raison
+        // que « absent », sur toutes les plateformes, sans jouer sur les droits.
+        let dir = scratch_dir("illisible");
+        let path = dir.join(CACHE_FILENAME);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(matches!(load_from(&path), Err(CacheLoadError::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_valide_se_relit_a_l_identique() {
+        let dir = scratch_dir("valide");
+        let path = dir.join(CACHE_FILENAME);
+        let cache = cache_with(
+            vec![CacheEntry {
+                item: "/p/A.vst3".into(),
+                fingerprint: fp(1, 2),
+                plugins: vec![vst3("/p/A.vst3", "A")],
+            }],
+            vec![],
+        );
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(load_from(&path).expect("valide"), cache);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

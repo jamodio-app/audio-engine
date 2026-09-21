@@ -145,7 +145,24 @@ fn reconcile_with_disk(
     let prior = if force {
         cache::CacheFile::default()
     } else {
-        cache::load()
+        match cache::load() {
+            Ok(prior) => prior,
+            Err(e) => {
+                // Les plugins que ce cache connaissait ne sont PAS réutilisés :
+                // tous repassent « à inventorier » (compte `pending`). On repart
+                // de zéro — le scan doit pouvoir tourner — mais jamais en
+                // silence : sans cette ligne, la liste du musicien se vide sans
+                // cause. (Aucun message du protocole ne porte encore cette cause
+                // jusqu'à l'UI : seul `pending` y est visible.)
+                tracing::error!(
+                    target: "jamodio::plugin",
+                    path = %cache::cache_path().display(),
+                    error = %e,
+                    "cache de scan présent mais illisible — plugins connus non réutilisés, tous à réinventorier"
+                );
+                cache::CacheFile::default()
+            }
+        }
     };
     let plan = cache::reconcile(&discovered, &prior);
     tracing::info!(
