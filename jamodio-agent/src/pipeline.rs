@@ -1029,36 +1029,12 @@ pub struct ProducerNetStats {
 /// `recv_task`, et le CPAL capture callback. `Clone` cheap (Arc).
 #[derive(Clone)]
 pub struct PerfHandles {
-    /// Pic ABSOLU du signal capté, tel que le pilote nous le livre — avant
-    /// remap, plugin, gain d'envoi et limiteur. `output_peak` ne peut pas
-    /// répondre à la question posée le 20/09/2026 (« d'où vient un signal à 7
-    /// fois la pleine échelle ? ») : il est mesuré APRÈS le plugin, donc un
-    /// simulateur d'ampli chargé masque complètement ce qui entre.
-    ///
-    /// Avec `input_over_samples`, il sépare deux causes qui n'ont rien à voir :
-    /// un niveau d'entrée trop fort (beaucoup d'échantillons au-dessus) d'une
-    /// pluie d'impulsions isolées (pic très haut, presque aucun dépassement).
-    pub input_peak: Arc<std::sync::atomic::AtomicU32>,
-    /// Pic du bloc à l'ARRIVÉE dans `process_stage` — entre la capture et le
-    /// limiteur. Encadre le trajet où le signal se met à dépasser.
-    pub process_in_peak: Arc<std::sync::atomic::AtomicU32>,
     /// Pic de la SORTIE casque (bus master, post master/clamp) — ce que le
     /// musicien ENTEND. `output_peak`, malgré son nom, mesure ce qu'il ENVOIE
-    /// aux autres : le 21/09/2026, un larsen saturait le casque pendant que
-    /// `output_peak` lisait −65 dB, et le journal n'en disait rien. Alimenté par
+    /// aux autres : le 21/09/2026, un grésillement remplissait le casque pendant
+    /// que `output_peak` lisait −65 dB, et le journal n'en disait rien. Alimenté par
     /// la lecture 10 Hz des VU (hors callback), lu et remis à zéro à 1 Hz.
     pub heard_peak: Arc<std::sync::atomic::AtomicU32>,
-    pub input_over_samples: Arc<std::sync::atomic::AtomicU64>,
-    pub input_total_samples: Arc<std::sync::atomic::AtomicU64>,
-    /// Continuité du signal capté au BORD des blocs livrés par le pilote —
-    /// la seule chose qu'on ne mesurait pas, et celle qui distinguait une prise
-    /// saine d'une prise « horrible » que rien d'autre ne différenciait
-    /// (19/09/2026). Écrits par le thread de capture, JAMAIS par le callback
-    /// audio ; lus et remis à zéro à 1 Hz. Cf. `edge_continuity`.
-    pub edge_blocks: Arc<std::sync::atomic::AtomicU64>,
-    pub edge_peaks: Arc<std::sync::atomic::AtomicU64>,
-    /// Part attendue par pur hasard (%), qui dépend de la taille du bloc.
-    pub edge_chance_pct: Arc<std::sync::atomic::AtomicU32>,
     pub plugin_latency: Arc<Mutex<Histogram>>,
     /// End-to-end CAPTURE_in → ENCODE_send. Inclut le temps en file dans les
     /// ringbufs entre stages (S3) — c'est la VRAIE latence pipeline ressentie.
@@ -1151,14 +1127,7 @@ impl PerfHandles {
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
         Self {
-            input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            process_in_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            input_over_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            input_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            edge_blocks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            edge_peaks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            edge_chance_pct: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             pipeline_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
@@ -2513,11 +2482,6 @@ impl PipelineState {
         // perdues sans que rien ne le dise (14/09).
         let bench = crate::bench_flags::BenchFlags::load();
         bench.log();
-        // 1.2a — sonde de réveil : sur son propre thread, ~2 s, uniquement sous
-        // interrupteur. Elle ne traverse aucun étage audio ; elle dit seulement
-        // avec quel retard l'OS tient une échéance de 2,5 ms, ce dont dépend
-        // l'implémentation du masquage anticipé.
-        crate::audio::wake_probe::run_if_enabled(bench.wake_probe);
         // Lot V — une veille en pleine session est une panne audio (pilote ASIO
         // dégradé au réveil) : on pose une demande de maintien éveillé pour la
         // durée de la session. C'est une DEMANDE à l'OS, pas une garantie : en
@@ -3456,16 +3420,6 @@ enum VoiceControl {
 /// `start_capture`) ; un index hors plage retomberait sur Default par sécurité.
 ///
 /// Sortie : un `Vec<f32>` de longueur `frames × 2` (interleaved stéréo).
-/// Le canal physique qui porte l'instrument (à gauche pour une paire), résolu
-/// comme `remap_to_stereo` : une sélection hors plage retombe sur le défaut.
-fn followed_channel(sel: ChannelSel, channels_in: usize) -> usize {
-    match sel {
-        ChannelSel::Mono(i) if (i as usize) < channels_in => i as usize,
-        ChannelSel::StereoPair(s) if (s as usize + 1) < channels_in => s as usize,
-        _ => 0,
-    }
-}
-
 fn remap_to_stereo(src: &[f32], channels_in: usize, sel: ChannelSel) -> Vec<f32> {
     if channels_in == 0 {
         return Vec::new();
@@ -3854,13 +3808,6 @@ fn capture_stage_loop(
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
     let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
-    // Continuité au bord des blocs (cf. `edge_continuity`). Vit sur CE thread :
-    // le callback audio n'en sait rien.
-    let mut edge_continuity = jamodio_audio_core::edge_continuity::EdgeContinuity::new();
-    // Le canal suivi est celui que le musicien joue (même résolution que
-    // `remap_to_stereo`) : sur une interface à plusieurs entrées, le canal 0
-    // peut être vide, et une entrée vide ne dit rien de la prise.
-    let edge_channel = followed_channel(channel_sel, channels_in);
     // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
     // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
     // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
@@ -3940,44 +3887,6 @@ fn capture_stage_loop(
                         }
                     }
                 }
-                // Pic BRUT, au même endroit et sur le même buffer que la
-                // rugosité : ce que le pilote livre, avant toute transformation.
-                // Deux comparaisons par échantillon, hors du callback audio.
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let mut peak = 0.0f32;
-                    let mut overs = 0u64;
-                    for v in &samples {
-                        let a = v.abs();
-                        if a > peak {
-                            peak = a;
-                        }
-                        if a > 1.0 {
-                            overs += 1;
-                        }
-                    }
-                    perfstats.input_peak.fetch_max(peak.to_bits(), Relaxed);
-                    perfstats.input_over_samples.fetch_add(overs, Relaxed);
-                    perfstats
-                        .input_total_samples
-                        .fetch_add(samples.len() as u64, Relaxed);
-                }
-                // La prise se recolle-t-elle d'un bloc au suivant ? Sur le
-                // buffer BRUT du pilote, sur le canal que le musicien joue, hors
-                // du callback audio.
-                edge_continuity.observe(&samples, channels_in, edge_channel);
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let w = edge_continuity.drain();
-                    if w.blocks > 0 {
-                        perfstats.edge_blocks.fetch_add(w.blocks, Relaxed);
-                        perfstats.edge_peaks.fetch_add(w.peak_at_edge, Relaxed);
-                        perfstats
-                            .edge_chance_pct
-                            .store(w.chance_pct.to_bits(), Relaxed);
-                    }
-                }
-
                 // Timestamp début pipeline INSTRUMENT : posé APRÈS le tap voix
                 // pour que le coût voix reste invisible aux métriques instrument.
                 let t_block_start = std::time::Instant::now();
@@ -4206,23 +4115,6 @@ fn process_stage_loop(
         }
         match in_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok((t_block_start, mut stereo)) => {
-                // Pic du bloc À SON ARRIVÉE dans cet étage, avant quoi que ce
-                // soit. Encadre exactement le trajet où un signal borné à 1,0 à
-                // la capture ressort à 6,3 au limiteur (banc du 20/09/2026,
-                // entrée silencieuse et sortie qui fabrique du son). Si ce pic
-                // vaut déjà 6, le défaut est dans la capture ou le transport
-                // entre les deux étages ; s'il vaut 1, il est ici.
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let mut peak = 0.0f32;
-                    for v in stereo.iter() {
-                        let a = v.abs();
-                        if a > peak {
-                            peak = a;
-                        }
-                    }
-                    perfstats.process_in_peak.fetch_max(peak.to_bits(), Relaxed);
-                }
                 // v0.4.8 — timer "traitement pur" du process_stage : démarre
                 // ici (= après pop ringbuf), s'arrête juste avant le send.
                 let t_stage_start = std::time::Instant::now();
@@ -6006,21 +5898,11 @@ mod plugin_control_tests {
 // ═══════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod remap_tests {
-    use super::{extract_channel_mono, followed_channel, remap_to_stereo, ChannelSel};
+    use super::{extract_channel_mono, remap_to_stereo, ChannelSel};
 
     // Bloc 3 canaux × 2 frames : frame0 = [10,20,30], frame1 = [11,21,31].
     fn block_3ch() -> Vec<f32> {
         vec![10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
-    }
-
-    #[test]
-    fn le_canal_suivi_est_celui_que_lon_joue() {
-        assert_eq!(followed_channel(ChannelSel::Mono(2), 4), 2);
-        assert_eq!(followed_channel(ChannelSel::StereoPair(2), 4), 2);
-        assert_eq!(followed_channel(ChannelSel::Default, 4), 0);
-        // Hors plage : même repli que `remap_to_stereo`, jamais un index fou.
-        assert_eq!(followed_channel(ChannelSel::Mono(7), 4), 0);
-        assert_eq!(followed_channel(ChannelSel::StereoPair(3), 4), 0);
     }
 
     #[test]

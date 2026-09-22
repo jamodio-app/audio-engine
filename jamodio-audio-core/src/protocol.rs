@@ -1150,30 +1150,6 @@ pub enum AgentMessage {
         monitor_buffer_ms: usize,
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
-        /// 0.6.5-10 — la rugosité du signal capté se groupe-t-elle au BORD des
-        /// blocs ? Rapport à ce que le hasard donnerait : **1 = rien à
-        /// signaler**, 2 et plus = elle se groupe là où elle ne devrait pas.
-        /// Calibré sur l'enregistrement du 19/09/2026 : prise abîmée 2,3×,
-        /// signal sain 1,0 à 1,3×. Absent hors capture : on ne publie pas un
-        /// chiffre rassurant quand rien n'a été regardé. Cf. `edge_continuity`.
-        #[serde(rename = "edgePeakRatio", skip_serializing_if = "Option::is_none")]
-        edge_peak_ratio: Option<f32>,
-        /// Pic ABSOLU du signal capté, tel que le pilote le livre — avant
-        /// remap, plugin, gain d'envoi et limiteur. À ne pas confondre avec
-        /// `outputPeak`, mesuré APRÈS le plugin : un simulateur d'ampli chargé
-        /// masque complètement ce qui entre, et c'est exactement ce qui a caché
-        /// le défaut du 20/09/2026 (pic à 7× la pleine échelle, invisible tant
-        /// qu'AmpliTube était chargé).
-        ///
-        /// `inputOverPct` dit si c'est un NIVEAU trop fort (beaucoup
-        /// d'échantillons au-dessus de la pleine échelle) ou une pluie
-        /// d'IMPULSIONS isolées (pic très haut, presque aucun dépassement) —
-        /// deux causes sans rapport, que le pic seul ne distingue pas.
-        /// Absents hors capture.
-        #[serde(rename = "inputPeak", skip_serializing_if = "Option::is_none")]
-        input_peak: Option<f32>,
-        #[serde(rename = "inputOverPct", skip_serializing_if = "Option::is_none")]
-        input_over_pct: Option<f32>,
         /// Taille du bloc que le callback d'ENTRÉE livre d'un seul coup, en
         /// frames PAR CANAL (48 kHz : 64 frames = 1,33 ms). C'est elle qui dit
         /// combien de trames Opus un réveil produit, donc la rafale d'émission
@@ -1184,7 +1160,7 @@ pub enum AgentMessage {
         /// Idem pour la SORTIE — la taille que le callback consomme d'un seul
         /// tirage. C'est le vrai seuil de survie du tampon de réception : en
         /// dessous, le prochain tirage laisse un trou (cf. `mixer::conceal`).
-        /// Publiée depuis la 0.6.5-11, parce que le banc du 20/09/2026 s'est
+        /// Publiée depuis la 0.6.5, parce que le banc du 20/09/2026 s'est
         /// conclu sans elle : le correctif du seuil de masquage dépendait de
         /// cette valeur, et elle n'était lisible nulle part.
         #[serde(rename = "outputBlockFrames", skip_serializing_if = "Option::is_none")]
@@ -1702,9 +1678,6 @@ mod tests {
                 output_clip_pct: 0.0,
                 monitor_buffer_ms: 5,
                 monitor_underruns: 0,
-                edge_peak_ratio: None,
-                input_peak: None,
-                input_over_pct: None,
                 input_block_frames: input,
                 output_block_frames: output,
                 callback_deficit_in: None,
@@ -1729,55 +1702,6 @@ mod tests {
         let v = perfstats(None, None);
         assert!(v.get("inputBlockFrames").is_none(), "{v}");
         assert!(v.get("outputBlockFrames").is_none(), "{v}");
-    }
-
-    /// Contrat wire — le pic BRUT de l'entrée voyage à part du pic de sortie.
-    ///
-    /// Le 20/09/2026, un signal à sept fois la pleine échelle est resté invisible
-    /// parce que la seule mesure disponible était prise APRÈS le plugin : un
-    /// simulateur d'ampli chargé la ramenait sous 2. Les deux valeurs doivent
-    /// donc voyager séparément, et `inputOverPct` dire s'il s'agit d'un niveau
-    /// trop fort ou d'impulsions isolées.
-    #[test]
-    fn le_pic_brut_de_lentree_voyage_a_part_du_pic_de_sortie() {
-        let v = serde_json::to_value(AgentMessage::PerfStats {
-            timestamp_ms: 1,
-            plugin: None,
-            pipeline_latency_ms: PipelineLatency {
-                count: 0, p50_ms: 0.0, p99_ms: 0.0, max_ms: 0.0, mean_ms: 0.0, drops_per_sec: 0,
-            },
-            peers: vec![],
-            // Le cas réel : la sortie paraît sage, l'entrée ne l'est pas.
-            output_peak: 1.2,
-            output_clip_pct: 0.0,
-            monitor_buffer_ms: 5,
-            monitor_underruns: 0,
-            edge_peak_ratio: None,
-            input_peak: Some(7.44),
-            input_over_pct: Some(0.01),
-            input_block_frames: Some(64),
-            output_block_frames: Some(64),
-            callback_deficit_in: None,
-            callback_deficit_out: None,
-            cpu_pct: None,
-            memory_pressure: None,
-            memory_load_pct: None,
-            net_interface: None,
-            uplink: None,
-            recv_streams: vec![],
-        })
-        .unwrap();
-        // Comparaison tolérante : un f32 relu en f64 ne retombe pas sur le
-        // littéral décimal (7,44 devient 7,440000057…).
-        let proche = |x: &serde_json::Value, attendu: f64| {
-            (x.as_f64().expect("nombre") - attendu).abs() < 1e-4
-        };
-        assert!(proche(&v["inputPeak"], 7.44), "{v}");
-        assert!(proche(&v["outputPeak"], 1.2), "{v}");
-        // Un pic très haut avec presque aucun dépassement = des impulsions
-        // isolées, pas un niveau trop fort. C'est cette distinction qui décide
-        // où chercher.
-        assert!(proche(&v["inputOverPct"], 0.01), "{v}");
     }
 
     // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent

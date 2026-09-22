@@ -37,11 +37,6 @@ pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
-    /// Mesure, sur un thread à part, le retard réel d'un réveil à 2,5 ms — ce
-    /// sur quoi le masquage anticipé reposera (cf. `audio::wake_probe`). Relancée
-    /// à CHAQUE démarrage de capture tant que l'interrupteur est posé. Ne touche
-    /// à aucun étage audio.
-    pub wake_probe: bool,
 }
 
 impl BenchFlags {
@@ -95,7 +90,6 @@ impl BenchFlags {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
-                "wake-probe" => flags.wake_probe = on,
                 other => tracing::warn!(
                     target: "jamodio::bench",
                     flag = other,
@@ -143,9 +137,6 @@ impl BenchFlags {
         if self.no_rtcp {
             active.push("no-rtcp");
         }
-        if self.wake_probe {
-            active.push("wake-probe");
-        }
         active
     }
 
@@ -190,24 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn la_sonde_de_reveil_sannonce_comme_les_autres() {
-        let flags = BenchFlags::parse("wake-probe = 1\n");
-        assert!(flags.wake_probe);
-        assert!(!flags.no_rtcp);
-        assert_eq!(flags.active(), vec!["wake-probe"]);
-    }
-
-    #[test]
-    fn plusieurs_interrupteurs_sont_tous_annonces() {
-        // Le journal doit nommer TOUT ce qui est détourné, sinon une mesure de
-        // banc reste interprétable de travers.
-        let flags = BenchFlags::parse("no-rtcp = 1\nwake-probe = 1\n");
-        assert_eq!(flags.active(), vec!["no-rtcp", "wake-probe"]);
-    }
-
-    #[test]
     fn une_ligne_sans_egal_est_signalee_et_ignoree() {
-        let (entries, issues) = BenchFlags::entries("no-rtcp\nwake-probe = 1\n");
+        let (entries, issues) = BenchFlags::entries("no-rtcp\nautre = 1\n");
         assert_eq!(entries.len(), 1);
         assert_eq!(
             issues,
@@ -234,7 +209,7 @@ mod tests {
 
     #[test]
     fn un_fichier_propre_ne_signale_rien() {
-        let (_, issues) = BenchFlags::entries("# commentaire\n\nno-rtcp = 1\nwake-probe = 0\n");
+        let (_, issues) = BenchFlags::entries("# commentaire\n\nno-rtcp = 1\n");
         assert!(issues.is_empty());
     }
 

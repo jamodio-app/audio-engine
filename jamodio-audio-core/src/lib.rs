@@ -1,7 +1,3 @@
-// 19/09/2026 — la seule chose qu'on ne mesurait pas : la CONTINUITÉ du signal
-// capté au bord des blocs. C'est elle qui distinguait une prise saine d'une prise
-// « horrible » que rien d'autre ne différenciait.
-pub mod edge_continuity;
 pub mod codec;
 pub mod gain;
 pub mod net;

@@ -392,9 +392,6 @@ impl AsioDuplexHost {
             // Horodatage du bloc précédent — état PRIVÉ du closure (appelé seulement
             // depuis le thread du driver), donc ni atomique ni verrou.
             let mut prev_cb: Option<Instant> = None;
-            // Bascule précédente annoncée par le pilote (moitié + position) —
-            // état PRIVÉ du closure, comme `prev_cb`. Cf. `record_switch`.
-            let mut switch_tracker = crate::audio::callback_health::SwitchTracker::default();
             driver.add_callback(move |info| {
                 let cb_start = Instant::now();
                 let idx = info.buffer_index as usize;
@@ -408,15 +405,6 @@ impl AsioDuplexHost {
                 let gap_us = prev_cb
                     .map(|prev| cb_start.saturating_duration_since(prev).as_micros() as u64);
                 prev_cb = Some(cb_start);
-                // Ce que le pilote annonce pour cette bascule (mesure du 21/09) :
-                // quelques comparaisons d'entiers, un atomique sur anomalie seulement.
-                callback_health.record_switch(
-                    &mut switch_tracker,
-                    idx,
-                    info.sample_position,
-                    buffer_size,
-                    gap_us,
-                );
 
                 // --- ENTRÉE : dé-entrelacé natif → f32 entrelacé → sample_tx ---
                 if let Some(inp) = st.input.as_ref() {

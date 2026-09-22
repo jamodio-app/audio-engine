@@ -54,39 +54,6 @@ pub struct CallbackHealth {
     worst_gap_us: AtomicU64,
     /// Pire durée de traitement de la fenêtre (µs).
     worst_work_us: AtomicU64,
-    /// ── Ce que le PILOTE annonce à chaque bascule (mesure du 21/09/2026) ──
-    ///
-    /// Deux gels de ~14 ms du callback ASIO (Focusrite, 20/09 et 21/09) ont
-    /// chacun été suivis d'une prise abîmée jusqu'à la réouverture du pilote.
-    /// Hypothèse à trancher : après le gel, le pilote rattrape en rafale et la
-    /// moitié de tampon qu'on lit n'est plus celle qu'il vient de remplir. Ces
-    /// compteurs disent ce que le pilote a réellement annoncé.
-    ///
-    /// Même moitié de tampon annoncée deux bascules de suite (0,0 ou 1,1) :
-    /// on relit alors un tampon que le pilote n'a pas rafraîchi.
-    index_repeats: AtomicU64,
-    /// Position annoncée qui n'avance pas d'exactement une taille de tampon.
-    position_irregular: AtomicU64,
-    /// Pire écart (échantillons) entre l'avance annoncée et la taille du tampon.
-    position_worst_dev: AtomicU64,
-    /// Bascules sans position valide (pilote qui ne la fournit pas).
-    position_missing: AtomicU64,
-    /// Bascules arrivées en rafale : moins de `BURST_GAP_US` après la
-    /// précédente. Mesure seule : c'est aussi un régime SAIN chez certains
-    /// pilotes (~250/s sur la Focusrite, 21/09/2026), donc jamais une anomalie
-    /// en soi — on la lit en comparant avant/après un gel.
-    burst_blocks: AtomicU64,
-}
-
-/// En deçà, deux bascules sont « en rafale ». Seuil de MESURE, pas d'alerte : la
-/// Focusrite en produit ~250/s en régime sain (cf. `burst_blocks`).
-pub const BURST_GAP_US: u64 = 300;
-
-/// État PRIVÉ du callback (un seul thread l'écrit) : la bascule précédente.
-#[derive(Debug, Default)]
-pub struct SwitchTracker {
-    prev_index: Option<usize>,
-    prev_position: Option<i64>,
 }
 
 /// Instantané d'une fenêtre, rendu par [`CallbackHealth::drain`].
@@ -97,26 +64,13 @@ pub struct CallbackHealthWindow {
     pub over_budget_blocks: u64,
     pub worst_gap_us: u64,
     pub worst_work_us: u64,
-    pub index_repeats: u64,
-    pub position_irregular: u64,
-    pub position_worst_dev: u64,
-    pub position_missing: u64,
-    pub burst_blocks: u64,
 }
 
 impl CallbackHealthWindow {
     /// `true` si aucun bloc n'a été en retard ni hors budget — le cas nominal,
     /// pour lequel on ne journalise RIEN.
-    ///
-    /// Les bascules en rafale (`burst_blocks`) n'y figurent PAS : la Focusrite en
-    /// livre ~250 par seconde en régime sain (mesuré sur 10 207 s le 21/09/2026),
-    /// et les compter comme anomalie écrivait une ligne CHAQUE seconde. Elles
-    /// restent mesurées et portées par la ligne quand une vraie anomalie l'ouvre.
     pub fn is_clean(&self) -> bool {
-        self.late_blocks == 0
-            && self.over_budget_blocks == 0
-            && self.index_repeats == 0
-            && self.position_irregular == 0
+        self.late_blocks == 0 && self.over_budget_blocks == 0
     }
 }
 
@@ -159,42 +113,6 @@ impl CallbackHealth {
         }
     }
 
-    /// Enregistre ce que le pilote annonce pour CETTE bascule. Appelé une fois par
-    /// callback. Coût : quelques comparaisons d'entiers ; un atomique n'est
-    /// touché QUE sur anomalie (hors `position_missing`, un par bloc quand le
-    /// pilote ne donne pas de position).
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn record_switch(
-        &self,
-        tracker: &mut SwitchTracker,
-        index: usize,
-        position: Option<i64>,
-        buffer_frames: u32,
-        gap_us: Option<u64>,
-    ) {
-        if tracker.prev_index == Some(index) {
-            self.index_repeats.fetch_add(1, Relaxed);
-        }
-        tracker.prev_index = Some(index);
-        match (tracker.prev_position, position) {
-            (Some(prev), Some(pos)) => {
-                let dev = (pos - prev - i64::from(buffer_frames)).unsigned_abs();
-                if dev != 0 {
-                    self.position_irregular.fetch_add(1, Relaxed);
-                    self.position_worst_dev.fetch_max(dev, Relaxed);
-                }
-            }
-            (_, None) => {
-                self.position_missing.fetch_add(1, Relaxed);
-            }
-            (None, Some(_)) => {}
-        }
-        tracker.prev_position = position;
-        if gap_us.is_some_and(|g| g < BURST_GAP_US) {
-            self.burst_blocks.fetch_add(1, Relaxed);
-        }
-    }
-
     /// Rend la fenêtre écoulée et remet tous les compteurs à zéro (lecture 1 Hz).
     pub fn drain(&self) -> CallbackHealthWindow {
         CallbackHealthWindow {
@@ -203,11 +121,6 @@ impl CallbackHealth {
             over_budget_blocks: self.over_budget_blocks.swap(0, Relaxed),
             worst_gap_us: self.worst_gap_us.swap(0, Relaxed),
             worst_work_us: self.worst_work_us.swap(0, Relaxed),
-            index_repeats: self.index_repeats.swap(0, Relaxed),
-            position_irregular: self.position_irregular.swap(0, Relaxed),
-            position_worst_dev: self.position_worst_dev.swap(0, Relaxed),
-            position_missing: self.position_missing.swap(0, Relaxed),
-            burst_blocks: self.burst_blocks.swap(0, Relaxed),
         }
     }
 }
@@ -348,88 +261,5 @@ mod tests {
         let second = h.drain();
         assert_eq!(second, CallbackHealthWindow::default());
         assert!(second.is_clean(), "fenêtre suivante repart propre");
-    }
-
-    // ─── Bascules annoncées par le pilote (21/09/2026) ────────────────────
-
-    #[test]
-    fn des_bascules_saines_ne_laissent_aucune_trace() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        for i in 0..100i64 {
-            let gap = if i % 3 == 0 { 2300 } else { 945 }; // régime bimodal sain
-            h.record_switch(&mut t, (i % 2) as usize, Some(i * 64), 64, Some(gap));
-        }
-        let w = h.drain();
-        assert_eq!((w.index_repeats, w.position_irregular, w.burst_blocks), (0, 0, 0));
-        assert_eq!(w.position_missing, 0);
-        assert!(w.is_clean());
-    }
-
-    #[test]
-    fn la_meme_moitie_deux_fois_est_comptee() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        h.record_switch(&mut t, 0, Some(0), 64, None);
-        h.record_switch(&mut t, 0, Some(64), 64, Some(900));
-        let w = h.drain();
-        assert_eq!(w.index_repeats, 1);
-        assert!(!w.is_clean());
-    }
-
-    #[test]
-    fn une_position_qui_saute_est_mesuree() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        h.record_switch(&mut t, 0, Some(0), 64, None);
-        // Gel : le pilote annonce 10 tampons plus loin d'un coup.
-        h.record_switch(&mut t, 1, Some(640), 64, Some(14_000));
-        // Puis une position qui recule (tampon relu).
-        h.record_switch(&mut t, 0, Some(576), 64, Some(900));
-        let w = h.drain();
-        assert_eq!(w.position_irregular, 2);
-        assert_eq!(w.position_worst_dev, 576, "640 − 0 − 64");
-    }
-
-    #[test]
-    fn un_rattrapage_en_rafale_est_compte() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        h.record_switch(&mut t, 0, Some(0), 64, Some(14_000));
-        for i in 1..6i64 {
-            h.record_switch(&mut t, (i % 2) as usize, Some(i * 64), 64, Some(40));
-        }
-        let w = h.drain();
-        assert_eq!(w.burst_blocks, 5);
-        // Le gel, lui, salit la fenêtre (bloc en retard) ; la rafale seule non.
-        assert!(w.is_clean(), "record_switch seul ne compte pas le retard : c'est record_block");
-    }
-
-    #[test]
-    fn un_pilote_sans_position_est_signale_sans_salir_la_fenetre() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        for i in 0..4 {
-            h.record_switch(&mut t, i % 2, None, 64, Some(1333));
-        }
-        let w = h.drain();
-        assert_eq!(w.position_missing, 4);
-        assert!(w.is_clean(), "l'absence de position n'est pas une anomalie de flux");
-    }
-
-    /// Régression du 21/09/2026 : la 0.6.5-21 écrivait une ligne par seconde,
-    /// parce que les rafales — régime sain de la Focusrite — salissaient la fenêtre.
-    #[test]
-    fn des_rafales_seules_ne_font_pas_une_seconde_anormale() {
-        let h = CallbackHealth::new();
-        let mut t = SwitchTracker::default();
-        for i in 0..750i64 {
-            let gap = if i % 3 == 0 { 40 } else { 1900 };
-            h.record_block(Some(gap), 80, 1333, 2666);
-            h.record_switch(&mut t, (i % 2) as usize, Some(i * 64), 64, Some(gap));
-        }
-        let w = h.drain();
-        assert_eq!(w.burst_blocks, 250);
-        assert!(w.is_clean(), "régime sain : aucune ligne");
     }
 }

@@ -28,11 +28,7 @@
 //   5. `create_buffers` rend `AsioError::InvalidBufferSize` au lieu de
 //      `panic!` quand le pilote annonce une taille préférée ≤ 0 (une panique
 //      sur le thread COM de l'hôte, pour une réponse de pilote, n'est pas une
-//      erreur exploitable) ;
-//   6. `CallbackInfo::sample_position` : la position d'échantillon que le
-//      pilote annonce à chaque bascule de tampon (`ASIOTimeInfo`), `None` si
-//      le pilote ne la déclare pas valide. L'amont la recevait et la jetait.
-//      Coût : une lecture de champ et un test par bloc.
+//      erreur exploitable).
 //
 // RÉPONSES RENDUES AU PILOTE — deux changent, toutes deux pour `kAsioOverload` :
 //   - `kAsioSelectorSupported` interrogé sur `kAsioOverload` : 0 → 1 ;
@@ -150,11 +146,6 @@ pub struct CallbackInfo {
     pub buffer_index: i32,
     pub system_time: ai::ASIOTimeStamp,
     pub callback_flag: u32,
-    /// PATCH JAMODIO — position (en échantillons depuis `ASIOStart`) du tampon
-    /// que cette bascule livre, telle que le pilote l'annonce ; `None` s'il ne
-    /// la déclare pas valide. Sur un flux sain, elle avance d'exactement une
-    /// taille de tampon d'une bascule à l'autre.
-    pub sample_position: Option<i64>,
 }
 
 /// Holds the pointer to the callbacks that come from cpal
@@ -1208,19 +1199,10 @@ extern "C" fn buffer_switch_time_info(
     // Alternates: 0, 1, 0, 1, ...
     let callback_flag = CALLBACK_FLAG.fetch_xor(1, Ordering::Relaxed);
 
-    // PATCH JAMODIO — voir `CallbackInfo::sample_position`.
-    let position_valid = asio_time.time_info.flags
-        & (ai::AsioTimeInfoFlags::kSamplePositionValid.0 as c_long)
-        != 0;
-    let sample_position = position_valid.then(|| {
-        let sp = asio_time.time_info.sample_position;
-        (((sp.hi as u64) << 32) | (sp.lo as u64)) as i64
-    });
     let callback_info = CallbackInfo {
         buffer_index: double_buffer_index,
         system_time: asio_time.time_info.system_time,
         callback_flag,
-        sample_position,
     };
     for &mut (_, ref mut bc) in bcs.iter_mut() {
         bc.run(&callback_info);

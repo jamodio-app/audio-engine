@@ -1150,26 +1150,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let elapsed_secs = tick_now.duration_since(prev_tick).as_secs_f64();
             prev_tick = tick_now;
             let capturing_now = matches!(pl.state, AgentState::Capturing);
+            // Ce que le musicien ENTEND (sortie casque), pic de la seconde.
+            let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
             // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
             // callback correspondant n'a pas encore tourné : on publie alors
             // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
-            // Pic BRUT de l'entrée (avant plugin) + part d'échantillons au-delà
-            // de la pleine échelle. Remis à zéro à chaque fenêtre : c'est un pic
-            // PAR SECONDE, comme `outputPeak`.
-            let raw_peak = f32::from_bits(pl.perfstats.input_peak.swap(0, Ordering::Relaxed));
-            let proc_in_peak =
-                f32::from_bits(pl.perfstats.process_in_peak.swap(0, Ordering::Relaxed));
-            let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
-            let raw_overs = pl.perfstats.input_over_samples.swap(0, Ordering::Relaxed);
-            let raw_total = pl.perfstats.input_total_samples.swap(0, Ordering::Relaxed);
-            let (input_peak, input_over_pct) = if raw_total > 0 {
-                (
-                    Some(raw_peak),
-                    Some(100.0 * raw_overs as f32 / raw_total as f32),
-                )
-            } else {
-                (None, None)
-            };
             let input_block_frames =
                 Some(pl.perfstats.input_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
             let output_block_frames =
@@ -1234,39 +1219,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 })
                 .collect();
 
-            // ── Continuité de la prise au bord des blocs (cf. `edge_continuity`) ─
-            // Une ligne SEULEMENT si la prise est abîmée : une session saine
-            // n'ajoute rien au journal. Le pourcentage, lui, part dans les
-            // perf-stats de la même seconde.
-            let edge_peak_ratio = {
-                let blocks = pl.perfstats.edge_blocks.swap(0, Ordering::Relaxed);
-                let peaks = pl.perfstats.edge_peaks.swap(0, Ordering::Relaxed);
-                let chance =
-                    f32::from_bits(pl.perfstats.edge_chance_pct.load(Ordering::Relaxed));
-                if blocks == 0 || chance <= 0.0 {
-                    None
-                } else {
-                    let ratio = (100.0 * peaks as f32 / blocks as f32) / chance;
-                    // Calibré sur l'enregistrement du 19/09 : prise abîmée 2,3×
-                    // le hasard, signal sain 1,0 à 1,3×. 1,8 sépare les deux avec
-                    // de la marge des deux côtés. CONSTANTE DE CALIBRATION —
-                    // établie avec la première version du calcul (base ≈ 0,87 sur
-                    // un signal sain, silence compté au bord) ; le calcul corrigé
-                    // du 21/09/2026 lit 1,0 sur un bruit franc et ne juge plus le
-                    // silence. À recalibrer sur la prochaine prise abîmée.
-                    if ratio > 1.8 {
-                        tracing::warn!(
-                            target: "jamodio::audio",
-                            ratio,
-                            blocks,
-                            chance_pct = chance,
-                            "RUGOSITÉ AU BORD DES BLOCS ÉLEVÉE : le pic de rugosité du signal capté tombe au bord des blocs plus souvent que le hasard"
-                        );
-                    }
-                    Some(ratio)
-                }
-            };
-
             // ── Irrégularités du callback audio (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
             // en RETARD par le driver/l'OS (`late_blocks`) vs blocs dont NOTRE
@@ -1287,16 +1239,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         worst_work_us = cbh.worst_work_us,
                         budget_us = crate::audio::callback_health::block_budget_us(frames, 48_000),
                         buffer_frames = frames,
-                        // 0.6.5-21 — ce que le pilote a annoncé (moitié de
-                        // tampon, position, rafales) : cf. `record_switch`.
-                        index_repeats = cbh.index_repeats,
-                        position_irregular = cbh.position_irregular,
-                        position_worst_dev = cbh.position_worst_dev,
-                        position_missing = cbh.position_missing,
-                        burst_blocks = cbh.burst_blocks,
                         // Le snapshot perfstats de la MÊME seconde porte déjà
                         // plugin_name / pipeline_p99 / drops : on ne duplique pas.
-                        "CALLBACK AUDIO IRRÉGULIER : bloc en retard, hors budget, ou bascule irrégulière du pilote sur la dernière seconde"
+                        "CALLBACK AUDIO IRRÉGULIER : bloc en retard ou hors budget sur la dernière seconde"
                     );
                 }
             }
@@ -1661,16 +1606,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // active = cold-start muet (watchdog). ≈370/s = sain.
                 capture_cb_per_sec,
                 output_cb_per_sec,
-                // 0.6.5-17 — ce que le pilote livre VRAIMENT, avant plugin.
-                input_peak,
-                input_over_pct,
-                // 0.6.5-18 — le même bloc à l'arrivée dans process_stage : borne
-                // l'endroit où le signal se met à dépasser.
-                process_in_peak = proc_in_peak,
-                // 0.6.5-22 — la sortie casque (ce qu'on ENTEND) ; `output_peak`
+                // 0.6.5 — la sortie casque (ce qu'on ENTEND) ; `output_peak`
                 // plus bas est ce qu'on ENVOIE.
                 heard_peak,
-                // 0.6.5-11 — taille de bloc livrée par l'OS (frames/canal).
+                // 0.6.5 — taille de bloc livrée par l'OS (frames/canal).
                 input_block_frames,
                 output_block_frames,
                 peers = peers.len(),
@@ -1678,16 +1617,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
-                edge_peak_ratio,
-                // 0.6.5-19 — de quoi recouper une ligne à elle seule (énigme du
-                // 21/09/2026 : pic à 6,5 et zéro dépassement sur la même ligne,
-                // ce qu'aucun chemin de code n'explique). Compteurs BRUTS de la
-                // fenêtre, et l'identité de qui écrit : si deux agents tournent,
-                // leurs lignes se distinguent.
+                // Compteurs BRUTS de la fenêtre (le pourcentage seul arrondit),
+                // et l'identité de qui écrit : si deux agents tournent, leurs
+                // lignes se distinguent.
                 output_clip_samples = clip_samples,
                 output_total_samples = total_samples,
-                input_over_samples = raw_overs,
-                input_total_samples = raw_total,
                 pid = std::process::id(),
                 "perfstats snapshot"
             );
@@ -1701,9 +1635,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
-                edge_peak_ratio,
-                input_peak,
-                input_over_pct,
                 input_block_frames,
                 output_block_frames,
                 callback_deficit_in,

@@ -223,7 +223,7 @@ pub fn recheck_in_ms(
 /// celui-ci) : dépassement médian 396 µs, p99 810 µs, pire cas 1,06 ms sur 800
 /// mesures — soit une marge confortable sur une trame de 2,5 ms. C'est ce qui a
 /// permis de garder l'attente simple et d'écarter une minuterie haute résolution
-/// (sonde `wake_probe`, 19/09/2026).
+/// (banc de réveil du 19/09/2026).
 pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
     const MAX_SLEEP_MS: f64 = 5.0;
     /// Plancher de sommeil. Une échéance déjà dépassée rendait `0`, ce qui
