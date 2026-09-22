@@ -5,6 +5,41 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5-24] — 2026-09-22 (pré-version de test)
+
+**Dernière pré-version avant la 0.6.5 publique : les mesures de chasse sont
+retirées, et deux défauts Windows trouvés en les suivant sont corrigés.**
+
+### Corrigé
+
+- **Windows — le masquage d'un paquet en retard part à l'heure.** Une attente
+  minutée de l'Audio Engine se réveillait au tic de 15,6 ms de la minuterie
+  Windows (jusqu'à 67 ms mesurés), Windows 11 ignorant la demande de précision
+  d'une application à fenêtre masquée. Un masquage réveillé trop tard laissait
+  le tampon se vider : un trou au lieu d'un raccord. L'Audio Engine s'exempte
+  désormais de ce bridage et demande une minuterie à 1 ms pendant la session
+  seulement (mesuré hors Audio Engine : 1,85 ms de médiane, 4,3 ms au pire).
+- **Windows — l'écran reste allumé pendant une session.** Chaque rallumage de
+  l'écran réinitialisait le pilote ASIO (~7 s sans son). Hors session, rien ne
+  change ; un écran éteint à la main repasse par la réinitialisation.
+- **Journal** : un réveil dit sa vraie cause (sortie de veille du PC, écran
+  rallumé, ou les deux) au lieu de « réveil de veille PC » dans tous les cas.
+
+### Retiré
+
+- Les mesures posées pour trouver les gels du PC de recette, dont la cause est
+  établie (deux pilotes Intel monopolisant le CPU 0) : bascules du pilote ASIO
+  (la seule mesure dans le callback temps réel ; `asio-sys` revient à l'octet
+  près à son état d'avant), pics d'entrée, rugosité au bord des blocs, banc de
+  réveil. La mesure du masquage prématuré est gardée : c'est elle qui dit si
+  un clic vient du réseau ou de nous.
+
+### Ajouté
+
+- Les symboles de débogage Windows (`.pdb`) sont joints à chaque release
+  (`Jamodio-Audio-Engine-Windows-symbols-<version>.zip`) : une trace ou un
+  crash nomme désormais nos fonctions. Jamais installés chez l'utilisateur.
+
 ## [0.6.5-23] — 2026-09-21 (pré-version de test)
 
 ### Corrigé
