@@ -16,6 +16,7 @@ mod pipeline;
 mod plugin_scan;
 mod device_loss;
 mod recv_activity;
+mod timer_precision;
 #[cfg(target_os = "windows")]
 mod tray_promote;
 mod ws_server;
@@ -367,6 +368,11 @@ fn main() {
     // les events pendant le setup Tauri. Le guard doit rester vivant : on le
     // bind à _log_guard au scope de main() (drop = fin du process = OK).
     let _log_guard = logging::init();
+
+    // Windows 11 bride la minuterie d'un processus à fenêtre masquée (l'agent) :
+    // sans cette exemption, la minuterie fine de session serait ignorée et les
+    // masquages partiraient jusqu'à 15 ms en retard. Cf. `timer_precision`.
+    timer_precision::exempt_process_from_timer_throttling();
 
     // Filet de diagnostic crash (0.5.11) : un panic Rust part par DÉFAUT sur
     // stderr — jeté sur une app GUI Windows → invisible dans `agent.log` (donc

@@ -677,6 +677,10 @@ pub struct PipelineState {
     /// au démarrage de la capture, relâchée à son démontage. Portée par un objet
     /// pour qu'aucun chemin de sortie (erreur, fermeture) ne la laisse en place.
     keep_awake: Option<crate::keep_awake::KeepAwake>,
+    /// Minuterie fine (1 ms) tenue pendant la session, même cycle de vie que
+    /// `keep_awake` : sans elle, sous Windows, l'échéance du masquage se réveille
+    /// au tic de 15,6 ms. Cf. `timer_precision`.
+    timer_resolution: Option<crate::timer_precision::SessionTimerResolution>,
     pub mixer: Arc<AudioMixer>,
     /// CPAL streams must be kept alive — dropping them stops audio.
     ///
@@ -1329,6 +1333,7 @@ impl PipelineState {
     pub fn new(mixer: Arc<AudioMixer>) -> Self {
         Self {
             keep_awake: None,
+            timer_resolution: None,
             mixer,
             capture_stream: None,
             playback_stream: None,
@@ -1921,6 +1926,7 @@ impl PipelineState {
         self.uplink = None;
         // Lot V — la session est finie : la machine peut se rendormir.
         self.keep_awake = None;
+        self.timer_resolution = None;
         // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
         // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
         // le thread `voice_encode` termine en cascade (Disconnected). On lâche
@@ -2490,6 +2496,7 @@ impl PipelineState {
         self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
             "Jamodio — session en cours",
         ));
+        self.timer_resolution = Some(crate::timer_precision::SessionTimerResolution::acquire());
         self.uplink = if bench.no_rtcp {
             tracing::warn!(
                 target: "jamodio::uplink",
