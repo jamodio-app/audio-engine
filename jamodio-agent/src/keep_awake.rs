@@ -10,10 +10,17 @@
 //! destruction relâche, quel que soit le chemin de sortie (arrêt normal, erreur,
 //! fermeture de l'application) — une demande ne peut pas fuir.
 //!
-//! Ce qu'on ne fait PAS : empêcher l'écran de s'éteindre. C'est l'extinction de
-//! l'écran qui déclenche la veille moderne sous Windows ; si le banc BV montre
-//! que « système requis » ne suffit pas sur le PC, on en discutera avant
-//! d'imposer un écran allumé, qui est un effet de bord visible.
+//! Sous Windows, on garde aussi l'ÉCRAN allumé pendant la session. Mesuré le
+//! 22/09/2026 sur le PC de recette : chaque rallumage de l'écran déclenche le
+//! re-init du pilote ASIO (filet anti-veille moderne, cf.
+//! `audio::power_events`), soit ~7 s sans son, et sur certaines machines un gel
+//! de 15 ms d'un pilote Intel au même instant. « Système requis » seul
+//! n'empêche pas l'écran de s'éteindre. Un écran qui reste allumé tant qu'on
+//! joue, c'est ce que fait un lecteur vidéo ; hors session, rien ne change.
+//! Un écran éteint à la main, ou un capot fermé, repasse par le re-init : le
+//! filet reste en place.
+//!
+//! Sur Mac, l'écran peut s'éteindre : CoreAudio n'en souffre pas.
 
 use std::sync::Arc;
 
@@ -206,11 +213,17 @@ mod windows {
     use std::sync::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Power::{
-        PowerClearRequest, PowerCreateRequest, PowerSetRequest, PowerRequestSystemRequired,
+        PowerClearRequest, PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
+        PowerRequestSystemRequired, POWER_REQUEST_TYPE,
     };
     use windows_sys::Win32::System::Threading::{
         REASON_CONTEXT, REASON_CONTEXT_0, POWER_REQUEST_CONTEXT_SIMPLE_STRING,
     };
+
+    /// Ce qui est demandé pendant une session : pas de veille, écran allumé
+    /// (cf. la doc du module). Les deux ou rien : une demande à moitié posée
+    /// ne se dirait pas.
+    const REQUESTS: [POWER_REQUEST_TYPE; 2] = [PowerRequestSystemRequired, PowerRequestDisplayRequired];
 
     /// Une demande à la fois : la session est unique. Le handle est gardé pour
     /// pouvoir la relâcher et la fermer proprement.
@@ -249,11 +262,18 @@ mod windows {
             if handle.is_null() {
                 return Err("PowerCreateRequest a échoué".into());
             }
-            // SAFETY : handle valide, rendu par PowerCreateRequest.
-            let set = unsafe { PowerSetRequest(handle, PowerRequestSystemRequired) };
-            if set == 0 {
-                unsafe { CloseHandle(handle) };
-                return Err("PowerSetRequest a échoué".into());
+            for (i, &kind) in REQUESTS.iter().enumerate() {
+                // SAFETY : handle valide, rendu par PowerCreateRequest.
+                if unsafe { PowerSetRequest(handle, kind) } == 0 {
+                    // SAFETY : on défait ce qui a été posé, puis on ferme le handle.
+                    unsafe {
+                        for &posee in &REQUESTS[..i] {
+                            PowerClearRequest(handle, posee);
+                        }
+                        CloseHandle(handle);
+                    }
+                    return Err(format!("PowerSetRequest a échoué (demande {kind})"));
+                }
             }
             *self.handle.lock().unwrap() = Some(HandleHolder(handle));
             Ok(handle as usize as u64)
@@ -263,18 +283,19 @@ mod windows {
             if let Some(HandleHolder(handle)) = self.handle.lock().unwrap().take() {
                 // SAFETY : handle tenu par nous, relâché puis fermé une seule fois.
                 unsafe {
-                    PowerClearRequest(handle, PowerRequestSystemRequired);
+                    for &kind in &REQUESTS {
+                        PowerClearRequest(handle, kind);
+                    }
                     CloseHandle(handle);
                 }
             }
         }
 
-        /// `PowerRequestSystemRequired` écarte la veille par inactivité. Sur une
-        /// machine en veille moderne (S0ix), elle n'empêche probablement PAS
-        /// l'entrée en veille à l'extinction de l'écran — non vérifié (banc BV) :
-        /// le journal nomme donc la demande, sans promettre son effet.
+        /// Pas de veille par inactivité, et écran allumé. Le journal nomme les
+        /// demandes, sans promettre leur effet : l'utilisateur peut toujours
+        /// éteindre l'écran ou fermer le capot.
         fn request_kind(&self) -> &'static str {
-            "PowerRequestSystemRequired"
+            "PowerRequestSystemRequired+PowerRequestDisplayRequired"
         }
     }
 }

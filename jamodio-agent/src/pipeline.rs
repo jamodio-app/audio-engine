@@ -2484,9 +2484,9 @@ impl PipelineState {
         bench.log();
         // Lot V — une veille en pleine session est une panne audio (pilote ASIO
         // dégradé au réveil) : on pose une demande de maintien éveillé pour la
-        // durée de la session. C'est une DEMANDE à l'OS, pas une garantie : en
-        // veille moderne (S0ix, Windows), elle n'empêche probablement pas la
-        // mise en veille à l'extinction de l'écran (cf. `keep_awake`).
+        // durée de la session, écran compris sous Windows (son rallumage coûte
+        // un re-init du pilote). C'est une DEMANDE à l'OS, pas une garantie : un
+        // écran éteint à la main passe outre (cf. `keep_awake`).
         self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
             "Jamodio — session en cours",
         ));
