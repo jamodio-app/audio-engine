@@ -1803,14 +1803,14 @@ impl PipelineState {
         if output_changed && self.playback_stream.is_some() {
             // Un nouveau choix de sortie remplace une sortie perdue : plus rien à attendre.
             self.device_loss.forget_output();
-            self.restart_playback();
+            let _ = self.restart_playback();
         }
     }
 
     /// Sprint 3.1 — Recrée le CPAL output stream avec le device courant.
     /// Le mixer est conservé (Arc partagé), aucun audio en cours n'est perdu :
     /// le ring buffer continue d'accumuler côté décodeur pendant la transition.
-    fn restart_playback(&mut self) {
+    fn restart_playback(&mut self) -> PlaybackReopen {
         // ASIO mono-client : sur Windows, impossible d'ouvrir un 2e stream sur
         // le driver tant que l'ancien le tient → on FERME l'ancien (sur le
         // thread COM-STA) AVANT d'ouvrir le nouveau. Le ring buffer décodeur
@@ -1830,16 +1830,56 @@ impl PipelineState {
                 self.output_hw = crate::audio::declared_latency::output(&name);
                 tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
                 self.output_device_name = Some(name);
+                PlaybackReopen::Chosen
             }
+            // Sortie choisie absente : le son passe par la sortie du système au
+            // lieu de se taire, et on le dit (D5c) — le superviseur y ramènera le
+            // son quand elle reviendra. Même règle qu'à l'ouverture et qu'à la
+            // reconstruction ; seul « aucune sortie du tout » laisse muet.
             OutputOpen::NotFound => {
-                tracing::warn!(
-                    target: "jamodio::pipeline",
-                    requested = ?self.output_device_id,
-                    "output device introuvable — playback désactivé jusqu'à nouvelle sélection"
-                );
-                self.output_buffer_samples = None;
-                self.output_hw = None;
-                self.output_device_name = None;
+                let requested = self.output_device_id.clone();
+                // Hors ASIO seulement : sous ASIO, entrée et sortie sont la même
+                // interface (mono-client) — pas de « sortie du système » à part.
+                let fallback = requested
+                    .as_ref()
+                    .filter(|_| !Self::host_is_asio())
+                    .and_then(|_| crate::audio::com_exec::run(crate::audio::device::default_output_id));
+                let reopened = fallback.map(|id| {
+                    open_output_on_com(
+                        Some(id),
+                        self.mixer.clone(),
+                        self.perfstats.output_callbacks.clone(),
+                        self.perfstats.output_frames.clone(),
+                        self.output_pair_start.clone(),
+                    )
+                });
+                match (requested, reopened) {
+                    (Some(requested), Some(OutputOpen::Opened { stream, buffer, name, .. })) => {
+                        tracing::warn!(
+                            target: "jamodio::pipeline",
+                            requested = %requested,
+                            device = %name,
+                            "sortie choisie introuvable — son sur la sortie du système en attendant son retour"
+                        );
+                        self.playback_stream = Some(stream);
+                        self.output_buffer_samples = buffer;
+                        self.output_hw = crate::audio::declared_latency::output(&name);
+                        self.device_loss.output_fell_back(&requested, &name);
+                        self.output_device_name = Some(name);
+                        PlaybackReopen::FellBack
+                    }
+                    _ => {
+                        tracing::warn!(
+                            target: "jamodio::pipeline",
+                            requested = ?self.output_device_id,
+                            "output device introuvable et aucune sortie de repli — playback désactivé jusqu'à nouvelle sélection"
+                        );
+                        self.output_buffer_samples = None;
+                        self.output_hw = None;
+                        self.output_device_name = None;
+                        PlaybackReopen::Silent
+                    }
+                }
             }
             OutputOpen::BuildFailed(e) => {
                 tracing::error!(
@@ -1850,6 +1890,7 @@ impl PipelineState {
                 self.output_buffer_samples = None;
                 self.output_hw = None;
                 self.output_device_name = None;
+                PlaybackReopen::Silent
             }
             // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
             // duplex de start_capture).
@@ -1885,7 +1926,7 @@ impl PipelineState {
         if !self.output_follows_os_default() {
             return;
         }
-        self.restart_playback();
+        let _ = self.restart_playback();
     }
 
     /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
@@ -2262,6 +2303,14 @@ impl PipelineState {
                 sample_rx: sample_rx.clone(),
                 parked_since: None,
             });
+        }
+
+        // Sortie choisie absente à l'ouverture : le son part par la sortie du
+        // système, et on attend son retour comme après une perte en session.
+        if output_fallback {
+            if let Some(requested) = self.output_device_id.clone() {
+                self.device_loss.output_fell_back_at_open(&requested, &output_name);
+            }
         }
 
         Ok(AcquiredAudio {
@@ -3148,8 +3197,9 @@ impl PipelineState {
 
     /// D5c — la sortie choisie est de nouveau présente : on y revient.
     pub fn return_to_chosen_output(&mut self) {
-        self.restart_playback();
-        if self.playback_stream.is_some() {
+        // Revenue seulement si c'est ELLE qui s'est rouverte : un repli (elle a
+        // redisparu entre le sondage et la réouverture) n'est pas un retour.
+        if self.restart_playback() == PlaybackReopen::Chosen {
             self.device_loss.output_back();
         }
     }
@@ -5171,6 +5221,17 @@ fn next_wait(
             jamodio_audio_core::mixer::conceal::sleep_until_deadline_ms(ms) / 1000.0,
         ),
     }
+}
+
+/// Ce qu'une réouverture de la sortie a donné (cf. `restart_playback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackReopen {
+    /// La sortie choisie joue.
+    Chosen,
+    /// Elle manque : le son passe par la sortie du système.
+    FellBack,
+    /// Aucune sortie n'a pu s'ouvrir.
+    Silent,
 }
 
 /// Durée que le callback de SORTIE consomme d'un seul tirage. C'est le vrai

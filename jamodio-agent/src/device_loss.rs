@@ -95,6 +95,15 @@ impl DeviceLoss {
         });
     }
 
+    /// La sortie choisie manquait DÉJÀ à l'ouverture de la carte son : le son est
+    /// parti par `fallback`. Retenu comme une perte en session — c'est ce qui
+    /// ramène le son sur la sortie choisie quand elle revient (22/09/2026 : la
+    /// Scarlett rebranchée restait ignorée) — mais sans événement : le navigateur
+    /// l'a déjà appris par `capture-started` (`outputFallback`).
+    pub fn output_fell_back_at_open(&mut self, device: &str, fallback: &str) {
+        self.output = Some((device.to_string(), fallback.to_string()));
+    }
+
     /// La sortie choisie est rouverte : si elle était perdue, elle est revenue.
     pub fn output_back(&mut self) {
         if let Some((device, _)) = self.output.take() {
@@ -336,5 +345,20 @@ mod tests {
         let step = lost_input_step(Some(REBUILD_CONFIRM_WINDOW), false, true);
         assert_eq!(step, LostInputStep::ProbeAndRebuild);
     }
-}
 
+    /// 22/09/2026 — sortie choisie absente dès l'ouverture : on attend son retour
+    /// comme après une perte en session, sans prévenir deux fois le navigateur.
+    #[test]
+    fn un_repli_a_l_ouverture_attend_le_retour_sans_evenement() {
+        let mut d = DeviceLoss::default();
+        d.output_fell_back_at_open("0:Scarlett Solo 4th Gen", "2:Haut-parleurs MacBook Pro");
+        assert_eq!(d.lost_output(), Some("0:Scarlett Solo 4th Gen"));
+        assert!(d.take_events().is_empty(), "capture-started l'a déjà dit");
+        d.output_back();
+        assert_eq!(
+            d.take_events(),
+            vec![DeviceEvent::OutputRestored { device: "0:Scarlett Solo 4th Gen".into() }]
+        );
+        assert_eq!(d.lost_output(), None);
+    }
+}
