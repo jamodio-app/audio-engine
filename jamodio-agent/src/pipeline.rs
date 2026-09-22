@@ -1602,6 +1602,10 @@ impl PipelineState {
         std::thread::Builder::new()
             .name("plugin-scan".into())
             .spawn(move || {
+                // Un scan qui panique ne doit pas laisser la liste « en cours »
+                // pour toujours : `begin_scan` refuserait alors tout nouvel
+                // inventaire jusqu'au redémarrage de l'agent (revue du 22/09/2026).
+                let _unstick = ScanStuckGuard(cache.clone());
                 let t0 = std::time::Instant::now();
                 tracing::info!(target: "jamodio::plugin", kind, forced, "plugin scan starting (out-of-process)");
                 let scan = if forced {
@@ -1817,84 +1821,78 @@ impl PipelineState {
         // côté mixer couvre le court gap (changement de sortie = action rare).
         // Résolution + ouverture atomiques sur le thread COM-STA (cf. com_exec).
         close_stream_on_com(self.playback_stream.take());
-        match open_output_on_com(
+        let opened = open_output_on_com(
             self.output_device_id.clone(),
             self.mixer.clone(),
             self.perfstats.output_callbacks.clone(),
             self.perfstats.output_frames.clone(),
             self.output_pair_start.clone(),
-        ) {
+        );
+        let why = match opened {
             OutputOpen::Opened { stream, buffer, name, .. } => {
                 self.playback_stream = Some(stream);
                 self.output_buffer_samples = buffer;
                 self.output_hw = crate::audio::declared_latency::output(&name);
                 tracing::info!(target: "jamodio::pipeline", device = %name, "output device switched");
                 self.output_device_name = Some(name);
-                PlaybackReopen::Chosen
+                return PlaybackReopen::Chosen;
             }
-            // Sortie choisie absente : le son passe par la sortie du système au
-            // lieu de se taire, et on le dit (D5c) — le superviseur y ramènera le
-            // son quand elle reviendra. Même règle qu'à l'ouverture et qu'à la
-            // reconstruction ; seul « aucune sortie du tout » laisse muet.
-            OutputOpen::NotFound => {
-                let requested = self.output_device_id.clone();
-                // Hors ASIO seulement : sous ASIO, entrée et sortie sont la même
-                // interface (mono-client) — pas de « sortie du système » à part.
-                let fallback = requested
-                    .as_ref()
-                    .filter(|_| !Self::host_is_asio())
-                    .and_then(|_| crate::audio::com_exec::run(crate::audio::device::default_output_id));
-                let reopened = fallback.map(|id| {
-                    open_output_on_com(
-                        Some(id),
-                        self.mixer.clone(),
-                        self.perfstats.output_callbacks.clone(),
-                        self.perfstats.output_frames.clone(),
-                        self.output_pair_start.clone(),
-                    )
-                });
-                match (requested, reopened) {
-                    (Some(requested), Some(OutputOpen::Opened { stream, buffer, name, .. })) => {
-                        tracing::warn!(
-                            target: "jamodio::pipeline",
-                            requested = %requested,
-                            device = %name,
-                            "sortie choisie introuvable — son sur la sortie du système en attendant son retour"
-                        );
-                        self.playback_stream = Some(stream);
-                        self.output_buffer_samples = buffer;
-                        self.output_hw = crate::audio::declared_latency::output(&name);
-                        self.device_loss.output_fell_back(&requested, &name);
-                        self.output_device_name = Some(name);
-                        PlaybackReopen::FellBack
-                    }
-                    _ => {
-                        tracing::warn!(
-                            target: "jamodio::pipeline",
-                            requested = ?self.output_device_id,
-                            "output device introuvable et aucune sortie de repli — playback désactivé jusqu'à nouvelle sélection"
-                        );
-                        self.output_buffer_samples = None;
-                        self.output_hw = None;
-                        self.output_device_name = None;
-                        PlaybackReopen::Silent
-                    }
-                }
+            OutputOpen::NotFound => "introuvable".to_string(),
+            // Présente mais qui refuse de s'ouvrir (ex. interface rebranchée que
+            // CoreAudio n'a pas encore fini de monter) : même traitement qu'une
+            // absence — sinon le retour sur elle coupait un repli qui marchait.
+            OutputOpen::BuildFailed(e) => format!("ouverture refusée : {e}"),
+            // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
+            // duplex de start_capture).
+            OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
+        };
+        // Sortie choisie injouable : le son passe par la sortie du système au lieu
+        // de se taire, et on le dit (D5c) — le superviseur y ramènera le son quand
+        // elle sera là. Même règle qu'à l'ouverture et qu'à la reconstruction ;
+        // seul « aucune sortie du tout » laisse muet. Hors ASIO seulement : sous
+        // ASIO, entrée et sortie sont la même interface (mono-client).
+        let requested = self.output_device_id.clone();
+        let reopened = requested
+            .as_ref()
+            .filter(|_| !Self::host_is_asio())
+            .and_then(|_| crate::audio::com_exec::run(crate::audio::device::default_output_id))
+            .map(|id| {
+                open_output_on_com(
+                    Some(id),
+                    self.mixer.clone(),
+                    self.perfstats.output_callbacks.clone(),
+                    self.perfstats.output_frames.clone(),
+                    self.output_pair_start.clone(),
+                )
+            });
+        match (requested, reopened) {
+            (Some(requested), Some(OutputOpen::Opened { stream, buffer, name, .. })) => {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    requested = %requested,
+                    cause = %why,
+                    device = %name,
+                    "sortie choisie injouable — son sur la sortie du système en attendant son retour"
+                );
+                self.playback_stream = Some(stream);
+                self.output_buffer_samples = buffer;
+                self.output_hw = crate::audio::declared_latency::output(&name);
+                self.device_loss.output_fell_back(&requested, &name);
+                self.output_device_name = Some(name);
+                PlaybackReopen::FellBack
             }
-            OutputOpen::BuildFailed(e) => {
+            _ => {
                 tracing::error!(
                     target: "jamodio::pipeline",
-                    error = %e,
-                    "restart_playback échoué — playback désactivé jusqu'à nouvelle sélection"
+                    requested = ?self.output_device_id,
+                    cause = %why,
+                    "sortie injouable et aucune sortie de repli — playback désactivé jusqu'à nouvelle sélection"
                 );
                 self.output_buffer_samples = None;
                 self.output_hw = None;
                 self.output_device_name = None;
                 PlaybackReopen::Silent
             }
-            // `open_output_on_com` ne renvoie jamais Skipped (réservé au passage
-            // duplex de start_capture).
-            OutputOpen::Skipped => unreachable!("open_output_on_com ne renvoie pas Skipped"),
         }
     }
 
@@ -5223,6 +5221,23 @@ fn next_wait(
     }
 }
 
+/// Garde du thread de scan : s'il se termine (panique comprise) en laissant la
+/// liste en `Scanning`, elle repasse en `Ready` vide — dit dans le journal — et
+/// « Tout rescanner » redevient possible.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+struct ScanStuckGuard(Arc<Mutex<PluginScanCache>>);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl Drop for ScanStuckGuard {
+    fn drop(&mut self) {
+        let mut cache = self.0.lock();
+        if matches!(*cache, PluginScanCache::Scanning) {
+            tracing::error!(target: "jamodio::plugin", "scan interrompu sans résultat — liste remise à vide, un nouvel inventaire est possible");
+            *cache = PluginScanCache::Ready(ScanResult::default());
+        }
+    }
+}
+
 /// Ce qu'une réouverture de la sortie a donné (cf. `restart_playback`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybackReopen {
@@ -7185,5 +7200,14 @@ mod plugin_scan_guard_tests {
             "la liste répond « en cours » pendant l'inventaire"
         );
         assert!(!pl.begin_scan(), "un second clic n'en lance pas un autre");
+    }
+
+    /// Un scan qui s'arrête sans résultat (panique) ne bloque pas les suivants.
+    #[test]
+    fn un_scan_interrompu_ne_laisse_pas_la_liste_en_cours() {
+        let pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        assert!(matches!(*pl.plugin_scan_cache.lock(), PluginScanCache::Scanning));
+        drop(super::ScanStuckGuard(pl.plugin_scan_cache.clone()));
+        assert!(pl.begin_scan(), "un nouvel inventaire redevient possible");
     }
 }

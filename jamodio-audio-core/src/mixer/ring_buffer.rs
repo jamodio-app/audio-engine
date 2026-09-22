@@ -659,8 +659,12 @@ impl JitterBuffer {
 
     /// `false` pendant le ré-amorçage qui suit un trou : la sortie ne tire plus
     /// rien de ce tampon tant qu'il n'est pas remonté à sa cible (cf. `pull`).
+    /// Remonté à la cible, il est EN LECTURE dès maintenant, même si `primed` ne
+    /// basculera qu'au prochain tirage : sinon une échéance tombée entre les deux
+    /// (jusqu'à un bloc de sortie, 10,7 ms sur Mac) serait prise pour un
+    /// ré-amorçage et désarmée (revue du 22/09/2026).
     pub fn is_playing(&self) -> bool {
-        self.primed
+        self.primed || self.consumer.occupied_len() >= self.target_samples
     }
 
     pub fn target_ms(&self) -> usize {
@@ -878,6 +882,17 @@ impl JitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Revue du 22/09/2026 — remonté à sa cible, le tampon est « en lecture »
+    /// dès maintenant, sans attendre que le prochain tirage bascule `primed`.
+    #[test]
+    fn un_tampon_remonte_a_sa_cible_est_en_lecture_avant_le_tirage() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        assert!(!jb.is_playing(), "vide : ré-amorçage");
+        jb.push(&vec![0.0_f32; 480 * 2]); // 10 ms stéréo : la cible
+        assert!(jb.is_playing());
+    }
 
     // ══ Lot 0 du chantier tampon — les mesures qui décideront du Lot 2 ══
     //
