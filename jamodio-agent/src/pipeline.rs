@@ -2852,7 +2852,7 @@ impl PipelineState {
 
     /// 0.5.4-18 — réinitialise le JitterBuffer de découplage du self-monitor après
     /// une discontinuité d'horloge de capture (re-init long-settle du driver ASIO :
-    /// cold-start ou réveil de veille PC, cf. `audio_liveness_supervisor`). Le volume
+    /// cold-start ou réveil du PC ou de l'écran, cf. `audio_liveness_supervisor`). Le volume
     /// est préservé ; seul le tampon de gigue repart propre — sinon son drift, mal
     /// ré-estimé à cheval sur le trou de ~6 s, produit une distorsion persistante
     /// dans le casque.

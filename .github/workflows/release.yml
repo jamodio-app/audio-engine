@@ -196,6 +196,31 @@ jobs:
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
+      # Symboles de débogage Windows (.pdb) : la table adresse → nom de fonction.
+      # Sans elle, une trace ETW ou un crash ne montre que « jamodio-agent.exe+0x… »
+      # (diagnostic des gels du 22/09/2026 : threads de l'agent impossibles à
+      # nommer). Jamais installé chez l'utilisateur ; joint à la release, dont le
+      # code source est déjà public. Absent = ÉCHEC : une release sans ses
+      # symboles ne se découvre pas le jour où on en a besoin.
+      - name: Archive Windows debug symbols (.pdb)
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pdb = "target/${{ matrix.target }}/release/jamodio_agent.pdb"
+          if (-not (Test-Path $pdb)) {
+            Get-ChildItem "target/${{ matrix.target }}/release" -Filter *.pdb | Format-Table Name
+            throw "symboles introuvables : $pdb"
+          }
+          $out = "Jamodio-Audio-Engine-Windows-symbols-$env:TAG.zip"
+          Compress-Archive -Path $pdb -DestinationPath $out -Force
+          gh release upload $env:TAG $out --clobber -R $env:REPO
+          if ($LASTEXITCODE -ne 0) { throw "envoi des symboles échoué ($LASTEXITCODE)" }
+
   publish:
     needs: build
     runs-on: ubuntu-latest

@@ -2224,7 +2224,7 @@ async fn audio_liveness_supervisor(
     // Windows (le signal n'est jamais déclenché). Idempotent.
     let resume_signal = crate::audio::power_events::register();
     let resume_notify = resume_signal.notify_handle();
-    let mut last_resume_seen = resume_signal.resume_count();
+    let mut last_resume_seen = resume_signal.counts();
 
     let mut interval = tokio::time::interval(Duration::from_millis(TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2390,7 +2390,7 @@ async fn audio_liveness_supervisor(
             last_reset_seen = reset_signal.request_count();
             // Un réveil survenu hors session est sans objet (le prochain start
             // rouvrira à froid) → on le consomme pour ne pas réparer à vide.
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             // Une demande de backoff arrivée hors session est caduque : le
             // prochain start rouvrira déjà à la cible courante. On la purge pour
             // éviter un rebuild parasite au démarrage suivant.
@@ -2531,7 +2531,7 @@ async fn audio_liveness_supervisor(
             );
             let _ = repair_audio_streams(&pipeline).await;
             last_reset_seen = reset_signal.request_count();
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
             last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
@@ -2551,13 +2551,13 @@ async fn audio_liveness_supervisor(
         // JitterBuffer self-monitor (le trou d'horloge fausserait sinon son drift →
         // distorsion persistante au casque) → démute. Délai réglable via
         // `JAMODIO_RESUME_SETTLE_MS` (défaut 6000). Windows/ASIO uniquement.
-        let resumed = resume_signal.resume_count() != last_resume_seen;
-        if resumed {
+        if let Some(cause) = resume_signal.counts().cause_since(last_resume_seen) {
             let settle = crate::pipeline::resume_reinit_settle().as_millis() as u64;
             tracing::info!(
                 target: "jamodio::ws",
+                cause,
                 settle_ms = settle,
-                "réveil de veille PC : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
+                "réveil : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
             );
             {
                 let mut pl = pipeline.lock().await;
@@ -2575,18 +2575,18 @@ async fn audio_liveness_supervisor(
             match res {
                 Ok(()) => tracing::info!(
                     target: "jamodio::ws",
-                    "réveil de veille PC : streams reconstruits"
+                    "réveil : streams reconstruits"
                 ),
                 // Échec (mono-client pas encore relâché ?) : le filet de liveness
                 // ci-dessous (streams tombés → flatline) relancera avec backoff.
                 Err(e) => tracing::warn!(
                     target: "jamodio::ws",
                     error = %e,
-                    "réveil de veille PC : reconstruction échouée (le filet de liveness relancera)"
+                    "réveil : reconstruction échouée (le filet de liveness relancera)"
                 ),
             }
             last_reset_seen = reset_signal.request_count();
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
             last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
@@ -2736,7 +2736,7 @@ async fn audio_liveness_supervisor(
 
         // Réparation requise si : le driver l'a demandé, OU les streams sont tombés
         // (rebuild précédent échoué), OU flatline confirmé. (Le cold-start et le
-        // réveil de veille PC sont déjà traités plus haut par le re-init long-settle.)
+        // réveil (PC ou écran) sont déjà traités plus haut par le re-init long-settle.)
         let flatline = !advancing && last_progress.elapsed().as_millis() >= FLATLINE_MS;
         if !(reset_requested || !has_stream || flatline) {
             continue;
@@ -2787,7 +2787,7 @@ async fn audio_liveness_supervisor(
         // Consomme la demande de reset/réveil traitée + fenêtre de grâce (les
         // callbacks recréés mettent quelques ms à démarrer) + re-baseline compteurs.
         last_reset_seen = reset_signal.request_count();
-        last_resume_seen = resume_signal.resume_count();
+        last_resume_seen = resume_signal.counts();
         last_progress = Instant::now();
         {
             let pl = pipeline.lock().await;
