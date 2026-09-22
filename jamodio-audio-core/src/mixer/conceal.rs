@@ -49,6 +49,11 @@ pub enum Wait {
     /// Le tampon tient jusqu'au prochain tirage de la sortie : la place du
     /// paquet est encore libre, on la lui laisse.
     BufferHolds,
+    /// Le tampon se ré-amorce après un trou : la sortie n'y puise rien tant
+    /// qu'il n'est pas remonté à sa cible. Une trame inventée n'y serait pas
+    /// jouée plus tôt — elle prendrait seulement la place du vrai paquet, qui
+    /// arrive ensuite et serait écarté. L'arrivée suivante réarme l'échéance.
+    Repriming,
 }
 
 /// Ce que le thread de décodage doit faire à l'échéance.
@@ -70,11 +75,19 @@ const GRACE_MIN_MS: f64 = 1.0;
 const GRACE_MAX_MS: f64 = 10.0;
 
 /// Imprécision du réveil du thread de décodage, à couvrir en plus du bloc de
-/// sortie. Mesurée par la sonde 1.2a sur le PC (thread promu MMCSS) : 396 µs
-/// médians, 810 µs au p99, 1,06 ms au pire. On retient 0,5 ms — au-dessus du
-/// cas courant, sous le p99 : les rares réveils plus tardifs sont rattrapés au
-/// suivant, alors qu'un seuil calé sur le pire cas ferait inventer trop tôt en
-/// permanence.
+/// sortie. CONSTANTE DE CALIBRATION, pas encore établie par la mesure :
+///
+/// - la sonde du 19/09/2026 (396 µs médians, 1,06 ms au pire) mesurait
+///   `thread::sleep`, minuterie haute résolution — PAS l'attente réelle de ce
+///   thread (`recv_timeout`) ;
+/// - `recv_timeout` sous Windows, minuterie fine posée (`timer_precision`),
+///   mesuré hors agent le 22/09/2026 : ~0,85 ms de dépassement médian, 3,3 ms
+///   au pire. 0,5 ms est donc sous le retard typique d'un réveil Windows.
+///
+/// On ne la relève pas à l'aveugle : une marge plus grande fait inventer plus
+/// tôt, donc plus souvent pour rien. La trancher demande de savoir si les trous
+/// rendus viennent de réveils tardifs — ce que les compteurs actuels ne
+/// distinguent pas (chantier tampon, après la 0.6.5).
 const WAKE_SLACK_MS: f64 = 0.5;
 
 /// Décision à l'échéance d'une trame.
@@ -141,7 +154,8 @@ pub fn decide(
     //
     // `FRAME_MS` ne reste que comme repli quand la taille du bloc n'a pas été
     // mesurée : on ne devine pas un seuil plus court que ce qu'on sait.
-    if fill_ms >= survival_ms(output_block_ms) {
+    // Remplissage non fini : même règle qu'en tête, on attend.
+    if !fill_ms.is_finite() || fill_ms >= survival_ms(output_block_ms) {
         return Conceal::Wait(Wait::BufferHolds);
     }
     if consecutive >= MAX_CONSECUTIVE {
@@ -203,7 +217,7 @@ pub fn recheck_in_ms(
     jitter_tail_ms: Option<f64>,
 ) -> Option<f64> {
     let ms = match why {
-        Wait::NotDue => return None,
+        Wait::NotDue | Wait::Repriming => return None,
         Wait::LinkUnknown => FRAME_MS,
         Wait::WithinGrace => match jitter_tail_ms {
             Some(tail) if tail.is_finite() => grace_ms(tail) - late_by_ms,
@@ -219,11 +233,10 @@ pub fn recheck_in_ms(
 /// Combien de temps dormir avant la prochaine échéance, bornée pour que la
 /// boucle se réveille même quand aucun flux n'attend rien.
 ///
-/// Le réveil a été mesuré sur le PC de recette (Windows, thread promu comme
-/// celui-ci) : dépassement médian 396 µs, p99 810 µs, pire cas 1,06 ms sur 800
-/// mesures — soit une marge confortable sur une trame de 2,5 ms. C'est ce qui a
-/// permis de garder l'attente simple et d'écarter une minuterie haute résolution
-/// (banc de réveil du 19/09/2026).
+/// Précision du réveil : sous Windows, elle dépend de la minuterie du processus
+/// (15,6 ms par défaut, ~1 ms pendant une session — cf. `timer_precision`) ; sur
+/// macOS elle est sub-milliseconde. Voir `WAKE_SLACK_MS` pour ce qui reste à
+/// mesurer.
 pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
     const MAX_SLEEP_MS: f64 = 5.0;
     /// Plancher de sommeil. Une échéance déjà dépassée rendait `0`, ce qui
@@ -260,12 +273,8 @@ pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
 ///
 /// Une mesure non finie ne prouve rien : on ne compte pas un prématuré qu'on
 /// n'a pas établi.
-pub fn was_premature(fill_ms_at_conceal: f64, arrival_delay_ms: f64) -> bool {
-    premature_margin_ms(fill_ms_at_conceal, arrival_delay_ms).is_some()
-}
-
-/// DE COMBIEN le masquage était-il prématuré ? `None` s'il ne l'était pas.
 ///
+/// Rendu : DE COMBIEN le masquage était prématuré, `None` s'il ne l'était pas.
 /// C'est la marge qu'on n'a pas su attendre : le tampon tenait encore
 /// `fill_ms_at_conceal`, le paquet est arrivé au bout de `arrival_delay_ms`, il
 /// restait donc cette différence de rab. Savoir COMBIEN décide du réglage :
@@ -295,10 +304,10 @@ mod tests {
     fn un_paquet_qui_arrive_avant_que_le_tampon_se_vide_prouve_un_masquage_de_trop() {
         // Le tampon tenait encore 4 ms ; le paquet est arrivé 1,5 ms après le
         // masquage. Il aurait été joué à sa place.
-        assert!(was_premature(4.0, 1.5));
+        assert!(premature_margin_ms(4.0, 1.5).is_some());
         // Il arrive après que le tampon se soit vidé : le trou était réel.
-        assert!(!was_premature(4.0, 4.0));
-        assert!(!was_premature(4.0, 9.0));
+        assert!(premature_margin_ms(4.0, 4.0).is_none());
+        assert!(premature_margin_ms(4.0, 9.0).is_none());
     }
 
     #[test]
@@ -317,18 +326,18 @@ mod tests {
     #[test]
     fn un_tampon_vide_ne_produit_jamais_de_premature() {
         // Rien à tenir : aucun délai d'arrivée ne peut être « à temps ».
-        assert!(!was_premature(0.0, 0.0));
-        assert!(!was_premature(0.0, 0.5));
+        assert!(premature_margin_ms(0.0, 0.0).is_none());
+        assert!(premature_margin_ms(0.0, 0.5).is_none());
     }
 
     #[test]
     fn une_mesure_absurde_ne_compte_pas_un_premature() {
         // On ne compte pas ce qu'on n'a pas établi.
-        assert!(!was_premature(f64::NAN, 1.0));
-        assert!(!was_premature(4.0, f64::NAN));
-        assert!(!was_premature(f64::INFINITY, 1.0));
+        assert!(premature_margin_ms(f64::NAN, 1.0).is_none());
+        assert!(premature_margin_ms(4.0, f64::NAN).is_none());
+        assert!(premature_margin_ms(f64::INFINITY, 1.0).is_none());
         // Horloge à l'envers (paquet horodaté avant le masquage) : on s'abstient.
-        assert!(!was_premature(4.0, -1.0));
+        assert!(premature_margin_ms(4.0, -1.0).is_none());
     }
 
     #[test]

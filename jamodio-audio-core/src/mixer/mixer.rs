@@ -418,6 +418,15 @@ pub struct StreamPerfSnapshot {
     pub overflow_ms: f64,
 }
 
+/// État de lecture d'un flux reçu, lu d'un seul coup sous le verrou de sa cellule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Playout {
+    /// Ce qu'il reste à jouer, en millisecondes.
+    pub buffered_ms: f64,
+    /// `false` pendant le ré-amorçage qui suit un trou : la sortie n'y puise pas.
+    pub playing: bool,
+}
+
 /// Mixes N remote audio streams into a single stereo output.
 /// Each stream has its own jitter buffer and volume control.
 ///
@@ -957,20 +966,21 @@ impl AudioMixer {
         }
     }
 
-    /// Ce qu'il reste à jouer dans le tampon de ce flux, en millisecondes.
+    /// Ce qu'il reste à jouer dans le tampon de ce flux, et si la sortie y puise.
     ///
     /// Lu par le thread de décodage à l'échéance d'une trame : un tampon qui tient
-    /// encore n'a besoin d'aucun masquage (cf. `mixer::conceal`). Même discipline
+    /// encore n'a besoin d'aucun masquage, et un tampon en ré-amorçage non plus —
+    /// la sortie n'y lit rien (cf. `mixer::conceal`). Même discipline
     /// de verrous que `push_samples` (C2.1) — verrou lecture de la carte, clone de
     /// l'Arc, verrou COURT de la cellule (une lecture). Sa fréquence est bornée
     /// par le thread de décodage, qui ne réexamine un flux qu'au moment où
     /// l'attente peut changer (`conceal::recheck_in_ms`).
     ///
     /// `None` = flux inconnu (pas encore `add_stream`, ou déjà retiré).
-    pub fn buffered_ms(&self, producer_id: &str) -> Option<f64> {
+    pub fn playout(&self, producer_id: &str) -> Option<Playout> {
         let cell = self.streams.read().get(producer_id).cloned()?;
-        let ms = cell.jitter.lock().buffered_ms();
-        Some(ms)
+        let jb = cell.jitter.lock();
+        Some(Playout { buffered_ms: jb.buffered_ms(), playing: jb.is_playing() })
     }
 
     /// Push decoded samples into a stream's jitter buffer.

@@ -1328,7 +1328,7 @@ pub struct PeerPerf {
     pub concealed_underrun_frames: u64,
     /// Parmi les trames ci-dessus, celles inventées alors que le vrai paquet
     /// allait arriver À TEMPS : le tampon tenait encore assez pour le jouer à sa
-    /// place (cf. `conceal::was_premature`). Chacune est donc du son extrapolé
+    /// place (cf. `conceal::premature_margin_ms`). Chacune est donc du son extrapolé
     /// substitué à de la vraie matière, **et** un paquet légitime écarté.
     ///
     /// Zéro = tous les masquages ont bouché un trou réel. Un chiffre proche de
@@ -1373,6 +1373,10 @@ pub struct PeerPerf {
     pub wait_buffer_holds: u64,
     #[serde(rename = "concealWaitNotDue")]
     pub wait_not_due: u64,
+    /// Échéances tombées pendant le ré-amorçage du tampon après un trou : la
+    /// sortie n'y lisait rien, on n'a rien inventé (agent ≥ 0.6.5).
+    #[serde(rename = "concealWaitRepriming")]
+    pub wait_repriming: u64,
     #[serde(rename = "concealDeadlineDisarmed")]
     pub deadline_disarmed: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le

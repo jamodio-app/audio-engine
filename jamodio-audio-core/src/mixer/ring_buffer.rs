@@ -45,7 +45,7 @@ pub struct JitterBuffer {
     continuous_zero_filled: u64,
     /// Lot 0 (tampon) — remplissage relevé juste avant chaque `push`, en samples
     /// interleaved. Anneau de taille fixe (zéro allocation), lu par la
-    /// télémétrie 1 Hz via `fill_stats()`.
+    /// télémétrie 1 Hz via `fill_snapshot()`.
     fill_obs: [u32; FILL_OBS_LEN],
     /// Nombre d'observations valides dans `fill_obs` (plafonné à sa taille).
     fill_obs_len: usize,
@@ -280,7 +280,12 @@ pub struct FillSnapshot {
 }
 
 impl FillSnapshot {
-    /// `(minimum, médiane)` en ms ; `None` sans observation.
+    /// Lot 0 — remplissage observé aux dernières arrivées : `(minimum, médiane)`
+    /// en ms ; `None` tant qu'aucune arrivée n'a été observée.
+    ///
+    /// Le MINIMUM est la mesure qui décide du Lot 2 : c'est la marge que la
+    /// sortie n'a jamais consommée, donc ce que la cible pourrait rendre sans
+    /// créer un seul accroc de plus.
     pub fn stats(mut self) -> Option<(f64, f64)> {
         if self.len == 0 {
             return None;
@@ -595,7 +600,7 @@ impl JitterBuffer {
             available
         };
 
-        // Chantier C — fondu d'ENTRÉE à la reprise après un trou (mode local) :
+        // Chantier C — fondu d'ENTRÉE à la reprise après un trou :
         // rampe 0→1 sur les premiers samples RÉELS poppés → pas de clic au bord
         // de reprise. On l'applique UNIQUEMENT sur un pull plein (= vraie
         // reprise), jamais sur le pull d'underrun lui-même (dont la tête est
@@ -650,6 +655,12 @@ impl JitterBuffer {
     /// tampon (entrelacement stéréo), qui n'appartient qu'à lui.
     pub fn buffered_ms(&self) -> f64 {
         samples_to_ms_f64(self.consumer.occupied_len() as u64)
+    }
+
+    /// `false` pendant le ré-amorçage qui suit un trou : la sortie ne tire plus
+    /// rien de ce tampon tant qu'il n'est pas remonté à sa cible (cf. `pull`).
+    pub fn is_playing(&self) -> bool {
+        self.primed
     }
 
     pub fn target_ms(&self) -> usize {
@@ -739,16 +750,6 @@ impl JitterBuffer {
     /// ré-amorçage), en ms. Monotone, comme `underruns`.
     pub fn zero_filled_ms(&self) -> f64 {
         samples_to_ms_f64(self.zero_filled_samples)
-    }
-
-    /// Lot 0 — remplissage observé aux dernières arrivées : `(minimum, médiane)`
-    /// en ms. `None` tant qu'aucune arrivée n'a été observée.
-    ///
-    /// Le MINIMUM est la mesure qui décide du Lot 2 : c'est la marge que la
-    /// sortie n'a jamais consommée, donc ce que la cible pourrait rendre sans
-    /// créer un seul accroc de plus.
-    pub fn fill_stats(&self) -> Option<(f64, f64)> {
-        self.fill_snapshot().stats()
     }
 
     /// Copie brute des observations de remplissage, à calculer HORS du verrou :
@@ -926,18 +927,18 @@ mod tests {
     fn fill_stats_report_the_margin_left_before_each_arrival() {
         let mut jb = JitterBuffer::new();
         jb.set_target_ms(10);
-        assert!(jb.fill_stats().is_none(), "aucune arrivée : aucune mesure");
+        assert!(jb.fill_snapshot().stats().is_none(), "aucune arrivée : aucune mesure");
 
         let chunk = 480; // 5 ms
         jb.push(&vec![0.1_f32; chunk]); // relevé : ring vide
-        let (min, _) = jb.fill_stats().expect("une observation");
+        let (min, _) = jb.fill_snapshot().stats().expect("une observation");
         assert!(min.abs() < 1e-9, "la 1re arrivée voit un tampon vide");
 
         // Trois arrivées sans aucune sortie : le remplissage monte, le minimum
         // reste celui du tampon vide.
         jb.push(&vec![0.1_f32; chunk]);
         jb.push(&vec![0.1_f32; chunk]);
-        let (min, p50) = jb.fill_stats().expect("des observations");
+        let (min, p50) = jb.fill_snapshot().stats().expect("des observations");
         assert!(min.abs() < 1e-9, "le minimum garde le creux le plus bas");
         assert!(p50 > min, "la médiane suit le remplissage réel ({p50} ms)");
     }

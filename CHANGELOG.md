@@ -28,7 +28,8 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 - **Première installation sans fenêtres de plugins** : l'Audio Engine compte
   les plugins au démarrage et c'est le studio qui propose de les inventorier.
   Un plugin qui n'a pas répondu retente sa chance ; un cache de plugins
-  illisible est signalé au lieu de vider la liste.
+  illisible est signalé au lieu de vider la liste. Un second clic pendant un
+  inventaire n'en lance plus un deuxième.
 - Un musicien qui rejoint arrive en douceur, sans éclat dans les casques.
 
 ### Ajouté

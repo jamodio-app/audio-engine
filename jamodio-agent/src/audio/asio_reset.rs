@@ -44,8 +44,9 @@ use tokio::sync::Notify;
 // `kAsioResetRequest` n'est pas la seule chose qu'un pilote sait dire. Il peut
 // aussi annoncer qu'il a PERDU des données (`kAsioResyncRequest`), que ses
 // latences ont changé, qu'il a décroché, ou que le sample rate a bougé. Le crate
-// `asio-sys` publié interceptait les trois premiers sans les transmettre et
-// envoyait le quatrième dans un `eprintln!` vers une sortie que personne ne lit :
+// `asio-sys` publié jetait les deux premiers (`TODO: Handle this`), rangeait le
+// décrochage (`kAsioOverload`) dans le fourre-tout « inconnu », et envoyait le
+// changement de sample rate dans un `eprintln!` vers une sortie que personne ne lit :
 // après deux épisodes de son dégradé (18/09/2026), impossible de savoir si le
 // Focusrite avait crié. Notre copie patchée (`vendor/asio-sys`) les compte.
 //
@@ -126,10 +127,12 @@ impl ResetSignal {
 
     /// Signale un `kAsioResetRequest` (incrément atomique + réveil du superviseur).
     /// Appelé par le callback de message qu'`AsioDuplexHost` enregistre sur son
-    /// driver. Sur le thread du driver, le coût est : un incrément atomique, et
-    /// `Notify::notify_one` (quelques opérations atomiques, sans allocation ; il
-    /// peut prendre brièvement le verrou interne de `Notify` si une tâche est en
-    /// attente — rare : un par reset demandé, jamais par bloc audio).
+    /// driver. Notre part, sur le thread du driver : un incrément atomique, et
+    /// `Notify::notify_one` (quelques opérations atomiques ; il peut prendre
+    /// brièvement le verrou interne de `Notify` si une tâche est en attente).
+    /// Avant de nous appeler, `asio-sys` prend son verrou `MESSAGE_CALLBACKS` et
+    /// alloue un `Vec` (comportement d'origine du crate, gardé pour ce seul
+    /// message) : rare — un par reset demandé, jamais par bloc audio.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // appelé uniquement côté ASIO (Windows)
     pub fn signal(&self) {
         self.requests.fetch_add(1, Ordering::Relaxed);
@@ -185,11 +188,11 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn hors_windows_aucun_signal_nest_inventé() {
         // Pas d'ASIO hors Windows : l'instantané doit rester vide, jamais une
         // valeur par défaut qui ressemblerait à une mesure.
-        #[cfg(not(windows))]
         assert!(driver_notices().is_quiet());
     }
 }

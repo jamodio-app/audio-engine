@@ -103,15 +103,15 @@ impl MusicDecoder {
     /// aucune trace (revue du 21/09/2026).
     pub fn decode_loss(&mut self) -> Option<&[f32]> {
         let stereo_len = self.actual_frame * 2;
+        // Erreur gardée typée : formatée seulement si la trace part (aucune
+        // allocation sur le thread de décodage pour un échec non journalisé).
         let decoded = match MutSignals::try_from(&mut self.pcm_buf[..stereo_len])
-            .map_err(|e| format!("{e:?}"))
-            .and_then(|signals| {
-                self.decoder.decode(None, signals, false).map_err(|e| format!("{e:?}"))
-            }) {
+            .and_then(|signals| self.decoder.decode(None, signals, false))
+        {
             Ok(n) => n,
             Err(error) => {
                 if self.log_count.is_multiple_of(500) {
-                    tracing::warn!(target: "jamodio::decoder", %error, "decode_loss (PLC) failed");
+                    tracing::warn!(target: "jamodio::decoder", error = ?error, "decode_loss (PLC) failed");
                 }
                 self.log_count += 1;
                 self.errors += 1;

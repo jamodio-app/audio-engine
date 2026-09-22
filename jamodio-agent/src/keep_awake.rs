@@ -176,6 +176,12 @@ mod macos {
             let kind = cf_string(ASSERTION_TYPE);
             let name = cf_string(reason);
             if kind.is_null() || name.is_null() {
+                // SAFETY : on ne relâche que la chaîne effectivement créée.
+                for s in [kind, name] {
+                    if !s.is_null() {
+                        unsafe { CFRelease(s as *const std::ffi::c_void) };
+                    }
+                }
                 return Err("CFString non créée".into());
             }
             let mut id: u32 = 0;

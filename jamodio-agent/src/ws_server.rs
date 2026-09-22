@@ -1091,6 +1091,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // s'emballe (peak pré-clip ≫ plein-échelle). Exiger PLUSIEURS fenêtres
         // évite un faux positif sur un transitoire fort légitime.
         let mut runaway_windows: u32 = 0;
+        // Première fenêtre après la promotion du client : les compteurs cumulés
+        // depuis le dernier lecteur (débits de callbacks, histogrammes, temps
+        // écoulé) y seraient lus comme UNE seconde. On la lit pour remettre les
+        // compteurs à zéro, sans la publier ni la juger — comme les mètres VU.
+        let mut first_window = true;
         loop {
             interval.tick().await;
             // Même règle que les mètres VU : la lecture est DESTRUCTIVE (swap(0)
@@ -1101,6 +1106,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // détection de surcharge sur demi-fenêtres, lignes « perfstats
             // snapshot » en double dans le journal.
             if !perfstats_armed.load(Ordering::Relaxed) {
+                first_window = true;
                 continue;
             }
             // Relevé système HORS du verrou pipeline (appels système de quelques µs).
@@ -1218,6 +1224,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     recv_errors: st.recv_errors,
                 })
                 .collect();
+
+            if first_window {
+                first_window = false;
+                let _ = pl.perfstats.callback_health.drain();
+                prev_monitor_underruns = monitor_underruns;
+                continue;
+            }
 
             // ── Irrégularités du callback audio (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
@@ -1509,6 +1522,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         wait_within_grace: net.wait_within_grace,
                         wait_buffer_holds: net.wait_buffer_holds,
                         wait_not_due: net.wait_not_due,
+                        wait_repriming: net.wait_repriming,
                         deadline_disarmed: net.deadline_disarmed,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
@@ -3755,7 +3769,11 @@ async fn handle_message(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
-                    pl.spawn_plugin_scan();
+                    if !pl.spawn_plugin_scan() {
+                        // Un inventaire tourne déjà : la réponse dit « en cours », le
+                        // studio repolle, et aucun plugin n'est ouvert deux fois.
+                        tracing::info!(target: "jamodio::plugin", demande = "inventaire", "inventaire déjà en cours — demande ignorée");
+                    }
                 }
                 vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
@@ -3772,7 +3790,11 @@ async fn handle_message(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
-                    pl.spawn_plugin_scan_forced();
+                    if !pl.spawn_plugin_scan_forced() {
+                        // Un inventaire tourne déjà : la réponse dit « en cours », le
+                        // studio repolle, et aucun plugin n'est ouvert deux fois.
+                        tracing::info!(target: "jamodio::plugin", demande = "rescan", "inventaire déjà en cours — demande ignorée");
+                    }
                 }
                 vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
             }

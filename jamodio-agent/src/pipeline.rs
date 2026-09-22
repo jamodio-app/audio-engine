@@ -1011,7 +1011,7 @@ pub struct ProducerNetStats {
     /// Lot 1.2 — masquages déclenchés à l'échéance (paquet en RETARD).
     pub concealed_underrun_frames: u64,
     /// Parmi les précédentes, celles inventées alors que le paquet allait
-    /// arriver à temps (cf. `conceal::was_premature`).
+    /// arriver à temps (cf. `conceal::premature_margin_ms`).
     pub concealed_premature_frames: u64,
     /// Somme et pire des marges gâchées (ms) sur ces trames-là.
     pub concealed_premature_margin_ms: f64,
@@ -1021,6 +1021,7 @@ pub struct ProducerNetStats {
     pub wait_link_unknown: u64,
     pub wait_within_grace: u64,
     pub wait_buffer_holds: u64,
+    pub wait_repriming: u64,
     pub deadline_disarmed: u64,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
@@ -1508,14 +1509,35 @@ impl PipelineState {
         self.input_source.lock().clone()
     }
 
-    /// Lance le scan plugin en background. Appelé une fois après `new()` par
-    /// `main.rs`. Depuis 0.5.9-2 le scan est OUT-OF-PROCESS
-    /// (PLAN-PLUGIN-SCAN-OOP) : un plugin qui crashe à l'instanciation tue un
-    /// worker jetable, pas l'agent → il est blocklisté et le scan continue.
-    /// Le `plugin_host` n'est plus touché ici (il ne sert qu'au load réel).
+    /// « Inventorier » (`ScanNewPlugins`) : scan en arrière-plan des plugins
+    /// jamais vus, le cache servant le reste. Depuis 0.5.9-2 le scan est
+    /// OUT-OF-PROCESS (PLAN-PLUGIN-SCAN-OOP) : un plugin qui crashe à
+    /// l'instanciation tue un worker jetable, pas l'agent → il est blocklisté et
+    /// le scan continue. Le `plugin_host` n'est plus touché ici (il ne sert
+    /// qu'au load réel).
+    ///
+    /// `false` = un inventaire tourne déjà : on n'en lance pas un second (cf.
+    /// `begin_scan`).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn spawn_plugin_scan(&self) {
-        self.spawn_scan_inner(false);
+    pub fn spawn_plugin_scan(&self) -> bool {
+        self.begin_scan() && {
+            self.spawn_scan_inner(false);
+            true
+        }
+    }
+
+    /// Passe la liste en `Scanning` — la liste répond « en cours » et le studio
+    /// repolle — sauf si un inventaire tourne déjà. Deux scans simultanés
+    /// ouvriraient chaque plugin deux fois (fenêtres de licence en double) et se
+    /// disputeraient l'écriture du cache.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn begin_scan(&self) -> bool {
+        let mut cache = self.plugin_scan_cache.lock();
+        if matches!(*cache, PluginScanCache::Scanning) {
+            return false;
+        }
+        *cache = PluginScanCache::Scanning;
+        true
     }
 
     /// Démarrage de l'agent — INVENTAIRE SEUL : on lit le cache, on compte ce
@@ -1563,10 +1585,14 @@ impl PipelineState {
     /// Repasse le cache en `Scanning` (l'UI réaffiche « Scan… » + repolle) puis
     /// relance un scan qui IGNORE le cache disque → les AU blocklistés à tort
     /// retentent leur chance. Cf. `plugin_scan::run_full_scan_forced`.
+    ///
+    /// `false` = un inventaire tourne déjà (cf. `begin_scan`).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn spawn_plugin_scan_forced(&self) {
-        *self.plugin_scan_cache.lock() = PluginScanCache::Scanning;
-        self.spawn_scan_inner(true);
+    pub fn spawn_plugin_scan_forced(&self) -> bool {
+        self.begin_scan() && {
+            self.spawn_scan_inner(true);
+            true
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1602,10 +1628,6 @@ impl PipelineState {
                 });
             })
             .expect("spawn plugin-scan thread");
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    pub fn spawn_plugin_scan(&self) {
-        // No-op : pas d'host plugin Linux pour l'instant.
     }
 
     /// Helpers INSERT — appelés par les handlers WS dans `ws_server.rs`.
@@ -1924,9 +1946,6 @@ impl PipelineState {
         }
         // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
         self.uplink = None;
-        // Lot V — la session est finie : la machine peut se rendormir.
-        self.keep_awake = None;
-        self.timer_resolution = None;
         // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
         // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
         // le thread `voice_encode` termine en cascade (Disconnected). On lâche
@@ -1940,6 +1959,12 @@ impl PipelineState {
         // garde intacte, sinon le pair qui change son entrée perd tous les autres
         // instruments jusqu'au rejoin (bug asymétrique Mac/PC du 21/07).
         if !preserve_peers {
+            // Lot V — la session est finie : la machine peut se rendormir, et la
+            // minuterie fine est rendue. Pas avant : pendant un changement
+            // d'entrée, on continue d'entendre les pairs, et leur masquage
+            // dépend de cette minuterie — y compris si le changement échoue.
+            self.keep_awake = None;
+            self.timer_resolution = None;
             // Vraie fin de session : plus de SFU vers lequel relever le réseau local.
             self.sfu_addr = None;
             // Coupe les réceptions pair + le thread de décodage RT partagé.
@@ -2493,10 +2518,16 @@ impl PipelineState {
         // durée de la session, écran compris sous Windows (son rallumage coûte
         // un re-init du pilote). C'est une DEMANDE à l'OS, pas une garantie : un
         // écran éteint à la main passe outre (cf. `keep_awake`).
-        self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
-            "Jamodio — session en cours",
-        ));
-        self.timer_resolution = Some(crate::timer_precision::SessionTimerResolution::acquire());
+        // Déjà tenues après un changement d'entrée (cf. `teardown_session`) :
+        // on ne les reprend pas.
+        if self.keep_awake.is_none() {
+            self.keep_awake = Some(crate::keep_awake::KeepAwake::for_session(
+                "Jamodio — session en cours",
+            ));
+        }
+        if self.timer_resolution.is_none() {
+            self.timer_resolution = Some(crate::timer_precision::SessionTimerResolution::acquire());
+        }
         self.uplink = if bench.no_rtcp {
             tracing::warn!(
                 target: "jamodio::uplink",
@@ -4965,7 +4996,7 @@ struct DecodeState {
     fade_scratch: Vec<f32>,
     /// Dernier masquage à l'échéance : quand, ce que le tampon tenait encore à
     /// cet instant, et QUELLE place il a prise. Sert à juger APRÈS COUP si le
-    /// vrai paquet serait arrivé à temps (cf. `conceal::was_premature`). `None`
+    /// vrai paquet serait arrivé à temps (cf. `conceal::premature_margin_ms`). `None`
     /// tant qu'on n'a rien inventé depuis la dernière arrivée.
     last_conceal: Option<LastConceal>,
     /// Trames inventées alors que le paquet allait arriver à temps. Un masquage
@@ -4990,6 +5021,9 @@ struct DecodeState {
     wait_link_unknown: u64,
     wait_within_grace: u64,
     wait_buffer_holds: u64,
+    /// Échéances tombées pendant un ré-amorçage du tampon : rien à inventer, on
+    /// désarme jusqu'à l'arrivée suivante (cf. `Wait::Repriming`). Un événement.
+    wait_repriming: u64,
     /// Nombre de fois où l'on a DÉSARMÉ l'échéance — plafond de masquage
     /// atteint, ou flux tari. Un événement, pas un tour de boucle.
     deadline_disarmed: u64,
@@ -5029,11 +5063,14 @@ impl DecodeState {
             wait_link_unknown: 0,
             wait_within_grace: 0,
             wait_buffer_holds: 0,
+            wait_repriming: 0,
             deadline_disarmed: 0,
             next_deadline: None,
             next_check: None,
             consecutive_concealed: 0,
-            fade_scratch: Vec::new(),
+            // Taille d'une trame Opus de 20 ms en stéréo, bien au-delà de nos
+            // trames de 2,5 ms : aucune allocation au premier paquet du flux.
+            fade_scratch: Vec::with_capacity(960 * 2),
             fade_in_remaining: JOIN_FADE_SAMPLES,
             pkt_count: 0,
             logged_large_jump: false,
@@ -5168,18 +5205,34 @@ fn conceal_due_streams(
         let late_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0;
         // Flux inconnu du mixer (retiré entre-temps) : 0 ms, donc la décision se
         // fait comme sur un tampon vide — et le push suivant ne trouvera personne.
-        let fill_ms = mixer.buffered_ms(id).unwrap_or(0.0);
+        let playout = mixer.playout(id);
+        let fill_ms = playout.map_or(0.0, |p| p.buffered_ms);
         // Le pire retard que CE lien produit déjà : en deçà, le paquet est encore
         // en vol. `None` tant que la mesure n'est pas chaude — on n'invente pas
         // sans connaître le réseau.
         let tail = st.jitter.is_warm().then(|| st.jitter.jitter_tail_ms());
-        match decide(late_ms, fill_ms, output_block_ms, tail, st.consecutive_concealed) {
+        // Tampon en ré-amorçage : la sortie n'y lit rien, inventer ne comblerait
+        // aucun trou et écarterait le vrai paquet (cf. `Wait::Repriming`).
+        let decision = if playout.is_some_and(|p| !p.playing) {
+            Conceal::Wait(Wait::Repriming)
+        } else {
+            decide(late_ms, fill_ms, output_block_ms, tail, st.consecutive_concealed)
+        };
+        match decision {
             Conceal::Wait(why) => {
                 match why {
                     Wait::NotDue => st.wait_not_due += 1,
                     Wait::LinkUnknown => st.wait_link_unknown += 1,
                     Wait::WithinGrace => st.wait_within_grace += 1,
                     Wait::BufferHolds => st.wait_buffer_holds += 1,
+                    Wait::Repriming => st.wait_repriming += 1,
+                }
+                // Ré-amorçage : rien à réexaminer avant le prochain paquet, dont
+                // l'arrivée réarme l'échéance.
+                if why == Wait::Repriming {
+                    st.next_deadline = None;
+                    st.next_check = None;
+                    continue;
                 }
                 // ⚠ L'ÉCHÉANCE NE BOUGE PAS. C'est tout le correctif du
                 // 20/09/2026 : on la réarmait à chaque examen, y compris quand
@@ -5240,8 +5293,11 @@ fn conceal_due_streams(
                     // retardataire sera écarté au lieu d'être joué après sa
                     // remplaçante.)
                     st.concealed_underrun_frames += 1;
-                    st.consecutive_concealed += 1;
                 }
+                // Compté même en cas d'échec d'Opus (compté et journalisé par le
+                // décodeur) : un masquage qui échoue en boucle atteint le plafond et
+                // désarme, au lieu de réveiller ce thread toutes les 2,5 ms sans fin.
+                st.consecutive_concealed += 1;
             }
             Conceal::FadeToSilence => {
                 // On cesse d'inventer. Le tampon fond vers le silence tout seul,
@@ -5253,8 +5309,9 @@ fn conceal_due_streams(
                 continue;
             }
         }
-        // On n'arrive ici QU'APRÈS avoir masqué : la place du paquet attendu est
-        // prise, donc la suivante est due une trame plus tard. Si l'échéance
+        // On n'arrive ici qu'après une tentative de masquage : la place du paquet
+        // attendu est prise (ou perdue, si Opus a échoué), donc la suivante est
+        // due une trame plus tard. Si l'échéance
         // recalculée est déjà passée (thread déprogrammé longtemps), on repart de
         // maintenant plutôt que de rattraper le retard en inventant à la chaîne.
         let next = deadline + FRAME;
@@ -5455,6 +5512,9 @@ fn decode_one_packet(
     // trame après SON arrivée (pas après « maintenant » : le paquet a pu
     // patienter dans la file). Et le compteur de trames inventées repart de zéro,
     // puisqu'on a de nouveau de la vraie matière.
+    // Trames déjà inventées à l'échéance pour ce trou : le masquage à l'arrivée
+    // ne peut prendre que ce qui reste du même budget (cf. `Arrival::Next`).
+    let invented_at_deadline = st.consecutive_concealed;
     if matches!(arrival, Arrival::Start | Arrival::Next { .. }) {
         // Le flux a repris sa place : le masquage précédent n'a plus de
         // retardataire à attendre, il n'y a plus rien à juger.
@@ -5489,6 +5549,7 @@ fn decode_one_packet(
             wait_link_unknown: st.wait_link_unknown,
             wait_within_grace: st.wait_within_grace,
             wait_buffer_holds: st.wait_buffer_holds,
+            wait_repriming: st.wait_repriming,
             deadline_disarmed: st.deadline_disarmed,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
@@ -5506,13 +5567,19 @@ fn decode_one_packet(
     match arrival {
         Arrival::Start => {}
         Arrival::Next { missing } => {
-            // Politique de masquage inchangée : un trou court est comblé par au plus
-            // PLC_MAX_FRAMES trames ; un trou plus long n'est pas masqué (le PLC
-            // Opus s'éteint de lui-même, le jitter buffer gère le manque).
+            // Un trou court est comblé par au plus `MAX_CONSECUTIVE` trames (7,5 ms) ;
+            // un trou plus long n'est pas masqué (le PLC Opus s'éteint de lui-même,
+            // le jitter buffer gère le manque).
+            //
+            // Ce budget est PARTAGÉ avec le masquage à l'échéance : un trou déjà
+            // comblé jusqu'au plafond, puis fondu au silence, ne reçoit pas de
+            // trames inventées en plus à l'arrivée — elles se joueraient après le
+            // silence et dépasseraient les 7,5 ms promises.
             const PLC_MAX_GAP: u16 = 10;
-            const PLC_MAX_FRAMES: u16 = 3;
+            let budget = jamodio_audio_core::mixer::conceal::MAX_CONSECUTIVE
+                .saturating_sub(invented_at_deadline);
             if (1..=PLC_MAX_GAP).contains(&missing) {
-                for _ in 0..missing.min(PLC_MAX_FRAMES) {
+                for _ in 0..u32::from(missing).min(budget) {
                     // Poussée immédiate, sans copie : cf. le masquage à l'échéance.
                     if let Some(plc) = st.decoder.decode_loss() {
                         mixer.push_samples(producer_id, plc);
@@ -6324,6 +6391,31 @@ mod conceal_loop_tests {
 
     /// Un flux déjà entendu ET dont on connaît la régularité : les deux
     /// conditions sans lesquelles on n'invente jamais rien.
+    /// Un flux dont la sortie est EN LECTURE, tampon VIDE : le cas où le masquage
+    /// a un sens. Un flux neuf, jamais amorcé, n'en a pas — la sortie n'y lit
+    /// rien (cf. `Wait::Repriming`).
+    fn flux_en_lecture(mixer: &AudioMixer) {
+        const BLOC: usize = 64 * 2;
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        mixer.push_samples("peer-test", &vec![0.0f32; 48_000 / 10 * 2]); // 100 ms
+        let mut bloc = vec![0.0f32; BLOC];
+        let restant = |m: &AudioMixer| {
+            (m.playout("peer-test").unwrap().buffered_ms * 48_000.0 * 2.0 / 1000.0).round() as usize
+        };
+        // Tirages PLEINS seulement : un tirage partiel serait un trou, qui
+        // relancerait le ré-amorçage. On complète le reste à un bloc entier.
+        while restant(mixer) >= BLOC {
+            mixer.mix_into(&mut bloc);
+        }
+        let reste = restant(mixer);
+        if reste > 0 {
+            mixer.push_samples("peer-test", &vec![0.0f32; BLOC - reste]);
+            mixer.mix_into(&mut bloc);
+        }
+        let p = mixer.playout("peer-test").unwrap();
+        assert!(p.playing && p.buffered_ms == 0.0, "{p:?}");
+    }
+
     fn state(now: Instant) -> DecodeState {
         let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
         st.seq.on_packet(1000);
@@ -6423,7 +6515,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_tampon_qui_tient_ne_declenche_aucun_masquage() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // 20 ms de matière dans le tampon : la sortie a de quoi jouer.
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
         let now = Instant::now();
@@ -6475,7 +6567,7 @@ mod conceal_loop_tests {
     /// sans rien d'autre, on masquerait.
     fn banc(now: Instant) -> Banc {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let mut st = state(now);
         st.next_deadline = Some(now - Duration::from_millis(10));
         let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
@@ -6526,7 +6618,7 @@ mod conceal_loop_tests {
         let s = b.states.values().next().unwrap();
         assert_eq!(s.concealed_underrun_frames, 0, "rien d'inventé : le vrai paquet était là");
         assert_eq!(s.seq.counters().late, 0, "et il n'a pas été écarté");
-        assert!(b.mixer.buffered_ms("peer-test").unwrap() > 0.0, "il est dans le tampon");
+        assert!(b.mixer.playout("peer-test").unwrap().buffered_ms > 0.0, "il est dans le tampon");
     }
 
     #[test]
@@ -6567,7 +6659,7 @@ mod conceal_loop_tests {
     #[test]
     fn une_attente_dans_la_grace_ne_revient_qu_a_sa_fin() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = states(now);
         st.values_mut().next().unwrap().next_deadline = Some(now - Duration::from_micros(300));
@@ -6593,7 +6685,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_tampon_garni_laisse_dormir_le_thread() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // Au-delà de la cible du tampon, qui ne joue pas avant d'être amorcé :
         // ce qui compte ici est ce que `buffered_ms` rapporte.
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
@@ -6612,7 +6704,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_paquet_qui_arrive_efface_le_rendez_vous() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = state(now);
         st.next_deadline = Some(now - Duration::from_micros(300));
@@ -6626,7 +6718,7 @@ mod conceal_loop_tests {
     #[test]
     fn tampon_vide_et_echeance_passee_on_invente_une_trame() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
         conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
@@ -6641,7 +6733,7 @@ mod conceal_loop_tests {
     #[test]
     fn sans_connaitre_le_lien_on_ninvente_rien() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
         let mut st = state_lien_inconnu(now);
@@ -6662,7 +6754,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_tampon_sous_le_bloc_de_sortie_declenche_le_masquage() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // 5 ms de matière : deux trames, mais moins que les 10,7 ms que le
         // callback CoreAudio consomme d'un seul tirage.
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 5 * 2]);
@@ -6709,7 +6801,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_masquage_retient_ce_que_le_tampon_tenait() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // 1 ms de matière : moins qu'une trame, donc on masque — mais le tampon
         // n'était pas vide, et c'est cette valeur qu'il faut retenir.
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 2]);
@@ -6729,7 +6821,7 @@ mod conceal_loop_tests {
     #[test]
     fn sans_masquage_il_ny_a_rien_a_juger() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
@@ -6746,7 +6838,7 @@ mod conceal_loop_tests {
     #[test]
     fn on_compte_pourquoi_on_renonce_a_masquer() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
 
         // Tampon confortable : la raison est « le tampon tient ».
@@ -6776,7 +6868,7 @@ mod conceal_loop_tests {
     #[test]
     fn une_echeance_non_armee_ne_compte_aucun_tour_de_boucle() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = states(now);
         st.values_mut().next().unwrap().next_deadline = None;
@@ -6798,7 +6890,7 @@ mod conceal_loop_tests {
     #[test]
     fn renoncer_ne_remet_pas_le_retard_a_zero() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // Tampon confortable : la première décision sera « le tampon tient ».
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 20 * 2]);
         let now = Instant::now();
@@ -6824,7 +6916,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_retard_qui_court_finit_par_declencher_le_masquage() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         // 1 ms de matière : sous le seuil de survie. Seul le retard décidera.
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 2]);
         let now = Instant::now();
@@ -6858,7 +6950,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_flux_tari_desarme_son_echeance() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         mixer.push_samples("peer-test", &vec![0.0f32; 48 * 100 * 2]);
         let now = Instant::now();
         let mut st = states(now);
@@ -6873,7 +6965,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_retard_ordinaire_se_compte_comme_tel() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         // Échéance dépassée de 0,5 ms seulement : sous le délai de grâce.
         let mut st = states(now - Duration::from_micros(500) - FRAME);
@@ -6895,7 +6987,7 @@ mod conceal_loop_tests {
     fn au_plafond_on_cesse_dinventer_et_on_desarme() {
         use jamodio_audio_core::mixer::conceal::MAX_CONSECUTIVE;
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = states(now - Duration::from_millis(10));
         st.values_mut().next().unwrap().consecutive_concealed = MAX_CONSECUTIVE;
@@ -6912,7 +7004,7 @@ mod conceal_loop_tests {
     #[test]
     fn une_trame_inventee_ne_bloque_pas_le_flux_quand_le_son_revient() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = state(now);
         st.consecutive_concealed = 2;
@@ -6921,7 +7013,7 @@ mod conceal_loop_tests {
         recevoir(&mut st, &mixer, 1002, now);
         assert_eq!(st.seq.counters().late, 0, "pris à sa place, pas écarté");
         assert_eq!(st.consecutive_concealed, 0, "de la vraie matière : on repart de zéro");
-        assert!(mixer.buffered_ms("peer-test").unwrap() > 0.0);
+        assert!(mixer.playout("peer-test").unwrap().buffered_ms > 0.0);
     }
 
     /// Seul le retardataire de LA place comblée juge le masquage. Un paquet plus
@@ -6929,7 +7021,7 @@ mod conceal_loop_tests {
     #[test]
     fn seul_le_paquet_remplace_juge_son_masquage() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut st = state(now);
         // Deux masquages d'affilée : places 1001 puis 1002.
@@ -6939,7 +7031,7 @@ mod conceal_loop_tests {
         conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
         // La sortie a joué la trame inventée : tampon de nouveau vide.
         mixer.remove_stream("peer-test");
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let later = now + Duration::from_millis(10);
         conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, later);
         let mut st = m.remove("peer-test").unwrap();
@@ -6957,7 +7049,7 @@ mod conceal_loop_tests {
     #[test]
     fn un_flux_jamais_entendu_nest_jamais_masque() {
         let mixer = Arc::new(AudioMixer::new());
-        mixer.add_stream("peer-test", StreamKind::Instrument);
+        flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
         let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
@@ -6967,5 +7059,70 @@ mod conceal_loop_tests {
         // `on_concealed` ne fait rien avant le premier paquet : rien n'est inventé
         // pour un flux dont on n'a jamais entendu la moindre trame.
         assert_eq!(m.values().next().unwrap().seq.counters().expected, 0);
+    }
+
+    // ─── Revue du 22/09/2026 ──────────────────────────────────────────────
+
+    /// Un tampon en ré-amorçage (ici : jamais amorcé) n'est pas lu par la sortie :
+    /// une trame inventée n'y comblerait aucun trou, et prendrait la place du vrai
+    /// paquet. On n'invente rien, et on attend l'arrivée suivante.
+    #[test]
+    fn un_tampon_en_reamorcage_ne_se_voit_rien_inventer() {
+        let mixer = Arc::new(AudioMixer::new());
+        mixer.add_stream("peer-test", StreamKind::Instrument);
+        let now = Instant::now();
+        let mut st = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut st, &mixer, BLOC_ASIO_MS, now);
+        let s = st.values().next().unwrap();
+        assert_eq!(s.concealed_underrun_frames, 0);
+        assert_eq!(s.wait_repriming, 1);
+        assert!(s.next_deadline.is_none(), "désarmée jusqu'au prochain paquet");
+        assert_eq!(mixer.playout("peer-test").unwrap().buffered_ms, 0.0);
+    }
+
+    /// Le masquage à l'arrivée partage le budget du masquage à l'échéance : un trou
+    /// déjà comblé jusqu'au plafond (puis fondu au silence) ne reçoit pas de trames
+    /// inventées en plus, qui se joueraient après le silence.
+    #[test]
+    fn un_trou_deja_comble_a_l_echeance_ne_recoit_rien_de_plus_a_l_arrivee() {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        let now = Instant::now();
+        // Sans masquage préalable : les deux places manquantes sont comblées.
+        let mut libre = state(now);
+        recevoir(&mut libre, &mixer, 1003, now);
+        assert_eq!(libre.concealed_frames, 2);
+        // Plafond déjà atteint à l'échéance : rien de plus.
+        let mut epuise = state(now);
+        epuise.consecutive_concealed = jamodio_audio_core::mixer::conceal::MAX_CONSECUTIVE;
+        recevoir(&mut epuise, &mixer, 1003, now);
+        assert_eq!(epuise.concealed_frames, 0);
+        // Budget entamé d'une trame : il en reste deux.
+        let mut entame = state(now);
+        entame.consecutive_concealed = 1;
+        recevoir(&mut entame, &mixer, 1005, now); // 4 places manquantes
+        assert_eq!(entame.concealed_frames, 2);
+    }
+}
+
+/// Revue du 22/09/2026 — un seul inventaire de plugins à la fois.
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod plugin_scan_guard_tests {
+    use super::{PipelineState, PluginScanCache, ScanResult};
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    #[test]
+    fn un_second_inventaire_est_refuse_tant_que_le_premier_tourne() {
+        let pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        // Au démarrage, l'inventaire du cache tourne : rien d'autre ne part.
+        assert!(!pl.begin_scan());
+        *pl.plugin_scan_cache.lock() = PluginScanCache::Ready(ScanResult::default());
+        assert!(pl.begin_scan(), "liste prête : l'inventaire part");
+        assert!(
+            matches!(*pl.plugin_scan_cache.lock(), PluginScanCache::Scanning),
+            "la liste répond « en cours » pendant l'inventaire"
+        );
+        assert!(!pl.begin_scan(), "un second clic n'en lance pas un autre");
     }
 }
