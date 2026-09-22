@@ -54,6 +54,9 @@ pub enum CloseCause {
     Exited,
     /// Silence > timeout → le coordinateur a tué le worker.
     TimedOut,
+    /// Tous les items ont reçu leur `end` : le coordinateur arrête le worker
+    /// sans attendre qu'il sorte de lui-même (cf. `Session::is_complete`).
+    Completed,
 }
 
 /// Verdict d'une session close.
@@ -122,22 +125,32 @@ impl Session {
         }
     }
 
-    /// Clôt la session (worker mort ou tué) et rend le verdict.
+    /// Tous les items envoyés sont terminés : le worker n'a plus rien à dire.
+    ///
+    /// Sa sortie n'est pas un signal fiable : un plugin chargé peut bloquer la
+    /// fin du process (destructeurs, threads à lui). Le 22/09/2026 sur Mac, le
+    /// worker a terminé sa liste puis n'est jamais sorti — 30 s de « Scan… »
+    /// de plus, jusqu'au kill pour silence.
+    pub fn is_complete(&self) -> bool {
+        self.pending.is_empty() && self.current.is_none()
+    }
+
+    /// Clôt la session (worker mort, tué, ou arrêté liste finie) et rend le verdict.
     pub fn close(mut self, cause: CloseCause) -> SessionEnd {
-        let blocked = self.current.take().map(|item| {
+        let reason = match cause {
+            CloseCause::Exited => Some(BlockReason::Crash),
+            CloseCause::TimedOut => Some(BlockReason::Timeout),
+            // Liste terminée : personne n'est en cours, donc personne à condamner.
+            CloseCause::Completed => None,
+        };
+        let blocked = reason.and_then(|reason| self.current.take().map(|item| {
             // Le condamné sort des restants — c'est LE mécanisme de
             // progression : chaque crash retire exactement un item.
             if let Some(pos) = self.pending.iter().position(|i| *i == item) {
                 self.pending.remove(pos);
             }
-            BlockedItem {
-                item,
-                reason: match cause {
-                    CloseCause::Exited => BlockReason::Crash,
-                    CloseCause::TimedOut => BlockReason::Timeout,
-                },
-            }
-        });
+            BlockedItem { item, reason }
+        }));
         SessionEnd {
             plugins: self.plugins,
             blocked,
@@ -244,5 +257,22 @@ mod tests {
         let out = s.close(CloseCause::Exited);
         assert_eq!(out.blocked, None);
         assert_eq!(out.remaining, vec!["a".to_string()]);
+    }
+
+    /// 22/09/2026 — liste finie = session finie, même si le worker ne sort pas.
+    #[test]
+    fn une_liste_terminee_est_complete_et_ne_condamne_personne() {
+        let mut s = Session::new(vec!["a".into(), "b".into()]);
+        assert!(!s.is_complete());
+        s.on_event(begin("a"));
+        s.on_event(WorkerEvent::End { item: "a".into() });
+        s.on_event(begin("b"));
+        assert!(!s.is_complete(), "b est en cours");
+        s.on_event(WorkerEvent::End { item: "b".into() });
+        assert!(s.is_complete());
+        let end = s.close(CloseCause::Completed);
+        assert!(end.blocked.is_none());
+        assert!(end.remaining.is_empty());
+        assert!(end.progressed);
     }
 }

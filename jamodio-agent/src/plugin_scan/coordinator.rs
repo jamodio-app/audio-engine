@@ -173,7 +173,16 @@ fn run_session(
     let cause = loop {
         match rx.recv_timeout(item_timeout) {
             Ok(line) => match serde_json::from_str(&line) {
-                Ok(event) => session.on_event(event),
+                Ok(event) => {
+                    session.on_event(event);
+                    // Liste finie : on n'attend pas que le worker sorte de
+                    // lui-même — un plugin chargé peut l'en empêcher, et c'est
+                    // 30 s de « Scan… » pour rien (cf. `Session::is_complete`).
+                    if session.is_complete() {
+                        child.kill();
+                        break CloseCause::Completed;
+                    }
+                }
                 Err(e) => tracing::warn!(
                     target: "jamodio::plugin",
                     error = %e,
