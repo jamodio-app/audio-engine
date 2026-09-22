@@ -120,3 +120,14 @@ jobs:
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: cargo test --workspace --target ${{ matrix.target }}
+
+      # `vendor/asio-sys` (copie patchée) est hors du workspace : `--workspace` ne
+      # lance donc pas ses tests, dont celui qui garde le contrat des patchs
+      # (seules les réponses à `kAsioOverload` changent). Windows seul : c'est là
+      # que l'ASIO se compile.
+      - name: Tests (asio-sys patché)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: cargo test --manifest-path vendor/asio-sys/Cargo.toml --target ${{ matrix.target }}

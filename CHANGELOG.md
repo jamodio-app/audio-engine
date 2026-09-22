@@ -5,6 +5,54 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.5] — 2026-09-22
+
+**Moins de clics, et une session qui tient.**
+
+### Corrigé
+
+- **Un paquet en retard ne fait plus de clic sec.** Le moteur comble le trou
+  (quelques millisecondes, jamais plus de 7,5, avec des fondus aux bords), au
+  bon moment : ni trop tôt, ce qui remplaçait un son qui arrivait, ni trop
+  tard, sur Mac comme sur PC. Aucune latence ajoutée.
+- **Windows : le comblement part à l'heure**, même quand l'Audio Engine tourne
+  en arrière-plan (Windows 11 ralentissait sa minuterie à 15,6 ms).
+- **Windows : une erreur réseau isolée** ne rend plus la réception aveugle
+  pendant 10 ms.
+- **Pas de veille pendant une session** (Mac et Windows) et, sous Windows,
+  **l'écran reste allumé** : son rallumage coûtait ~7 s sans son.
+- **Mac : un micro ou un casque rebranché en session** est repris une fois pour
+  toutes, au lieu d'être rouvert toutes les 3 secondes.
+- **Sortie débranchée ou absente à l'entrée en studio** : le son passe par la
+  sortie du système au lieu de se couper, et revient sur la sortie choisie dès
+  qu'elle est rebranchée.
+- **Windows (ASIO) : la carte son est préparée en une seule fois** à
+  l'ouverture, et les messages du pilote sont lus sans ralentir le son.
+- **Première installation sans fenêtres de plugins** : l'Audio Engine compte
+  les plugins au démarrage et c'est le studio qui propose de les inventorier.
+  Un plugin qui n'a pas répondu retente sa chance ; un cache de plugins
+  illisible est signalé au lieu de vider la liste. Un second clic pendant un
+  inventaire n'en lance plus un deuxième, et l'inventaire se termine dès le
+  dernier plugin lu (jusqu'à 30 s de moins).
+- Un musicien qui rejoint arrive en douceur, sans éclat dans les casques.
+
+### Ajouté
+
+- **Un journal qui sert au support** : les signaux du pilote ASIO, les blocs
+  audio servis en retard, l'état du tampon de réception, la cause d'un réveil
+  (PC ou écran). Une session saine n'y ajoute rien.
+- Symboles de débogage Windows joints à chaque release (jamais installés).
+
+### Bon à savoir
+
+- Des coupures brèves (~15 ms, environ une par heure) sur certains PC Intel
+  venaient de pilotes Intel (graphique ancien, Management Engine), hors
+  Jamodio : mettre à jour le pilote graphique Intel règle le cas.
+
+### Sécurité
+
+- Bibliothèque des tampons audio mise à jour (RUSTSEC-2026-0293).
+
 ## [0.6.4] — 2026-09-18
 
 **La robustesse des périphériques audio.** Tout ce qui se passe quand une interface

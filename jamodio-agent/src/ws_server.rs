@@ -880,6 +880,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 let m = &pl.mixer;
                 (m.take_stream_levels(), m.take_bus_levels())
             };
+            // Ce que le musicien ENTEND, pour le journal 1 Hz (`heard_peak`) : la
+            // même lecture que le VU MASTER, aucune mesure de plus dans le callback.
+            pl.perfstats.heard_peak.fetch_max(
+                bus.master.peak_l.max(bus.master.peak_r).to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // input_rms (instrument self post-plugin) alimente le VU d'entrée
             // browser ; midi_active (Note ON dans les ~200 dernières ms) est conservé
             // par back-compat du protocole. Ces 2 valeurs sont reset entre les
@@ -1022,6 +1028,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     });
 
     let perfstats_pipeline = handle.pipeline.clone();
+    let perfstats_armed = levels_armed.clone();
     let perfstats_tx = out_tx.clone();
     let perfstats_start = Instant::now();
     let perfstats_task = tokio::spawn(async move {
@@ -1033,6 +1040,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // (son dashboard utilise GetStats, pull non-destructif), donc gater
         // sur !is_internal ne change rien à son affichage et garantit un seul
         // flusher pendant les sessions (toujours pilotées par le client externe).
+        // Les connexions externes non promues sont écartées dans la boucle
+        // (`perfstats_armed`), comme pour les mètres VU.
         if is_internal {
             return;
         }
@@ -1082,8 +1091,24 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // s'emballe (peak pré-clip ≫ plein-échelle). Exiger PLUSIEURS fenêtres
         // évite un faux positif sur un transitoire fort légitime.
         let mut runaway_windows: u32 = 0;
+        // Première fenêtre après la promotion du client : les compteurs cumulés
+        // depuis le dernier lecteur (débits de callbacks, histogrammes, temps
+        // écoulé) y seraient lus comme UNE seconde. On la lit pour remettre les
+        // compteurs à zéro, sans la publier ni la juger — comme les mètres VU.
+        let mut first_window = true;
         loop {
             interval.tick().await;
+            // Même règle que les mètres VU : la lecture est DESTRUCTIVE (swap(0)
+            // des atomiques, vidage des histogrammes), donc UN SEUL lecteur — le
+            // client promu. Sans ce garde, tout onglet ou sonde qui gardait son
+            // WS ouvert plus d'une seconde lançait sa propre boucle et volait la
+            // moitié des fenêtres (revue du 21/09/2026) : mesures faussées,
+            // détection de surcharge sur demi-fenêtres, lignes « perfstats
+            // snapshot » en double dans le journal.
+            if !perfstats_armed.load(Ordering::Relaxed) {
+                first_window = true;
+                continue;
+            }
             // Relevé système HORS du verrou pipeline (appels système de quelques µs).
             let machine_sample = machine.sample();
             if net_tick.is_multiple_of(NET_INTERFACE_EVERY_TICKS) {
@@ -1131,6 +1156,15 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let elapsed_secs = tick_now.duration_since(prev_tick).as_secs_f64();
             prev_tick = tick_now;
             let capturing_now = matches!(pl.state, AgentState::Capturing);
+            // Ce que le musicien ENTEND (sortie casque), pic de la seconde.
+            let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
+            // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
+            // callback correspondant n'a pas encore tourné : on publie alors
+            // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
+            let input_block_frames =
+                Some(pl.perfstats.input_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
+            let output_block_frames =
+                Some(pl.perfstats.output_frames.load(Ordering::Relaxed)).filter(|f| *f > 0);
             let callback_deficit_in = capturing_now
                 .then(|| {
                     crate::machine_health::callback_deficit_per_sec(
@@ -1183,10 +1217,22 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let recv_streams: Vec<RecvStreamPerf> = pl
                 .recv_stream_states()
                 .into_iter()
-                .map(|st| RecvStreamPerf { producer_id: st.producer_id, kind: st.kind, silent_ms: st.silent_ms })
+                .map(|st| RecvStreamPerf {
+                    producer_id: st.producer_id,
+                    kind: st.kind,
+                    silent_ms: st.silent_ms,
+                    recv_errors: st.recv_errors,
+                })
                 .collect();
 
-            // ── Diagnostic des CRAQUEMENTS (cf. `audio::callback_health`) ────────
+            if first_window {
+                first_window = false;
+                let _ = pl.perfstats.callback_health.drain();
+                prev_monitor_underruns = monitor_underruns;
+                continue;
+            }
+
+            // ── Irrégularités du callback audio (cf. `audio::callback_health`) ────────
             // Deux causes possibles, désormais chiffrées séparément : blocs servis
             // en RETARD par le driver/l'OS (`late_blocks`) vs blocs dont NOTRE
             // traitement a débordé (`over_budget_blocks`). On draine à chaque
@@ -1208,7 +1254,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         buffer_frames = frames,
                         // Le snapshot perfstats de la MÊME seconde porte déjà
                         // plugin_name / pipeline_p99 / drops : on ne duplique pas.
-                        "CRAQUEMENT : blocs audio en retard et/ou hors budget sur la dernière seconde"
+                        "CALLBACK AUDIO IRRÉGULIER : bloc en retard ou hors budget sur la dernière seconde"
                     );
                 }
             }
@@ -1454,26 +1500,51 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             // les métriques réseau valent 0.0 (cf. drift.rs / jitter.rs).
             let peers: Vec<PeerPerf> = mixer_stats
                 .into_iter()
-                .map(|(producer_id, underruns, drift_drops, target_ms)| {
-                    let net = net_stats_map.get(&producer_id).copied().unwrap_or_default();
+                .map(|s| {
+                    let net = net_stats_map.get(&s.producer_id).copied().unwrap_or_default();
                     PeerPerf {
-                        producer_id,
+                        producer_id: s.producer_id,
                         drift_ppm: net.drift_ppm,
                         jitter_ms: net.jitter_ms,
                         jitter_tail_ms: net.jitter_tail_ms,
-                        buffer_target_ms: target_ms,
-                        underruns,
-                        drift_drops,
+                        buffer_target_ms: s.target_ms,
+                        underruns: s.underruns,
+                        drift_drops: s.drift_drops,
                         packets_expected: net.packets_expected,
                         packets_lost: net.packets_lost,
                         packets_late: net.packets_late,
                         concealed_frames: net.concealed_frames,
+                        concealed_underrun_frames: net.concealed_underrun_frames,
+                        concealed_premature_frames: net.concealed_premature_frames,
+                        concealed_premature_margin_ms: net.concealed_premature_margin_ms,
+                        concealed_premature_margin_max_ms: net.concealed_premature_margin_max_ms,
+                        wait_link_unknown: net.wait_link_unknown,
+                        wait_within_grace: net.wait_within_grace,
+                        wait_buffer_holds: net.wait_buffer_holds,
+                        wait_not_due: net.wait_not_due,
+                        wait_repriming: net.wait_repriming,
+                        deadline_disarmed: net.deadline_disarmed,
+                        target_jitter_ms: s.target_jitter_ms,
+                        target_glitch_ms: s.target_glitch_ms,
+                        target_reactive_ms: s.target_reactive_ms,
+                        fill_min_ms: s.fill_min_ms,
+                        fill_p50_ms: s.fill_p50_ms,
+                        zero_filled_ms: s.zero_filled_ms,
+                        overflow_ms: s.overflow_ms,
+                        packets_duplicate: net.packets_duplicate,
+                        packets_jump: net.packets_jump,
+                        decode_errors: net.decode_errors,
                     }
                 })
                 .collect();
 
             // Phase A — observabilité : log par peer de la gigue mesurée vs la
             // cible courante du buffer (calibration des Phases B/C). 1 Hz, debug.
+            //
+            // Lot 0 du chantier tampon : la ligne porte aussi DE QUOI la cible est
+            // faite et ce que le tampon a vraiment vécu (remplissage réel, silence
+            // rendu). C'est ce que le rapport de bug ramènera du banc : sans ces
+            // champs, on ne saurait pas quelle part de la cible est reprenable.
             for p in &peers {
                 tracing::debug!(
                     target: "jamodio::netstats",
@@ -1482,7 +1553,18 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     jitter_tail_ms = p.jitter_tail_ms,
                     drift_ppm = p.drift_ppm,
                     buffer_target_ms = p.buffer_target_ms,
+                    target_jitter_ms = p.target_jitter_ms,
+                    target_glitch_ms = p.target_glitch_ms,
+                    target_reactive_ms = p.target_reactive_ms,
+                    fill_min_ms = p.fill_min_ms,
+                    fill_p50_ms = p.fill_p50_ms,
+                    zero_filled_ms = p.zero_filled_ms,
+                    overflow_ms = p.overflow_ms,
                     underruns = p.underruns,
+                    packets_late = p.packets_late,
+                    packets_duplicate = p.packets_duplicate,
+                    packets_jump = p.packets_jump,
+                    decode_errors = p.decode_errors,
                     "peer net stats"
                 );
             }
@@ -1538,11 +1620,23 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // active = cold-start muet (watchdog). ≈370/s = sain.
                 capture_cb_per_sec,
                 output_cb_per_sec,
+                // 0.6.5 — la sortie casque (ce qu'on ENTEND) ; `output_peak`
+                // plus bas est ce qu'on ENVOIE.
+                heard_peak,
+                // 0.6.5 — taille de bloc livrée par l'OS (frames/canal).
+                input_block_frames,
+                output_block_frames,
                 peers = peers.len(),
                 output_peak,
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
+                // Compteurs BRUTS de la fenêtre (le pourcentage seul arrondit),
+                // et l'identité de qui écrit : si deux agents tournent, leurs
+                // lignes se distinguent.
+                output_clip_samples = clip_samples,
+                output_total_samples = total_samples,
+                pid = std::process::id(),
                 "perfstats snapshot"
             );
 
@@ -1555,6 +1649,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 output_clip_pct,
                 monitor_buffer_ms,
                 monitor_underruns,
+                input_block_frames,
+                output_block_frames,
                 callback_deficit_in,
                 callback_deficit_out,
                 cpu_pct: machine_sample.cpu_pct,
@@ -2142,7 +2238,7 @@ async fn audio_liveness_supervisor(
     // Windows (le signal n'est jamais déclenché). Idempotent.
     let resume_signal = crate::audio::power_events::register();
     let resume_notify = resume_signal.notify_handle();
-    let mut last_resume_seen = resume_signal.resume_count();
+    let mut last_resume_seen = resume_signal.counts();
 
     let mut interval = tokio::time::interval(Duration::from_millis(TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2153,6 +2249,17 @@ async fn audio_liveness_supervisor(
     let mut prev_out = 0u64;
     let mut last_progress = Instant::now();
     let mut last_reset_seen = reset_signal.request_count();
+    // Lot ASIO (chantier tampon) — le pilote qui demande un reset est un FAIT que
+    // le journal ne disait pas : le callback de messages ne peut rien écrire (thread
+    // du driver, potentiellement temps-réel — il se contente de compter et de
+    // notifier, cf. `audio::asio_reset`), et le superviseur n'en gardait aucune
+    // trace. Après coup, impossible de savoir si le pilote avait crié pendant un
+    // épisode. On journalise donc ICI, hors thread temps-réel, une fois par
+    // demande.
+    let mut last_reset_logged = last_reset_seen;
+    // Idem pour les signaux qui ne déclenchent AUCUNE action : on ne journalise
+    // que sur changement, donc une session saine n'ajoute pas une ligne.
+    let mut last_notices = crate::audio::asio_reset::driver_notices();
     let mut degraded = false;
     // Lot 0 (chantier robustesse ASIO, 17/09/2026) — nombre de reconstructions
     // consécutives qui N'ONT PAS ramené les callbacks. Un pilote ASIO débranché
@@ -2179,6 +2286,9 @@ async fn audio_liveness_supervisor(
     let mut last_default_out: Option<String> = None;
     let mut last_default_check = Instant::now();
     let mut last_lost_device_check = Instant::now();
+    // Entrée perdue rouverte, en attente de la preuve que du son est livré
+    // (cf. `device_loss::lost_input_step`) : l'instant de la réouverture.
+    let mut input_rebuilt_at: Option<Instant> = None;
     // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE DE RATE (déterministe). On
     // déduit le rate RÉEL du driver de son débit de callbacks
     // (`cb_per_sec × frames_livrés_par_callback`) et on le confronte au 48 kHz
@@ -2294,7 +2404,7 @@ async fn audio_liveness_supervisor(
             last_reset_seen = reset_signal.request_count();
             // Un réveil survenu hors session est sans objet (le prochain start
             // rouvrira à froid) → on le consomme pour ne pas réparer à vide.
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             // Une demande de backoff arrivée hors session est caduque : le
             // prochain start rouvrira déjà à la cible courante. On la purge pour
             // éviter un rebuild parasite au démarrage suivant.
@@ -2435,7 +2545,7 @@ async fn audio_liveness_supervisor(
             );
             let _ = repair_audio_streams(&pipeline).await;
             last_reset_seen = reset_signal.request_count();
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
             last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
@@ -2455,13 +2565,13 @@ async fn audio_liveness_supervisor(
         // JitterBuffer self-monitor (le trou d'horloge fausserait sinon son drift →
         // distorsion persistante au casque) → démute. Délai réglable via
         // `JAMODIO_RESUME_SETTLE_MS` (défaut 6000). Windows/ASIO uniquement.
-        let resumed = resume_signal.resume_count() != last_resume_seen;
-        if resumed {
+        if let Some(cause) = resume_signal.counts().cause_since(last_resume_seen) {
             let settle = crate::pipeline::resume_reinit_settle().as_millis() as u64;
             tracing::info!(
                 target: "jamodio::ws",
+                cause,
                 settle_ms = settle,
-                "réveil de veille PC : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
+                "réveil : re-init long-settle du driver ASIO (mute → fermeture → settle → réouverture → reset self-monitor)"
             );
             {
                 let mut pl = pipeline.lock().await;
@@ -2479,18 +2589,18 @@ async fn audio_liveness_supervisor(
             match res {
                 Ok(()) => tracing::info!(
                     target: "jamodio::ws",
-                    "réveil de veille PC : streams reconstruits"
+                    "réveil : streams reconstruits"
                 ),
                 // Échec (mono-client pas encore relâché ?) : le filet de liveness
                 // ci-dessous (streams tombés → flatline) relancera avec backoff.
                 Err(e) => tracing::warn!(
                     target: "jamodio::ws",
                     error = %e,
-                    "réveil de veille PC : reconstruction échouée (le filet de liveness relancera)"
+                    "réveil : reconstruction échouée (le filet de liveness relancera)"
                 ),
             }
             last_reset_seen = reset_signal.request_count();
-            last_resume_seen = resume_signal.resume_count();
+            last_resume_seen = resume_signal.counts();
             last_progress = Instant::now();
             last_repair = Some(Instant::now());
             last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
@@ -2522,20 +2632,47 @@ async fn audio_liveness_supervisor(
         // fermée PAR NATURE — ni flatline ni reconstruction tant que l'entrée n'est
         // pas revenue (sinon on couperait la réception en boucle). Au retour, une
         // reconstruction complète relance la capture.
+        if lost_input.is_none() {
+            // Plus rien à confirmer (entrée revenue, ou autre entrée choisie).
+            input_rebuilt_at = None;
+        }
         if let Some(id) = lost_input {
             if output_outlives_input {
-                if last_lost_device_check.elapsed() >= LOST_DEVICE_POLL {
-                    last_lost_device_check = Instant::now();
-                    if device_present(DeviceKind::Input, id).await {
-                        tracing::info!(target: "jamodio::ws", "entrée revenue — reconstruction des flux audio");
-                        let repaired = repair_audio_streams(&pipeline).await;
-                        if let Err(e) = &repaired {
-                            tracing::warn!(target: "jamodio::ws", error = %e, "entrée revenue mais reconstruction échouée — nouvel essai au prochain sondage");
-                            pipeline.lock().await.keep_listening_without_input();
-                        }
-                        last_repair = Some(Instant::now());
-                        last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
+                let cap_now = {
+                    let pl = pipeline.lock().await;
+                    pl.perfstats.capture_callbacks.load(Ordering::Relaxed)
+                };
+                let step = crate::device_loss::lost_input_step(
+                    input_rebuilt_at.map(|t| t.elapsed()),
+                    cap_now > prev_cap,
+                    last_lost_device_check.elapsed() >= LOST_DEVICE_POLL,
+                );
+                match step {
+                    crate::device_loss::LostInputStep::InputBack => {
+                        // Du son est livré depuis la réouverture : l'entrée est
+                        // revenue pour de bon. Le navigateur en est prévenu
+                        // (`InputRestored`), et la boucle reprend son cours normal.
+                        tracing::info!(target: "jamodio::ws", "entrée revenue — capture de nouveau délivrée");
+                        input_rebuilt_at = None;
+                        pipeline.lock().await.note_input_back();
                     }
+                    crate::device_loss::LostInputStep::ProbeAndRebuild => {
+                        last_lost_device_check = Instant::now();
+                        input_rebuilt_at = None;
+                        if device_present(DeviceKind::Input, id).await {
+                            tracing::info!(target: "jamodio::ws", "entrée revenue — reconstruction des flux audio");
+                            match repair_audio_streams(&pipeline).await {
+                                Ok(()) => input_rebuilt_at = Some(Instant::now()),
+                                Err(e) => {
+                                    tracing::warn!(target: "jamodio::ws", error = %e, "entrée revenue mais reconstruction échouée — nouvel essai au prochain sondage");
+                                    pipeline.lock().await.keep_listening_without_input();
+                                }
+                            }
+                            last_repair = Some(Instant::now());
+                            last_disruption = Instant::now(); // flux coupé : aucune mesure de rate n'est jugeable
+                        }
+                    }
+                    crate::device_loss::LostInputStep::Wait => {}
                 }
                 let pl = pipeline.lock().await;
                 prev_cap = pl.perfstats.capture_callbacks.load(Ordering::Relaxed);
@@ -2549,6 +2686,29 @@ async fn audio_liveness_supervisor(
         // Un kAsioResetRequest est-il arrivé depuis la dernière observation ?
         let reqs = reset_signal.request_count();
         let reset_requested = reqs != last_reset_seen;
+        if reqs != last_reset_logged {
+            tracing::warn!(
+                target: "jamodio::audio",
+                requests_total = reqs,
+                "le pilote ASIO a demandé un reset (kAsioResetRequest)"
+            );
+            last_reset_logged = reqs;
+        }
+        {
+            let notices = crate::audio::asio_reset::driver_notices();
+            if notices != last_notices && !notices.is_quiet() {
+                tracing::warn!(
+                    target: "jamodio::audio",
+                    resync = notices.resync,
+                    latencies_changed = notices.latencies_changed,
+                    overload = notices.overload,
+                    sample_rate_changes = notices.sample_rate_changes,
+                    last_reported_rate_hz = notices.last_reported_rate_hz,
+                    "le pilote ASIO signale un incident (cumuls depuis le démarrage)"
+                );
+                last_notices = notices;
+            }
+        }
 
         // Session saine = la capture avance ET (la sortie avance OU il n'y a PAS de
         // sortie par design). Sans ce `|| !has_output`, une machine dont le playback
@@ -2590,7 +2750,7 @@ async fn audio_liveness_supervisor(
 
         // Réparation requise si : le driver l'a demandé, OU les streams sont tombés
         // (rebuild précédent échoué), OU flatline confirmé. (Le cold-start et le
-        // réveil de veille PC sont déjà traités plus haut par le re-init long-settle.)
+        // réveil (PC ou écran) sont déjà traités plus haut par le re-init long-settle.)
         let flatline = !advancing && last_progress.elapsed().as_millis() >= FLATLINE_MS;
         if !(reset_requested || !has_stream || flatline) {
             continue;
@@ -2641,7 +2801,7 @@ async fn audio_liveness_supervisor(
         // Consomme la demande de reset/réveil traitée + fenêtre de grâce (les
         // callbacks recréés mettent quelques ms à démarrer) + re-baseline compteurs.
         last_reset_seen = reset_signal.request_count();
-        last_resume_seen = resume_signal.resume_count();
+        last_resume_seen = resume_signal.counts();
         last_progress = Instant::now();
         {
             let pl = pipeline.lock().await;
@@ -3563,9 +3723,12 @@ async fn handle_message(
                         items: vec![],
                         scanning: true,
                         blocked: vec![],
+                        pending: 0,
+                        cache_unreadable: false,
                     }];
                 };
-                let (items, blocked_items, scanning) = pl.list_instrument_plugins();
+                let (scan, scanning) = pl.list_instrument_plugins();
+                let crate::pipeline::ScanResult { plugins: items, blocked: blocked_items, pending, cache_unreadable } = scan;
                 let blocked = blocked_items
                     .iter()
                     .map(|b| {
@@ -3590,11 +3753,33 @@ async fn handle_message(
                         bp
                     })
                     .collect();
-                vec![AgentMessage::PluginList { items, scanning, blocked }]
+                vec![AgentMessage::PluginList { items, scanning, blocked, pending, cache_unreadable }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
+            }
+        }
+
+        // 0.6.5-x — « Inventorier » : le musicien a été prévenu que certains
+        // plugins ouvriront leur fenêtre de licence, et il a accepté. Seuls les
+        // items jamais vus sont ouverts (le cache sert le reste), contrairement
+        // à `RescanPlugins` qui reprend tout depuis zéro.
+        BrowserMessage::ScanNewPlugins => {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                if let Some(pl) = lock_pipeline_wait(pipeline).await {
+                    if !pl.spawn_plugin_scan() {
+                        // Un inventaire tourne déjà : la réponse dit « en cours », le
+                        // studio repolle, et aucun plugin n'est ouvert deux fois.
+                        tracing::info!(target: "jamodio::plugin", demande = "inventaire", "inventaire déjà en cours — demande ignorée");
+                    }
+                }
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
         }
 
@@ -3605,13 +3790,17 @@ async fn handle_message(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if let Some(pl) = lock_pipeline_wait(pipeline).await {
-                    pl.spawn_plugin_scan_forced();
+                    if !pl.spawn_plugin_scan_forced() {
+                        // Un inventaire tourne déjà : la réponse dit « en cours », le
+                        // studio repolle, et aucun plugin n'est ouvert deux fois.
+                        tracing::info!(target: "jamodio::plugin", demande = "rescan", "inventaire déjà en cours — demande ignorée");
+                    }
                 }
-                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: true, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![] }]
+                vec![AgentMessage::PluginList { items: vec![], scanning: false, blocked: vec![], pending: 0, cache_unreadable: false }]
             }
         }
 

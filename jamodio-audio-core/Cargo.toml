@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -10,7 +10,7 @@ description = "Jamodio audio engine core — Opus codec, RTP, UDP, mixer, jitter
 audiopus = "0.3.0-rc.0"    # Opus encode/decode (safe wrapper around libopus)
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 crossbeam-channel = "0.5"  # Lock-free channels (audio thread ↔ network thread)
-ringbuf = "0.4"            # SPSC lock-free ring buffer (jitter management)
+ringbuf = "0.5"            # SPSC lock-free ring buffer (jitter management)
 parking_lot = "0.12"       # Verrous fins du mixer (RwLock map + Mutex par flux) — C2.1
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,6 +57,17 @@ srtp = { version = "0.7", default-features = false, features = ["bytes", "log", 
 [target.'cfg(windows)'.dependencies]
 webrtc-srtp = "0.17"
 bytes = "1"
+# N13 (chantier tampon) — SIO_UDP_CONNRESET sur la socket de réception RTP.
+# Winsock remonte WSAECONNRESET (10054) sur un `recv` UDP quand un ICMP « port
+# unreachable » revient d'un ENVOI précédent : la socket reste parfaitement
+# valable, mais notre boucle traite ça comme une erreur. Constaté en vrai le
+# 18/09/2026 (21 occurrences en une session sur le PC de recette). Cf. net/udp.rs.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    # La signature de WSAIoctl référence OVERLAPPED (passé nul : ioctl synchrone).
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 hound = "3"                # lecture/écriture WAV pour l'exemple de diagnostic iso_offline

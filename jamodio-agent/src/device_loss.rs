@@ -95,6 +95,15 @@ impl DeviceLoss {
         });
     }
 
+    /// La sortie choisie manquait DÉJÀ à l'ouverture de la carte son : le son est
+    /// parti par `fallback`. Retenu comme une perte en session — c'est ce qui
+    /// ramène le son sur la sortie choisie quand elle revient (22/09/2026 : la
+    /// Scarlett rebranchée restait ignorée) — mais sans événement : le navigateur
+    /// l'a déjà appris par `capture-started` (`outputFallback`).
+    pub fn output_fell_back_at_open(&mut self, device: &str, fallback: &str) {
+        self.output = Some((device.to_string(), fallback.to_string()));
+    }
+
     /// La sortie choisie est rouverte : si elle était perdue, elle est revenue.
     pub fn output_back(&mut self) {
         if let Some((device, _)) = self.output.take() {
@@ -127,6 +136,54 @@ impl DeviceLoss {
     /// Événements à relayer, dans l'ordre (vidés).
     pub fn take_events(&mut self) -> Vec<DeviceEvent> {
         std::mem::take(&mut self.pending)
+    }
+}
+
+/// Que faire, à ce tour du superviseur, d'une entrée perdue dont la sortie
+/// continue seule (hors ASIO) ?
+///
+/// Bug corrigé le 21/09/2026 (présent depuis la 0.6.4, Mac) : au rebranchement,
+/// l'entrée était rouverte, mais le constat « du son est livré, l'entrée est
+/// revenue » ne vivait qu'en aval d'une branche qui passait TOUJOURS son tour
+/// tant que l'entrée était marquée perdue. Elle le restait donc à jamais :
+/// réouverture toutes les 3 s (son coupé à chaque fois, « ta machine sature »
+/// côté studio), et l'avis « entrée débranchée » ne se retirait jamais.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostInputStep {
+    /// Rien à faire à ce tour.
+    Wait,
+    /// Le moment de sonder : si l'entrée est présente, la rouvrir.
+    ProbeAndRebuild,
+    /// Une réouverture a eu lieu ET la capture livre de nouveau : l'entrée est
+    /// revenue pour de bon.
+    InputBack,
+}
+
+/// Délai laissé à une entrée rouverte pour livrer du son avant de la resonder :
+/// au-delà, la réouverture n'a rien donné (pilote muet), on retente.
+pub const REBUILD_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(9);
+
+/// Décision pure (testée) : `since_rebuild` = temps depuis la dernière
+/// réouverture RÉUSSIE en attente de confirmation (`None` si aucune) ;
+/// `capture_advanced` = des callbacks de capture ont été livrés depuis le tour
+/// précédent ; `poll_due` = l'intervalle de sondage est écoulé.
+pub fn lost_input_step(
+    since_rebuild: Option<std::time::Duration>,
+    capture_advanced: bool,
+    poll_due: bool,
+) -> LostInputStep {
+    if let Some(elapsed) = since_rebuild {
+        if capture_advanced {
+            return LostInputStep::InputBack;
+        }
+        if elapsed < REBUILD_CONFIRM_WINDOW {
+            return LostInputStep::Wait;
+        }
+    }
+    if poll_due {
+        LostInputStep::ProbeAndRebuild
+    } else {
+        LostInputStep::Wait
     }
 }
 
@@ -255,5 +312,53 @@ mod tests {
     fn le_nom_wire_des_raisons_est_stable() {
         assert_eq!(LostReason::Unplugged.wire(), "unplugged");
         assert_eq!(LostReason::Silent.wire(), "silent");
+    }
+
+    // ─── Entrée perdue puis revenue (21/09/2026) ─────────────────────────
+
+    use std::time::Duration;
+
+    #[test]
+    fn entree_toujours_absente_on_sonde_au_rythme_prevu() {
+        assert_eq!(lost_input_step(None, false, false), LostInputStep::Wait);
+        assert_eq!(lost_input_step(None, false, true), LostInputStep::ProbeAndRebuild);
+    }
+
+    #[test]
+    fn apres_une_reouverture_on_attend_le_son_sans_rouvrir() {
+        // Le bug : on rouvrait toutes les 3 s. Pendant la fenêtre de confirmation,
+        // même un sondage échu ne relance rien.
+        let step = lost_input_step(Some(Duration::from_secs(3)), false, true);
+        assert_eq!(step, LostInputStep::Wait);
+    }
+
+    #[test]
+    fn le_son_livre_apres_reouverture_declare_l_entree_revenue() {
+        assert_eq!(
+            lost_input_step(Some(Duration::from_millis(500)), true, false),
+            LostInputStep::InputBack
+        );
+    }
+
+    #[test]
+    fn une_reouverture_restee_muette_est_retentee() {
+        let step = lost_input_step(Some(REBUILD_CONFIRM_WINDOW), false, true);
+        assert_eq!(step, LostInputStep::ProbeAndRebuild);
+    }
+
+    /// 22/09/2026 — sortie choisie absente dès l'ouverture : on attend son retour
+    /// comme après une perte en session, sans prévenir deux fois le navigateur.
+    #[test]
+    fn un_repli_a_l_ouverture_attend_le_retour_sans_evenement() {
+        let mut d = DeviceLoss::default();
+        d.output_fell_back_at_open("0:Scarlett Solo 4th Gen", "2:Haut-parleurs MacBook Pro");
+        assert_eq!(d.lost_output(), Some("0:Scarlett Solo 4th Gen"));
+        assert!(d.take_events().is_empty(), "capture-started l'a déjà dit");
+        d.output_back();
+        assert_eq!(
+            d.take_events(),
+            vec![DeviceEvent::OutputRestored { device: "0:Scarlett Solo 4th Gen".into() }]
+        );
+        assert_eq!(d.lost_output(), None);
     }
 }

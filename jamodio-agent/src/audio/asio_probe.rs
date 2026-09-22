@@ -117,22 +117,13 @@ fn probe() {
     let n_in = (ins.max(0) as usize).clamp(1, 2);
     let n_out = (outs.max(0) as usize).clamp(1, 2);
 
-    // Cœur du spike : UN SEUL `ASIOCreateBuffers` couvrant entrée PUIS sortie,
-    // via le chaînage `prepare_input_stream` → `prepare_output_stream` (on passe
-    // le résultat de l'un en argument de l'autre). `buffer_size = None` = taille
-    // préférée du driver (jamais forcée).
-    let streams = match driver.prepare_input_stream(None, n_in, None) {
+    // Cœur du spike : UN SEUL `ASIOCreateBuffers` couvrant entrée ET sortie
+    // (`prepare_duplex_streams`, copie patchée d'`asio-sys`). `buffer_size = None`
+    // = taille préférée du driver (jamais forcée).
+    let streams = match driver.prepare_duplex_streams(n_in, n_out, None) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(target: "jamodio::asioprobe", error = ?e, "prepare_input_stream a échoué");
-            let _ = driver.destroy();
-            return;
-        }
-    };
-    let streams = match driver.prepare_output_stream(streams.input, n_out, None) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(target: "jamodio::asioprobe", error = ?e, "prepare_output_stream a échoué");
+            tracing::error!(target: "jamodio::asioprobe", error = ?e, "prepare_duplex_streams a échoué");
             let _ = driver.destroy();
             return;
         }

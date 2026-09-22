@@ -5,6 +5,8 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod audio;
+mod bench_flags;
+mod keep_awake;
 mod logging;
 #[cfg(target_os = "macos")]
 mod cf_string;
@@ -14,6 +16,7 @@ mod pipeline;
 mod plugin_scan;
 mod device_loss;
 mod recv_activity;
+mod timer_precision;
 #[cfg(target_os = "windows")]
 mod tray_promote;
 mod ws_server;
@@ -366,6 +369,11 @@ fn main() {
     // bind à _log_guard au scope de main() (drop = fin du process = OK).
     let _log_guard = logging::init();
 
+    // Windows 11 bride la minuterie d'un processus à fenêtre masquée (l'agent) :
+    // sans cette exemption, la minuterie fine de session serait ignorée et les
+    // masquages partiraient jusqu'à 15 ms en retard. Cf. `timer_precision`.
+    timer_precision::exempt_process_from_timer_throttling();
+
     // Filet de diagnostic crash (0.5.11) : un panic Rust part par DÉFAUT sur
     // stderr — jeté sur une app GUI Windows → invisible dans `agent.log` (donc
     // absent du bug-report support). On installe un hook qui route le panic
@@ -581,10 +589,16 @@ fn main() {
             // commandes d'état latché l'atteignent alors sans passer par le mutex
             // pipeline, donc sans pouvoir être perdues sur contention.
             let mut pipeline = PipelineState::new(mixer.clone());
-            // Sprint INSERT (S1.3) — lance le scan AU en background dès le
-            // boot. Le scan complet prend ~13s, mais l'utilisateur n'ouvre
-            // pas le menu FX avant plusieurs secondes → cache prêt à temps.
-            pipeline.spawn_plugin_scan();
+            // 19/09/2026 — INVENTAIRE seulement : on lit le cache, on compte ce
+            // qui reste à connaître, on n'ouvre aucun plugin. Instancier, c'est
+            // laisser chaque plugin sous licence ouvrir SA fenêtre : un nouvel
+            // utilisateur en voyait surgir plusieurs dès sa première
+            // installation, sans comprendre, et chacune non cliquée coûtait 30 s
+            // puis condamnait le plugin. Un utilisateur déjà installé ne voit
+            // aucune différence (son cache répond en quelques ms). Le scan qui
+            // ouvre vraiment les plugins est demandé depuis le studio, une fois
+            // le musicien prévenu (`ScanNewPlugins`).
+            pipeline.spawn_plugin_inventory();
             // Sprint S2.7 — Crée un port MIDI virtuel "Jamodio Virtual MIDI"
             // dans CoreMIDI. Apparaît comme destination dans toutes les apps
             // MIDI macOS (Logic, Ableton, GarageBand…). Évite à l'user

@@ -24,8 +24,57 @@ fn bind_udp_dscp_ef() -> std::io::Result<UdpSocket> {
     if let Err(e) = sock.set_tos(DSCP_EF_TOS) {
         tracing::warn!(target: "jamodio::udp", error = %e, "set_tos(EF) non appliqué — trafic en best-effort");
     }
+    #[cfg(windows)]
+    disable_udp_conn_reset(&sock);
     let std_sock: std::net::UdpSocket = sock.into();
     UdpSocket::from_std(std_sock)
+}
+
+/// N13 (chantier tampon) — Windows : ne plus faire échouer un `recv` UDP parce
+/// qu'un ENVOI précédent a reçu un ICMP « port unreachable ».
+///
+/// Winsock remonte alors `WSAECONNRESET` (10054) sur la RÉCEPTION, alors que la
+/// socket est saine et que les paquets suivants arriveront normalement. C'est un
+/// comportement hérité, propre à Windows, que tout récepteur UDP temps réel
+/// désactive : `SIO_UDP_CONNRESET = FALSE`. Sans ça, chaque ICMP tardif (le SFU
+/// qui recycle un port, un pare-feu) coûtait une erreur de réception — donc une
+/// attente — pour rien : 21 occurrences en une session de recette (18/09/2026).
+///
+/// Best-effort assumé : si l'ioctl échoue, on le DIT et on continue avec le
+/// comportement d'avant (la boucle de réception sait encaisser l'erreur), plutôt
+/// que de refuser d'ouvrir la socket — aucune session ne doit tomber pour ça.
+#[cfg(windows)]
+fn disable_udp_conn_reset(sock: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, WSAIoctl};
+
+    // FALSE : « ne me remonte plus WSAECONNRESET sur cette socket ».
+    let mut disable: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY : `sock` vit pendant tout l'appel (emprunt), donc son handle est
+    // valide ; `disable` et `returned` sont deux u32 locaux dont on passe les
+    // adresses avec leur taille exacte ; l'ioctl est SYNCHRONE (OVERLAPPED nul et
+    // routine de complétion nulle), donc l'appelé ne conserve aucun pointeur.
+    let rc = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            std::ptr::addr_of_mut!(disable).cast::<core::ffi::c_void>(),
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::addr_of_mut!(returned),
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            target: "jamodio::udp",
+            error = %std::io::Error::last_os_error(),
+            "SIO_UDP_CONNRESET non désactivé — les ICMP tardifs continueront de faire échouer des recv"
+        );
+    }
 }
 
 /// Send RTP packets to the SFU PlainTransport.

@@ -396,6 +396,37 @@ impl MixScratch {
     }
 }
 
+/// Lot 0 (chantier tampon) — ce qu'un flux reçu dit de lui-même à la télémétrie
+/// 1 Hz. Les trois parts de la cible et le remplissage réel sont les mesures qui
+/// décideront s'il y a des ms à reprendre au tampon (porte du Lot 2).
+#[derive(Debug, Clone)]
+pub struct StreamPerfSnapshot {
+    pub producer_id: String,
+    pub underruns: u64,
+    pub drift_drops: u64,
+    /// Cible courante, telle que le web l'affiche déjà (`bufferTargetMs`).
+    pub target_ms: usize,
+    pub target_jitter_ms: f64,
+    pub target_glitch_ms: f64,
+    pub target_reactive_ms: f64,
+    /// Remplissage minimal et médian observés aux dernières arrivées ; `None`
+    /// tant qu'aucun paquet n'est arrivé pour ce flux.
+    pub fill_min_ms: Option<f64>,
+    pub fill_p50_ms: Option<f64>,
+    /// Silence rendu par le tampon (cumul) et audio jeté faute de place.
+    pub zero_filled_ms: f64,
+    pub overflow_ms: f64,
+}
+
+/// État de lecture d'un flux reçu, lu d'un seul coup sous le verrou de sa cellule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Playout {
+    /// Ce qu'il reste à jouer, en millisecondes.
+    pub buffered_ms: f64,
+    /// `false` pendant le ré-amorçage qui suit un trou : la sortie n'y puise pas.
+    pub playing: bool,
+}
+
 /// Mixes N remote audio streams into a single stereo output.
 /// Each stream has its own jitter buffer and volume control.
 ///
@@ -935,6 +966,23 @@ impl AudioMixer {
         }
     }
 
+    /// Ce qu'il reste à jouer dans le tampon de ce flux, et si la sortie y puise.
+    ///
+    /// Lu par le thread de décodage à l'échéance d'une trame : un tampon qui tient
+    /// encore n'a besoin d'aucun masquage, et un tampon en ré-amorçage non plus —
+    /// la sortie n'y lit rien (cf. `mixer::conceal`). Même discipline
+    /// de verrous que `push_samples` (C2.1) — verrou lecture de la carte, clone de
+    /// l'Arc, verrou COURT de la cellule (une lecture). Sa fréquence est bornée
+    /// par le thread de décodage, qui ne réexamine un flux qu'au moment où
+    /// l'attente peut changer (`conceal::recheck_in_ms`).
+    ///
+    /// `None` = flux inconnu (pas encore `add_stream`, ou déjà retiré).
+    pub fn playout(&self, producer_id: &str) -> Option<Playout> {
+        let cell = self.streams.read().get(producer_id).cloned()?;
+        let jb = cell.jitter.lock();
+        Some(Playout { buffered_ms: jb.buffered_ms(), playing: jb.is_playing() })
+    }
+
     /// Push decoded samples into a stream's jitter buffer.
     ///
     /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).
@@ -1285,18 +1333,39 @@ impl AudioMixer {
 
     /// Sprint S1 — snapshot perf par stream remote (self-monitor exclu).
     /// Retourne (producer_id, underruns_cumul, drift_drops_cumul, target_ms_courant).
-    pub fn stream_perf_stats(&self) -> Vec<(String, u64, u64, usize)> {
+    pub fn stream_perf_stats(&self) -> Vec<StreamPerfSnapshot> {
         let map = self.streams.read();
         map.values()
             .filter(|cell| cell.id != SELF_MONITOR_ID)
             .map(|cell| {
-                let jitter = cell.jitter.lock();
-                (
-                    cell.id.clone(),
-                    jitter.underruns(),
-                    jitter.drift_drops(),
-                    jitter.target_ms(),
-                )
+                // Le verrou de la cellule est celui que le callback de sortie
+                // prend à chaque tirage : on n'y fait que des lectures et une
+                // copie, le calcul (tri) se fait une fois le verrou rendu.
+                let (snap, fill_obs) = {
+                    let jitter = cell.jitter.lock();
+                    let (target_jitter_ms, target_glitch_ms, target_reactive_ms) =
+                        jitter.target_parts_ms();
+                    let snap = StreamPerfSnapshot {
+                        producer_id: cell.id.clone(),
+                        underruns: jitter.underruns(),
+                        drift_drops: jitter.drift_drops(),
+                        target_ms: jitter.target_ms(),
+                        target_jitter_ms,
+                        target_glitch_ms,
+                        target_reactive_ms,
+                        fill_min_ms: None,
+                        fill_p50_ms: None,
+                        zero_filled_ms: jitter.zero_filled_ms(),
+                        overflow_ms: jitter.overflow_ms(),
+                    };
+                    (snap, jitter.fill_snapshot())
+                };
+                let fill = fill_obs.stats();
+                StreamPerfSnapshot {
+                    fill_min_ms: fill.map(|(min, _)| min),
+                    fill_p50_ms: fill.map(|(_, p50)| p50),
+                    ..snap
+                }
             })
             .collect()
     }
@@ -1731,7 +1800,7 @@ mod tests {
         assert_eq!(self_target, SELF_MONITOR_TARGET_MS, "self-monitor préservé");
         let peers = m.stream_perf_stats();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].3, 40, "peer prend bien la nouvelle target");
+        assert_eq!(peers[0].target_ms, 40, "peer prend bien la nouvelle target");
     }
 
     /// Garde NaN sur set_volume (alignée sur set_pan) : NaN.clamp() = NaN

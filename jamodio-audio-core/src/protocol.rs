@@ -22,6 +22,18 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 // ─── Browser → Agent ───────────────────────────────────
 
+/// Prédicat serde : un compteur à zéro ne part pas sur le fil. Le champ garde
+/// alors exactement la sémantique qu'il avait avant d'exister (absent = rien à
+/// signaler), donc aucun browser n'a besoin de le connaître pour rester juste.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Même règle que `is_zero`, pour un drapeau.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Ratio de pulse par défaut (noire) si le browser ne l'envoie pas (agent
 /// recevant un `reference-config` pré-0.5.8 → comportement historique 4/4).
 fn default_pulse_ratio() -> f64 {
@@ -319,6 +331,14 @@ pub enum BrowserMessage {
     /// AU blocklisté (empreinte absente → retenu à vie sinon) retente sa chance.
     /// L'agent répond `PluginList { scanning: true }` puis le browser repolle.
     RescanPlugins,
+    /// 0.6.5-x (19/09/2026) — inventorie les plugins JAMAIS vus, à la demande du
+    /// musicien. L'agent ne le fait plus tout seul au démarrage : instancier un
+    /// plugin, c'est le laisser ouvrir sa fenêtre de licence, et un nouvel
+    /// utilisateur en voyait surgir plusieurs sans explication. Le studio
+    /// prévient d'abord, puis envoie ceci. Différent de `RescanPlugins`, qui
+    /// reprend TOUT depuis zéro : ici, seuls les items inconnus sont ouverts.
+    /// L'agent répond `PluginList { scanning: true }` puis le browser repolle.
+    ScanNewPlugins,
     /// Sprint INSERT (S1) — charge un plugin sur la tranche instrument self.
     /// Réponse : `InstrumentPluginLoaded` ou `InstrumentPluginError`.
     /// Charge UN seul plugin à la fois côté MVP (1 slot) — un appel quand un
@@ -938,6 +958,18 @@ pub enum AgentMessage {
         scanning: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blocked: Vec<BlockedPlugin>,
+        /// 0.6.5-x — plugins découverts que l'agent n'a PAS ouverts (il ne le
+        /// fait plus de lui-même). > 0 ⇒ le studio propose de les inventorier,
+        /// en prévenant que certains demanderont leur licence. `0` ⇒ la liste
+        /// est complète. `#[serde(default)]` : rétro-compat browser antérieur.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pending: usize,
+        /// 0.6.5-x (21/09/2026) — le cache de scan de l'agent existait mais n'a
+        /// pas pu être relu : les plugins qu'il connaissait sont tous repassés
+        /// « à inventorier ». Le studio le DIT (sinon la liste se vide sans
+        /// cause). Absent du fil quand `false` : rétro-compatible.
+        #[serde(rename = "cacheUnreadable", default, skip_serializing_if = "is_false")]
+        cache_unreadable: bool,
     },
     /// Sprint INSERT (S1) — réponse à `LoadInstrumentPlugin` ET push
     /// automatique au connect WS si un plugin est déjà chargé (sync state
@@ -1118,6 +1150,21 @@ pub enum AgentMessage {
         monitor_buffer_ms: usize,
         #[serde(rename = "monitorUnderruns")]
         monitor_underruns: u64,
+        /// Taille du bloc que le callback d'ENTRÉE livre d'un seul coup, en
+        /// frames PAR CANAL (48 kHz : 64 frames = 1,33 ms). C'est elle qui dit
+        /// combien de trames Opus un réveil produit, donc la rafale d'émission
+        /// possible. Absente tant que la capture n'a pas démarré : on ne publie
+        /// pas une taille qu'on n'a pas mesurée.
+        #[serde(rename = "inputBlockFrames", skip_serializing_if = "Option::is_none")]
+        input_block_frames: Option<u32>,
+        /// Idem pour la SORTIE — la taille que le callback consomme d'un seul
+        /// tirage. C'est le vrai seuil de survie du tampon de réception : en
+        /// dessous, le prochain tirage laisse un trou (cf. `mixer::conceal`).
+        /// Publiée depuis la 0.6.5, parce que le banc du 20/09/2026 s'est
+        /// conclu sans elle : le correctif du seuil de masquage dépendait de
+        /// cette valeur, et elle n'était lisible nulle part.
+        #[serde(rename = "outputBlockFrames", skip_serializing_if = "Option::is_none")]
+        output_block_frames: Option<u32>,
         /// Callbacks audio d'ENTRÉE manquants par seconde (attendus sur le temps
         /// écoulé − réellement servis) : chaque callback manquant est un bloc de
         /// son perdu. Absent hors capture ou tant que la taille de bloc est inconnue.
@@ -1264,6 +1311,110 @@ pub struct PeerPerf {
     /// Trames de masquage (PLC) jouées à la place de paquets absents.
     #[serde(rename = "concealedFrames")]
     pub concealed_frames: u64,
+    /// Lot 1.2 — trames de masquage poussées À L'ÉCHÉANCE, pour un paquet en
+    /// RETARD, sans attendre qu'une arrivée révèle le trou. Comptées à part de
+    /// `concealedFrames` (paquet perdu, découvert à l'arrivée) : les deux disent
+    /// des choses différentes du réseau, et c'est celle-ci qui chiffre le gain du
+    /// chantier.
+    ///
+    /// ⚠ `underruns` ne compte PAS l'accroc masqué. Le plan du chantier
+    /// l'annonçait, le code fait l'inverse et c'est LUI qui a raison : le
+    /// compteur n'est incrémenté que là où le tampon rend vraiment du silence
+    /// (`ring_buffer.rs`, branche `available < needed`), au même endroit que
+    /// `zeroFilledMs`. `underruns` = ce que le musicien SUBIT, ce que la bulle
+    /// du lien appelle une coupure. Un trou évité par masquage se lit ici, pas
+    /// là-bas. Confondre les deux a coûté une analyse fausse le 20/09/2026.
+    #[serde(rename = "concealedUnderrunFrames")]
+    pub concealed_underrun_frames: u64,
+    /// Parmi les trames ci-dessus, celles inventées alors que le vrai paquet
+    /// allait arriver À TEMPS : le tampon tenait encore assez pour le jouer à sa
+    /// place (cf. `conceal::premature_margin_ms`). Chacune est donc du son extrapolé
+    /// substitué à de la vraie matière, **et** un paquet légitime écarté.
+    ///
+    /// Zéro = tous les masquages ont bouché un trou réel. Un chiffre proche de
+    /// `concealedUnderrunFrames` = on invente trop tôt, et le réglage du délai
+    /// de grâce est à revoir. Sans ce compteur, les deux cas sont
+    /// indiscernables : un masquage utile et un masquage de trop laissent la
+    /// même trace (une trame inventée, aucun accroc).
+    #[serde(rename = "concealedPrematureFrames")]
+    pub concealed_premature_frames: u64,
+    /// De COMBIEN on a tiré trop tôt : somme des marges gâchées sur les trames
+    /// ci-dessus, et la pire d'entre elles (ms). Le compte dit qu'on invente
+    /// trop tôt ; ces deux-ci disent lequel du seuil de survie ou du délai de
+    /// grâce il faut bouger, et de combien. Quelques dizaines de microsecondes
+    /// par trame ne se règlent pas de la même façon que deux millisecondes.
+    #[serde(rename = "concealedPrematureMarginMs")]
+    pub concealed_premature_margin_ms: f64,
+    #[serde(rename = "concealedPrematureMarginMaxMs")]
+    pub concealed_premature_margin_max_ms: f64,
+    /// POURQUOI le masquage n'est pas parti, compté par raison (cumuls).
+    /// `linkUnknown` : la régularité du lien n'est pas encore connue.
+    /// `withinGrace` : le paquet est en retard, mais pas plus que d'habitude.
+    /// `bufferHolds` : le tampon tient jusqu'au prochain tirage.
+    /// `notDue` : mesure de temps inexploitable (horloge qui déraille).
+    /// `deadlineDisarmed` : nombre de fois où l'échéance a été DÉSARMÉE —
+    /// plafond de masquage atteint, ou flux tari (talkback coupé, pair parti).
+    /// Un événement, pas un tour de boucle.
+    ///
+    /// Les quatre raisons comptent des EXAMENS : un par échéance, puis un à
+    /// chaque instant où l'attente pouvait changer (fin de la grâce, tampon
+    /// près du seuil — agent ≥ 0.6.5-19). Avant, chaque réveil du thread
+    /// (≥ 0,5 ms) en comptait un : les valeurs antérieures ne se comparent pas.
+    ///
+    /// Un masquage qui ne part JAMAIS et un masquage qui n'a rien à faire
+    /// laissent la même trace : zéro trame inventée. Ces quatre compteurs sont
+    /// la seule façon de les distinguer — le diagnostic du 20/09/2026 est resté
+    /// bloqué faute de les avoir.
+    #[serde(rename = "concealWaitLinkUnknown")]
+    pub wait_link_unknown: u64,
+    #[serde(rename = "concealWaitWithinGrace")]
+    pub wait_within_grace: u64,
+    #[serde(rename = "concealWaitBufferHolds")]
+    pub wait_buffer_holds: u64,
+    #[serde(rename = "concealWaitNotDue")]
+    pub wait_not_due: u64,
+    /// Échéances tombées pendant le ré-amorçage du tampon après un trou : la
+    /// sortie n'y lisait rien, on n'a rien inventé (agent ≥ 0.6.5).
+    #[serde(rename = "concealWaitRepriming")]
+    pub wait_repriming: u64,
+    #[serde(rename = "concealDeadlineDisarmed")]
+    pub deadline_disarmed: u64,
+    /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
+    /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
+    /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).
+    ///
+    /// Les trois parts de `bufferTargetMs` : plancher tiré de la gigue, plancher
+    /// de glitch persistant, filet réactif. Leur somme bornée = la cible.
+    #[serde(rename = "targetJitterMs")]
+    pub target_jitter_ms: f64,
+    #[serde(rename = "targetGlitchMs")]
+    pub target_glitch_ms: f64,
+    #[serde(rename = "targetReactiveMs")]
+    pub target_reactive_ms: f64,
+    /// Remplissage RÉEL relevé aux dernières arrivées (~1,3 s) : minimum et
+    /// médiane. Le minimum est la marge que la sortie n'a jamais consommée.
+    /// Absents tant qu'aucun paquet n'est arrivé.
+    #[serde(rename = "fillMinMs", skip_serializing_if = "Option::is_none")]
+    pub fill_min_ms: Option<f64>,
+    #[serde(rename = "fillP50Ms", skip_serializing_if = "Option::is_none")]
+    pub fill_p50_ms: Option<f64>,
+    /// Silence RENDU par le tampon (cumul) : sous-alimentations et ré-amorçages.
+    /// À ne pas confondre avec `recvStreams[].silentMs`, qui compte l'absence de
+    /// paquets reçus : un silence réseau produit les deux, un accroc de tampon
+    /// seulement celui-ci.
+    #[serde(rename = "zeroFilledMs")]
+    pub zero_filled_ms: f64,
+    /// Audio jeté à l'arrivée faute de place dans le tampon (cumul).
+    #[serde(rename = "overflowMs")]
+    pub overflow_ms: f64,
+    /// Paquets arrivés en double, et sauts de numérotation constatés.
+    #[serde(rename = "packetsDuplicate")]
+    pub packets_duplicate: u64,
+    #[serde(rename = "packetsJump")]
+    pub packets_jump: u64,
+    /// Paquets qu'Opus n'a pas su décoder.
+    #[serde(rename = "decodeErrors")]
+    pub decode_errors: u64,
 }
 
 /// Un flux reçu d'un pair, tel que l'Audio Engine le tient. Un flux silencieux reste
@@ -1276,6 +1427,9 @@ pub struct RecvStreamPerf {
     /// Durée sans paquet reçu (ms) ; depuis l'ajout du flux si aucun n'est arrivé.
     #[serde(rename = "silentMs")]
     pub silent_ms: u64,
+    /// Lot 0 (chantier tampon) — erreurs rendues par la socket UDP pour ce flux.
+    #[serde(rename = "recvErrors")]
+    pub recv_errors: u64,
 }
 
 /// Flux montant de l'instrument d'après le dernier Receiver Report du SFU.
@@ -1469,6 +1623,24 @@ mod blocked_plugin_tests {
 mod tests {
     use super::*;
 
+    /// 21/09/2026 — un cache de plugins illisible se DIT au studio ; absent du
+    /// fil sinon (un browser antérieur ne voit aucune différence).
+    #[test]
+    fn plugin_list_porte_le_cache_illisible_seulement_quand_il_l_est() {
+        let msg = |cache_unreadable| AgentMessage::PluginList {
+            items: vec![],
+            scanning: false,
+            blocked: vec![],
+            pending: 3,
+            cache_unreadable,
+        };
+        let oui = serde_json::to_value(msg(true)).unwrap();
+        assert_eq!(oui["cacheUnreadable"], serde_json::json!(true));
+        assert_eq!(oui["pending"], serde_json::json!(3));
+        let non = serde_json::to_value(msg(false)).unwrap();
+        assert!(non.get("cacheUnreadable").is_none(), "{non}");
+    }
+
     // Contrat wire avec le browser (groupe.js / studio-settings-modal.js) :
     // `restart` et `relaunch-now` doivent rester stables (kebab-case du tag
     // `type`). Ne JAMAIS renommer sans migration côté web.
@@ -1482,6 +1654,58 @@ mod tests {
             serde_json::from_str::<BrowserMessage>(r#"{"type":"relaunch-now"}"#).unwrap(),
             BrowserMessage::RelaunchNow
         ));
+    }
+
+    /// Contrat wire — la taille de bloc livrée par l'OS doit être LISIBLE.
+    ///
+    /// Le banc du 20/09/2026 s'est conclu sans elle : le correctif du seuil de
+    /// masquage dépendait de la taille du bloc de sortie, et elle n'apparaissait
+    /// nulle part — ni dans perf-stats, ni dans les logs hors ligne `CALLBACK AUDIO IRRÉGULIER`.
+    /// Absente = callback pas encore tourné ; jamais `0`, qui se lirait comme une
+    /// mesure.
+    #[test]
+    fn les_tailles_de_bloc_sont_publiees_et_absentes_si_non_mesurees() {
+        fn perfstats(input: Option<u32>, output: Option<u32>) -> serde_json::Value {
+            serde_json::to_value(AgentMessage::PerfStats {
+                timestamp_ms: 1,
+                plugin: None,
+                pipeline_latency_ms: PipelineLatency {
+                    count: 0,
+                    p50_ms: 0.0,
+                    p99_ms: 0.0,
+                    max_ms: 0.0,
+                    mean_ms: 0.0,
+                    drops_per_sec: 0,
+                },
+                peers: vec![],
+                output_peak: 0.0,
+                output_clip_pct: 0.0,
+                monitor_buffer_ms: 5,
+                monitor_underruns: 0,
+                input_block_frames: input,
+                output_block_frames: output,
+                callback_deficit_in: None,
+                callback_deficit_out: None,
+                cpu_pct: None,
+                memory_pressure: None,
+                memory_load_pct: None,
+                net_interface: None,
+                uplink: None,
+                recv_streams: vec![],
+            })
+            .unwrap()
+        }
+
+        // Mesurées : ASIO 64 frames en entrée, CoreAudio 512 en sortie.
+        let v = perfstats(Some(64), Some(512));
+        assert_eq!(v["type"], "perf-stats");
+        assert_eq!(v["inputBlockFrames"], 64);
+        assert_eq!(v["outputBlockFrames"], 512);
+
+        // Pas encore mesurées : les clés sont ABSENTES, pas à zéro.
+        let v = perfstats(None, None);
+        assert!(v.get("inputBlockFrames").is_none(), "{v}");
+        assert!(v.get("outputBlockFrames").is_none(), "{v}");
     }
 
     // Contrat wire — `requestId` d'un start-capture renvoyé dans la réponse, absent

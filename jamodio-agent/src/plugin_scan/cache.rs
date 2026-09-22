@@ -65,7 +65,7 @@ struct BlockedRecord {
 }
 
 /// Contenu sérialisé du fichier cache.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheFile {
     scanner_abi: u32,
@@ -131,7 +131,16 @@ pub fn reconcile(discovered: &[(String, Option<FileFingerprint>)], cache: &Cache
             }
         }
         if let Some(rec) = cache.blocked.iter().find(|b| b.item == *item) {
-            if fingerprints_match(rec.fingerprint, *fp) {
+            // Un DÉPASSEMENT DE DÉLAI n'est pas un plugin cassé (19/09/2026).
+            // Le cas courant, c'est un plugin sous licence qui a ouvert SA
+            // fenêtre et attend un clic : au premier lancement, l'utilisateur
+            // ferme ces fenêtres sans comprendre, et chaque plugin ainsi
+            // « condamné » l'était À VIE — un AU n'a pas d'empreinte fichier,
+            // donc plus rien ne pouvait lui rendre sa chance sauf un bump d'ABI.
+            // On ne retient donc que les vrais plantages ; un délai dépassé
+            // repart à l'inventaire suivant, qui est désormais demandé par le
+            // musicien et non plus lancé dans son dos.
+            if rec.reason == BlockReason::Crash && fingerprints_match(rec.fingerprint, *fp) {
                 plan.retained_blocked.push(BlockedItem {
                     item: item.clone(),
                     reason: rec.reason,
@@ -248,28 +257,46 @@ fn base_data_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/jamodio")
 }
 
-fn cache_path() -> PathBuf {
+/// Chemin du cache disque (journalisé par l'appelant quand il est illisible).
+pub fn cache_path() -> PathBuf {
     data_dir().join(CACHE_FILENAME)
 }
 
-/// Charge le cache. Absent/corrompu/ABI périmé → cache vide (tout sera
-/// rescanné) : jamais d'erreur propagée, le scan doit toujours pouvoir tourner.
-pub fn load() -> CacheFile {
-    let path = cache_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return CacheFile::default();
-    };
-    match serde_json::from_slice::<CacheFile>(&bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "jamodio::plugin",
-                error = %e,
-                "cache de scan illisible — rescan complet"
-            );
-            CacheFile::default()
+/// Le cache existe mais n'a pas pu être lu. Distinct de « absent » (première
+/// installation, cas normal) : ici, des plugins CONNUS vont disparaître de la
+/// liste jusqu'au prochain inventaire, et la cause doit être dite.
+#[derive(Debug)]
+pub enum CacheLoadError {
+    /// Lecture refusée ou en échec (permissions, disque, verrou…).
+    Io(std::io::Error),
+    /// Fichier lu mais contenu inexploitable (tronqué, corrompu, format inconnu).
+    Parse(serde_json::Error),
+}
+
+impl std::fmt::Display for CacheLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheLoadError::Io(e) => write!(f, "lecture impossible : {e}"),
+            CacheLoadError::Parse(e) => write!(f, "contenu inexploitable : {e}"),
         }
     }
+}
+
+/// Charge le cache. Absent → cache vide (`Ok`, tout est à inventorier : c'est
+/// la première installation). Présent mais illisible → `Err` : l'appelant
+/// décide (et DIT) ce qu'il fait des plugins que ce cache connaissait. Un ABI
+/// périmé n'est pas une erreur : `reconcile` le traite (tout rescanner).
+pub fn load() -> Result<CacheFile, CacheLoadError> {
+    load_from(&cache_path())
+}
+
+fn load_from(path: &Path) -> Result<CacheFile, CacheLoadError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CacheFile::default()),
+        Err(e) => return Err(CacheLoadError::Io(e)),
+    };
+    serde_json::from_slice::<CacheFile>(&bytes).map_err(CacheLoadError::Parse)
 }
 
 /// Écrit le cache de façon atomique (temp + rename) pour ne jamais laisser un
@@ -316,6 +343,62 @@ mod tests {
         CacheFile { scanner_abi: SCANNER_ABI, entries, blocked }
     }
 
+    /// Dossier temporaire propre à un test (pas de dépendance `tempfile`).
+    fn scratch_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jamodio-plugin-cache-{}-{test}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        dir
+    }
+
+    #[test]
+    fn un_cache_absent_est_une_premiere_installation_pas_une_erreur() {
+        let dir = scratch_dir("absent");
+        let loaded = load_from(&dir.join(CACHE_FILENAME)).expect("absent = Ok");
+        assert_eq!(loaded, CacheFile::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_corrompu_est_une_erreur_dite_pas_un_cache_vide() {
+        let dir = scratch_dir("corrompu");
+        let path = dir.join(CACHE_FILENAME);
+        std::fs::write(&path, b"{ tronque").unwrap();
+        assert!(matches!(load_from(&path), Err(CacheLoadError::Parse(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_illisible_est_une_erreur_dite_pas_un_cache_vide() {
+        // Un DOSSIER à la place du fichier : `read` échoue pour une autre raison
+        // que « absent », sur toutes les plateformes, sans jouer sur les droits.
+        let dir = scratch_dir("illisible");
+        let path = dir.join(CACHE_FILENAME);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(matches!(load_from(&path), Err(CacheLoadError::Io(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn un_cache_valide_se_relit_a_l_identique() {
+        let dir = scratch_dir("valide");
+        let path = dir.join(CACHE_FILENAME);
+        let cache = cache_with(
+            vec![CacheEntry {
+                item: "/p/A.vst3".into(),
+                fingerprint: fp(1, 2),
+                plugins: vec![vst3("/p/A.vst3", "A")],
+            }],
+            vec![],
+        );
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(load_from(&path).expect("valide"), cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unchanged_items_are_reused_not_rescanned() {
         let cache = cache_with(
@@ -347,6 +430,47 @@ mod tests {
         let plan = reconcile(&discovered, &cache);
         assert_eq!(plan.to_scan, vec!["/a.vst3".to_string()]);
         assert!(plan.reused.is_empty());
+    }
+
+    /// Un plugin sous licence ouvre sa fenêtre et attend un clic : au premier
+    /// lancement, l'utilisateur la ferme sans comprendre → dépassement de délai.
+    /// Le condamner d'une session à l'autre, c'est le faire disparaître à vie
+    /// pour un AU (pas d'empreinte fichier). Il doit repartir à l'inventaire.
+    #[test]
+    fn un_depassement_de_delai_ne_condamne_pas_dune_session_a_lautre() {
+        let cache = cache_with(
+            vec![],
+            vec![BlockedRecord {
+                item: "au:aufx.Xpns.Xpns".into(),
+                fingerprint: None,
+                reason: BlockReason::Timeout,
+            }],
+        );
+        let discovered = vec![("au:aufx.Xpns.Xpns".to_string(), None)];
+        let plan = reconcile(&discovered, &cache);
+        assert_eq!(
+            plan.to_scan,
+            vec!["au:aufx.Xpns.Xpns".to_string()],
+            "un délai dépassé doit retenter sa chance"
+        );
+        assert!(plan.retained_blocked.is_empty());
+    }
+
+    /// Un vrai plantage, lui, reste retenu : rien n'a changé pour ce cas.
+    #[test]
+    fn un_plantage_reste_condamne_tant_que_le_fichier_ne_bouge_pas() {
+        let cache = cache_with(
+            vec![],
+            vec![BlockedRecord {
+                item: "au:aufx.Bad.Bad".into(),
+                fingerprint: None,
+                reason: BlockReason::Crash,
+            }],
+        );
+        let discovered = vec![("au:aufx.Bad.Bad".to_string(), None)];
+        let plan = reconcile(&discovered, &cache);
+        assert!(plan.to_scan.is_empty());
+        assert_eq!(plan.retained_blocked.len(), 1);
     }
 
     #[test]

@@ -54,27 +54,65 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-/// Signal de réveil : compteur cumulé de resumes + `Notify` pour réveiller le
+/// D'où vient un réveil. Les deux déclenchent le même re-init, mais le journal
+/// doit dire lequel : « l'écran s'est rallumé » et « le PC sort de veille » ne
+/// mènent pas au même diagnostic (22/09/2026 : un écran rallumé était journalisé
+/// « réveil de veille PC »).
+// Construit par le seul callback Windows (et les tests).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeSource {
+    /// `PBT_APMRESUME*` : sortie de veille système (S3).
+    System,
+    /// Écran éteint → allumé : seul signal d'une sortie de veille moderne (S0ix),
+    /// mais aussi d'un simple écran mis en veille.
+    Display,
+}
+
+/// Réveils cumulés depuis le démarrage, par source. Le superviseur compare deux
+/// relevés pour savoir si un réveil est survenu, et lequel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WakeCounts {
+    pub system: u64,
+    pub display: u64,
+}
+
+impl WakeCounts {
+    /// Ce qui s'est produit depuis `earlier`, pour le journal. `None` = rien.
+    pub fn cause_since(&self, earlier: WakeCounts) -> Option<&'static str> {
+        match (self.system != earlier.system, self.display != earlier.display) {
+            (false, false) => None,
+            (true, false) => Some("sortie de veille du PC"),
+            (false, true) => Some("écran rallumé (veille de l'écran ou veille moderne)"),
+            (true, true) => Some("sortie de veille du PC et écran rallumé"),
+        }
+    }
+}
+
+/// Signal de réveil : compteurs cumulés par source + `Notify` pour réveiller le
 /// superviseur immédiatement (sans attendre son tick). Clonable (Arc partagés).
 #[derive(Clone)]
 pub struct ResumeSignal {
-    count: Arc<AtomicU64>,
+    system: Arc<AtomicU64>,
+    display: Arc<AtomicU64>,
     notify: Arc<Notify>,
 }
 
 impl ResumeSignal {
     fn new() -> Self {
         Self {
-            count: Arc::new(AtomicU64::new(0)),
+            system: Arc::new(AtomicU64::new(0)),
+            display: Arc::new(AtomicU64::new(0)),
             notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Nombre cumulé de réveils système observés depuis le boot. Le superviseur
-    /// compare un delta pour savoir si un resume est survenu depuis sa dernière
-    /// observation.
-    pub fn resume_count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
+    /// Réveils observés depuis le démarrage, par source.
+    pub fn counts(&self) -> WakeCounts {
+        WakeCounts {
+            system: self.system.load(Ordering::Relaxed),
+            display: self.display.load(Ordering::Relaxed),
+        }
     }
 
     /// Handle pour `.notified().await` côté superviseur.
@@ -85,8 +123,11 @@ impl ResumeSignal {
     /// Signale un réveil (incrément + notification). Appelé depuis le callback
     /// système Windows (thread arbitraire) — donc strictement non bloquant.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // appelé uniquement côté power events (Windows)
-    fn signal(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+    fn signal(&self, source: WakeSource) {
+        match source {
+            WakeSource::System => self.system.fetch_add(1, Ordering::Relaxed),
+            WakeSource::Display => self.display.fetch_add(1, Ordering::Relaxed),
+        };
         self.notify.notify_one();
     }
 }
@@ -148,7 +189,7 @@ pub fn register() -> ResumeSignal {
 
 #[cfg(windows)]
 mod win {
-    use super::ResumeSignal;
+    use super::{ResumeSignal, WakeSource};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
@@ -203,7 +244,7 @@ mod win {
         // couvre les deux — dans les deux cas le driver a pu perdre son état.
         if event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND {
             if let Some(sig) = RESUME.get() {
-                sig.signal();
+                sig.signal(WakeSource::System);
             }
             return 0;
         }
@@ -224,7 +265,7 @@ mod win {
                 let prev = DISPLAY_STATE.swap(state, Ordering::Relaxed);
                 if is_display_wake(prev, state) {
                     if let Some(sig) = RESUME.get() {
-                        sig.signal();
+                        sig.signal(WakeSource::Display);
                     }
                 }
             }
@@ -312,12 +353,33 @@ mod tests {
     #[test]
     fn resume_signal_counts_and_defaults_zero() {
         let sig = ResumeSignal::new();
-        assert_eq!(sig.resume_count(), 0, "aucun réveil au départ");
-        sig.signal();
-        sig.signal();
-        assert_eq!(sig.resume_count(), 2, "deux réveils comptés");
+        assert_eq!(sig.counts(), WakeCounts::default(), "aucun réveil au départ");
+        sig.signal(WakeSource::System);
+        sig.signal(WakeSource::Display);
+        sig.signal(WakeSource::Display);
+        assert_eq!(sig.counts(), WakeCounts { system: 1, display: 2 }, "comptés par source");
         // Le handle de notification est clonable et indépendant du compteur.
         let _ = sig.notify_handle();
+    }
+
+    /// Régression du 22/09/2026 : un écran rallumé était journalisé « réveil de
+    /// veille PC », ce qui envoyait le diagnostic sur une fausse piste.
+    #[test]
+    fn le_journal_nomme_la_vraie_source_du_reveil() {
+        let avant = WakeCounts { system: 1, display: 3 };
+        assert_eq!(avant.cause_since(avant), None, "rien de neuf, aucun réveil");
+        let ecran = WakeCounts { display: 4, ..avant };
+        assert_eq!(
+            ecran.cause_since(avant),
+            Some("écran rallumé (veille de l'écran ou veille moderne)")
+        );
+        let pc = WakeCounts { system: 2, ..avant };
+        assert_eq!(pc.cause_since(avant), Some("sortie de veille du PC"));
+        let les_deux = WakeCounts { system: 2, display: 4 };
+        assert_eq!(
+            les_deux.cause_since(avant),
+            Some("sortie de veille du PC et écran rallumé")
+        );
     }
 
     /// Le cas qui MANQUAIT : la veille moderne (S0ix) ne délivre aucun
@@ -357,6 +419,6 @@ mod tests {
     fn register_is_inert_off_windows() {
         // Hors Windows : jamais déclenché, compteur reste à zéro.
         let sig = register();
-        assert_eq!(sig.resume_count(), 0);
+        assert_eq!(sig.counts(), WakeCounts::default());
     }
 }

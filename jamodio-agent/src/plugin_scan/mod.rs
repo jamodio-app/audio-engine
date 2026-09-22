@@ -71,6 +71,14 @@ pub struct FullScan {
     pub blocked: Vec<BlockedItem>,
     /// Nombre d'items réellement passés au worker (0 = tout servi par le cache).
     pub scanned: usize,
+    /// Items découverts qu'on n'a PAS instanciés — uniquement en mode
+    /// [`run_cache_only`]. Zéro après un scan complet.
+    pub pending: usize,
+    /// Le cache disque existait mais n'a pas pu être relu : les plugins qu'il
+    /// connaissait repassent tous « à inventorier ». Remonté jusqu'au studio
+    /// pour que le musicien sache POURQUOI sa liste s'est vidée. Toujours
+    /// `false` après un scan complet, qui réécrit le cache.
+    pub cache_unreadable: bool,
 }
 
 /// Scan complet out-of-process avec cache persisté (PLAN §3.3-3.4).
@@ -94,9 +102,42 @@ pub fn run_full_scan_forced() -> FullScan {
     run_full_scan_impl(true)
 }
 
-/// Cœur du scan. `force` = ignorer le cache disque comme prior (rescan total).
+/// Inventaire SANS instancier quoi que ce soit : on lit le cache, on compte ce
+/// qui reste à connaître, et on s'arrête là.
+///
+/// C'est ce qui tourne au démarrage de l'agent depuis le 19/09/2026. Instancier
+/// un plugin, c'est le laisser ouvrir SA fenêtre — licence, activation, démo
+/// expirée. Un nouvel utilisateur en voyait donc plusieurs s'ouvrir sans aucune
+/// explication dès la première installation, et chaque fenêtre non cliquée
+/// coûtait 30 s puis condamnait le plugin. Un utilisateur déjà installé, lui, ne
+/// voit rien : son cache répond en quelques millisecondes, exactement comme
+/// avant. Le scan qui instancie vraiment est désormais demandé par le musicien
+/// (`run_full_scan`), prévenu de ce qui va se passer.
+///
+/// Le cache n'est PAS réécrit ici : on n'a rien appris.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn run_full_scan_impl(force: bool) -> FullScan {
+pub fn run_cache_only() -> FullScan {
+    let (plan, _fp, cache_unreadable) = reconcile_with_disk(false);
+    FullScan {
+        pending: plan.to_scan.len(),
+        plugins: plan.reused,
+        blocked: plan.retained_blocked,
+        scanned: 0,
+        cache_unreadable,
+    }
+}
+
+/// Découverte + réconciliation avec le cache disque. Rendu séparément parce que
+/// l'inventaire seul et le scan complet partent exactement du même état. Le
+/// troisième élément dit si un cache PRÉSENT n'a pas pu être relu.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn reconcile_with_disk(
+    force: bool,
+) -> (
+    cache::Plan,
+    std::collections::HashMap<String, Option<cache::FileFingerprint>>,
+    bool,
+) {
     use std::collections::HashMap;
 
     let items = discovery::discover_items();
@@ -109,10 +150,28 @@ fn run_full_scan_impl(force: bool) -> FullScan {
 
     // Rescan forcé : prior vide (scanner_abi = 0 ≠ SCANNER_ABI) → la
     // réconciliation bascule sur « tout rescanner, blocklist ignorée ».
+    let mut cache_unreadable = false;
     let prior = if force {
         cache::CacheFile::default()
     } else {
-        cache::load()
+        match cache::load() {
+            Ok(prior) => prior,
+            Err(e) => {
+                // Les plugins que ce cache connaissait ne sont PAS réutilisés :
+                // tous repassent « à inventorier » (compte `pending`). On repart
+                // de zéro — le scan doit pouvoir tourner — mais jamais en
+                // silence : journalisé ici, et remonté jusqu'au studio
+                // (`PluginList.cacheUnreadable`), qui le dit au musicien.
+                tracing::error!(
+                    target: "jamodio::plugin",
+                    path = %cache::cache_path().display(),
+                    error = %e,
+                    "cache de scan présent mais illisible — plugins connus non réutilisés, tous à réinventorier"
+                );
+                cache_unreadable = true;
+                cache::CacheFile::default()
+            }
+        }
     };
     let plan = cache::reconcile(&discovered, &prior);
     tracing::info!(
@@ -123,6 +182,14 @@ fn run_full_scan_impl(force: bool) -> FullScan {
         blocked_retained = plan.retained_blocked.len(),
         "scan: réconciliation cache terminée"
     );
+    (plan, fp_by_item, cache_unreadable)
+}
+
+/// Cœur du scan. `force` = ignorer le cache disque comme prior (rescan total).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn run_full_scan_impl(force: bool) -> FullScan {
+    // Un cache illisible est reconstruit par ce scan : plus rien à signaler.
+    let (plan, fp_by_item, _cache_unreadable) = reconcile_with_disk(force);
 
     let scanned = plan.to_scan.len();
     let fresh = if plan.to_scan.is_empty() {
@@ -140,5 +207,6 @@ fn run_full_scan_impl(force: bool) -> FullScan {
     let mut blocked = plan.retained_blocked;
     blocked.extend(fresh.blocked);
 
-    FullScan { plugins, blocked, scanned }
+    // Tout a été instancié : plus rien en attente.
+    FullScan { plugins, blocked, scanned, pending: 0, cache_unreadable: false }
 }

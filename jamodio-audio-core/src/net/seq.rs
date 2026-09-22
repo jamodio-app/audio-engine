@@ -52,6 +52,11 @@ pub struct SeqCounters {
     pub received: u64,
     /// Paquets reçus trop tard pour être joués.
     pub late: u64,
+    /// Lot 0 (chantier tampon) — paquets arrivés en double (même numéro déjà vu).
+    pub duplicate: u64,
+    /// Lot 0 — sauts de numérotation : un numéro trop loin pour être un retard,
+    /// tenu en quarantaine jusqu'à confirmation par le suivant.
+    pub jump: u64,
 }
 
 impl SeqCounters {
@@ -68,6 +73,13 @@ pub struct SeqTracker {
     highest: Option<u16>,
     /// Bit `i` = paquet `highest - i` reçu.
     history: u128,
+    /// Lot 1.2 — bit `i` = la place `highest - i` a été REMPLIE par une trame de
+    /// masquage, sans que le paquet soit arrivé. Distinct de `history` : la place
+    /// est occupée, mais rien n'a été reçu. C'est ce qui permet de classer le
+    /// retardataire en `Late` (il est arrivé, trop tard) plutôt qu'en doublon
+    /// (le réseau l'aurait envoyé deux fois) — deux faits différents, deux
+    /// compteurs différents.
+    concealed: u128,
     /// Numéro qui confirmerait la reprise après un saut (`Jump`).
     resync_seq: Option<u16>,
     counters: SeqCounters,
@@ -82,6 +94,13 @@ impl SeqTracker {
         self.counters
     }
 
+    /// Place courante du flux (dernier numéro reçu ou comblé), `None` avant le
+    /// premier paquet. Après `on_concealed`, c'est la place que la trame
+    /// inventée vient de prendre.
+    pub fn highest(&self) -> Option<u16> {
+        self.highest
+    }
+
     /// Classe le paquet `seq` et met à jour les compteurs.
     pub fn on_packet(&mut self, seq: u16) -> Arrival {
         let Some(highest) = self.highest else {
@@ -89,6 +108,16 @@ impl SeqTracker {
         };
         let ahead = seq.wrapping_sub(highest);
         if ahead == 0 {
+            // Place remplie par une trame inventée : le paquet est en RETARD, pas
+            // en double. On l'écarte (sa place est prise) et on le dit comme tel.
+            if self.concealed & 1 != 0 {
+                self.concealed &= !1;
+                self.history |= 1;
+                self.counters.received += 1;
+                self.counters.late += 1;
+                return Arrival::Late;
+            }
+            self.counters.duplicate += 1;
             return Arrival::Duplicate;
         }
         if ahead < MAX_DROPOUT {
@@ -96,6 +125,11 @@ impl SeqTracker {
                 1
             } else {
                 (self.history << ahead) | 1
+            };
+            self.concealed = if ahead >= HISTORY_BITS {
+                0
+            } else {
+                self.concealed << ahead
             };
             self.highest = Some(seq);
             self.resync_seq = None;
@@ -107,8 +141,12 @@ impl SeqTracker {
         if behind < MAX_MISORDER {
             let bit = 1u128 << behind;
             if self.history & bit != 0 {
+                self.counters.duplicate += 1;
                 return Arrival::Duplicate;
             }
+            // Place déjà remplie par une trame inventée : on la libère du masque,
+            // le paquet reste écarté et compté en retard (ci-dessous).
+            self.concealed &= !bit;
             self.history |= bit;
             self.counters.received += 1;
             self.counters.late += 1;
@@ -118,12 +156,39 @@ impl SeqTracker {
             return self.start(seq);
         }
         self.resync_seq = Some(seq.wrapping_add(1));
+        self.counters.jump += 1;
         Arrival::Jump
+    }
+
+    /// Lot 1.2 — la place du paquet attendu vient d'être REMPLIE par une trame de
+    /// masquage, faute de l'avoir vu arriver à l'heure.
+    ///
+    /// On avance donc la place courante comme si le paquet était passé : s'il
+    /// arrive quand même après coup, il sera classé `Late` et écarté, au lieu
+    /// d'être joué APRÈS la trame qui a pris sa place — ce qui décalerait le flux
+    /// d'une trame à chaque masquage.
+    ///
+    /// Le paquet n'est PAS compté comme reçu : `expected` avance seul, donc le
+    /// taux de perte publié continue de dire la vérité du réseau. Sans effet tant
+    /// qu'aucun paquet n'est encore arrivé (rien à remplacer).
+    pub fn on_concealed(&mut self) {
+        let Some(highest) = self.highest else { return };
+        self.highest = Some(highest.wrapping_add(1));
+        // La place avance sans être marquée reçue : c'est `concealed` qui retient
+        // qu'on l'a remplie nous-mêmes.
+        self.history <<= 1;
+        self.concealed = (self.concealed << 1) | 1;
+        // `resync_seq` n'est PAS touché : une quarantaine de saut en cours attend
+        // la confirmation du NOUVEAU flux, qu'une trame inventée sur l'ancien ne
+        // change en rien. L'effacer ici retardait la reprise d'un paquet à chaque
+        // masquage (revue du 21/09/2026).
+        self.counters.expected += 1;
     }
 
     fn start(&mut self, seq: u16) -> Arrival {
         self.highest = Some(seq);
         self.history = 1;
+        self.concealed = 0;
         self.resync_seq = None;
         self.counters.expected += 1;
         self.counters.received += 1;
@@ -156,7 +221,9 @@ mod tests {
             SeqCounters {
                 expected: 3,
                 received: 3,
-                late: 0
+                late: 0,
+                duplicate: 0,
+                jump: 0
             }
         );
         assert_eq!(t.counters().lost(), 0);
@@ -192,7 +259,9 @@ mod tests {
             SeqCounters {
                 expected: 4,
                 received: 4,
-                late: 1
+                late: 1,
+                duplicate: 0,
+                jump: 0
             }
         );
         assert_eq!(t.counters().lost(), 0);
@@ -209,7 +278,9 @@ mod tests {
             SeqCounters {
                 expected: 2,
                 received: 2,
-                late: 0
+                late: 0,
+                duplicate: 2,
+                jump: 0
             }
         );
     }
@@ -263,7 +334,9 @@ mod tests {
             SeqCounters {
                 expected: 4,
                 received: 4,
-                late: 0
+                late: 0,
+                jump: 1,
+                duplicate: 0
             }
         );
     }
@@ -279,6 +352,55 @@ mod tests {
     }
 
     #[test]
+    fn un_paquet_masque_puis_arrive_est_ecarte() {
+        // Le cœur de 1.2 : on a inventé la trame 1 faute de l'avoir vue à l'heure.
+        // Quand elle arrive enfin, elle ne doit PAS être jouée après sa remplaçante.
+        let mut t = SeqTracker::new();
+        assert_eq!(t.on_packet(0), Arrival::Start);
+        t.on_concealed(); // remplit la place du paquet 1
+        assert_eq!(t.on_packet(1), Arrival::Late);
+        assert_eq!(t.counters().late, 1);
+        // Et la suite reprend normalement, sans faux trou.
+        assert_eq!(t.on_packet(2), Arrival::Next { missing: 0 });
+    }
+
+    #[test]
+    fn masquer_ne_compte_pas_un_paquet_recu() {
+        // Le taux de perte publié doit continuer de dire la vérité du réseau :
+        // une trame inventée n'est pas un paquet reçu.
+        let mut t = SeqTracker::new();
+        t.on_packet(0);
+        let avant = t.counters();
+        t.on_concealed();
+        let apres = t.counters();
+        assert_eq!(apres.received, avant.received, "rien n'a été reçu");
+        assert_eq!(apres.expected, avant.expected + 1, "une place de plus attendue");
+        assert_eq!(apres.lost(), avant.lost() + 1);
+    }
+
+    #[test]
+    fn masquer_avant_le_premier_paquet_ne_fait_rien() {
+        // On n'invente pas du son pour un flux qu'on n'a jamais entendu.
+        let mut t = SeqTracker::new();
+        t.on_concealed();
+        assert_eq!(t.counters().expected, 0);
+        assert_eq!(t.on_packet(42), Arrival::Start);
+    }
+
+    #[test]
+    fn plusieurs_masquages_daffilee_restent_coherents() {
+        let mut t = SeqTracker::new();
+        t.on_packet(10);
+        t.on_concealed();
+        t.on_concealed();
+        t.on_concealed();
+        // Les trois places sont passées : le paquet 14 suit sans trou déduit.
+        assert_eq!(t.on_packet(14), Arrival::Next { missing: 0 });
+        // Et les retardataires des places inventées sont écartés.
+        assert_eq!(t.on_packet(12), Arrival::Late);
+    }
+
+    #[test]
     fn grand_trou_sous_le_seuil_de_saut() {
         let mut t = SeqTracker::new();
         t.on_packet(0);
@@ -290,5 +412,17 @@ mod tests {
         );
         // L'historique est reparti : l'ancien paquet 0 est hors fenêtre → saut.
         assert_eq!(t.on_packet(0), Arrival::Jump);
+    }
+
+    #[test]
+    fn une_trame_inventee_ne_retarde_pas_la_reprise_apres_un_saut() {
+        let mut t = SeqTracker::new();
+        assert_eq!(t.on_packet(100), Arrival::Start);
+        // Saut : 5000 est mis en quarantaine, 5001 le confirmera.
+        assert_eq!(t.on_packet(5000), Arrival::Jump);
+        // Entre-temps, l'échéance de l'ancien flux fait inventer une trame.
+        t.on_concealed();
+        // Le paquet de confirmation redémarre le flux, sans attendre un de plus.
+        assert_eq!(t.on_packet(5001), Arrival::Start);
     }
 }

@@ -1,4 +1,4 @@
-//! Santé du callback audio temps-réel — diagnostic des CRAQUEMENTS.
+//! Santé du callback audio temps-réel — ses irrégularités, mesurées (ligne « CALLBACK AUDIO IRRÉGULIER »).
 //!
 //! # Pourquoi
 //!

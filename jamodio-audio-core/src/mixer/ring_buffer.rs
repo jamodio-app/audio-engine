@@ -34,6 +34,23 @@ pub struct JitterBuffer {
     /// Nombre cumulé de samples les plus anciens jetés côté `push` quand le
     /// ring est plein (burst SFU + drift d'horloge). Reporting via getter.
     overflow_drops: u64,
+    /// Lot 0 (tampon) — cumul des samples de SILENCE rendus par `pull` : la fin
+    /// d'un bloc en sous-alimentation, puis tout le ré-amorçage. C'est la durée
+    /// que l'oreille perd. À ne pas confondre avec le silence RÉSEAU (aucun
+    /// paquet reçu), compté par le pipeline depuis la 0.6.3.
+    zero_filled_samples: u64,
+    /// Silence rendu D'AFFILÉE, remis à zéro dès qu'un bloc complet sort. Sert
+    /// uniquement à borner `zero_filled_samples` (cf.
+    /// `MAX_CONTINUOUS_ZERO_FILL_SAMPLES`).
+    continuous_zero_filled: u64,
+    /// Lot 0 (tampon) — remplissage relevé juste avant chaque `push`, en samples
+    /// interleaved. Anneau de taille fixe (zéro allocation), lu par la
+    /// télémétrie 1 Hz via `fill_snapshot()`.
+    fill_obs: [u32; FILL_OBS_LEN],
+    /// Nombre d'observations valides dans `fill_obs` (plafonné à sa taille).
+    fill_obs_len: usize,
+    /// Prochaine case à écrire dans `fill_obs`.
+    fill_obs_next: usize,
     /// Nombre cumulé de samples drainés côté `pull` quand le buffer s'est
     /// rempli durablement bien au-dessus de `target_samples` (drift drain
     /// pré-emptif pour borner la latence post-burst).
@@ -155,6 +172,19 @@ const LOCAL_ADAPT_DOWN_SECS: u64 = 8;
 /// Durée du fondu de concealment (entrée/sortie) autour d'un trou self-monitor.
 /// ~2 ms = assez pour tuer le clic, assez court pour rester transparent.
 const CONCEAL_FADE_MS: usize = 2;
+/// Au-delà de cette durée de silence CONTINU, on cesse de l'imputer au tampon.
+///
+/// `zeroFilledMs` répond à « combien de silence le tampon a-t-il rendu à la
+/// place du son ? ». Un trou de quelques dizaines de millisecondes, oui. Mais un
+/// pair qui part, ou qui se tait, laisse le tampon se vider puis se ré-amorcer
+/// indéfiniment : le compteur montait alors de 1 000 ms PAR SECONDE, sans
+/// qu'aucun accroc ne soit compté (le ré-amorçage n'est pas une
+/// sous-alimentation). Deux sessions de banc s'étaient ainsi retrouvées avec
+/// 6,2 s et 1,1 s de « silence rendu » qui n'étaient que la fin de la session.
+/// L'absence de flux est déjà mesurée, et mieux, par `recvStreams[].silentMs`.
+const MAX_CONTINUOUS_ZERO_FILL_MS: usize = 200;
+const MAX_CONTINUOUS_ZERO_FILL_SAMPLES: u64 =
+    (MAX_CONTINUOUS_ZERO_FILL_MS * SAMPLE_RATE * CHANNELS / 1000) as u64;
 const CONCEAL_FADE_SAMPLES: usize = CONCEAL_FADE_MS * SAMPLE_RATE * CHANNELS / 1000;
 /// Phase C — gain proportionnel du servo de drift (erreur de remplissage relative
 /// → écart de vitesse). Un simple P suffit : la correction stationnaire requise
@@ -230,6 +260,44 @@ fn ms_f64_to_samples(ms: f64) -> usize {
     (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
 }
 
+/// Convertit un nombre de samples interleaved stéréo en ms.
+fn samples_to_ms_f64(samples: u64) -> f64 {
+    samples as f64 * 1000.0 / (SAMPLE_RATE * CHANNELS) as f64
+}
+
+/// Lot 0 (tampon) — profondeur de la fenêtre d'observation du remplissage :
+/// 512 arrivées ≈ 1,3 s à 400 paquets/s (trame Opus de 2,5 ms).
+/// CONSTANTE DE CALIBRATION : assez longue pour un minimum qui a du sens, assez
+/// courte pour suivre un changement de régime réseau.
+const FILL_OBS_LEN: usize = 512;
+
+/// Observations de remplissage copiées sous verrou, pour être exploitées après
+/// (cf. `JitterBuffer::fill_snapshot`).
+#[derive(Clone, Copy)]
+pub struct FillSnapshot {
+    obs: [u32; FILL_OBS_LEN],
+    len: usize,
+}
+
+impl FillSnapshot {
+    /// Lot 0 — remplissage observé aux dernières arrivées : `(minimum, médiane)`
+    /// en ms ; `None` tant qu'aucune arrivée n'a été observée.
+    ///
+    /// Le MINIMUM est la mesure qui décide du Lot 2 : c'est la marge que la
+    /// sortie n'a jamais consommée, donc ce que la cible pourrait rendre sans
+    /// créer un seul accroc de plus.
+    pub fn stats(mut self) -> Option<(f64, f64)> {
+        if self.len == 0 {
+            return None;
+        }
+        let obs = &mut self.obs[..self.len];
+        let min = obs.iter().copied().min().unwrap_or(0);
+        obs.sort_unstable();
+        let median = obs[self.len / 2];
+        Some((samples_to_ms_f64(min as u64), samples_to_ms_f64(median as u64)))
+    }
+}
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -269,6 +337,11 @@ impl JitterBuffer {
             shrink_accum: 0.0,
             glitch_floor_samples: 0,
             glitch_calm_pulls: 0,
+            zero_filled_samples: 0,
+            continuous_zero_filled: 0,
+            fill_obs: [0; FILL_OBS_LEN],
+            fill_obs_len: 0,
+            fill_obs_next: 0,
         }
     }
 
@@ -329,6 +402,12 @@ impl JitterBuffer {
     /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
     /// audiblement moins violent qu'une coupure mid-paquet.
     pub fn push(&mut self, samples: &[f32]) {
+        // Lot 0 (tampon) — mesure prise AVANT d'écrire : c'est le creux réel
+        // laissé par la sortie entre deux arrivées. Le minimum de la fenêtre dit
+        // la marge qui n'a jamais servi (ce que la cible pourrait rendre), la
+        // médiane dit le régime. Vu ici, il porte la gigue du réseau ET
+        // l'irrégularité des callbacks : aucune ligne dans le callback.
+        self.record_fill_observation();
         // Phase C — en régime établi (primed) et pour les streams réseau, on
         // resample le flux entrant en continu pour tenir le remplissage sur la
         // cible (compensation de drift d'horloge sender↔nous). Hors régime
@@ -345,6 +424,15 @@ impl JitterBuffer {
         } else {
             self.push_to_ring(samples);
         }
+    }
+
+    /// Lot 0 — enregistre le remplissage courant dans la fenêtre glissante.
+    /// Zéro allocation : tableau de taille fixe écrit en anneau.
+    fn record_fill_observation(&mut self) {
+        let fill = self.consumer.occupied_len().min(u32::MAX as usize) as u32;
+        self.fill_obs[self.fill_obs_next] = fill;
+        self.fill_obs_next = (self.fill_obs_next + 1) % FILL_OBS_LEN;
+        self.fill_obs_len = (self.fill_obs_len + 1).min(FILL_OBS_LEN);
     }
 
     /// Écrit `data` dans le ring avec politique drop-oldest sur overflow.
@@ -433,6 +521,10 @@ impl JitterBuffer {
                 self.primed = true;
             } else {
                 output.fill(0.0);
+                // Lot 0 — le ré-amorçage est du silence rendu, au même titre que
+                // la fin d'un bloc en sous-alimentation : une addition entière.
+                // Lot 1.3 — bornée : au-delà, c'est un flux absent, pas un trou.
+                self.count_zero_filled(output.len() as u64);
                 return 0;
             }
         }
@@ -472,11 +564,20 @@ impl JitterBuffer {
             if available > 0 {
                 self.consumer.pop_slice(&mut output[..available]);
             }
-            // Chantier C — mode local : au lieu d'une coupure sèche (clic), on
-            // fond la fin du réel vers le silence et on armera un fondu
-            // d'entrée à la reprise → le trou (spike plugin) devient un bref
-            // creux lissé, ZÉRO craquement. La latence reste inchangée.
-            if self.local_mode {
+            // Au lieu d'une coupure sèche (clic), on fond la fin du réel vers le
+            // silence et on arme un fondu d'entrée à la reprise : le trou devient
+            // un bref creux lissé, ZÉRO craquement. La latence reste inchangée.
+            //
+            // Chantier C (07/2026) : d'abord réservé au retour casque, parce que
+            // son trou à lui (spike plugin) était le seul qu'on savait provoquer.
+            // Lot 1.1 (09/2026) : étendu aux flux RÉSEAU, où le même clic se
+            // produit pour la même raison — le tampon n'a plus rien à donner. Sur
+            // 28 minutes de banc, 30 accrocs par machine, chacun un clic sec.
+            //
+            // ⚠ Ce code tourne dans le callback audio. Ce n'est PAS un étage
+            // nouveau : même branche, même boucle, uniquement sur un accroc — le
+            // chemin nominal (`available >= needed`) ne le traverse jamais.
+            {
                 let n = CONCEAL_FADE_SAMPLES.min(available);
                 let start = available - n;
                 for (i, s) in output[start..available].iter_mut().enumerate() {
@@ -485,6 +586,7 @@ impl JitterBuffer {
                 self.conceal_fade_in_remaining = CONCEAL_FADE_SAMPLES;
             }
             output[available..].fill(0.0);
+            self.count_zero_filled((output.len() - available) as u64);
             self.underruns += 1;
             self.adapt_up();
             // C1 — un underrun pousse la pression (bornée) : tant qu'elle reste
@@ -498,13 +600,15 @@ impl JitterBuffer {
             available
         };
 
-        // Chantier C — fondu d'ENTRÉE à la reprise après un trou (mode local) :
+        // Chantier C — fondu d'ENTRÉE à la reprise après un trou :
         // rampe 0→1 sur les premiers samples RÉELS poppés → pas de clic au bord
         // de reprise. On l'applique UNIQUEMENT sur un pull plein (= vraie
         // reprise), jamais sur le pull d'underrun lui-même (dont la tête est
         // l'audio d'AVANT le trou, déjà fondu en sortie). S'étale sur plusieurs
         // pulls si needed < fondu restant.
-        if self.local_mode && self.conceal_fade_in_remaining > 0 && pulled == needed {
+        // Lot 1.1 — le fondu d'entrée suit le fondu de sortie ci-dessus : il vaut
+        // donc pour les flux réseau comme pour le retour casque.
+        if self.conceal_fade_in_remaining > 0 && pulled == needed {
             let total = CONCEAL_FADE_SAMPLES;
             let n = self.conceal_fade_in_remaining.min(pulled);
             for (i, s) in output[..n].iter_mut().enumerate() {
@@ -543,6 +647,24 @@ impl JitterBuffer {
 
     pub fn buffered(&self) -> usize {
         self.consumer.occupied_len()
+    }
+
+    /// Ce qu'il reste à jouer, en millisecondes — la même quantité que
+    /// [`Self::buffered`], dans l'unité où le masquage raisonne (`mixer::conceal`).
+    /// La conversion vit ici : ailleurs, elle supposerait connue la géométrie du
+    /// tampon (entrelacement stéréo), qui n'appartient qu'à lui.
+    pub fn buffered_ms(&self) -> f64 {
+        samples_to_ms_f64(self.consumer.occupied_len() as u64)
+    }
+
+    /// `false` pendant le ré-amorçage qui suit un trou : la sortie ne tire plus
+    /// rien de ce tampon tant qu'il n'est pas remonté à sa cible (cf. `pull`).
+    /// Remonté à la cible, il est EN LECTURE dès maintenant, même si `primed` ne
+    /// basculera qu'au prochain tirage : sinon une échéance tombée entre les deux
+    /// (jusqu'à un bloc de sortie, 10,7 ms sur Mac) serait prise pour un
+    /// ré-amorçage et désarmée (revue du 22/09/2026).
+    pub fn is_playing(&self) -> bool {
+        self.primed || self.consumer.occupied_len() >= self.target_samples
     }
 
     pub fn target_ms(&self) -> usize {
@@ -610,6 +732,52 @@ impl JitterBuffer {
         self.overflow_drops
     }
 
+    /// Lot 0 — durée cumulée jetée à `push` faute de place (ring plein), en ms.
+    pub fn overflow_ms(&self) -> f64 {
+        samples_to_ms_f64(self.overflow_drops)
+    }
+
+    /// Impute `n` échantillons de silence au tampon, tant que ce silence n'a pas
+    /// duré au point de ne plus rien vouloir dire (cf.
+    /// `MAX_CONTINUOUS_ZERO_FILL_SAMPLES`). Le compteur continu, lui, avance
+    /// toujours : c'est lui qui sait quand s'arrêter, et il ne repart qu'au
+    /// retour d'un vrai bloc.
+    fn count_zero_filled(&mut self, n: u64) {
+        if self.continuous_zero_filled < MAX_CONTINUOUS_ZERO_FILL_SAMPLES {
+            let room = MAX_CONTINUOUS_ZERO_FILL_SAMPLES - self.continuous_zero_filled;
+            self.zero_filled_samples += n.min(room);
+        }
+        self.continuous_zero_filled = self.continuous_zero_filled.saturating_add(n);
+    }
+
+    /// Lot 0 — durée cumulée de SILENCE rendue par `pull` (sous-alimentation et
+    /// ré-amorçage), en ms. Monotone, comme `underruns`.
+    pub fn zero_filled_ms(&self) -> f64 {
+        samples_to_ms_f64(self.zero_filled_samples)
+    }
+
+    /// Copie brute des observations de remplissage, à calculer HORS du verrou :
+    /// ce tampon est tiré par le callback de sortie sous le même verrou, et le
+    /// tri de 512 valeurs n'a rien à faire pendant qu'on le tient (revue du
+    /// 21/09/2026). Une copie de 2 Ko, rien de plus.
+    pub fn fill_snapshot(&self) -> FillSnapshot {
+        FillSnapshot {
+            obs: self.fill_obs,
+            len: self.fill_obs_len,
+        }
+    }
+
+    /// Lot 0 — de quoi la cible est faite : `(plancher de gigue, plancher de
+    /// glitch, filet réactif)` en ms. Leur somme, bornée, donne `target_ms()` :
+    /// sans cette décomposition, on ne sait pas QUI tient le tampon en l'air.
+    pub fn target_parts_ms(&self) -> (f64, f64, f64) {
+        (
+            samples_to_ms_f64(self.floor_samples as u64),
+            samples_to_ms_f64(self.glitch_floor_samples as u64),
+            samples_to_ms_f64(self.reactive_extra_samples as u64),
+        )
+    }
+
     /// Cumul des samples drainés à `pull` quand le buffer dépassait 3× target
     /// (correction de drift / post-burst).
     pub fn drift_drops(&self) -> u64 {
@@ -671,6 +839,8 @@ impl JitterBuffer {
     /// (`local_mode`) garde son adaptation temporelle historique (`adapt_down`)
     /// — INTOUCHÉ (scope réseau uniquement).
     fn recover_after_full_pull(&mut self) {
+        // Le son coule de nouveau : le prochain trou repart d'un compteur neuf.
+        self.continuous_zero_filled = 0;
         self.underrun_pressure *= UNDERRUN_PRESSURE_LEAK;
         if self.local_mode {
             self.adapt_down();
@@ -712,6 +882,108 @@ impl JitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Revue du 22/09/2026 — remonté à sa cible, le tampon est « en lecture »
+    /// dès maintenant, sans attendre que le prochain tirage bascule `primed`.
+    #[test]
+    fn un_tampon_remonte_a_sa_cible_est_en_lecture_avant_le_tirage() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        assert!(!jb.is_playing(), "vide : ré-amorçage");
+        jb.push(&vec![0.0_f32; 480 * 2]); // 10 ms stéréo : la cible
+        assert!(jb.is_playing());
+    }
+
+    // ══ Lot 0 du chantier tampon — les mesures qui décideront du Lot 2 ══
+    //
+    // Elles ne changent rien au son : ces tests vérifient qu'elles disent la
+    // vérité, car tout le chantier s'appuiera dessus.
+
+    /// Le silence RENDU est compté au sample près : d'abord le ré-amorçage
+    /// (aucun audio disponible), puis la fin du bloc en sous-alimentation.
+    #[test]
+    fn zero_filled_ms_counts_every_silent_sample() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        let block = 128; // samples interleaved
+
+        // Rien à jouer : tout le bloc est du silence de ré-amorçage.
+        let mut out = vec![0.0_f32; block];
+        assert_eq!(jb.pull(&mut out), 0);
+        let after_prime = jb.zero_filled_ms();
+        assert!(
+            (after_prime - samples_to_ms_f64(block as u64)).abs() < 1e-9,
+            "ré-amorçage : {after_prime} ms comptées pour {block} samples"
+        );
+
+        // Amorce, puis une sous-alimentation : le tampon rend `available`
+        // samples réels et complète le bloc en silence.
+        let target = 10 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![0.5_f32; target]);
+        let mut full = vec![0.0_f32; target];
+        assert_eq!(jb.pull(&mut full), target, "le bloc amorcé est servi en entier");
+        let before = jb.zero_filled_ms();
+
+        jb.push(&vec![0.5_f32; block / 2]);
+        let mut short = vec![0.0_f32; block];
+        jb.pull(&mut short);
+        let added = jb.zero_filled_ms() - before;
+        assert!(
+            added >= samples_to_ms_f64((block / 2) as u64) - 1e-9,
+            "la part manquante du bloc doit être comptée (ajouté {added} ms)"
+        );
+        assert_eq!(jb.underruns(), 1, "une seule sous-alimentation");
+    }
+
+    /// Le remplissage est relevé AVANT l'écriture : son minimum est la marge
+    /// que la sortie n'a jamais consommée — la mesure qui ouvre (ou ferme) le
+    /// Lot 2. Sans arrivée, il n'y a rien à dire : `None`.
+    #[test]
+    fn fill_stats_report_the_margin_left_before_each_arrival() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(10);
+        assert!(jb.fill_snapshot().stats().is_none(), "aucune arrivée : aucune mesure");
+
+        let chunk = 480; // 5 ms
+        jb.push(&vec![0.1_f32; chunk]); // relevé : ring vide
+        let (min, _) = jb.fill_snapshot().stats().expect("une observation");
+        assert!(min.abs() < 1e-9, "la 1re arrivée voit un tampon vide");
+
+        // Trois arrivées sans aucune sortie : le remplissage monte, le minimum
+        // reste celui du tampon vide.
+        jb.push(&vec![0.1_f32; chunk]);
+        jb.push(&vec![0.1_f32; chunk]);
+        let (min, p50) = jb.fill_snapshot().stats().expect("des observations");
+        assert!(min.abs() < 1e-9, "le minimum garde le creux le plus bas");
+        assert!(p50 > min, "la médiane suit le remplissage réel ({p50} ms)");
+    }
+
+    /// La cible est la somme bornée de ses trois parts : les publier permet de
+    /// dire QUI la tient en l'air (gigue, plancher de glitch, filet réactif).
+    #[test]
+    fn target_parts_add_up_to_the_target() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(4.0); // plancher = 1,0 × 4 + 3 = 7 ms
+
+        let (jitter_part, glitch_part, reactive_part) = jb.target_parts_ms();
+        assert!((jitter_part - 7.0).abs() < 0.05, "plancher de gigue : {jitter_part} ms");
+        assert_eq!(glitch_part, 0.0);
+        assert_eq!(reactive_part, 0.0);
+        assert_eq!(jb.target_ms(), 7);
+
+        // Une sous-alimentation monte le filet (+5 ms) et le plancher de glitch
+        // (+1 ms) : la somme doit se retrouver dans la cible.
+        let mut out = vec![0.0_f32; 128];
+        jb.pull(&mut out); // pas amorcé → underrun comptabilisé par adapt_up
+        let (jitter_part, glitch_part, reactive_part) = jb.target_parts_ms();
+        let sum = jitter_part + glitch_part + reactive_part;
+        assert!(
+            (sum - jb.target_ms() as f64).abs() <= 1.0,
+            "somme des parts {sum} ms vs cible {} ms",
+            jb.target_ms()
+        );
+    }
+
 
     /// Plus grand écart entre 2 samples interleaved consécutifs d'un même
     /// canal (= dérivée discrète par canal). Sur un signal continu cette
@@ -838,6 +1110,95 @@ mod tests {
             out[pulled - 1]
         );
         assert_eq!(jb.underruns(), 1);
+    }
+
+    /// Lot 1.3 — un pair qui part ne doit pas gonfler « le silence rendu ».
+    #[test]
+    fn un_flux_absent_narrete_pas_de_gonfler_le_silence_rendu() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let mut out = vec![0.0_f32; 480]; // 5 ms
+        // Personne n'a jamais rien envoyé : que du ré-amorçage, indéfiniment.
+        for _ in 0..400 {
+            jb.pull(&mut out);
+        }
+        let rendu = jb.zero_filled_ms();
+        assert!(
+            rendu <= MAX_CONTINUOUS_ZERO_FILL_MS as f64,
+            "silence rendu borné à {MAX_CONTINUOUS_ZERO_FILL_MS} ms, got {rendu}"
+        );
+    }
+
+    /// Mais un vrai trou, lui, reste compté en entier — et le compteur repart
+    /// à zéro quand le son revient.
+    #[test]
+    fn un_vrai_trou_reste_compte_et_le_compteur_repart() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t * 2]; // tire le double → trou de 5 ms
+        jb.pull(&mut out);
+        let apres_trou = jb.zero_filled_ms();
+        assert!(apres_trou > 0.0, "un vrai trou doit être compté");
+        assert!(apres_trou < MAX_CONTINUOUS_ZERO_FILL_MS as f64);
+        // Le son revient franchement : bloc complet servi → compteur continu à zéro.
+        jb.push(&vec![1.0_f32; t * 4]);
+        let mut plein = vec![0.0_f32; t];
+        assert_eq!(jb.pull(&mut plein), plein.len());
+        // Un nouveau trou est de nouveau compté pour ce qu'il vaut.
+        let mut encore = vec![0.0_f32; t * 8];
+        jb.pull(&mut encore);
+        assert!(
+            jb.zero_filled_ms() > apres_trou,
+            "après reprise, un nouveau trou doit s'ajouter"
+        );
+    }
+
+    /// Lot 1.1 — le même soin pour un flux RÉSEAU : c'est là que les 30 accrocs
+    /// par machine et par demi-heure produisaient un clic sec (banc du 18/09).
+    #[test]
+    fn un_flux_reseau_ne_coupe_plus_net_sur_un_accroc() {
+        let mut jb = JitterBuffer::new();
+        // PAS de set_local_mode : on est sur le chemin réseau, celui des pairs.
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t + 4800];
+        let pulled = jb.pull(&mut out);
+        assert!(pulled > 0 && pulled < out.len(), "underrun partiel attendu");
+        assert!(
+            out[pulled - 1].abs() < 0.15,
+            "la fin du réel doit être fondue vers 0, got {}",
+            out[pulled - 1]
+        );
+        assert_eq!(jb.underruns(), 1, "l'accroc reste COMPTÉ, même masqué");
+    }
+
+    /// Et la reprise ne claque pas non plus.
+    #[test]
+    fn un_flux_reseau_reprend_en_douceur_apres_un_accroc() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let t = 5 * SAMPLE_RATE * CHANNELS / 1000;
+        jb.push(&vec![1.0_f32; t]);
+        let mut out = vec![0.0_f32; t + 4800];
+        jb.pull(&mut out); // underrun → fondu de sortie + fondu d'entrée armé
+        // Le son revient, à plein régime.
+        jb.push(&vec![1.0_f32; t * 4]);
+        let mut back = vec![0.0_f32; t];
+        let pulled = jb.pull(&mut back);
+        assert_eq!(pulled, back.len(), "la reprise doit servir le bloc entier");
+        assert!(
+            back[0].abs() < 0.15,
+            "la reprise doit démarrer bas (rampe), got {}",
+            back[0]
+        );
+        assert!(
+            back[back.len() - 1] > 0.9,
+            "et retrouver le plein régime, got {}",
+            back[back.len() - 1]
+        );
     }
 
     #[test]
