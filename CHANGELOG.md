@@ -5,7 +5,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [0.6.5] — à paraître
+## [0.6.5] — 2026-09-22
 
 **Moins de clics, et une session qui tient.**
 
@@ -23,13 +23,17 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   **l'écran reste allumé** : son rallumage coûtait ~7 s sans son.
 - **Mac : un micro ou un casque rebranché en session** est repris une fois pour
   toutes, au lieu d'être rouvert toutes les 3 secondes.
+- **Sortie débranchée ou absente à l'entrée en studio** : le son passe par la
+  sortie du système au lieu de se couper, et revient sur la sortie choisie dès
+  qu'elle est rebranchée.
 - **Windows (ASIO) : la carte son est préparée en une seule fois** à
   l'ouverture, et les messages du pilote sont lus sans ralentir le son.
 - **Première installation sans fenêtres de plugins** : l'Audio Engine compte
   les plugins au démarrage et c'est le studio qui propose de les inventorier.
   Un plugin qui n'a pas répondu retente sa chance ; un cache de plugins
   illisible est signalé au lieu de vider la liste. Un second clic pendant un
-  inventaire n'en lance plus un deuxième.
+  inventaire n'en lance plus un deuxième, et l'inventaire se termine dès le
+  dernier plugin lu (jusqu'à 30 s de moins).
 - Un musicien qui rejoint arrive en douceur, sans éclat dans les casques.
 
 ### Ajouté
