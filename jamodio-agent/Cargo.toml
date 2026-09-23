@@ -103,6 +103,11 @@ windows-sys = { version = "0.59", features = [
     # signale ces transitions. Le GUID vit dans SystemServices.
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
+    # Sonde d'horodatage noyau de la réception (examples/recv_timestamp_probe.rs) :
+    # WSAIoctl (déclarée sous System_IO, qui porte OVERLAPPED) et
+    # QueryPerformanceCounter (horloge des horodatages logiciels de Winsock).
+    "Win32_System_IO",
+    "Win32_System_Performance",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
