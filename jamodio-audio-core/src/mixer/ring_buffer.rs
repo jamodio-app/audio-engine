@@ -113,6 +113,11 @@ pub struct JitterBuffer {
     /// P0 — compteur de pulls calmes consécutifs, pour la décroissance très lente
     /// de `glitch_floor_samples`.
     glitch_calm_pulls: u32,
+    /// Lot 1-A (23/09/2026) — ce que le tirage a trouvé au dernier trou, en
+    /// attente d'être rendu au thread de décodage par le `push` suivant (cf.
+    /// [`HoleAtPull`]). Un seul à la fois : après un trou le tampon se ré-amorce,
+    /// et aucun autre trou ne peut être compté avant un nouveau `push`.
+    pending_hole: Option<HoleAtPull>,
 }
 
 const SAMPLE_RATE: usize = 48000;
@@ -139,6 +144,13 @@ const TAIL_HEADROOM_MS: f64 = 3.0;
 /// de MAX_TARGET_MS (40) pour absorber les bursts SFU sans truncation
 /// même quand le buffer est proche de sa cible haute. Coût RAM : ~115 KB / stream.
 const CAPACITY_MS: usize = 300;
+/// Capacité du ring en samples interleaved.
+const CAPACITY_SAMPLES: usize = CAPACITY_MS * SAMPLE_RATE * CHANNELS / 1000;
+/// Période de l'index de lecture du ring : `read_index()` parcourt
+/// `0..2 × capacité` (contrat de `ringbuf::traits::Observer`). L'écart entre deux
+/// lectures est donc exact tant que moins de 600 ms d'audio sont sortis entre
+/// les deux (cf. [`consumed_ms_between`]).
+const READ_INDEX_PERIOD: usize = 2 * CAPACITY_SAMPLES;
 /// Seuil hystérèse de drift-drain : si le buffer dépasse `DRIFT_DRAIN_FACTOR
 /// × target_samples`, on draine les plus anciens samples pour ramener à
 /// target. Borne la latence après un burst (sinon le buffer reste à 80-90 ms
@@ -265,6 +277,51 @@ fn samples_to_ms_f64(samples: u64) -> f64 {
     samples as f64 * 1000.0 / (SAMPLE_RATE * CHANNELS) as f64
 }
 
+/// Lot 1-A (23/09/2026) — ce que le tirage de la sortie a trouvé au moment
+/// d'un trou : l'instant, ce qu'il restait, ce qu'il fallait, et la position de
+/// lecture juste AVANT de vider le reste. Relevé dans la branche du trou de
+/// `pull`, jamais sur un tirage plein ; rendu au thread de décodage par le
+/// `push` suivant, qui seul sait ce qui est arrivé (ou pas) entre-temps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HoleAtPull {
+    pub at: std::time::Instant,
+    /// Ce que le tampon avait encore à donner (ms).
+    pub available_ms: f64,
+    /// Ce que le tirage réclamait d'un coup (ms) — un bloc de sortie.
+    pub needed_ms: f64,
+    /// Cible du tampon à cet instant (ms).
+    pub target_ms: f64,
+    /// Position de lecture avant le vidage (cf. [`consumed_ms_between`]).
+    pub read_index: usize,
+}
+
+/// Ce qu'un `push` laisse savoir au thread de décodage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PushReport {
+    /// Remplissage juste avant d'écrire (ms).
+    pub fill_before_ms: f64,
+    /// Remplissage juste après (ms).
+    pub fill_after_ms: f64,
+    /// Position de lecture après l'écriture (cf. [`consumed_ms_between`]).
+    pub read_index: usize,
+    /// Le trou survenu depuis le `push` précédent, s'il y en a eu un.
+    pub hole: Option<HoleAtPull>,
+}
+
+/// Audio réellement SORTI du tampon (tirages, drain de dérive, écartement sur
+/// débordement) entre deux positions de lecture, en ms.
+///
+/// C'est la consommation RÉELLE de la sortie, par blocs et à-coups compris,
+/// mesurée sans une ligne de plus dans le tirage : la position avance de toute
+/// façon. Exacte tant que moins de `READ_INDEX_PERIOD` samples (600 ms) sont
+/// sortis entre les deux lectures — à l'appelant de ne comparer que des
+/// positions proches dans le temps.
+pub fn consumed_ms_between(from: usize, to: usize) -> f64 {
+    let from = from % READ_INDEX_PERIOD;
+    let to = to % READ_INDEX_PERIOD;
+    samples_to_ms_f64(((to + READ_INDEX_PERIOD - from) % READ_INDEX_PERIOD) as u64)
+}
+
 /// Lot 0 (tampon) — profondeur de la fenêtre d'observation du remplissage :
 /// 512 arrivées ≈ 1,3 s à 400 paquets/s (trame Opus de 2,5 ms).
 /// CONSTANTE DE CALIBRATION : assez longue pour un minimum qui a du sens, assez
@@ -306,8 +363,7 @@ impl Default for JitterBuffer {
 
 impl JitterBuffer {
     pub fn new() -> Self {
-        let capacity = CAPACITY_MS * SAMPLE_RATE * CHANNELS / 1000;
-        let rb = HeapRb::<f32>::new(capacity);
+        let rb = HeapRb::<f32>::new(CAPACITY_SAMPLES);
         let (producer, consumer) = rb.split();
 
         let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
@@ -342,6 +398,7 @@ impl JitterBuffer {
             fill_obs: [0; FILL_OBS_LEN],
             fill_obs_len: 0,
             fill_obs_next: 0,
+            pending_hole: None,
         }
     }
 
@@ -361,6 +418,10 @@ impl JitterBuffer {
         // Vide les samples périmés accumulés pendant le gel de sortie.
         let occupied = self.consumer.occupied_len();
         self.consumer.skip(occupied);
+        // Lot 1-A — un trou relevé avant le gel appartient au gel, pas au
+        // réseau : on ne le rend pas. (Après ce reset, aucun trou ne peut être
+        // compté avant un nouveau `push` : le tampon se ré-amorce.)
+        self.pending_hole = None;
         // Re-prime propre + cible de démarrage (le filet réactif repart de 0).
         let initial = INITIAL_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
         self.primed = false;
@@ -401,12 +462,18 @@ impl JitterBuffer {
     /// Le drop-oldest préserve l'audio le plus récent (=> latence minimale)
     /// et la discontinuité tombe entre 2 paquets côté pull, ce qui est
     /// audiblement moins violent qu'une coupure mid-paquet.
-    pub fn push(&mut self, samples: &[f32]) {
+    ///
+    /// Lot 1-A — rend ce que le thread de décodage doit savoir de cet instant
+    /// (remplissage, position de lecture) et le trou survenu depuis le `push`
+    /// précédent, s'il y en a eu un. Le tampon du retour casque le rend aussi ;
+    /// son appelant l'ignore.
+    pub fn push(&mut self, samples: &[f32]) -> PushReport {
         // Lot 0 (tampon) — mesure prise AVANT d'écrire : c'est le creux réel
         // laissé par la sortie entre deux arrivées. Le minimum de la fenêtre dit
         // la marge qui n'a jamais servi (ce que la cible pourrait rendre), la
         // médiane dit le régime. Vu ici, il porte la gigue du réseau ET
         // l'irrégularité des callbacks : aucune ligne dans le callback.
+        let fill_before_ms = self.buffered_ms();
         self.record_fill_observation();
         // Phase C — en régime établi (primed) et pour les streams réseau, on
         // resample le flux entrant en continu pour tenir le remplissage sur la
@@ -423,6 +490,12 @@ impl JitterBuffer {
             self.rs_scratch = scratch; // restitué (capacité conservée → zéro-alloc).
         } else {
             self.push_to_ring(samples);
+        }
+        PushReport {
+            fill_before_ms,
+            fill_after_ms: self.buffered_ms(),
+            read_index: self.consumer.read_index(),
+            hole: self.pending_hole.take(),
         }
     }
 
@@ -561,6 +634,19 @@ impl JitterBuffer {
             self.recover_after_full_pull();
             needed
         } else {
+            // Lot 1-A — relevé du trou, AVANT de vider le reste : la position de
+            // lecture dit ce qui est sorti depuis le dernier `push`. Uniquement
+            // sur un trou (jamais sur un tirage plein) et hors retour casque —
+            // une lecture d'horloge et une copie, aucun tampon, aucune attente.
+            if !self.local_mode && self.pending_hole.is_none() {
+                self.pending_hole = Some(HoleAtPull {
+                    at: std::time::Instant::now(),
+                    available_ms: samples_to_ms_f64(available as u64),
+                    needed_ms: samples_to_ms_f64(needed as u64),
+                    target_ms: samples_to_ms_f64(self.target_samples as u64),
+                    read_index: self.consumer.read_index(),
+                });
+            }
             if available > 0 {
                 self.consumer.pop_slice(&mut output[..available]);
             }
@@ -655,6 +741,11 @@ impl JitterBuffer {
     /// tampon (entrelacement stéréo), qui n'appartient qu'à lui.
     pub fn buffered_ms(&self) -> f64 {
         samples_to_ms_f64(self.consumer.occupied_len() as u64)
+    }
+
+    /// Position de lecture courante (cf. [`consumed_ms_between`]).
+    pub fn read_index(&self) -> usize {
+        self.consumer.read_index()
     }
 
     /// `false` pendant le ré-amorçage qui suit un trou : la sortie ne tire plus
@@ -1594,5 +1685,105 @@ mod tests {
             "local : pas de récupération rapide C1 (chemin adapt_down intact): {} ms",
             jb.target_ms()
         );
+    }
+
+    // ══ Lot 1-A (23/09/2026) — ce que le tirage a trouvé au trou ══
+
+    /// La période de l'index de lecture est celle que `consumed_ms_between`
+    /// suppose : sinon toutes les consommations mesurées seraient fausses.
+    #[test]
+    fn la_capacite_du_ring_est_celle_que_suppose_la_mesure_de_consommation() {
+        let jb = JitterBuffer::new();
+        assert_eq!(jb.consumer.capacity().get(), CAPACITY_SAMPLES);
+    }
+
+    /// Ce qui sort par l'avant se lit à l'index de lecture, au sample près,
+    /// sans rien ajouter au tirage.
+    #[test]
+    fn la_position_de_lecture_dit_ce_que_la_sortie_a_consomme() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        // 14 ms : sous le seuil du drain de dérive (3 × cible = 15 ms).
+        let r0 = jb.push(&vec![0.1_f32; 48 * 14 * 2]).read_index;
+        let mut out = vec![0.0_f32; 128]; // 64 frames = 1,33 ms
+        for _ in 0..3 {
+            jb.pull(&mut out);
+        }
+        let consumed = consumed_ms_between(r0, jb.read_index());
+        assert!((consumed - 4.0).abs() < 1e-9, "3 tirages de 1,33 ms = 4 ms, lu {consumed}");
+    }
+
+    /// Le tour de l'index ne fausse pas l'écart.
+    #[test]
+    fn la_consommation_se_lit_a_travers_le_tour_de_l_index() {
+        let near_end = READ_INDEX_PERIOD - 96; // 1 ms avant le tour
+        assert!((consumed_ms_between(near_end, 96) - 2.0).abs() < 1e-9);
+        assert_eq!(consumed_ms_between(500, 500), 0.0);
+    }
+
+    /// Un trou est relevé avec ce qu'il restait, ce qu'il fallait, et rendu une
+    /// seule fois, au `push` suivant.
+    #[test]
+    fn un_trou_est_releve_puis_rendu_au_push_suivant() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        let before = jb.push(&vec![0.1_f32; 48 * 5 * 2]); // 5 ms = la cible
+        assert!(before.hole.is_none());
+        let mut out = vec![0.0_f32; 48 * 2 * 2]; // tirages de 2 ms
+        jb.pull(&mut out);
+        jb.pull(&mut out); // reste 1 ms
+        jb.pull(&mut out); // trou : 1 ms dispo pour 2 demandées
+        let r = jb.push(&vec![0.1_f32; 240]);
+        let hole = r.hole.expect("le trou doit être rendu");
+        assert!((hole.available_ms - 1.0).abs() < 1e-9, "{hole:?}");
+        assert!((hole.needed_ms - 2.0).abs() < 1e-9, "{hole:?}");
+        assert!((hole.target_ms - 5.0).abs() < 1e-9, "{hole:?}");
+        // Position AVANT le vidage : 4 ms sortis depuis le push.
+        assert!((consumed_ms_between(before.read_index, hole.read_index) - 4.0).abs() < 1e-9);
+        assert!(jb.push(&vec![0.1_f32; 240]).hole.is_none(), "rendu une seule fois");
+    }
+
+    /// Un tirage plein ne relève rien : le chemin nominal n'est pas touché.
+    #[test]
+    fn un_tirage_plein_ne_releve_aucun_trou() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        jb.push(&vec![0.1_f32; 48 * 14 * 2]); // sous le drain de dérive (15 ms)
+        let mut out = vec![0.0_f32; 128];
+        for _ in 0..10 {
+            jb.pull(&mut out);
+        }
+        assert!(jb.push(&vec![0.1_f32; 240]).hole.is_none());
+    }
+
+    /// Le retour casque a ses propres trous (spikes plugin), pas ceux du réseau.
+    #[test]
+    fn le_retour_casque_ne_releve_pas_de_trou() {
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(3);
+        jb.push(&vec![0.1_f32; 48 * 3 * 2]);
+        jb.pull(&mut vec![0.0_f32; 48 * 5 * 2]);
+        assert!(jb.push(&vec![0.1_f32; 240]).hole.is_none());
+    }
+
+    /// Un trou d'avant un gel de sortie appartient au gel : pas rendu.
+    #[test]
+    fn un_trou_d_avant_la_reprise_n_est_pas_rendu() {
+        let mut jb = JitterBuffer::new();
+        jb.set_target_ms(5);
+        jb.push(&vec![0.1_f32; 48 * 5 * 2]);
+        jb.pull(&mut vec![0.0_f32; 48 * 8 * 2]);
+        jb.reset_for_recovery();
+        assert!(jb.push(&vec![0.1_f32; 240]).hole.is_none());
+    }
+
+    /// Le remplissage avant/après l'écriture, au sample près.
+    #[test]
+    fn le_push_dit_le_remplissage_avant_et_apres() {
+        let mut jb = JitterBuffer::new();
+        let r = jb.push(&vec![0.1_f32; 48 * 3 * 2]);
+        assert_eq!(r.fill_before_ms, 0.0);
+        assert!((r.fill_after_ms - 3.0).abs() < 1e-9);
     }
 }

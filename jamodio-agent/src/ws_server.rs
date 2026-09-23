@@ -1140,6 +1140,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
             // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
             let recv_path_snap = pl.perfstats.recv_path.lock().flush();
+            // Lot 1-C — retard du réveil du thread de décodage sur l'instant prévu.
+            let decode_wake_late_snap = pl.perfstats.decode_wake_late.lock().flush();
             // 0.5.3-4 — débit de callbacks CPAL sur la fenêtre 1 s (liveness ASIO).
             // Compteurs cumulés → on logue le delta. 0 en session active = sortie
             // ou entrée muette (cold-start), sinon ≈370/s.
@@ -1524,6 +1526,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         wait_not_due: net.wait_not_due,
                         wait_repriming: net.wait_repriming,
                         deadline_disarmed: net.deadline_disarmed,
+                        holes_arrival: net.holes.arrival,
+                        holes_decode: net.holes.decode,
+                        holes_consumption: net.holes.consumption,
+                        holes_sequence: net.holes.sequence,
+                        holes_unclassified: net.holes.unclassified,
+                        holes_after_buffer_holds: net.holes.after_buffer_holds,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
                         target_reactive_ms: s.target_reactive_ms,
@@ -1610,6 +1618,13 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 recv_path_p50_ms = recv_path_snap.p50_ms,
                 recv_path_p99_ms = recv_path_snap.p99_ms,
                 recv_path_max_ms = recv_path_snap.max_ms,
+                // Lot 1-C — de combien le thread de décodage se réveille APRÈS
+                // l'instant prévu quand une échéance de masquage est armée. La
+                // marge de réveil du masquage (`WAKE_SLACK_MS`) doit le couvrir.
+                decode_wake_late_count = decode_wake_late_snap.count,
+                decode_wake_late_p50_ms = decode_wake_late_snap.p50_ms,
+                decode_wake_late_p99_ms = decode_wake_late_snap.p99_ms,
+                decode_wake_late_max_ms = decode_wake_late_snap.max_ms,
                 // 0.5.3 — rafale d'émission : frames Opus émises par bloc d'entrée.
                 // ≈1 = flux régulier (pas de rafale) ; ≫1 = callback gros (ASIO non
                 // honoré). À 48 k natif : emit_burst_mean ≈ taille_callback / 120.

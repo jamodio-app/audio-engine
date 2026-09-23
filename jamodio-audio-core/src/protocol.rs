@@ -1379,6 +1379,35 @@ pub struct PeerPerf {
     pub wait_repriming: u64,
     #[serde(rename = "concealDeadlineDisarmed")]
     pub deadline_disarmed: u64,
+    /// ── Lot 1-A (plan « ms en trop sur PC », 23/09/2026) : POURQUOI chaque
+    /// trou compté dans `underruns` a été rendu (cumuls, remis à zéro avec le
+    /// flux). Leur somme égale `underruns`, à un trou près (celui dont le push
+    /// suivant n'est pas encore venu). Mesure seule : le web ne les lit pas.
+    ///
+    /// `holesArrival` : le paquet suivant n'était pas encore arrivé à l'instant
+    /// du trou (réseau, ou fil de réception servi trop tard — non séparés ici) ;
+    /// `holesDecode` : arrivé à temps, poussé trop tard par le décodage ;
+    /// `holesConsumption` : les paquets étaient là, la sortie a tiré plus que le
+    /// temps écoulé (rafale de callbacks) ; `holesSequence` : un paquet arrivé a
+    /// été écarté (retard après masquage, doublon, saut) ; `holesUnclassified` :
+    /// faits manquants. Le détail de chaque trou est dans le journal de l'agent
+    /// (ligne `TROU`).
+    #[serde(rename = "holesArrival")]
+    pub holes_arrival: u64,
+    #[serde(rename = "holesDecode")]
+    pub holes_decode: u64,
+    #[serde(rename = "holesConsumption")]
+    pub holes_consumption: u64,
+    #[serde(rename = "holesSequence")]
+    pub holes_sequence: u64,
+    #[serde(rename = "holesUnclassified")]
+    pub holes_unclassified: u64,
+    /// Lot 1-C — parmi ces trous, ceux survenus alors que le masquage avait
+    /// jugé, depuis le dernier paquet, que le tampon tiendrait (`bufferHolds`) :
+    /// son réveil suivant est venu trop tard. Dit si la marge de réveil du
+    /// masquage est trop courte.
+    #[serde(rename = "holesAfterBufferHolds")]
+    pub holes_after_buffer_holds: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).

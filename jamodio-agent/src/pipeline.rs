@@ -7,7 +7,10 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
 use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
+use jamodio_audio_core::mixer::conceal::Wait;
+use jamodio_audio_core::mixer::hole::{self, HoleCause, HoleFacts};
 use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
+use jamodio_audio_core::mixer::ring_buffer::{consumed_ms_between, HoleAtPull, PushReport};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
@@ -1023,6 +1026,8 @@ pub struct ProducerNetStats {
     pub wait_buffer_holds: u64,
     pub wait_repriming: u64,
     pub deadline_disarmed: u64,
+    /// Lot 1-A — trous rendus, comptés par cause (cf. `mixer::hole`).
+    pub holes: HoleCounts,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -1075,6 +1080,11 @@ pub struct PerfHandles {
     /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
     /// bug Windows que ce thread RT corrige).
     pub recv_path: Arc<Mutex<Histogram>>,
+    /// Lot 1-C (23/09/2026) — retard du RÉVEIL du thread de décodage sur
+    /// l'instant prévu, quand il dort jusqu'à une échéance de masquage (ms).
+    /// C'est l'imprécision que `conceal::WAKE_SLACK_MS` est censé couvrir ;
+    /// jusqu'ici elle n'avait été mesurée que hors de l'agent.
+    pub decode_wake_late: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     /// 0.5.3-4 — LIVENESS du callback CPAL d'ENTRÉE : incrémenté d'1 à chaque
     /// callback de capture (cf. `capture::forward_samples`). Sert au watchdog
@@ -1141,6 +1151,7 @@ impl PerfHandles {
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            decode_wake_late: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3338,6 +3349,7 @@ impl PipelineState {
                     self.mixer.clone(),
                     self.perfstats.net_stats_by_producer.clone(),
                     self.perfstats.recv_path.clone(),
+                    self.perfstats.decode_wake_late.clone(),
                     self.perfstats.output_frames.clone(),
                 )
                 .map_err(|e| format!("spawn decode thread: {}", e))?,
@@ -5005,7 +5017,12 @@ enum DecodeMsg {
 #[derive(Debug, Clone, Copy)]
 struct LastConceal {
     at: std::time::Instant,
+    /// Vraie matière que le tampon tenait juste avant la trame inventée.
     fill_ms: f64,
+    /// Position de lecture juste après l'avoir poussée : ce que la sortie
+    /// consommera ensuite se lit par écart (Lot 1-B, cf.
+    /// `conceal::premature_margin_ms`).
+    read_index: usize,
     /// Numéro de la place comblée : seul CE paquet peut dire si ce masquage
     /// était de trop. Un autre retardataire (place plus ancienne d'une série
     /// de masquages, ou paquet simplement déréordonné qui n'a jamais été
@@ -5013,10 +5030,42 @@ struct LastConceal {
     slot: u16,
 }
 
+/// Lot 1-A — trous rendus par le tampon d'un flux, comptés par cause (cf.
+/// `mixer::hole::HoleCause`). Cumuls, remis à zéro si le flux est recréé.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HoleCounts {
+    pub arrival: u64,
+    pub decode: u64,
+    pub consumption: u64,
+    pub sequence: u64,
+    pub unclassified: u64,
+    /// Lot 1-C — parmi tous, ceux survenus alors que le masquage avait jugé,
+    /// DEPUIS le dernier push, que le tampon tiendrait (`Wait::BufferHolds`) :
+    /// le réveil suivant est arrivé trop tard. C'est la mesure qui dit si
+    /// `conceal::WAKE_SLACK_MS` est trop court.
+    pub after_buffer_holds: u64,
+}
+
+/// Lot 1-A — l'état du tampon au dernier `push` de ce flux, point de départ de
+/// l'analyse du trou suivant.
+#[derive(Debug, Clone, Copy)]
+struct PushMark {
+    at: std::time::Instant,
+    fill_after_ms: f64,
+    read_index: usize,
+    /// Paquets écartés (tardifs + doublons + sauts) cumulés à cet instant.
+    discarded: u64,
+    /// Arrivée du dernier VRAI paquet poussé (une trame de masquage n'en a pas).
+    last_received: Option<std::time::Instant>,
+}
+
 /// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
 struct DecodeState {
     /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
     epoch: u64,
+    /// Nature du flux : les trous de la voix (qui se tait légitimement) ne se
+    /// journalisent pas comme ceux de l'instrument.
+    kind: StreamKind,
     decoder: MusicDecoder,
     drift: DriftEstimator,
     jitter: JitterEstimator,
@@ -5072,6 +5121,13 @@ struct DecodeState {
     /// Échéances tombées pendant un ré-amorçage du tampon : rien à inventer, on
     /// désarme jusqu'à l'arrivée suivante (cf. `Wait::Repriming`). Un événement.
     wait_repriming: u64,
+    /// Lot 1-A — dernière raison pour laquelle le masquage a attendu, et quand.
+    /// Journalisée avec chaque trou : un trou survenu pendant `BufferHolds` dit
+    /// que le réveil suivant est arrivé trop tard (Lot 1-C).
+    last_wait: Option<(Wait, std::time::Instant)>,
+    /// Lot 1-A — état au dernier `push`, et trous comptés par cause.
+    last_push: Option<PushMark>,
+    holes: HoleCounts,
     /// Nombre de fois où l'on a DÉSARMÉ l'échéance — plafond de masquage
     /// atteint, ou flux tari. Un événement, pas un tour de boucle.
     deadline_disarmed: u64,
@@ -5086,7 +5142,7 @@ struct DecodeState {
 }
 
 impl DecodeState {
-    fn new(producer_id: &str, epoch: u64) -> Option<Self> {
+    fn new(producer_id: &str, epoch: u64, kind: StreamKind) -> Option<Self> {
         let decoder = match MusicDecoder::new() {
             Ok(d) => d,
             Err(e) => {
@@ -5097,6 +5153,7 @@ impl DecodeState {
         let drift_label = producer_id.chars().take(8).collect::<String>();
         Some(Self {
             epoch,
+            kind,
             decoder,
             drift: DriftEstimator::new(drift_label),
             jitter: JitterEstimator::new(),
@@ -5112,6 +5169,9 @@ impl DecodeState {
             wait_within_grace: 0,
             wait_buffer_holds: 0,
             wait_repriming: 0,
+            last_wait: None,
+            last_push: None,
+            holes: HoleCounts::default(),
             deadline_disarmed: 0,
             next_deadline: None,
             next_check: None,
@@ -5142,6 +5202,7 @@ fn spawn_decode_thread(
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
+    decode_wake_late: Arc<Mutex<Histogram>>,
     // Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
     // et non la durée d'une trame, qui dit combien le tampon doit contenir pour
     // survivre au prochain tirage (cf. `conceal_due_streams`).
@@ -5157,7 +5218,7 @@ fn spawn_decode_thread(
     let join = std::thread::Builder::new()
         .name("audio-decode".into())
         .spawn(move || {
-            decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path, output_frames)
+            decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path, decode_wake_late, output_frames)
         })?;
     Ok(DecodeThread { tx, pool_rx, join })
 }
@@ -5257,6 +5318,130 @@ fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
     f64::from(frames) * 1000.0 / 48_000.0
 }
 
+/// Lot 1-A — à appeler après CHAQUE push dans le tampon d'un flux reçu : si la
+/// sortie y a trouvé un trou depuis le push précédent, dit POURQUOI (compteur +
+/// une ligne de journal par trou), puis retient l'état de ce push comme point de
+/// départ du trou suivant.
+///
+/// `now` : instant du push. `arrived` : arrivée du vrai paquet qui provoque ce
+/// push (le paquet décodé, ou celui dont l'arrivée révèle une perte) ; `None`
+/// pour une trame inventée à l'échéance, qu'aucun paquet n'accompagne.
+///
+/// Tourne sur le thread de décodage : le tirage n'a fait que relever
+/// `HoleAtPull`, tout le reste se fait ici.
+fn note_push(
+    st: &mut DecodeState,
+    producer_id: &str,
+    report: &PushReport,
+    now: std::time::Instant,
+    arrived: Option<std::time::Instant>,
+    output_block_ms: f64,
+) {
+    let counters = st.seq.counters();
+    let discarded = counters.late + counters.duplicate + counters.jump;
+    if let Some(h) = report.hole {
+        report_hole(st, producer_id, &h, discarded, arrived, now, output_block_ms);
+    }
+    let last_received = arrived.or(st.last_push.and_then(|p| p.last_received));
+    st.last_push = Some(PushMark {
+        at: now,
+        fill_after_ms: report.fill_after_ms,
+        read_index: report.read_index,
+        discarded,
+        last_received,
+    });
+}
+
+/// Lot 1-A — classe un trou rendu par la sortie, le compte et le journalise.
+fn report_hole(
+    st: &mut DecodeState,
+    producer_id: &str,
+    h: &HoleAtPull,
+    discarded_now: u64,
+    arrived: Option<std::time::Instant>,
+    now: std::time::Instant,
+    output_block_ms: f64,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    // Pas de push connu avant le trou (flux recréé entre-temps) : les faits
+    // manquent, on le dit.
+    let facts = st.last_push.map(|p| HoleFacts {
+        fill_at_last_push_ms: p.fill_after_ms,
+        // Trou relevé AVANT le push de référence : horloges incohérentes, la
+        // classification rendra `Unclassified`.
+        since_last_push_ms: if h.at >= p.at { ms(h.at - p.at) } else { -1.0 },
+        consumed_since_push_ms: consumed_ms_between(p.read_index, h.read_index),
+        output_block_ms,
+        next_received_before_hole: arrived.map(|a| a <= h.at),
+        discarded_since_push: discarded_now.saturating_sub(p.discarded),
+    });
+    let cause = facts.as_ref().map_or(HoleCause::Unclassified, hole::classify);
+    match cause {
+        HoleCause::Arrival => st.holes.arrival += 1,
+        HoleCause::Decode => st.holes.decode += 1,
+        HoleCause::Consumption => st.holes.consumption += 1,
+        HoleCause::Sequence => st.holes.sequence += 1,
+        HoleCause::Unclassified => st.holes.unclassified += 1,
+    }
+    // Ce que le masquage avait décidé depuis le dernier push (sinon : rien).
+    let wait = st
+        .last_wait
+        .filter(|(_, at)| st.last_push.is_some_and(|p| *at >= p.at))
+        .map(|(w, _)| w);
+    if wait == Some(Wait::BufferHolds) {
+        st.holes.after_buffer_holds += 1;
+    }
+
+    let short = &producer_id[..8.min(producer_id.len())];
+    // Faits bruts, à côté de la cause : si le classement se révèle mal posé, la
+    // session reste relisable. `-1` = inconnu.
+    let fill_ms = facts.map_or(-1.0, |f| f.fill_at_last_push_ms);
+    let since_push_ms = facts.map_or(-1.0, |f| f.since_last_push_ms);
+    let consumed_ms = facts.map_or(-1.0, |f| f.consumed_since_push_ms);
+    // Écart entre les deux arrivées qui encadrent le trou.
+    let arrival_gap_ms = match (arrived, st.last_push.and_then(|p| p.last_received)) {
+        (Some(a), Some(prev)) => ms(a.saturating_duration_since(prev)),
+        _ => -1.0,
+    };
+    // Du paquet arrivé à son push : le retard du décodage.
+    let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a)));
+    let wait = match wait {
+        None => "none",
+        Some(Wait::NotDue) => "not_due",
+        Some(Wait::LinkUnknown) => "link_unknown",
+        Some(Wait::WithinGrace) => "within_grace",
+        Some(Wait::BufferHolds) => "buffer_holds",
+        Some(Wait::Repriming) => "repriming",
+    };
+    macro_rules! hole_line {
+        ($lvl:ident) => {
+            tracing::$lvl!(
+                target: "jamodio::recv",
+                producer = short,
+                kind = ?st.kind,
+                cause = cause.as_str(),
+                fill_ms,
+                since_push_ms,
+                consumed_ms,
+                available_ms = h.available_ms,
+                needed_ms = h.needed_ms,
+                target_ms = h.target_ms,
+                arrival_gap_ms,
+                decode_delay_ms,
+                conceal_wait = wait,
+                "TROU"
+            )
+        };
+    }
+    // La voix se tait légitimement dès que personne ne parle : chacun de ses
+    // silences finit en « trou ». Comptés, mais pas au même niveau de journal.
+    if st.kind == StreamKind::Voice {
+        hole_line!(debug);
+    } else {
+        hole_line!(info);
+    }
+}
+
 /// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
 ///
 /// Tourne sur le thread de décodage, JAMAIS dans le callback audio : il ne fait
@@ -5296,6 +5481,7 @@ fn conceal_due_streams(
         };
         match decision {
             Conceal::Wait(why) => {
+                st.last_wait = Some((why, now));
                 match why {
                     Wait::NotDue => st.wait_not_due += 1,
                     Wait::LinkUnknown => st.wait_link_unknown += 1,
@@ -5351,20 +5537,21 @@ fn conceal_due_streams(
                 // décodage suivant (Sprint 3 BUG 7) : on la pousse tout de suite
                 // — `push_samples` la recopie dans le tampon — plutôt que d'en
                 // allouer une copie à chaque trame sur ce thread.
-                let pushed = match st.decoder.decode_loss() {
-                    Some(plc) => {
-                        mixer.push_samples(id, plc);
-                        true
-                    }
-                    None => false,
-                };
-                if pushed {
-                    // Ce que le tampon tenait À CET INSTANT : c'est la seule
-                    // façon de juger après coup si le vrai paquet serait arrivé
-                    // à temps. Écrasé à chaque masquage — on juge le dernier,
-                    // celui qui précède immédiatement l'arrivée.
+                let report = st.decoder.decode_loss().and_then(|plc| mixer.push_samples(id, plc));
+                if let Some(report) = report {
+                    note_push(st, id, &report, now, None, output_block_ms);
+                    // Ce que le tampon tenait À CET INSTANT, et où en était la
+                    // lecture : c'est la seule façon de juger après coup si le
+                    // vrai paquet serait arrivé à temps (Lot 1-B). Écrasé à
+                    // chaque masquage — on juge le dernier, celui qui précède
+                    // immédiatement l'arrivée.
                     st.seq.on_concealed();
-                    st.last_conceal = st.seq.highest().map(|slot| LastConceal { at: now, fill_ms, slot });
+                    st.last_conceal = st.seq.highest().map(|slot| LastConceal {
+                        at: now,
+                        fill_ms: report.fill_before_ms,
+                        read_index: report.read_index,
+                        slot,
+                    });
                     // (`on_concealed` ci-dessus : la place est prise, un
                     // retardataire sera écarté au lieu d'être joué après sa
                     // remplaçante.)
@@ -5403,6 +5590,7 @@ fn decode_rt_loop(
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: Arc<Mutex<Histogram>>,
+    decode_wake_late: Arc<Mutex<Histogram>>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
@@ -5416,14 +5604,30 @@ fn decode_rt_loop(
         // PROCHAIN EXAMEN UTILE. Sans ça, un paquet en retard ne réveille
         // personne, le tampon se vide et la sortie joue du silence — le trou sec
         // que ce chantier supprime.
-        let wait = next_wait(&states, std::time::Instant::now());
+        let slept_at = std::time::Instant::now();
+        let wait = next_wait(&states, slept_at);
+        // Lot 1-C — une échéance est armée : ce réveil est celui dont dépend le
+        // masquage. (Sans échéance, on dort 100 ms en attendant un paquet : son
+        // heure de réveil n'importe à personne.)
+        let deadline_armed = states.values().any(|st| st.next_deadline.is_some());
+        let block_ms = output_block_ms(&output_frames);
         match rx.recv_timeout(wait) {
             Ok(msg) => {
-                if handle_decode_msg(msg, &mut states, &pool_tx, &mixer, &net_stats_by_producer, &recv_path).is_break() {
+                if handle_decode_msg(msg, &mut states, &pool_tx, &mixer, &net_stats_by_producer, &recv_path, block_ms)
+                    .is_break()
+                {
                     break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // Lot 1-C — de combien le réveil a dépassé l'instant prévu : c'est
+                // l'imprécision que `conceal::WAKE_SLACK_MS` doit couvrir, mesurée
+                // ici avec la vraie primitive d'attente de ce thread.
+                if deadline_armed {
+                    let late = slept_at.elapsed().saturating_sub(wait);
+                    decode_wake_late.lock().observe(late.as_secs_f32() * 1000.0);
+                }
+            }
             // Tous les émetteurs partis : plus rien n'arrivera jamais.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
@@ -5434,7 +5638,7 @@ fn decode_rt_loop(
             &mixer,
             &net_stats_by_producer,
             &recv_path,
-            output_block_ms(&output_frames),
+            block_ms,
             std::time::Instant::now,
         )
         .is_break()
@@ -5478,7 +5682,7 @@ fn drain_then_conceal(
     now: impl Fn() -> std::time::Instant,
 ) -> std::ops::ControlFlow<()> {
     while let Ok(msg) = rx.try_recv() {
-        handle_decode_msg(msg, states, pool_tx, mixer, net_stats_by_producer, recv_path)?;
+        handle_decode_msg(msg, states, pool_tx, mixer, net_stats_by_producer, recv_path, output_block_ms)?;
     }
     conceal_due_streams(states, mixer, output_block_ms, now());
     std::ops::ControlFlow::Continue(())
@@ -5492,6 +5696,7 @@ fn handle_decode_msg(
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: &Arc<Mutex<Histogram>>,
+    output_block_ms: f64,
 ) -> std::ops::ControlFlow<()> {
     match msg {
         DecodeMsg::Shutdown => return std::ops::ControlFlow::Break(()),
@@ -5526,7 +5731,7 @@ fn handle_decode_msg(
                 None => true,
             };
             if needs_create {
-                match DecodeState::new(&producer_id, epoch) {
+                match DecodeState::new(&producer_id, epoch, kind) {
                     Some(st) => {
                         mixer.add_stream(&producer_id, kind);
                         states.insert(producer_id.clone(), st);
@@ -5538,7 +5743,7 @@ fn handle_decode_msg(
                 }
             }
             let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
-            decode_one_packet(st, &producer_id, recv_instant, &buf, mixer, net_stats_by_producer, recv_path);
+            decode_one_packet(st, &producer_id, recv_instant, &buf, mixer, net_stats_by_producer, recv_path, output_block_ms);
             // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
             let _ = pool_tx.try_send(buf);
         }
@@ -5558,6 +5763,7 @@ fn decode_one_packet(
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: &Arc<Mutex<Histogram>>,
+    output_block_ms: f64,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
     st.pkt_count += 1;
@@ -5627,6 +5833,7 @@ fn decode_one_packet(
             wait_buffer_holds: st.wait_buffer_holds,
             wait_repriming: st.wait_repriming,
             deadline_disarmed: st.deadline_disarmed,
+            holes: st.holes,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -5657,8 +5864,11 @@ fn decode_one_packet(
             if (1..=PLC_MAX_GAP).contains(&missing) {
                 for _ in 0..u32::from(missing).min(budget) {
                     // Poussée immédiate, sans copie : cf. le masquage à l'échéance.
-                    if let Some(plc) = st.decoder.decode_loss() {
-                        mixer.push_samples(producer_id, plc);
+                    let report = st.decoder.decode_loss().and_then(|plc| mixer.push_samples(producer_id, plc));
+                    if let Some(report) = report {
+                        // Le trou éventuel a été révélé par CE paquet : c'est son
+                        // arrivée qui compte.
+                        note_push(st, producer_id, &report, std::time::Instant::now(), Some(recv_instant), output_block_ms);
                         st.concealed_frames += 1;
                     }
                 }
@@ -5671,11 +5881,20 @@ fn decode_one_packet(
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
+            //
+            // Lot 1-B — on le juge sur ce que la sortie a RÉELLEMENT consommé
+            // depuis le masquage (position de lecture), pas sur le temps écoulé.
+            // Au-delà de `PREMATURE_JUDGE_MAX`, l'écart de position n'est plus
+            // sûr (tour de l'index) : on s'abstient plutôt que de compter faux.
+            const PREMATURE_JUDGE_MAX: std::time::Duration = std::time::Duration::from_millis(400);
             if let Some(lc) = st.last_conceal.filter(|lc| lc.slot == header.sequence) {
                 st.last_conceal = None;
-                let delay_ms = recv_instant.saturating_duration_since(lc.at).as_secs_f64() * 1000.0;
-                if let Some(margin) =
-                    jamodio_audio_core::mixer::conceal::premature_margin_ms(lc.fill_ms, delay_ms)
+                let consumed_ms = mixer
+                    .playout(producer_id)
+                    .filter(|_| recv_instant.saturating_duration_since(lc.at) < PREMATURE_JUDGE_MAX)
+                    .map(|p| consumed_ms_between(lc.read_index, p.read_index));
+                if let Some(margin) = consumed_ms
+                    .and_then(|c| jamodio_audio_core::mixer::conceal::premature_margin_ms(lc.fill_ms, c))
                 {
                     st.concealed_premature_frames += 1;
                     st.concealed_premature_margin_ms += margin;
@@ -5700,16 +5919,19 @@ fn decode_one_packet(
     if let Some(pcm) = st.decoder.decode(payload) {
         let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
         recv_path.lock().observe(recv_path_ms);
-        if st.fade_in_remaining > 0 {
+        let report = if st.fade_in_remaining > 0 {
             // Lot 1.4 — la rampe s'applique à une copie, dans un tampon de
             // travail gardé par le flux (aucune allocation une fois sa taille
             // atteinte), le temps des ~120 premiers blocs ; ensuite push direct.
             st.fade_scratch.clear();
             st.fade_scratch.extend_from_slice(pcm);
             st.fade_in_remaining = apply_join_fade(&mut st.fade_scratch, st.fade_in_remaining);
-            mixer.push_samples(producer_id, &st.fade_scratch);
+            mixer.push_samples(producer_id, &st.fade_scratch)
         } else {
-            mixer.push_samples(producer_id, pcm);
+            mixer.push_samples(producer_id, pcm)
+        };
+        if let Some(report) = report {
+            note_push(st, producer_id, &report, std::time::Instant::now(), Some(recv_instant), output_block_ms);
         }
     }
 }
@@ -6493,7 +6715,7 @@ mod conceal_loop_tests {
     }
 
     fn state(now: Instant) -> DecodeState {
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.seq.on_packet(1000);
         // Chauffe l'estimateur de gigue avec un flux parfaitement régulier
         // (120 paquets de 2,5 ms) : au-delà du warmup, la queue de gigue est
@@ -6511,7 +6733,7 @@ mod conceal_loop_tests {
     /// Le montage inverse : un flux entendu, mais dont on ne connaît pas encore
     /// la régularité.
     fn state_lien_inconnu(now: Instant) -> DecodeState {
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.seq.on_packet(1000);
         st.next_deadline = Some(now + FRAME);
         st
@@ -6623,7 +6845,7 @@ mod conceal_loop_tests {
     fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
         let stats = Arc::new(Mutex::new(HashMap::new()));
         let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
-        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path);
+        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path, BLOC_ASIO_MS);
     }
 
     // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
@@ -7128,7 +7350,7 @@ mod conceal_loop_tests {
         flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
         m.insert(Arc::from("peer-test"), st);
         conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
@@ -7178,6 +7400,142 @@ mod conceal_loop_tests {
         entame.consecutive_concealed = 1;
         recevoir(&mut entame, &mixer, 1005, now); // 4 places manquantes
         assert_eq!(entame.concealed_frames, 2);
+    }
+
+    // ─── Lot 1-A (23/09/2026) : la cause de chaque trou ──────────────────
+
+    /// Tire des blocs de 64 frames (1,33 ms, nos deux plateformes) jusqu'au
+    /// trou : le tirage qui ne trouve plus un bloc entier le relève.
+    fn tirer_jusqu_au_trou(mixer: &AudioMixer) {
+        let mut bloc = vec![0.0f32; 64 * 2];
+        for _ in 0..1000 {
+            let avant = mixer.playout("peer-test").unwrap();
+            mixer.mix_into(&mut bloc);
+            if !mixer.playout("peer-test").unwrap().playing && avant.playing {
+                return;
+            }
+        }
+        panic!("le tampon n'a jamais manqué");
+    }
+
+    /// Un flux en lecture qui vient de recevoir 1001 : point de départ commun.
+    fn apres_un_paquet() -> (Arc<AudioMixer>, DecodeState) {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        let mut st = state(Instant::now());
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert!(st.last_push.is_some(), "le push est retenu comme point de départ");
+        (mixer, st)
+    }
+
+    /// LE cas qu'on veut voir : le paquet suivant n'est arrivé qu'après le trou.
+    #[test]
+    fn un_paquet_arrive_apres_le_trou_est_compte_comme_arrivee() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
+    }
+
+    /// Arrivé avant le trou, poussé après : le décodage était en retard.
+    #[test]
+    fn un_paquet_arrive_avant_le_trou_mais_pousse_apres_accuse_le_decodage() {
+        let (mixer, mut st) = apres_un_paquet();
+        let arrive = Instant::now();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, arrive);
+        assert_eq!(st.holes, HoleCounts { decode: 1, ..HoleCounts::default() });
+    }
+
+    /// Un paquet arrivé puis écarté (doublon) entre les deux pushes.
+    #[test]
+    fn un_paquet_ecarte_avant_le_push_suivant_est_une_cause_de_sequence() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // doublon : écarté
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { sequence: 1, ..HoleCounts::default() });
+    }
+
+    /// La sortie vide 10 ms de tampon en un instant (rafale de callbacks) :
+    /// ce n'est pas l'arrivée qui a manqué.
+    #[test]
+    fn une_sortie_qui_vide_le_tampon_d_un_coup_est_une_cause_de_consommation() {
+        let (mixer, mut st) = apres_un_paquet();
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 48 * 10 * 2]).unwrap();
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { consumption: 1, ..HoleCounts::default() });
+    }
+
+    /// Lot 1-C : le masquage avait jugé que le tampon tiendrait, et il n'a
+    /// pas tenu — compté à part, en plus de la cause.
+    #[test]
+    fn un_trou_apres_un_tampon_juge_suffisant_est_compte_a_part() {
+        let (mixer, st) = apres_un_paquet();
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 48 * 10 * 2]).unwrap();
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        m.insert(Arc::from("peer-test"), st);
+        let st = m.get_mut("peer-test").unwrap();
+        note_push(st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        let now = Instant::now();
+        st.next_deadline = Some(now - Duration::from_millis(10));
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        let st = m.get_mut("peer-test").unwrap();
+        assert_eq!(st.last_wait.map(|(w, _)| w), Some(Wait::BufferHolds));
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes.after_buffer_holds, 1);
+        assert_eq!(st.holes.consumption, 1);
+    }
+
+    /// Un tirage plein ne produit rien à analyser.
+    #[test]
+    fn sans_trou_rien_n_est_compte() {
+        let (mixer, mut st) = apres_un_paquet();
+        mixer.mix_into(&mut vec![0.0f32; 64 * 2]);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts::default());
+    }
+
+    // ─── Lot 1-B (23/09/2026) : un masquage prématuré se juge en consommation ──
+
+    /// Un masquage sur 1 ms de vraie matière, retenu pour être jugé.
+    fn apres_un_masquage() -> (Arc<AudioMixer>, DecodeState) {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 2]); // 1 ms
+        let now = Instant::now();
+        let mut m = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        let st = m.remove("peer-test").unwrap();
+        let lc = st.last_conceal.expect("masquage retenu");
+        assert!((lc.fill_ms - 1.0).abs() < 0.05, "vraie matière retenue : {} ms", lc.fill_ms);
+        (mixer, st)
+    }
+
+    /// La sortie n'a rien tiré avant l'arrivée du vrai paquet : il aurait été
+    /// joué à temps. Le temps écoulé n'y est pour rien.
+    #[test]
+    fn un_paquet_arrive_avant_que_la_sortie_entame_l_invention_est_premature() {
+        let (mixer, mut st) = apres_un_masquage();
+        recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(5));
+        assert_eq!(st.concealed_premature_frames, 1);
+        assert!((st.concealed_premature_margin_ms - 1.0).abs() < 0.05, "{}", st.concealed_premature_margin_ms);
+    }
+
+    /// Deux tirages (2,67 ms) ont passé la vraie matière (1 ms) : ils ont joué
+    /// l'invention, qui a donc évité un trou.
+    #[test]
+    fn une_sortie_qui_a_joue_l_invention_prouve_un_masquage_utile() {
+        let (mixer, mut st) = apres_un_masquage();
+        let mut bloc = vec![0.0f32; 64 * 2];
+        mixer.mix_into(&mut bloc);
+        mixer.mix_into(&mut bloc);
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert_eq!(st.concealed_premature_frames, 0);
+        assert!(st.last_conceal.is_none(), "jugé");
     }
 }
 

@@ -1,5 +1,5 @@
 use super::reference::{Figure, MetroSound, OutputAnchor, ReferenceSource};
-use super::ring_buffer::JitterBuffer;
+use super::ring_buffer::{JitterBuffer, PushReport};
 use crate::protocol::StreamKind;
 use crate::record::RecordCmd;
 use crate::sync::clock::mono_now_ms;
@@ -425,6 +425,9 @@ pub struct Playout {
     pub buffered_ms: f64,
     /// `false` pendant le ré-amorçage qui suit un trou : la sortie n'y puise pas.
     pub playing: bool,
+    /// Position de lecture du tampon (cf. `ring_buffer::consumed_ms_between`) :
+    /// deux lectures disent ce que la sortie a RÉELLEMENT consommé entre-temps.
+    pub read_index: usize,
 }
 
 /// Mixes N remote audio streams into a single stereo output.
@@ -980,7 +983,11 @@ impl AudioMixer {
     pub fn playout(&self, producer_id: &str) -> Option<Playout> {
         let cell = self.streams.read().get(producer_id).cloned()?;
         let jb = cell.jitter.lock();
-        Some(Playout { buffered_ms: jb.buffered_ms(), playing: jb.is_playing() })
+        Some(Playout {
+            buffered_ms: jb.buffered_ms(),
+            playing: jb.is_playing(),
+            read_index: jb.read_index(),
+        })
     }
 
     /// Push decoded samples into a stream's jitter buffer.
@@ -990,7 +997,10 @@ impl AudioMixer {
     ///
     /// C2.1 — clone l'Arc du flux cible sous le RwLock lecture, relâche, puis
     /// verrouille SA cellule (verrou court). Ne croise le callback que sur ce flux.
-    pub fn push_samples(&self, producer_id: &str, samples: &[f32]) {
+    ///
+    /// Lot 1-A — rend ce que le tampon dit de cet instant (remplissage, position
+    /// de lecture, trou survenu depuis le push précédent) ; `None` = flux inconnu.
+    pub fn push_samples(&self, producer_id: &str, samples: &[f32]) -> Option<PushReport> {
         let cell = self.streams.read().get(producer_id).cloned();
 
         // REC-3 : tap stem-peer. Pre-fader (avant `vol *` dans mix_into),
@@ -1013,7 +1023,7 @@ impl AudioMixer {
                 producer = &producer_id[..8.min(producer_id.len())],
                 "push_samples on unknown stream"
             );
-            return;
+            return None;
         };
 
         // VU du flux — hors lock (ne lit que `samples`), une seule passe.
@@ -1024,10 +1034,10 @@ impl AudioMixer {
         cell.meter.push_interleaved(samples);
 
         // Verrou COURT de la cellule : push + lecture du compteur d'overflow.
-        let new_drops = {
+        let (report, new_drops) = {
             let mut jitter = cell.jitter.lock();
-            jitter.push(samples);
-            jitter.overflow_drops()
+            let report = jitter.push(samples);
+            (report, jitter.overflow_drops())
         };
 
         // Logging rate-limité (écrivain unique = ce thread décode pour ce flux).
@@ -1045,6 +1055,7 @@ impl AudioMixer {
             }
             cell.last_overflow_drops.store(new_drops, Ordering::Relaxed);
         }
+        Some(report)
     }
 
     /// Mix all streams into the output buffer.
