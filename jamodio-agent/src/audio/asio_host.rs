@@ -31,6 +31,7 @@ use crate::audio::asio_reset::ResetSignal;
 use crate::audio::callback_health::{block_budget_us, late_threshold_us, CallbackHealth};
 use crate::audio::declared_latency::{self, HardwareLatency};
 use crate::audio::output_pair::clamp_output_pair;
+use crate::audio::rate_check::{resolve_measured_rate, RateSample, RateVerdict};
 use asio_sys as sys;
 use crossbeam_channel::{Sender, TrySendError};
 use jamodio_audio_core::mixer::mixer::AudioMixer;
@@ -530,39 +531,66 @@ impl AsioDuplexHost {
         } else {
             // ── VÉRIFICATION DU RATE RÉEL (le driver peut MENTIR) ──────────────
             // On MESURE la cadence des callbacks sur une brève fenêtre : le rate
-            // réel = cb_par_seconde × buffer_size. C'est le SEUL signal fiable —
-            // `sample_rate()` peut rapporter 48 000 alors que le matériel tourne à
-            // 44,1 (Focusrite natif : mensonge prouvé le 04/08, cb=689×64≈44 100).
-            // Si le mesuré diverge nettement (> 3 %) du déclaré, on RETIENT LE
-            // MESURÉ → la garde R2 (start_capture) refusera un vrai non-48. Coût :
+            // réel = callbacks × buffer_size / temps de LIVRAISON. C'est le SEUL
+            // signal fiable — `sample_rate()` peut rapporter 48 000 alors que le
+            // matériel tourne à 44,1 (Focusrite natif : mensonge prouvé le 04/08,
+            // cb=689×64≈44 100). Le temps passé dans des trous de livraison est
+            // EXCLU (le Yamaha Steinberg USB en fait un de 70-200 ms juste après
+            // ASIOStart, à chaque ouverture — cas Guillaume H., 23/09), et une
+            // cadence qui ne tombe sur aucun rate standard ne remplace JAMAIS le
+            // déclaré. La décision vit dans `audio::rate_check` (testée partout) ;
+            // la garde R2 (start_capture) refuse ensuite un vrai non-48. Coût :
             // ~500 ms à l'ouverture (hors thread RT, une fois au join).
             let c0 = capture_callbacks.load(Ordering::Relaxed);
+            let s0 = callback_health.stall_us_total();
             let m0 = Instant::now();
             std::thread::sleep(Duration::from_millis(500));
-            let dt = m0.elapsed().as_secs_f64();
-            let cb_delta = capture_callbacks.load(Ordering::Relaxed).saturating_sub(c0);
-            if cb_delta > 0 && dt > 0.0 && buffer_size > 0 {
-                let measured_sr = (cb_delta as f64 / dt) * buffer_size as f64;
-                let declared = native_sr as f64;
-                if (measured_sr - declared).abs() / declared > 0.03 {
+            let sample = RateSample {
+                declared_sr: native_sr,
+                frames_per_cb: buffer_size,
+                callbacks: capture_callbacks.load(Ordering::Relaxed).saturating_sub(c0),
+                window_us: m0.elapsed().as_micros() as u64,
+                stall_us: callback_health.stall_us_total().saturating_sub(s0),
+            };
+            match resolve_measured_rate(&sample) {
+                RateVerdict::Confirmed { measured_sr } => {
+                    if sample.stall_us > 0 {
+                        tracing::warn!(
+                            target: "jamodio::audio",
+                            driver = driver_name,
+                            stall_ms = sample.stall_us / 1000,
+                            callbacks = sample.callbacks,
+                            measured_sr,
+                            buffer_size,
+                            "trou de livraison du pilote au démarrage (exclu de la mesure du rate — le rate déclaré est confirmé)"
+                        );
+                    }
+                }
+                RateVerdict::Lies { actual_sr, measured_sr } => {
                     tracing::warn!(
                         target: "jamodio::audio",
                         declared_sr = native_sr,
-                        measured_sr = measured_sr as u32,
-                        cb_per_sec = (cb_delta as f64 / dt) as u32,
+                        actual_sr,
+                        measured_sr,
+                        callbacks = sample.callbacks,
+                        stall_ms = sample.stall_us / 1000,
                         buffer_size,
-                        "driver MENT sur son rate (déclaré ≠ mesuré) — on retient le rate RÉEL mesuré (la capture sera refusée si ≠ 48 kHz)"
+                        "driver MENT sur son rate (déclaré ≠ mesuré) — on retient le rate RÉEL livré (la capture sera refusée si ≠ 48 kHz)"
                     );
-                    native_sr = measured_sr.round() as u32;
-                    // Snap au rate standard le plus proche (le mesuré a ±~1 % de
-                    // bruit) : évite qu'un 44 096 mesuré passe pour « ni 44,1 ni 48 ».
-                    for std_sr in [44100u32, 48000, 88200, 96000, 176400, 192000, 32000, 22050, 11025] {
-                        if (native_sr as i64 - std_sr as i64).abs() <= 400 {
-                            native_sr = std_sr;
-                            break;
-                        }
-                    }
+                    native_sr = actual_sr;
                 }
+                RateVerdict::Inconclusive { measured_sr } => {
+                    tracing::warn!(
+                        target: "jamodio::audio",
+                        declared_sr = native_sr,
+                        measured_sr,
+                        callbacks = sample.callbacks,
+                        stall_ms = sample.stall_us / 1000,
+                        buffer_size,
+                        "cadence de callbacks hors de tout rate standard — mesure non concluante, on garde le rate déclaré"
+                    );
+                }
+                RateVerdict::NotMeasurable => {}
             }
             tracing::info!(
                 target: "jamodio::audio",

@@ -5,6 +5,27 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [Non publié]
+
+### Corrigé
+
+- **Windows (ASIO) : une interface bien réglée en 48 kHz n'est plus refusée
+  à l'entrée en studio.** Certains pilotes (Yamaha Steinberg USB, UR22C)
+  marquent une pause de 70 à 200 ms juste après le démarrage du flux ; le
+  contrôle de fréquence de l'Audio Engine la comptait comme du temps de
+  livraison et concluait à une fréquence qui n'existe pas (« 29 692 Hz »),
+  puis refusait la capture. Le temps de pause est désormais exclu de la
+  mesure, et une cadence qui ne correspond à aucune fréquence standard ne
+  remplace plus jamais celle que déclare le pilote. Un pilote qui livre
+  réellement en 44,1 kHz reste refusé, comme avant.
+
+### Interne
+
+- Journal : la pause de démarrage d'un pilote est nommée (durée, pilote), et
+  une mesure non concluante est dite telle quelle au lieu d'être présentée
+  comme la fréquence de l'interface.
+
+
 ## [0.6.5] — 2026-09-22
 
 **Moins de clics, et une session qui tient.**

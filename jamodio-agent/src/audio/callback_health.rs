@@ -54,6 +54,12 @@ pub struct CallbackHealth {
     worst_gap_us: AtomicU64,
     /// Pire durée de traitement de la fenêtre (µs).
     worst_work_us: AtomicU64,
+    /// Temps cumulé passé dans des intervalles EN RETARD (µs), chacun compté
+    /// au-delà d'une période de bloc : c'est le temps pendant lequel le pilote ne
+    /// livrait PAS. **Monotone, jamais remis à zéro par `drain`** — un lecteur
+    /// prend deux instantanés et soustrait (cf. `audio::rate_check`), sans être
+    /// perturbé par le superviseur 1 Hz qui draine les autres compteurs.
+    stall_us_total: AtomicU64,
 }
 
 /// Instantané d'une fenêtre, rendu par [`CallbackHealth::drain`].
@@ -105,6 +111,10 @@ impl CallbackHealth {
             self.worst_gap_us.fetch_max(gap, Relaxed);
             if gap > late_us {
                 self.late_blocks.fetch_add(1, Relaxed);
+                // Le callback qui clôt le trou vaut UNE période de bloc : le reste
+                // de l'intervalle est du temps sans livraison. Une addition
+                // atomique de plus, sur la seule branche déjà anormale.
+                self.stall_us_total.fetch_add(gap.saturating_sub(budget_us), Relaxed);
             }
         }
         self.worst_work_us.fetch_max(work_us, Relaxed);
@@ -113,7 +123,15 @@ impl CallbackHealth {
         }
     }
 
-    /// Rend la fenêtre écoulée et remet tous les compteurs à zéro (lecture 1 Hz).
+    /// Temps cumulé sans livraison depuis la création (µs) — monotone, voir le champ.
+    // Lu par le seul chemin Windows (vérification du rate à l'ouverture ASIO).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn stall_us_total(&self) -> u64 {
+        self.stall_us_total.load(Relaxed)
+    }
+
+    /// Rend la fenêtre écoulée et remet les compteurs de fenêtre à zéro (lecture
+    /// 1 Hz). `stall_us_total` n'en fait pas partie : il est monotone.
     pub fn drain(&self) -> CallbackHealthWindow {
         CallbackHealthWindow {
             blocks: self.blocks.swap(0, Relaxed),
@@ -250,6 +268,25 @@ mod tests {
         assert_eq!(w.late_blocks, 0);
         assert_eq!(w.worst_gap_us, 0, "aucun intervalle mesurable au 1er bloc");
         assert!(w.is_clean());
+    }
+
+    /// Le temps sans livraison s'accumule (chaque trou moins une période de bloc),
+    /// n'est PAS compté pour la gigue saine, et survit à `drain` : un lecteur
+    /// peut encadrer sa propre fenêtre par deux instantanés (cf. `rate_check`).
+    #[test]
+    fn temps_de_trou_cumule_et_monotone() {
+        let h = CallbackHealth::new();
+        let budget = block_budget_us(32, 48_000); // 666 µs
+        let late = late_threshold_us(budget);
+        h.record_block(None, 10, budget, late);
+        h.record_block(Some(700), 10, budget, late); // gigue normale : rien
+        h.record_block(Some(195_827), 10, budget, late); // trou Yamaha (cas Guillaume)
+        assert_eq!(h.stall_us_total(), 195_827 - 666);
+        let w = h.drain();
+        assert_eq!(w.late_blocks, 1);
+        assert_eq!(h.stall_us_total(), 195_827 - 666, "drain ne touche pas au cumul");
+        h.record_block(Some(72_025), 10, budget, late); // second trou
+        assert_eq!(h.stall_us_total(), 195_827 - 666 + 72_025 - 666);
     }
 
     #[test]
