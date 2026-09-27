@@ -1,6 +1,7 @@
-//! Vérification du rate RÉEL d'un pilote à l'ouverture — la décision, hors de tout
-//! code plateforme, pour être testée partout (l'hôte ASIO qui l'appelle est
-//! `cfg(windows)`).
+//! Vérification du rate RÉEL d'un pilote — la décision, hors de tout code
+//! plateforme, pour être testée partout. Une seule règle pour les deux points de
+//! mesure : l'ouverture (`asio_host::open`, fenêtre de 500 ms) et le détecteur de
+//! dérive en session (`ws_server`, fenêtres de 2 s, R4).
 //!
 //! # Pourquoi mesurer
 //!
@@ -29,28 +30,27 @@
 //!    C'est une mesure non concluante : on GARDE le déclaré et on le dit dans le
 //!    journal. Le message « ton interface est en X Hz » ne peut plus afficher
 //!    qu'un rate standard réellement livré.
+//!
+//! Le 26/09/2026 (même utilisateur, agent 0.6.6-2), le détecteur EN SESSION, qui
+//! avait sa propre mesure brute, a coupé deux fois la répétition : trous de
+//! ~300 ms du même pilote en cours de jeu, « 41 644 Hz » mesurés, hard-stop. Il
+//! passe désormais lui aussi par [`resolve_measured_rate`].
 
-// Lus par le seul chemin Windows (hôte ASIO) ; la logique reste multi-plateforme
-// pour rester testable partout — `allow` CIBLÉ par item, jamais sur le module.
 /// Rates standard que peut délivrer une interface audio, en Hz.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub const STANDARD_RATES: [u32; 9] = [
     44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 32_000, 22_050, 11_025,
 ];
 
 /// Écart relatif au-delà duquel la cadence mesurée contredit le rate déclaré.
 /// 44,1 vs 48 = 8,1 % ; la gigue résiduelle d'une mesure sans trou est ≈ 1-2 %.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub const TOLERANCE: f64 = 0.03;
 
 /// Distance (Hz) sous laquelle une cadence mesurée est rattachée à un rate
 /// standard (le mesuré porte ±~1 % de bruit : un 44 096 EST du 44,1).
-#[cfg_attr(not(windows), allow(dead_code))]
 pub const SNAP_HZ: u32 = 400;
 
 /// Ce que l'hôte a compté pendant la fenêtre d'observation, après le 1er callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub struct RateSample {
     /// Rate déclaré par le pilote (`sample_rate()` après `set_sample_rate`).
     pub declared_sr: u32,
@@ -67,7 +67,6 @@ pub struct RateSample {
 
 /// Verdict sur le rate réellement livré.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub enum RateVerdict {
     /// Fenêtre inexploitable (aucun callback, géométrie inconnue, ou trous
     /// couvrant toute la fenêtre) : rien à conclure, on garde le déclaré.
@@ -85,7 +84,6 @@ pub enum RateVerdict {
 
 /// Rattache une cadence mesurée au rate standard le plus proche, si elle est à
 /// moins de [`SNAP_HZ`] de l'un d'eux.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn snap_to_standard_rate(measured_sr: u32) -> Option<u32> {
     STANDARD_RATES
         .iter()
@@ -95,7 +93,6 @@ pub fn snap_to_standard_rate(measured_sr: u32) -> Option<u32> {
 }
 
 /// Décide, à partir de la fenêtre observée, si le rate déclaré est le rate livré.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn resolve_measured_rate(s: &RateSample) -> RateVerdict {
     if s.callbacks == 0 || s.frames_per_cb == 0 || s.declared_sr == 0 {
         return RateVerdict::NotMeasurable;
@@ -211,6 +208,49 @@ mod tests {
             RateVerdict::Inconclusive { measured_sr } => assert_eq!(measured_sr, 29_696),
             other => panic!("attendu Inconclusive, obtenu {other:?}"),
         }
+    }
+
+    /// Cas Guillaume H. EN SESSION (26/09/2026 14:46:12 UTC, agent 0.6.6-2) :
+    /// fenêtre de 2,25 s, buffer 48, 1952 callbacks, un trou de 298,6 ms. Mesure
+    /// brute : « 41 644 Hz », deuxième fenêtre de suite → hard-stop. Attendu : 48 kHz.
+    #[test]
+    fn trou_en_session_yamaha_fenetre_2s_confirme_48k() {
+        let s = RateSample {
+            declared_sr: 48_000,
+            frames_per_cb: 48,
+            callbacks: 1_952,
+            window_us: 2_250_000,
+            stall_us: 298_579 - 1_000,
+        };
+        match resolve_measured_rate(&s) {
+            RateVerdict::Confirmed { measured_sr } => {
+                assert!((47_500..=48_500).contains(&measured_sr), "mesuré {measured_sr}");
+            }
+            other => panic!("attendu Confirmed, obtenu {other:?}"),
+        }
+        // Sans l'exclusion du trou, la même fenêtre ne tombe sur aucun rate
+        // standard : non concluante, jamais un « 41 644 Hz » présenté comme réel.
+        assert!(matches!(
+            resolve_measured_rate(&RateSample { stall_us: 0, ..s }),
+            RateVerdict::Inconclusive { .. }
+        ));
+    }
+
+    /// Un vrai re-clock à 44,1 en session (aucun trou, buffer 48, fenêtre de 2 s :
+    /// 918,75 cb/s) reste détecté.
+    #[test]
+    fn reclock_44100_en_session_est_detecte() {
+        let s = RateSample {
+            declared_sr: 48_000,
+            frames_per_cb: 48,
+            callbacks: 1_837,
+            window_us: 2_000_000,
+            stall_us: 0,
+        };
+        assert!(matches!(
+            resolve_measured_rate(&s),
+            RateVerdict::Lies { actual_sr: 44_100, .. }
+        ));
     }
 
     /// Session saine, sans trou : 750 cb/s × 64 = 48 000 exactement.

@@ -124,8 +124,8 @@ impl CallbackHealth {
     }
 
     /// Temps cumulé sans livraison depuis la création (µs) — monotone, voir le champ.
-    // Lu par le seul chemin Windows (vérification du rate à l'ouverture ASIO).
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Lu par les deux mesures de rate (ouverture ASIO et détecteur en session) ;
+    /// reste à 0 hors ASIO, où rien n'alimente [`Self::record_block`].
     pub fn stall_us_total(&self) -> u64 {
         self.stall_us_total.load(Relaxed)
     }

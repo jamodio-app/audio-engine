@@ -18,6 +18,14 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   mesure, et une cadence qui ne correspond à aucune fréquence standard ne
   remplace plus jamais celle que déclare le pilote. Un pilote qui livre
   réellement en 44,1 kHz reste refusé, comme avant.
+- **Windows (ASIO) : la session n'est plus coupée par une pause du pilote.**
+  Le même pilote peut marquer, en cours de jeu, des pauses d'environ 300 ms ;
+  la surveillance de fréquence en session les prenait pour un changement de
+  fréquence et faisait sortir du studio (« l'interface a quitté le 48 kHz »).
+  Elle applique désormais la même règle qu'à l'entrée : la pause est exclue
+  de la mesure, et seule une interface qui livre réellement à une autre
+  fréquence standard arrête la capture. La pause elle-même reste un vrai
+  silence, toujours tracée dans le journal.
 
 ### Interne
 
