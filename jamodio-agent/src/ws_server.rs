@@ -1159,6 +1159,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let capturing_now = matches!(pl.state, AgentState::Capturing);
             // Ce que le musicien ENTEND (sortie casque), pic de la seconde.
             let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
+            // Talkback : coût de l'isolation de voix et voix perdue devant l'étage
+            // voix sur la fenêtre (cf. `audio::voice_tap`). Zéros hors talkback.
+            let voice_stage = pl.perfstats.voice_stage.drain();
             // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
             // callback correspondant n'a pas encore tourné : on publie alors
             // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
@@ -1637,6 +1640,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // lignes se distinguent.
                 output_clip_samples = clip_samples,
                 output_total_samples = total_samples,
+                // Talkback — charge de l'isolation en % d'un cœur (> 100 % =
+                // l'étage voix ne suit pas le temps réel), pire bloc, voix perdue.
+                voice_iso_load_pct = voice_stage.iso_load_pct,
+                voice_iso_max_block_ms = voice_stage.iso_max_block_ms,
+                voice_dropped_ms = voice_stage.dropped_ms,
                 pid = std::process::id(),
                 "perfstats snapshot"
             );

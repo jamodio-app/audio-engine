@@ -22,7 +22,9 @@
 
 use cpal::traits::DeviceTrait;
 use cpal::{Device, SampleFormat};
-use crossbeam_channel::{Sender, TrySendError};
+
+use super::voice_tap::VoiceTapSender;
+use crossbeam_channel::Sender;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -219,7 +221,7 @@ pub struct VoiceStreamInfo {
 pub fn build_voice_capture_stream(
     device: &Device,
     channel: usize,
-    out_tx: Sender<Vec<f32>>,
+    out_tx: VoiceTapSender,
 ) -> Result<(cpal::Stream, VoiceStreamInfo), VoiceCaptureError> {
     let default_cfg = device
         .default_input_config()
@@ -236,23 +238,11 @@ pub fn build_voice_capture_stream(
     };
     let config: cpal::StreamConfig = default_cfg.clone().into();
 
-    // Blocs abandonnés d'affilée quand l'étage voix est en retard. Comme pour le
-    // tap instrument : on ne bloque JAMAIS le thread audio, mais on ne jette pas
-    // en silence non plus (log échantillonné, remis à zéro dès que ça repasse).
-    let mut drops: u32 = 0;
-    let mut send = move |block: &[f32]| match out_tx.try_send(block.to_vec()) {
-        Ok(()) => drops = 0,
-        Err(TrySendError::Full(_)) => {
-            drops += 1;
-            if drops.is_power_of_two() {
-                tracing::warn!(
-                    target: "jamodio::voice_capture",
-                    consecutive_drops = drops,
-                    "étage voix saturé — blocs talkback abandonnés"
-                );
-            }
-        }
-        Err(TrySendError::Disconnected(_)) => {}
+    // Étage voix en retard : on ne bloque JAMAIS le thread audio. Le bloc jeté est
+    // compté par la file, et c'est l'étage voix qui le trace (aucun journal dans ce
+    // callback) — cf. `audio::voice_tap`.
+    let mut send = move |block: &[f32]| {
+        let _ = out_tx.push(block.to_vec());
     };
 
     let err_fn = |err| {
@@ -334,7 +324,7 @@ impl Drop for VoiceCaptureHandle {
 pub fn spawn_voice_capture(
     device_id: String,
     channel: usize,
-    out_tx: Sender<Vec<f32>>,
+    out_tx: VoiceTapSender,
 ) -> Result<(VoiceStreamInfo, VoiceCaptureHandle), String> {
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Result<VoiceStreamInfo, String>>(1);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);

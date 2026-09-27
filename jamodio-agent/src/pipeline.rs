@@ -1124,6 +1124,9 @@ pub struct PerfHandles {
     /// donc aucune ligne. Cf. `audio::callback_health`. Aujourd'hui seul l'hôte
     /// ASIO l'alimente ; reste à zéro ailleurs (⇒ fenêtre propre ⇒ silence).
     pub callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
+    /// Coût de l'isolation de voix du talkback et voix perdue devant l'étage voix,
+    /// drainés à 1 Hz dans le journal perfstats. Cf. `audio::voice_tap`.
+    pub voice_stage: Arc<crate::audio::voice_tap::VoiceStageStats>,
 }
 
 impl PerfHandles {
@@ -1152,6 +1155,7 @@ impl PerfHandles {
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
+            voice_stage: Arc::new(crate::audio::voice_tap::VoiceStageStats::default()),
         }
     }
 }
@@ -2714,9 +2718,12 @@ impl PipelineState {
             .map_err(|e| format!("{}", e))?
             .port();
         let sender = Arc::new(sender);
-        // 5. Canal capture_stage → voice_encode (mono BRUT @ 48 kHz — R2). Même
-        //    marge que les ringbufs instrument (32 blocs).
-        let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
+        // 5. File capture → voice_encode (mono BRUT @ 48 kHz — R2), bornée en
+        //    DURÉE d'audio et non en blocs (cf. `audio::voice_tap`).
+        let (voice_tx, voice_rx) = crate::audio::voice_tap::voice_tap(
+            crate::audio::voice_tap::VOICE_TAP_MAX_MS,
+        );
+        let voice_stage = self.perfstats.voice_stage.clone();
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
         let voice_send_peak = self.voice_send_peak.clone();
@@ -2747,6 +2754,7 @@ impl PipelineState {
                     voice_send_peak,
                     voice_on_air,
                     isolation_active,
+                    voice_stage,
                     output_device_name,
                     ready_tx,
                 );
@@ -2754,8 +2762,8 @@ impl PipelineState {
             .map_err(|e| format!("spawn voice-encode: {}", e))?;
         // 7. Attend que le thread voix soit prêt AVANT de greffer le tap. Sans ça,
         //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
-        //    mesurés) : la file de 32 blocs déborde et la PREMIÈRE DEMI-SECONDE de
-        //    talkback part en silence (constaté en logs terrain, « tap voix saturé »).
+        //    mesurés) : la file déborde et le DÉBUT du talkback part en silence
+        //    (constaté en logs terrain, « tap voix saturé »).
         match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
             Ok(Ok(())) => {}
             // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
@@ -3486,7 +3494,7 @@ pub enum ChannelSel {
 enum VoiceControl {
     /// Active le tap : extrait le canal mono `channel_index` du buffer BRUT à
     /// chaque bloc CPAL et le pousse vers le `voice_encode_stage` via `out_tx`.
-    Add { channel_index: usize, out_tx: Sender<Vec<f32>> },
+    Add { channel_index: usize, out_tx: crate::audio::voice_tap::VoiceTapSender },
     /// Retire le tap : le `out_tx` détenu par `capture_stage` est droppé →
     /// le thread `voice_encode` termine en cascade.
     Remove,
@@ -3879,7 +3887,7 @@ fn capture_stage_loop(
     // tête de boucle : Add greffe l'extraction d'un canal mono du buffer BRUT,
     // Remove la retire. Le tap n'impacte JAMAIS le forward instrument (fait en
     // premier), et un ralentissement du thread voix ne peut pas bloquer ce
-    // stage (try_send + drop sur Full).
+    // stage (file bornée en durée, bloc jeté et compté au-delà).
     voice_ctrl_rx: Receiver<VoiceControl>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3893,14 +3901,7 @@ fn capture_stage_loop(
     // Talkback (Lot 2) — tap voix actif : `Some((canal_mono, out_tx))`. Le
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
-    let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
-    // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
-    // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
-    // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
-    // et c'est elle qui domine en pratique.
-    let mut voice_drops: u32 = 0;
-    // Fenêtre d'échantillonnage de la trace de saturation voix. Voir `Full`.
-    let mut voice_drops_last_warn: Option<std::time::Instant> = None;
+    let mut voice_out: Option<(usize, crate::audio::voice_tap::VoiceTapSender)> = None;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3925,52 +3926,16 @@ fn capture_stage_loop(
                 // multicanal BRUT (donc AVANT le plugin/monitor/remap instrument)
                 // et l'envoie au `voice_encode_stage`. Coût STRICTEMENT NUL quand
                 // la voix est inactive (`voice_out = None` → un seul test).
-                // try_send non bloquant : le thread capture instrument n'est
-                // JAMAIS ralenti par un retard du thread voix.
+                // Non bloquant : le thread capture instrument n'est JAMAIS ralenti
+                // par un retard du thread voix. Un bloc jeté (étage voix en retard
+                // de plus de la borne) est COMPTÉ par la file ; c'est l'étage voix
+                // qui le trace, une fois par fenêtre, quelle que soit la source
+                // (tap ici ou micro dédié) — cf. `audio::voice_tap`.
                 if let Some((vch, vtx)) = voice_out.as_ref() {
                     let mono = extract_channel_mono(&samples, channels_in, *vch);
-                    if !mono.is_empty() {
-                        match vtx.try_send(mono) {
-                            Ok(()) => {}
-                            // Thread voix en retard : on DROP ce bloc voix
-                            // (concealé par le PLC récepteur). Jamais de stall —
-                            // mais JAMAIS silencieux non plus : depuis que ce
-                            // thread fait tourner l'isolation de voix (deux
-                            // réseaux), une saturation durable s'entend, donc
-                            // elle se trace.
-                            //
-                            // Échantillonnage par le TEMPS (≤ 1 ligne/s), pas par
-                            // un compteur de drops consécutifs : ce dernier était
-                            // remis à zéro au premier bloc passé, si bien qu'une
-                            // saturation INTERMITTENTE (drop, ok, drop, ok…) ne
-                            // dépassait jamais 1-2 et traçait donc à CHAQUE drop —
-                            // 4352 lignes en 25 min mesurées le 05/09, l'exact
-                            // contraire du but recherché, et de quoi évincer le
-                            // diagnostic utile de l'export support (cap 5 Mo).
-                            // On journalise donc au plus une fois par seconde, en
-                            // rapportant le nombre RÉEL de blocs perdus depuis la
-                            // dernière trace.
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                                voice_drops += 1;
-                                const VOICE_WARN_EVERY: std::time::Duration =
-                                    std::time::Duration::from_secs(1);
-                                let due = voice_drops_last_warn
-                                    .is_none_or(|t| t.elapsed() >= VOICE_WARN_EVERY);
-                                if due {
-                                    tracing::warn!(
-                                        target: "jamodio::pipeline",
-                                        dropped_blocks = voice_drops,
-                                        "tap voix saturé — blocs talkback abandonnés (thread voix en retard)"
-                                    );
-                                    voice_drops = 0;
-                                    voice_drops_last_warn = Some(std::time::Instant::now());
-                                }
-                            }
-                            // Thread voix terminé : on cesse de taper.
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                voice_out = None;
-                            }
-                        }
+                    // Thread voix terminé : on cesse de taper.
+                    if !mono.is_empty() && vtx.push(mono).is_err() {
+                        voice_out = None;
                     }
                 }
                 // Timestamp début pipeline INSTRUMENT : posé APRÈS le tap voix
@@ -4724,7 +4689,7 @@ fn encode_stage_loop(
 // secondaire, on ne veut pas polluer la mesure de latence du chemin principal.
 #[allow(clippy::too_many_arguments)]
 fn voice_encode_stage_loop(
-    in_rx: Receiver<Vec<f32>>,
+    in_rx: crate::audio::voice_tap::VoiceTapReceiver,
     sender: Arc<RtpSender>,
     ssrc: u32,
     payload_type: u8,
@@ -4736,6 +4701,8 @@ fn voice_encode_stage_loop(
     voice_send_peak: Arc<LevelMeter>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
+    // Coût de l'isolation et voix perdue, pour le journal perfstats 1 Hz.
+    voice_stage: Arc<crate::audio::voice_tap::VoiceStageStats>,
     output_device_name: Option<String>,
     // Signale à `start_voice_capture` que ce thread est prêt à consommer (encodeur
     // créé, modèles d'isolation chargés) → il ne greffe le tap qu'à ce moment.
@@ -4826,6 +4793,13 @@ fn voice_encode_stage_loop(
     );
     let mut last_limiter_report = std::time::Instant::now();
 
+    // Saturation de l'étage voix (cf. `audio::voice_tap`) : par fenêtre, voix
+    // traitée vs voix jetée devant l'étage.
+    let mut saturation = crate::audio::voice_tap::SaturationWatch::default();
+    let mut window_start = std::time::Instant::now();
+    let mut window_processed: u64 = 0;
+    let mut dropped_seen = in_rx.dropped_samples_total();
+
     // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
     // `send` consomme le Sender — le canal se ferme donc de lui-même ensuite.
     let _ = ready_tx.send(());
@@ -4843,6 +4817,7 @@ fn voice_encode_stage_loop(
         if mono48.is_empty() {
             continue;
         }
+        window_processed += mono48.len() as u64;
 
         // Gain d'envoi du bloc : lu UNE fois, pour que le mètre et l'étage
         // d'envoi voient la même valeur.
@@ -4874,7 +4849,10 @@ fn voice_encode_stage_loop(
         //        on désactive l'isolation pour le reste de la session (voix brute)
         //        sans JAMAIS couper le talkback — dégradation visible, pas silencieuse.
         if let Some(iso) = isolator.as_mut() {
-            match iso.process_block(&mut mono48) {
+            let t_iso = std::time::Instant::now();
+            let result = iso.process_block(&mut mono48);
+            voice_stage.record_isolation(t_iso.elapsed(), mono48.len());
+            match result {
                 Ok(state) => {
                     voice_on_air.store(state.voice_active, std::sync::atomic::Ordering::Relaxed)
                 }
@@ -4889,6 +4867,41 @@ fn voice_encode_stage_loop(
                     isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+
+        // 1-ter-bis. Voix perdue devant l'étage (file pleine) : tracée par
+        //        fenêtre et, si elle persiste pendant que l'isolation tourne,
+        //        bascule en voix brute pour le reste de la session. Une voix
+        //        hachée à 20 % est inintelligible — et le gate de parole, nourri
+        //        d'un signal troué, s'ouvre et se ferme au hasard. La voix brute
+        //        est un repli VISIBLE (`isolation_active` → « VOIX BRUTE » dans
+        //        l'UI), jamais une coupure du talkback.
+        if window_start.elapsed() >= crate::audio::voice_tap::SATURATION_WINDOW {
+            let dropped_total = in_rx.dropped_samples_total();
+            let dropped = dropped_total.saturating_sub(dropped_seen);
+            dropped_seen = dropped_total;
+            voice_stage.record_dropped(dropped);
+            if dropped > 0 {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    dropped_ms = dropped * 1000 / 48_000,
+                    window_ms = window_start.elapsed().as_millis() as u64,
+                    isolation = isolator.is_some(),
+                    "tap voix saturé — voix talkback perdue (étage voix en retard)"
+                );
+            }
+            if saturation.observe(window_processed, dropped) && isolator.is_some() {
+                tracing::warn!(
+                    target: "jamodio::voice_isolation",
+                    "isolation de voix saturée (la machine ne suit pas le temps réel) \
+                     — talkback en voix brute pour le reste de la session"
+                );
+                isolator = None;
+                voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+                isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            window_start = std::time::Instant::now();
+            window_processed = 0;
         }
 
         // 1-quater. Gain d'ENVOI puis limiteur de crête (cf. `voice_send_stage`) :

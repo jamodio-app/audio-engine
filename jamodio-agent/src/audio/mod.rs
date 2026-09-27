@@ -20,6 +20,8 @@ pub mod hardware_presence;
 pub mod host;
 pub mod capture;
 pub mod voice_capture;
+/// File capture → étage voix bornée en durée + surveillance de saturation (cf. module).
+pub mod voice_tap;
 pub mod output_pair;
 pub mod playback;
 pub mod midi;
