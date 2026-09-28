@@ -1143,6 +1143,8 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let recv_path_snap = pl.perfstats.recv_path.lock().flush();
             // Lot 1-C — retard du réveil du thread de décodage sur l'instant prévu.
             let decode_wake_late_snap = pl.perfstats.decode_wake_late.lock().flush();
+            // Lot 1-D2 — attente entre la réception d'un paquet par le système et sa lecture.
+            let recv_stack_snap = pl.perfstats.recv_stack_delay.lock().flush();
             // 0.5.3-4 — débit de callbacks CPAL sur la fenêtre 1 s (liveness ASIO).
             // Compteurs cumulés → on logue le delta. 0 en session active = sortie
             // ou entrée muette (cold-start), sinon ≈370/s.
@@ -1531,6 +1533,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         wait_repriming: net.wait_repriming,
                         deadline_disarmed: net.deadline_disarmed,
                         holes_arrival: net.holes.arrival,
+                        holes_reception: net.holes.reception,
                         holes_decode: net.holes.decode,
                         holes_consumption: net.holes.consumption,
                         holes_sequence: net.holes.sequence,
@@ -1629,6 +1632,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 decode_wake_late_p50_ms = decode_wake_late_snap.p50_ms,
                 decode_wake_late_p99_ms = decode_wake_late_snap.p99_ms,
                 decode_wake_late_max_ms = decode_wake_late_snap.max_ms,
+                // Lot 1-D2 — attente système → lecture des paquets reçus (ms). Un
+                // max qui atteint l'écart d'un trou dit que le paquet était dans la
+                // machine et que la réception l'a lu tard. count = 0 en réception :
+                // le système n'horodate pas (dit une fois par flux au journal).
+                recv_stack_count = recv_stack_snap.count,
+                recv_stack_p50_ms = recv_stack_snap.p50_ms,
+                recv_stack_p99_ms = recv_stack_snap.p99_ms,
+                recv_stack_max_ms = recv_stack_snap.max_ms,
                 // 0.5.3 — rafale d'émission : frames Opus émises par bloc d'entrée.
                 // ≈1 = flux régulier (pas de rafale) ; ≫1 = callback gros (ASIO non
                 // honoré). À 48 k natif : emit_burst_mean ≈ taille_callback / 120.

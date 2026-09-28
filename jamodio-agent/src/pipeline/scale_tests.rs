@@ -91,7 +91,7 @@ fn simulate(n: usize, secs: f64, stall: Option<(f64, f64)>) -> Outcome {
             });
             let pkt = packet(&payload, seq);
             for (st, id) in states.iter_mut().zip(&ids) {
-                decode_one_packet(st, id, at(recv_us), &pkt, &mixer, &stats, &recv_path, BLOCK_US / 1000.0);
+                decode_one_packet(st, id, at(recv_us), &pkt, &mixer, &stats, &recv_path, BLOCK_US / 1000.0, None);
             }
             seq = seq.wrapping_add(1);
             next_frame_us += FRAME_US;

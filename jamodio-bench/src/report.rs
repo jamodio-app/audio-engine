@@ -17,6 +17,7 @@ use std::fmt::Write as _;
 pub const PEER_FIELDS: &[&str] = &[
     "underruns",
     "holesArrival",
+    "holesReception",
     "holesDecode",
     "holesConsumption",
     "holesSequence",
@@ -224,10 +225,11 @@ pub struct StepSummary {
     pub musicians: u32,
     pub seconds: f64,
     /// Trous par minute sur l'ensemble des instruments reçus : total, puis par
-    /// cause (arrivée, décodage, consommation, séquence, non classé), puis ceux
-    /// qui ont suivi un « le tampon tient ». `NaN` si l'agent ne les mesure pas.
+    /// cause (arrivée, réception, décodage, consommation, séquence, non classé),
+    /// puis ceux qui ont suivi un « le tampon tient ». `NaN` si l'agent ne les
+    /// mesure pas (« réception » : agent ≥ 0.6.6-6).
     pub underruns_per_min: f64,
-    pub holes_per_min: [f64; 6],
+    pub holes_per_min: [f64; 7],
     /// Cible du tampon des instruments (ms) : médiane et p95 sur tous les flux.
     pub target_median_ms: f64,
     pub target_p95_ms: f64,
@@ -248,8 +250,9 @@ pub struct StepSummary {
 /// servie dans la seconde. CONSTANTE DE CLASSEMENT : la valeur brute est au CSV.
 const LATE_CALLBACK_FRACTION: f64 = 0.01;
 
-const HOLE_FIELDS: [&str; 6] = [
+const HOLE_FIELDS: [&str; 7] = [
     "holesArrival",
+    "holesReception",
     "holesDecode",
     "holesConsumption",
     "holesSequence",
@@ -300,7 +303,7 @@ pub fn summarize(peers: &[PeerRow], machine: &[MachineRow], musicians: u32, from
     let sum_delta = |name: &str| -> f64 {
         per_stream.values().map(|(a, b)| delta(a.get(name), b.get(name))).sum::<f64>() / minutes
     };
-    let mut holes_per_min = [0.0; 6];
+    let mut holes_per_min = [0.0; 7];
     for (i, f) in HOLE_FIELDS.iter().enumerate() {
         holes_per_min[i] = sum_delta(f);
     }
@@ -370,11 +373,16 @@ pub struct Criterion {
 pub fn criteria(steps: &[StepSummary], local_regular: bool, voice_sent: bool) -> Vec<Criterion> {
     let mut out = Vec::new();
 
-    // 1. Zéro trou de cause locale (décodage, consommation).
-    let local: f64 = steps.iter().map(|s| (s.holes_per_min[1] + s.holes_per_min[2]) * s.seconds / 60.0).sum();
+    // 1. Zéro trou de cause locale (réception, décodage, consommation). La
+    // réception n'est mesurée qu'à partir de l'agent 0.6.6-6 : avant, elle
+    // reste inconnue (NaN) et le critère ne juge pas.
+    let local: f64 = steps
+        .iter()
+        .map(|s| (s.holes_per_min[1] + s.holes_per_min[2] + s.holes_per_min[3]) * s.seconds / 60.0)
+        .sum();
     out.push(Criterion {
         id: 1,
-        text: "zéro trou de cause locale (décodage, consommation), mode local, flux réguliers",
+        text: "zéro trou de cause locale (réception, décodage, consommation), mode local, flux réguliers",
         verdict: if !local_regular || !local.is_finite() {
             Verdict::NotApplicable
         } else if local == 0.0 {
@@ -385,9 +393,9 @@ pub fn criteria(steps: &[StepSummary], local_regular: bool, voice_sent: bool) ->
         detail: if !local_regular {
             "scénario avec réseau ou gigue simulée : un trou n'y est pas forcément local".into()
         } else if !local.is_finite() {
-            "l'Audio Engine ne mesure pas la cause des trous (version antérieure à 0.6.6-1)".into()
+            "l'Audio Engine ne mesure pas toutes les causes locales (réception : 0.6.6-6 et plus)".into()
         } else {
-            format!("{local:.0} trou(s) décodage + consommation sur la campagne")
+            format!("{local:.0} trou(s) réception + décodage + consommation sur la campagne")
         },
     });
 
@@ -457,15 +465,15 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
     }
     s.push_str(
         "\n## Par palier (instruments reçus)\n\n\
-| Musiciens | Trous/min | arrivée | décodage | consommation | séquence | non classé | après « tampon tient » \
+| Musiciens | Trous/min | arrivée | réception | décodage | consommation | séquence | non classé | après « tampon tient » \
 | Cible médiane (ms) | Cible p95 (ms) | dont gigue / anti-trou / réactif (ms) | CPU méd. / max (%) \
 | Sortie en retard (s) | Retard max du banc (ms) | Coupures instrument envoyé | Coupures voix envoyée |\n\
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for st in steps {
         let _ = writeln!(
             s,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} / {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} / {} | {} | {} | {} | {} |",
             st.musicians,
             cell(st.underruns_per_min),
             cell(st.holes_per_min[0]),
@@ -474,6 +482,7 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
             cell(st.holes_per_min[3]),
             cell(st.holes_per_min[4]),
             cell(st.holes_per_min[5]),
+            cell(st.holes_per_min[6]),
             cell(st.target_median_ms),
             cell(st.target_p95_ms),
             cell(st.target_parts_ms[0]),
@@ -566,7 +575,7 @@ mod tests {
             musicians: n,
             seconds: 60.0,
             underruns_per_min: decode,
-            holes_per_min: [0.0, decode, 0.0, 0.0, 0.0, 0.0],
+            holes_per_min: [0.0, 0.0, decode, 0.0, 0.0, 0.0, 0.0],
             target_median_ms: target,
             target_p95_ms: target,
             target_parts_ms: [target, 0.0, 0.0],

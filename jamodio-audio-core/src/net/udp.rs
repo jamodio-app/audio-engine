@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use super::rtcp::SendActivity;
+pub use super::rx_timestamp::Received;
 use super::srtp::SrtpContext;
 
 // DSCP EF (Expedited Forwarding, RFC 3246) pour le trafic audio temps réel.
@@ -163,6 +164,10 @@ impl RtpSender {
 pub struct RtpReceiver {
     socket: UdpSocket,
     srtp: Arc<SrtpContext>,
+    /// Lot 1-D2 — le système horodate les paquets reçus sur cette socket
+    /// (cf. `rx_timestamp`). `false` : refusé par le système (dit au journal),
+    /// lecture ordinaire sans horodatage.
+    stamped: bool,
     punch_ssrc: u32,
     punch_seq: AtomicU16,
     punch_ts: AtomicU32,
@@ -179,9 +184,21 @@ impl RtpReceiver {
         let ssrc = u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]);
         let seq = u16::from_be_bytes([seed[4], seed[5]]);
         let ts = u32::from_be_bytes([seed[6], seed[7], seed[8], seed[9]]);
+        let stamped = match super::rx_timestamp::enable(raw_socket(&socket)) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::udp",
+                    error = %e,
+                    "horodatage noyau de la réception indisponible — attente système/lecture non mesurée pour ce flux"
+                );
+                false
+            }
+        };
         Ok(Self {
             socket,
             srtp,
+            stamped,
             punch_ssrc: ssrc,
             punch_seq: AtomicU16::new(seq),
             punch_ts: AtomicU32::new(ts),
@@ -209,31 +226,67 @@ impl RtpReceiver {
         Ok(())
     }
 
-    /// Receive an SRTP packet, decrypt in place. Returns (data_length, sender_address).
-    /// Si la décryption échoue, retourne (0, addr) — caller doit ignorer.
-    pub async fn recv(&self, buf: &mut Vec<u8>) -> std::io::Result<(usize, SocketAddr)> {
-        // Resize to capacity so recv_from can fill it.
+    /// Reçoit un paquet SRTP et le déchiffre en place. `len == 0` : paquet à
+    /// ignorer (RTCP, ou échec de déchiffrement — déjà journalisé).
+    ///
+    /// Lot 1-D2 — rend aussi l'attente entre la réception du paquet par le
+    /// système et sa lecture ici (`stack_delay`), quand le système horodate.
+    /// Mesure seule : rien de ce qui suit ne s'en sert pour décider.
+    pub async fn recv(&self, buf: &mut Vec<u8>) -> std::io::Result<Received> {
+        // Resize to capacity so the read can fill it.
         let cap = buf.capacity();
         buf.resize(cap, 0);
-        let (len, addr) = self.socket.recv_from(buf).await?;
-        buf.truncate(len);
+        let r = if self.stamped {
+            loop {
+                self.socket.readable().await?;
+                let raw = raw_socket(&self.socket);
+                match self
+                    .socket
+                    .try_io(tokio::io::Interest::READABLE, || super::rx_timestamp::recv(raw, &mut buf[..]))
+                {
+                    Ok(r) => break r,
+                    // Réveil sans paquet (readiness périmée) : on se remet en attente.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            let (len, from) = self.socket.recv_from(buf).await?;
+            Received { len, from, stack_delay: None }
+        };
+        buf.truncate(r.len);
+        let ignored = Received { len: 0, ..r };
         // SRTCP (PT 200..=204 au 2e octet) : le SFU en ENVOIE bien aux agents — des
         // Sender Reports sur ce transport de réception, des Receiver Reports sur le
         // transport d'envoi (cf. worker mediasoup `Transport::SendRtcp`). L'agent ne
         // parle pas encore RTCP : on les ignore ici, sans les déchiffrer (voie B du
         // plan « infobulle latence » côté web).
         // Paquets RTP : déchiffrés en place.
-        if len >= 2 && buf[1] >= 200 && buf[1] <= 204 {
-            return Ok((0, addr));
+        if r.len >= 2 && buf[1] >= 200 && buf[1] <= 204 {
+            return Ok(ignored);
         }
         if let Err(e) = self.srtp.unprotect(buf) {
             tracing::warn!(target: "jamodio::srtp", role = "receiver", error = ?e, "SRTP unprotect failed");
-            return Ok((0, addr));
+            return Ok(ignored);
         }
-        Ok((buf.len(), addr))
+        Ok(Received { len: buf.len(), ..r })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+}
+
+/// Descripteur système de la socket, pour les appels que tokio n'expose pas
+/// (horodatage noyau, cf. `rx_timestamp`).
+#[cfg(unix)]
+fn raw_socket(s: &UdpSocket) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    s.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn raw_socket(s: &UdpSocket) -> windows_sys::Win32::Networking::WinSock::SOCKET {
+    use std::os::windows::io::AsRawSocket;
+    s.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET
 }

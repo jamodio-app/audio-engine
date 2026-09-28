@@ -67,7 +67,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     # La signature de WSAIoctl référence OVERLAPPED (passé nul : ioctl synchrone).
     "Win32_System_IO",
+    # Lot 1-D2 — horodatage noyau de la réception (net/rx_timestamp.rs) : les
+    # horodatages logiciels de Winsock sont des valeurs QueryPerformanceCounter.
+    "Win32_System_Performance",
 ] }
+
+# Lot 1-D2 — horodatage noyau de la réception sous macOS (SO_TIMESTAMP + recvmsg,
+# net/rx_timestamp.rs). Déjà dans l'arbre (socket2, tokio).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hound = "3"                # lecture/écriture WAV pour l'exemple de diagnostic iso_offline

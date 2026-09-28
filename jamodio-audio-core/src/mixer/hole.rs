@@ -39,10 +39,14 @@ const UNKNOWN_BLOCK_MS: f64 = super::conceal::FRAME_MS;
 /// Pourquoi le tampon n'avait pas de quoi servir le tirage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoleCause {
-    /// Le paquet suivant n'était pas encore arrivé (horodaté) à l'instant du
-    /// trou. Réseau, OU fil de réception pas ordonnancé avant l'horodatage : ce
-    /// relevé ne sépare pas les deux (Lot 1-D).
+    /// Le paquet suivant n'était pas encore arrivé à l'instant du trou — ni lu
+    /// par l'agent, ni (si le système horodate) reçu par la machine : le retard
+    /// est né en amont (réseau, serveur, émetteur).
     Arrival,
+    /// Lot 1-D2 — le paquet suivant était DÉJÀ dans la machine avant le trou
+    /// (horodatage du système), mais la tâche de réception de l'agent ne l'a lu
+    /// qu'après : cause LOCALE, la réception servie trop tard.
+    Reception,
     /// Le paquet suivant était arrivé avant le trou, mais pas encore dans le
     /// tampon : le thread de décodage était en retard.
     Decode,
@@ -61,6 +65,7 @@ impl HoleCause {
     pub fn as_str(self) -> &'static str {
         match self {
             HoleCause::Arrival => "arrival",
+            HoleCause::Reception => "reception",
             HoleCause::Decode => "decode",
             HoleCause::Consumption => "consumption",
             HoleCause::Sequence => "sequence",
@@ -81,13 +86,18 @@ pub struct HoleFacts {
     pub consumed_since_push_ms: f64,
     /// Bloc de sortie mesuré ; `0` s'il n'est pas encore connu.
     pub output_block_ms: f64,
-    /// Le paquet dont le `push` a rendu le trou était-il déjà arrivé à
-    /// l'instant du trou ? `None` : aucun paquet n'a encore suivi le trou (le
-    /// `push` était une trame de masquage).
+    /// Le paquet dont le `push` a rendu le trou avait-il été LU par l'agent
+    /// avant le trou ? `None` : aucun paquet n'a encore suivi le trou (le `push`
+    /// était une trame de masquage).
     pub next_received_before_hole: Option<bool>,
-    /// Paquets écartés (tardifs, doublons, sauts) entre le dernier `push` et
-    /// celui qui a rendu le trou.
-    pub discarded_since_push: u64,
+    /// Lot 1-D2 — ce paquet était-il déjà REÇU PAR LA MACHINE avant le trou
+    /// (horodatage du système) ? `None` : pas d'horodatage.
+    pub next_in_system_before_hole: Option<bool>,
+    /// Un paquet a-t-il été écarté (tardif, doublon, saut) AVANT le trou,
+    /// depuis le dernier `push` ? Un écart APRÈS le trou n'en est pas la cause :
+    /// c'en est la conséquence (le paquet arrive enfin, sa place a été prise par
+    /// le masquage) — banc du 28/09/2026, où ce cas était classé « séquence ».
+    pub discarded_before_hole: bool,
 }
 
 /// Classe un trou. L'ordre des questions compte :
@@ -96,9 +106,10 @@ pub struct HoleFacts {
 /// 2. **La sortie a-t-elle tiré plus que le temps ?** Si oui, même un paquet en
 ///    retard n'y est pour rien : à consommation normale, le tampon aurait tenu
 ///    plus longtemps. C'est la seule cause qui ne dépend pas de l'arrivée.
-/// 3. **Un paquet a-t-il été écarté ?** Il était là, on l'a jeté.
-/// 4. **Le paquet suivant était-il arrivé ?** Oui → le décodage était en retard ;
-///    non → il n'était pas arrivé.
+/// 3. **Un paquet a-t-il été écarté avant le trou ?** Il était là, on l'a jeté.
+/// 4. **Le paquet suivant avait-il été lu ?** Oui → le décodage était en retard.
+/// 5. **Était-il au moins dans la machine ?** Oui → la réception l'a lu trop
+///    tard (cause locale) ; non, ou inconnu → il n'était pas arrivé.
 pub fn classify(f: &HoleFacts) -> HoleCause {
     let finite = f.fill_at_last_push_ms.is_finite()
         && f.since_last_push_ms.is_finite()
@@ -114,13 +125,16 @@ pub fn classify(f: &HoleFacts) -> HoleCause {
     if f.consumed_since_push_ms - f.since_last_push_ms > CONSUMPTION_TOLERANCE_BLOCKS * block {
         return HoleCause::Consumption;
     }
-    if f.discarded_since_push > 0 {
+    if f.discarded_before_hole {
         return HoleCause::Sequence;
     }
-    match f.next_received_before_hole {
-        Some(true) => HoleCause::Decode,
-        Some(false) | None => HoleCause::Arrival,
+    if f.next_received_before_hole == Some(true) {
+        return HoleCause::Decode;
     }
+    if f.next_in_system_before_hole == Some(true) {
+        return HoleCause::Reception;
+    }
+    HoleCause::Arrival
 }
 
 #[cfg(test)]
@@ -139,7 +153,8 @@ mod tests {
             consumed_since_push_ms: 11.5,
             output_block_ms: BLOC,
             next_received_before_hole: Some(false),
-            discarded_since_push: 0,
+            next_in_system_before_hole: None,
+            discarded_before_hole: false,
         }
     }
 
@@ -161,11 +176,25 @@ mod tests {
     }
 
     #[test]
-    fn un_paquet_ecarte_passe_avant_l_arrivee_et_le_decodage() {
-        let f = HoleFacts { discarded_since_push: 1, ..faits() };
+    fn un_paquet_ecarte_avant_le_trou_passe_avant_l_arrivee_et_le_decodage() {
+        let f = HoleFacts { discarded_before_hole: true, ..faits() };
         assert_eq!(classify(&f), HoleCause::Sequence);
-        let f = HoleFacts { discarded_since_push: 1, next_received_before_hole: Some(true), ..faits() };
+        let f = HoleFacts { discarded_before_hole: true, next_received_before_hole: Some(true), ..faits() };
         assert_eq!(classify(&f), HoleCause::Sequence);
+    }
+
+    /// Lot 1-D2 : le paquet était dans la machine avant le trou, l'agent l'a lu
+    /// après — la réception était en retard, pas le réseau.
+    #[test]
+    fn un_paquet_dans_la_machine_mais_lu_apres_le_trou_accuse_la_reception() {
+        let f = HoleFacts { next_in_system_before_hole: Some(true), ..faits() };
+        assert_eq!(classify(&f), HoleCause::Reception);
+        // Arrivé dans la machine après le trou : en amont.
+        let f = HoleFacts { next_in_system_before_hole: Some(false), ..faits() };
+        assert_eq!(classify(&f), HoleCause::Arrival);
+        // Déjà lu avant le trou : c'est le décodage, pas la réception.
+        let f = HoleFacts { next_in_system_before_hole: Some(true), next_received_before_hole: Some(true), ..faits() };
+        assert_eq!(classify(&f), HoleCause::Decode);
     }
 
     /// La sortie a pris 12 ms en 6 ms : aucun paquet n'aurait suffi.
@@ -174,7 +203,7 @@ mod tests {
         let f = HoleFacts { since_last_push_ms: 6.0, consumed_since_push_ms: 12.0, ..faits() };
         assert_eq!(classify(&f), HoleCause::Consumption);
         // Même avec un paquet écarté : c'est la consommation qui a vidé le tampon.
-        let f = HoleFacts { discarded_since_push: 3, ..f };
+        let f = HoleFacts { discarded_before_hole: true, ..f };
         assert_eq!(classify(&f), HoleCause::Consumption);
     }
 

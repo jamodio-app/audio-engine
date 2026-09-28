@@ -1385,7 +1385,7 @@ pub struct PeerPerf {
     /// suivant n'est pas encore venu). Mesure seule : le web ne les lit pas.
     ///
     /// `holesArrival` : le paquet suivant n'était pas encore arrivé à l'instant
-    /// du trou (réseau, ou fil de réception servi trop tard — non séparés ici) ;
+    /// du trou — ni lu, ni (si le système horodate) reçu par la machine ;
     /// `holesDecode` : arrivé à temps, poussé trop tard par le décodage ;
     /// `holesConsumption` : les paquets étaient là, la sortie a tiré plus que le
     /// temps écoulé (rafale de callbacks) ; `holesSequence` : un paquet arrivé a
@@ -1394,6 +1394,12 @@ pub struct PeerPerf {
     /// (ligne `TROU`).
     #[serde(rename = "holesArrival")]
     pub holes_arrival: u64,
+    /// Lot 1-D2 (0.6.6-6) — le paquet suivant était déjà reçu par la MACHINE
+    /// avant le trou (horodatage du système), mais la réception de l'agent ne
+    /// l'a lu qu'après : cause locale. Jusqu'à 0.6.6-5 ces trous tombaient dans
+    /// `holesArrival` (ou, à tort, dans `holesSequence`).
+    #[serde(rename = "holesReception")]
+    pub holes_reception: u64,
     #[serde(rename = "holesDecode")]
     pub holes_decode: u64,
     #[serde(rename = "holesConsumption")]

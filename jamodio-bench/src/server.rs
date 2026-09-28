@@ -412,11 +412,15 @@ mod tests {
         let mut seqs = Vec::new();
         let t = Instant::now();
         while seqs.len() < 200 && t.elapsed() < Duration::from_secs(5) {
-            let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv(&mut buf))
+            let r = tokio::time::timeout(Duration::from_secs(2), receiver.recv(&mut buf))
                 .await
                 .expect("le flux arrive")
                 .unwrap();
-            assert!(len > 12, "paquet déchiffré par l'agent");
+            assert!(r.len > 12, "paquet déchiffré par l'agent");
+            // Lot 1-D2 : le récepteur de l'agent horodate (macOS, Windows).
+            if cfg!(any(target_os = "macos", windows)) {
+                assert!(r.stack_delay.is_some(), "attente système → lecture mesurée");
+            }
             seqs.push(rtp::parse_header(&buf).unwrap().0.sequence);
         }
         assert_eq!(seqs.len(), 200);

@@ -1085,6 +1085,9 @@ pub struct PerfHandles {
     /// C'est l'imprécision que `conceal::WAKE_SLACK_MS` est censé couvrir ;
     /// jusqu'ici elle n'avait été mesurée que hors de l'agent.
     pub decode_wake_late: Arc<Mutex<Histogram>>,
+    /// Lot 1-D2 — attente entre la réception d'un paquet par le système et sa
+    /// lecture par la tâche de réception (ms). Nourri par `recv_io_task`.
+    pub recv_stack_delay: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     /// 0.5.3-4 — LIVENESS du callback CPAL d'ENTRÉE : incrémenté d'1 à chaque
     /// callback de capture (cf. `capture::forward_samples`). Sert au watchdog
@@ -1155,6 +1158,7 @@ impl PerfHandles {
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             decode_wake_late: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_stack_delay: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3380,11 +3384,12 @@ impl PipelineState {
         // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
         let tx = decode.tx.clone();
         let pool_rx = decode.pool_rx.clone();
+        let stack_delay_hist = self.perfstats.recv_stack_delay.clone();
         let pid: Arc<str> = Arc::from(producer_id.as_str());
         self.recv_epoch = self.recv_epoch.wrapping_add(1);
         let epoch = self.recv_epoch;
         tokio::spawn(async move {
-            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, activity, tx, pool_rx, stop_rx).await;
+            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, activity, tx, pool_rx, stop_rx, stack_delay_hist).await;
         });
 
         // Start playback if not running. Résolution + ouverture sur le thread
@@ -5010,6 +5015,9 @@ enum DecodeMsg {
         producer_id: Arc<str>,
         epoch: u64,
         recv_instant: std::time::Instant,
+        /// Lot 1-D2 — attente entre la réception du paquet par le SYSTÈME et sa
+        /// lecture par `recv_io_task` (`None` : pas d'horodatage). Mesure seule.
+        stack_delay: Option<std::time::Duration>,
         buf: Vec<u8>,
         /// Lot C — nature du flux (constante pour le producteur) : détermine
         /// l'étage de mix au 1er paquet (`mixer.add_stream(kind)`).
@@ -5048,6 +5056,8 @@ struct LastConceal {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HoleCounts {
     pub arrival: u64,
+    /// Lot 1-D2 — le paquet était dans la machine, la réception l'a lu trop tard.
+    pub reception: u64,
     pub decode: u64,
     pub consumption: u64,
     pub sequence: u64,
@@ -5059,6 +5069,20 @@ pub struct HoleCounts {
     pub after_buffer_holds: u64,
 }
 
+/// Le vrai paquet qui provoque un push : quand l'agent l'a LU, et quand le
+/// SYSTÈME l'avait reçu (Lot 1-D2 ; `None` sans horodatage).
+#[derive(Debug, Clone, Copy)]
+struct Arrived {
+    read_at: std::time::Instant,
+    in_system_at: Option<std::time::Instant>,
+}
+
+impl Arrived {
+    fn new(read_at: std::time::Instant, stack_delay: Option<std::time::Duration>) -> Self {
+        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)) }
+    }
+}
+
 /// Lot 1-A — l'état du tampon au dernier `push` de ce flux, point de départ de
 /// l'analyse du trou suivant.
 #[derive(Debug, Clone, Copy)]
@@ -5066,8 +5090,6 @@ struct PushMark {
     at: std::time::Instant,
     fill_after_ms: f64,
     read_index: usize,
-    /// Paquets écartés (tardifs + doublons + sauts) cumulés à cet instant.
-    discarded: u64,
     /// Arrivée du dernier VRAI paquet poussé (une trame de masquage n'en a pas).
     last_received: Option<std::time::Instant>,
 }
@@ -5141,6 +5163,12 @@ struct DecodeState {
     /// Lot 1-A — état au dernier `push`, et trous comptés par cause.
     last_push: Option<PushMark>,
     holes: HoleCounts,
+    /// Lecture (`recv_instant`) du dernier paquet ÉCARTÉ (tardif, doublon,
+    /// saut). Seul un écart survenu AVANT un trou peut en être la cause.
+    last_discard: Option<std::time::Instant>,
+    /// Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
+    /// depuis le dernier push (ms) ; `NaN` si aucun n'était horodaté.
+    stack_delay_max_ms: f64,
     /// Nombre de fois où l'on a DÉSARMÉ l'échéance — plafond de masquage
     /// atteint, ou flux tari. Un événement, pas un tour de boucle.
     deadline_disarmed: u64,
@@ -5185,6 +5213,8 @@ impl DecodeState {
             last_wait: None,
             last_push: None,
             holes: HoleCounts::default(),
+            last_discard: None,
+            stack_delay_max_ms: f64::NAN,
             deadline_disarmed: 0,
             next_deadline: None,
             next_check: None,
@@ -5336,9 +5366,9 @@ fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
 /// une ligne de journal par trou), puis retient l'état de ce push comme point de
 /// départ du trou suivant.
 ///
-/// `now` : instant du push. `arrived` : arrivée du vrai paquet qui provoque ce
-/// push (le paquet décodé, ou celui dont l'arrivée révèle une perte) ; `None`
-/// pour une trame inventée à l'échéance, qu'aucun paquet n'accompagne.
+/// `now` : instant du push. `arrived` : le vrai paquet qui provoque ce push (le
+/// paquet décodé, ou celui dont l'arrivée révèle une perte) ; `None` pour une
+/// trame inventée à l'échéance, qu'aucun paquet n'accompagne.
 ///
 /// Tourne sur le thread de décodage : le tirage n'a fait que relever
 /// `HoleAtPull`, tout le reste se fait ici.
@@ -5347,22 +5377,20 @@ fn note_push(
     producer_id: &str,
     report: &PushReport,
     now: std::time::Instant,
-    arrived: Option<std::time::Instant>,
+    arrived: Option<Arrived>,
     output_block_ms: f64,
 ) {
-    let counters = st.seq.counters();
-    let discarded = counters.late + counters.duplicate + counters.jump;
     if let Some(h) = report.hole {
-        report_hole(st, producer_id, &h, discarded, arrived, now, output_block_ms);
+        report_hole(st, producer_id, &h, arrived, now, output_block_ms);
     }
-    let last_received = arrived.or(st.last_push.and_then(|p| p.last_received));
+    let last_received = arrived.map(|a| a.read_at).or(st.last_push.and_then(|p| p.last_received));
     st.last_push = Some(PushMark {
         at: now,
         fill_after_ms: report.fill_after_ms,
         read_index: report.read_index,
-        discarded,
         last_received,
     });
+    st.stack_delay_max_ms = f64::NAN;
 }
 
 /// Lot 1-A — classe un trou rendu par la sortie, le compte et le journalise.
@@ -5370,8 +5398,7 @@ fn report_hole(
     st: &mut DecodeState,
     producer_id: &str,
     h: &HoleAtPull,
-    discarded_now: u64,
-    arrived: Option<std::time::Instant>,
+    arrived: Option<Arrived>,
     now: std::time::Instant,
     output_block_ms: f64,
 ) {
@@ -5385,12 +5412,14 @@ fn report_hole(
         since_last_push_ms: if h.at >= p.at { ms(h.at - p.at) } else { -1.0 },
         consumed_since_push_ms: consumed_ms_between(p.read_index, h.read_index),
         output_block_ms,
-        next_received_before_hole: arrived.map(|a| a <= h.at),
-        discarded_since_push: discarded_now.saturating_sub(p.discarded),
+        next_received_before_hole: arrived.map(|a| a.read_at <= h.at),
+        next_in_system_before_hole: arrived.and_then(|a| a.in_system_at).map(|t| t <= h.at),
+        discarded_before_hole: st.last_discard.is_some_and(|d| d >= p.at && d <= h.at),
     });
     let cause = facts.as_ref().map_or(HoleCause::Unclassified, hole::classify);
     match cause {
         HoleCause::Arrival => st.holes.arrival += 1,
+        HoleCause::Reception => st.holes.reception += 1,
         HoleCause::Decode => st.holes.decode += 1,
         HoleCause::Consumption => st.holes.consumption += 1,
         HoleCause::Sequence => st.holes.sequence += 1,
@@ -5413,11 +5442,15 @@ fn report_hole(
     let consumed_ms = facts.map_or(-1.0, |f| f.consumed_since_push_ms);
     // Écart entre les deux arrivées qui encadrent le trou.
     let arrival_gap_ms = match (arrived, st.last_push.and_then(|p| p.last_received)) {
-        (Some(a), Some(prev)) => ms(a.saturating_duration_since(prev)),
+        (Some(a), Some(prev)) => ms(a.read_at.saturating_duration_since(prev)),
         _ => -1.0,
     };
     // Du paquet arrivé à son push : le retard du décodage.
-    let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a)));
+    let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.read_at)));
+    // Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
+    // depuis le dernier push : si elle vaut à peu près l'écart d'arrivée, les
+    // paquets étaient dans la machine et la réception les a lus en retard.
+    let stack_delay_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms } else { -1.0 };
     let wait = match wait {
         None => "none",
         Some(Wait::NotDue) => "not_due",
@@ -5441,6 +5474,7 @@ fn report_hole(
                 target_ms = h.target_ms,
                 arrival_gap_ms,
                 decode_delay_ms,
+                stack_delay_ms,
                 conceal_wait = wait,
                 "TROU"
             )
@@ -5725,7 +5759,7 @@ fn handle_decode_msg(
                 net_stats_by_producer.lock().remove(&*producer_id);
             }
         }
-        DecodeMsg::Packet { producer_id, epoch, recv_instant, buf, kind } => {
+        DecodeMsg::Packet { producer_id, epoch, recv_instant, stack_delay, buf, kind } => {
             // (Re)création de l'état + du stream mixer selon la génération.
             let needs_create = match states.get(&producer_id) {
                 Some(st) if st.epoch == epoch => false,
@@ -5756,7 +5790,17 @@ fn handle_decode_msg(
                 }
             }
             let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
-            decode_one_packet(st, &producer_id, recv_instant, &buf, mixer, net_stats_by_producer, recv_path, output_block_ms);
+            decode_one_packet(
+                st,
+                &producer_id,
+                recv_instant,
+                &buf,
+                mixer,
+                net_stats_by_producer,
+                recv_path,
+                output_block_ms,
+                stack_delay,
+            );
             // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
             let _ = pool_tx.try_send(buf);
         }
@@ -5777,9 +5821,16 @@ fn decode_one_packet(
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: &Arc<Mutex<Histogram>>,
     output_block_ms: f64,
+    stack_delay: Option<std::time::Duration>,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
     st.pkt_count += 1;
+    // Lot 1-D2 — la plus longue attente système → lecture depuis le dernier push.
+    if let Some(d) = stack_delay {
+        let d_ms = d.as_secs_f64() * 1000.0;
+        st.stack_delay_max_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms.max(d_ms) } else { d_ms };
+    }
+    let arrived = Arrived::new(recv_instant, stack_delay);
     if st.pkt_count == 1 {
         tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
     } else if st.pkt_count.is_multiple_of(5000) {
@@ -5881,7 +5932,7 @@ fn decode_one_packet(
                     if let Some(report) = report {
                         // Le trou éventuel a été révélé par CE paquet : c'est son
                         // arrivée qui compte.
-                        note_push(st, producer_id, &report, std::time::Instant::now(), Some(recv_instant), output_block_ms);
+                        note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
                         st.concealed_frames += 1;
                     }
                 }
@@ -5891,6 +5942,7 @@ fn decode_one_packet(
             }
         }
         Arrival::Late => {
+            st.last_discard = Some(recv_instant);
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
@@ -5917,8 +5969,12 @@ fn decode_one_packet(
             }
             return;
         }
-        Arrival::Duplicate => return,
+        Arrival::Duplicate => {
+            st.last_discard = Some(recv_instant);
+            return;
+        }
         Arrival::Jump => {
+            st.last_discard = Some(recv_instant);
             if !st.logged_large_jump {
                 tracing::warn!(target: "jamodio::recv", producer = short, got_seq = header.sequence, "seq jump — packet held until the stream restart is confirmed");
                 st.logged_large_jump = true;
@@ -5944,7 +6000,7 @@ fn decode_one_packet(
             mixer.push_samples(producer_id, pcm)
         };
         if let Some(report) = report {
-            note_push(st, producer_id, &report, std::time::Instant::now(), Some(recv_instant), output_block_ms);
+            note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
         }
     }
 }
@@ -5964,6 +6020,7 @@ async fn recv_io_task(
     tx: Sender<DecodeMsg>,
     pool_rx: Receiver<Vec<u8>>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    stack_delay_hist: Arc<Mutex<Histogram>>,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
 
@@ -6005,9 +6062,13 @@ async fn recv_io_task(
             }
             result = receiver.recv(&mut buf) => {
                 match result {
-                    Ok((len, _addr)) if len > 0 => {
+                    Ok(r) if r.len > 0 => {
                         // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
                         let recv_instant = std::time::Instant::now();
+                        // Lot 1-D2 — attente système → lecture (mesure seule).
+                        if let Some(d) = r.stack_delay {
+                            stack_delay_hist.lock().observe(d.as_secs_f32() * 1000.0);
+                        }
                         if silence_logged {
                             let silent_ms = activity.silent_ms(recv_instant);
                             tracing::info!(target: "jamodio::recv", producer = short, silent_ms, "paquets revenus après un silence");
@@ -6029,6 +6090,7 @@ async fn recv_io_task(
                                 producer_id: producer_id.clone(),
                                 epoch,
                                 recv_instant,
+                                stack_delay: r.stack_delay,
                                 buf: full,
                                 kind,
                             })
@@ -6860,9 +6922,14 @@ mod conceal_loop_tests {
     }
 
     fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
+        recevoir_horodate(st, mixer, seq, at, None);
+    }
+
+    /// Comme `recevoir`, avec l'attente système → lecture du paquet (Lot 1-D2).
+    fn recevoir_horodate(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant, stack_delay: Option<Duration>) {
         let stats = Arc::new(Mutex::new(HashMap::new()));
         let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
-        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path, BLOC_ASIO_MS);
+        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path, BLOC_ASIO_MS, stack_delay);
     }
 
     // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
@@ -6913,6 +6980,7 @@ mod conceal_loop_tests {
             producer_id: Arc::from("peer-test"),
             epoch: 1,
             recv_instant,
+            stack_delay: None,
             buf: paquet(seq),
             kind: StreamKind::Instrument,
         })
@@ -7464,14 +7532,42 @@ mod conceal_loop_tests {
         assert_eq!(st.holes, HoleCounts { decode: 1, ..HoleCounts::default() });
     }
 
-    /// Un paquet arrivé puis écarté (doublon) entre les deux pushes.
+    /// Un paquet arrivé puis écarté (doublon) AVANT le trou.
     #[test]
-    fn un_paquet_ecarte_avant_le_push_suivant_est_une_cause_de_sequence() {
+    fn un_paquet_ecarte_avant_le_trou_est_une_cause_de_sequence() {
         let (mixer, mut st) = apres_un_paquet();
-        tirer_jusqu_au_trou(&mixer);
         recevoir(&mut st, &mixer, 1001, Instant::now()); // doublon : écarté
+        tirer_jusqu_au_trou(&mixer);
         recevoir(&mut st, &mixer, 1002, Instant::now());
         assert_eq!(st.holes, HoleCounts { sequence: 1, ..HoleCounts::default() });
+    }
+
+    /// Banc du 28/09/2026 : rien n'arrive, le trou se fait, PUIS les retardataires
+    /// arrivent et sont écartés. L'écart est la conséquence du trou, pas sa cause.
+    #[test]
+    fn un_paquet_ecarte_apres_le_trou_n_en_est_pas_la_cause() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // retardataire écarté après le trou
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
+    }
+
+    /// Lot 1-D2 : le paquet était dans la machine 20 ms avant sa lecture, donc
+    /// avant le trou — la réception de l'agent l'a lu trop tard.
+    #[test]
+    fn un_paquet_dans_la_machine_mais_lu_apres_le_trou_accuse_la_reception() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        std::thread::sleep(Duration::from_millis(5));
+        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_millis(20)));
+        assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
+        // Arrivé dans la machine APRÈS le trou : en amont.
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        std::thread::sleep(Duration::from_millis(5));
+        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_micros(100)));
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
     }
 
     /// La sortie vide 10 ms de tampon en un instant (rafale de callbacks) :
