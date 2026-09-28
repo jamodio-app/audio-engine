@@ -282,11 +282,18 @@ fn spawn_listen(up: Arc<Uplink>, stop: Arc<AtomicBool>) -> std::thread::JoinHand
     std::thread::spawn(move || up.listen(stop))
 }
 
-/// Le périphérique demandé (tel quel, l'agent le vérifie strictement), sinon
-/// celui par défaut. Aucun défaut → erreur explicite, pas de choix au hasard.
+/// Le périphérique demandé, s'il figure EXACTEMENT dans la liste de l'agent
+/// (format strict `idx:nom`), sinon celui par défaut. Aucun défaut, ou un
+/// identifiant inconnu → erreur qui cite les identifiants valides : pas de
+/// choix au hasard, et pas d'aller-retour avec l'agent pour un identifiant faux
+/// (NUC, 28/09 : « 1 » au lieu de « 1:UMC ASIO Driver »).
 fn pick_device(list: &Value, wanted: Option<&str>, what: &str) -> Result<String, String> {
     if let Some(w) = wanted {
-        return Ok(w.to_string());
+        let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
+        if ids.contains(&w) {
+            return Ok(w.to_string());
+        }
+        return Err(format!("{what} « {w} » inconnue. Identifiants exacts : {}", ids.join(" | ")));
     }
     list.as_array()
         .and_then(|l| l.iter().find(|d| d["isDefault"].as_bool() == Some(true)))
@@ -429,6 +436,18 @@ mod tests {
             json!({ "name": "Reverb", "pluginRef": { "format": "vst3", "path": "b", "uid": "2" } }),
             json!({ "name": "Reverb", "pluginRef": { "format": "vst3", "path": "c", "uid": "3" } }),
         ]
+    }
+
+    #[test]
+    fn un_peripherique_se_designe_par_son_identifiant_exact() {
+        let l = json!([
+            { "id": "0:ASIO4ALL v2", "isDefault": false },
+            { "id": "1:UMC ASIO Driver", "isDefault": true },
+        ]);
+        assert_eq!(pick_device(&l, None, "entrée").unwrap(), "1:UMC ASIO Driver");
+        assert_eq!(pick_device(&l, Some("0:ASIO4ALL v2"), "entrée").unwrap(), "0:ASIO4ALL v2");
+        let e = pick_device(&l, Some("1"), "entrée").unwrap_err();
+        assert!(e.contains("« 1 » inconnue") && e.contains("1:UMC ASIO Driver"), "{e}");
     }
 
     #[test]
