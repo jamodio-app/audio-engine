@@ -38,7 +38,7 @@ Options de run :
   --peer-voice V          talkback des musiciens simulés : none | bursts | always
   --send-voice CANAL      l'Audio Engine envoie aussi son talkback (canal 1, 2…)
   --input ID / --output ID  périphériques, identifiant EXACT « idx:nom » (cf. devices),
-                          ex. --input "1:UMC ASIO Driver"
+                          ex. --input \"1:UMC ASIO Driver\"
   --channel CANAL         canal de l'instrument (1, 2…)
   --plugin NOM            charge ce plugin sur l'instrument, dans l'Audio Engine
                           (nom exact, cf. plugins) — la charge réelle du musicien
