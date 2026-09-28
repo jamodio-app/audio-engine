@@ -168,6 +168,11 @@ pub struct RtpReceiver {
     /// (cf. `rx_timestamp`). `false` : refusé par le système (dit au journal),
     /// lecture ordinaire sans horodatage.
     stamped: bool,
+    /// Le système a ACCEPTÉ d'horodater mais un paquet est arrivé sans
+    /// horodatage : dit une fois au journal. Sans ça, une carte qui accepte la
+    /// demande sans jamais dater (vu sur la VM de CI Windows, 28/09/2026)
+    /// laisserait la mesure absente en silence.
+    unstamped_logged: std::sync::atomic::AtomicBool,
     punch_ssrc: u32,
     punch_seq: AtomicU16,
     punch_ts: AtomicU32,
@@ -199,6 +204,7 @@ impl RtpReceiver {
             socket,
             srtp,
             stamped,
+            unstamped_logged: std::sync::atomic::AtomicBool::new(false),
             punch_ssrc: ssrc,
             punch_seq: AtomicU16::new(seq),
             punch_ts: AtomicU32::new(ts),
@@ -255,6 +261,15 @@ impl RtpReceiver {
             Received { len, from, stack_delay: None }
         };
         buf.truncate(r.len);
+        if self.stamped
+            && r.stack_delay.is_none()
+            && !self.unstamped_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                target: "jamodio::udp",
+                "le système a accepté d'horodater la réception mais ce paquet n'est pas daté (carte ou pilote) — attente système/lecture non mesurée"
+            );
+        }
         let ignored = Received { len: 0, ..r };
         // SRTCP (PT 200..=204 au 2e octet) : le SFU en ENVOIE bien aux agents — des
         // Sender Reports sur ce transport de réception, des Receiver Reports sur le
