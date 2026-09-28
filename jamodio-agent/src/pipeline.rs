@@ -760,15 +760,13 @@ pub struct PipelineState {
     /// navigateur (`add-stream` / `remove-stream`) : un flux qui se tait n'est
     /// jamais supprimé ici (cf. `recv_activity`).
     recv_streams: HashMap<String, RecvStream>,
-    /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
-    /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
-    /// `None` = pas de stream reçu en cours.
-    decode_thread: Option<DecodeThread>,
-    /// Lot 1-D3 — fil de réception dédié (priorité audio), démarré avec le
-    /// thread de décodage : il lit TOUTES les sockets reçues.
+    /// Lot 1-D4 (0.6.6-9) — fil UNIQUE de réception et de décodage (priorité
+    /// audio) : il lit TOUTES les sockets reçues, décode, pousse au mélangeur et
+    /// porte les échéances de masquage. Démarré au 1er `add_stream`, arrêté en
+    /// fin de session. `None` = aucun flux reçu en cours.
     recv_thread: Option<recv_thread::RecvThread>,
     /// 0.5.3-2 — compteur de génération des flux reçus. Incrémenté à
-    /// chaque `add_stream` ; permet au thread de décodage de distinguer un Remove
+    /// chaque `add_stream` ; permet au fil de réception de distinguer un Remove
     /// d'une ancienne connexion d'un re-add du même `producer_id` (race évitée).
     recv_epoch: u64,
     /// Selected devices : ids stricts au format `"{idx}:{name}"` produits par
@@ -995,8 +993,8 @@ pub struct RecvStreamState {
     pub recv_errors: u64,
 }
 
-/// Métriques de timing réseau mesurées par stream entrant, alimentées par les
-/// le thread de décodage (`decode_rt_loop`) et lues à 1 Hz par le perfstats_task.
+/// Métriques de timing réseau mesurées par stream entrant, alimentées par le
+/// fil de réception (`RxCore`) et lues à 1 Hz par le perfstats_task.
 /// Struct extensible : le chantier jitter buffer adaptatif y ajoutera la cible
 /// mesurée et le ratio de resampling de drift (Phases B/C).
 #[derive(Clone, Copy, Default)]
@@ -1078,20 +1076,22 @@ pub struct PerfHandles {
     /// taille de control panel (≈4 pour 512). Cible après fix : ≈1.
     /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
     pub emit_burst: Arc<Mutex<Histogram>>,
-    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de l'arrivée réseau (horodatée
-    /// par le fil de réception) à juste avant `push_samples` (file MPSC + parse +
-    /// décode Opus). Miroir de `send_path_latency`. Doit lire ~0,1-0,5 ms si le
-    /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
-    /// bug Windows que ce thread RT corrige).
+    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de la lecture du paquet à
+    /// juste avant `push_samples` (parse + décodage Opus). Miroir de
+    /// `send_path_latency`. Depuis le Lot 1-D4 (0.6.6-9), lecture et décodage se
+    /// font sur le même fil, à la suite : il n'y a plus d'attente dans un canal
+    /// entre les deux (c'était 5,5 ms au pire sur Mac, banc du 28/09).
     pub recv_path: Arc<Mutex<Histogram>>,
-    /// Lot 1-D3 (0.6.6-8) — `recv_path` découpé : attente du paquet dans le canal
-    /// avant que le décodage ne le prenne (fil de décodage indisponible), puis
-    /// traitement (parse + décodage Opus) jusqu'au push. Au banc du 28/09 (Mac,
-    /// 0.6.6-7), des pics de 5 à 6 ms lecture → push sont apparus : ces deux
-    /// mesures disent lequel des deux les porte.
-    pub recv_queue: Arc<Mutex<Histogram>>,
-    pub recv_process: Arc<Mutex<Histogram>>,
-    /// Lot 1-C (23/09/2026) — retard du RÉVEIL du thread de décodage sur
+    /// Lot 1-D4 (0.6.6-9) — travail du fil de réception à chaque réveil : du
+    /// retour de l'attente à la suivante (lecture, déchiffrement, décodage et
+    /// masquage de tous les flux prêts), en ms. Sur macOS, ce fil a un contrat
+    /// temps réel de `rt_priority::AUDIO_RECV_COMPUTATION` par période ; ce
+    /// qu'il se passe quand un réveil le dépasse n'est pas établi — d'où la
+    /// mesure, et le compte des réveils qui le dépassent (`…_over_budget`,
+    /// cumul remis à zéro au relevé 1 Hz).
+    pub recv_work: Arc<Mutex<Histogram>>,
+    pub recv_work_over_budget: Arc<std::sync::atomic::AtomicU64>,
+    /// Lot 1-C (23/09/2026) — retard du RÉVEIL du fil de réception sur
     /// l'instant prévu, quand il dort jusqu'à une échéance de masquage (ms).
     /// C'est l'imprécision que `conceal::WAKE_SLACK_MS` est censé couvrir ;
     /// jusqu'ici elle n'avait été mesurée que hors de l'agent.
@@ -1158,6 +1158,12 @@ impl PerfHandles {
     /// marge confortable pour le flush 1 Hz côté ws_server (10 % slack).
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
+        // Mesures de la RÉCEPTION : une observation par paquet (ou par réveil),
+        // soit jusqu'à ~400 × N par seconde. À 512 places, le relevé 1 Hz ne
+        // voyait que les ~0,15 dernière seconde à 9 musiciens — et pouvait
+        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à 16
+        // flux (le maximum accepté).
+        const RECV_HISTOGRAM_CAPACITY: usize = 8192;
         Self {
             heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
@@ -1167,11 +1173,11 @@ impl PerfHandles {
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            recv_queue: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            recv_process: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            decode_wake_late: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            recv_stack_delay: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_path: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_work: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_work_over_budget: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decode_wake_late: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_stack_delay: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1384,7 +1390,6 @@ impl PipelineState {
             encoder_stop: None,
             uplink: None,
             recv_streams: HashMap::new(),
-            decode_thread: None,
             recv_thread: None,
             recv_epoch: 0,
             input_device_id: None,
@@ -2039,7 +2044,7 @@ impl PipelineState {
             self.timer_resolution = None;
             // Vraie fin de session : plus de SFU vers lequel relever le réseau local.
             self.sfu_addr = None;
-            // Coupe les réceptions pair + le thread de décodage RT partagé.
+            // Coupe les réceptions des pairs (le fil s'arrête plus bas).
             let ids: Vec<String> = self.recv_streams.keys().cloned().collect();
             for id in ids {
                 self.remove_stream(&id);
@@ -2047,16 +2052,10 @@ impl PipelineState {
             // Fin de session : les réglages d'écoute des pairs partent avec eux.
             // (Hot-swap d'entrée : on garde la réception, donc aussi ses réglages.)
             self.mixer.clear_stream_settings();
-            // Le fil de réception d'abord : il envoie au décodage le `Remove` de
-            // chaque flux APRÈS son dernier paquet, puis se termine ; le décodage
-            // reçoit ensuite son arrêt.
+            // Le fil de réception retire chaque flux restant (socket, état,
+            // mélangeur, statistiques), puis se termine.
             if let Some(rt) = self.recv_thread.take() {
                 rt.shutdown();
-            }
-            if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
-                let _ = tx.send(DecodeMsg::Shutdown);
-                drop(tx);
-                let _ = join.join();
             }
         }
     }
@@ -3370,39 +3369,25 @@ impl PipelineState {
         // réception perce en boucle jusqu'au 1er paquet reçu (=> comedia activé
         // côté SFU).
 
-        // 0.5.3-2 — lazy-start du thread de décodage RT partagé (au 1er stream).
-        // Le stream mixer N'EST PLUS créé ici : le thread de décodage le crée au
-        // 1er paquet du pair (il est l'unique écrivain du mixer côté pairs → zéro
-        // race add/remove/push).
-        if self.decode_thread.is_none() {
-            self.decode_thread = Some(
-                spawn_decode_thread(
-                    self.mixer.clone(),
-                    self.perfstats.net_stats_by_producer.clone(),
-                    RecvHists {
-                        path: self.perfstats.recv_path.clone(),
-                        queue: self.perfstats.recv_queue.clone(),
-                        process: self.perfstats.recv_process.clone(),
-                    },
-                    self.perfstats.decode_wake_late.clone(),
-                    self.perfstats.output_frames.clone(),
-                )
-                .map_err(|e| format!("spawn decode thread: {}", e))?,
-            );
-        }
-        let decode = self
-            .decode_thread
-            .as_ref()
-            .expect("decode thread démarré juste au-dessus");
-
-        // Lot 1-D3 — le fil de réception dédié démarre avec le décodage (il lui
-        // transmet les paquets par le même canal).
+        // Lot 1-D4 — démarrage du fil de réception et de décodage au 1er flux.
+        // Le stream mixer N'EST PAS créé ici : le fil le crée au 1er paquet du
+        // pair (il est l'unique écrivain du mixer côté pairs → zéro race
+        // add/remove/push).
         if self.recv_thread.is_none() {
             self.recv_thread = Some(
                 recv_thread::RecvThread::spawn(
-                    decode.tx.clone(),
-                    decode.pool_rx.clone(),
-                    self.perfstats.recv_stack_delay.clone(),
+                    RxCore::new(
+                        self.mixer.clone(),
+                        self.perfstats.net_stats_by_producer.clone(),
+                        self.perfstats.recv_path.clone(),
+                        self.perfstats.output_frames.clone(),
+                    ),
+                    recv_thread::RxMeasures {
+                        stack_delay: self.perfstats.recv_stack_delay.clone(),
+                        wake_late: self.perfstats.decode_wake_late.clone(),
+                        wake_work: self.perfstats.recv_work.clone(),
+                        wake_over_budget: self.perfstats.recv_work_over_budget.clone(),
+                    },
                 )
                 .map_err(|e| format!("spawn recv thread: {}", e))?,
             );
@@ -3460,10 +3445,9 @@ impl PipelineState {
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
-        // Le fil de réception désinscrit la socket puis envoie `Remove` au thread
-        // de décodage, qui retire l'état + le stream mixer + net_stats APRÈS le
-        // dernier paquet du pair (même émetteur → ordre garanti, zéro 'unknown
-        // stream').
+        // Le fil de réception désinscrit la socket puis retire l'état, le stream
+        // mixer et net_stats, au même endroit : rien ne peut suivre le dernier
+        // paquet du pair (zéro 'unknown stream').
         if let Some(stream) = self.recv_streams.remove(producer_id) {
             if let Some(rt) = &self.recv_thread {
                 rt.send(recv_thread::RecvCmd::Remove {
@@ -5025,10 +5009,10 @@ fn voice_encode_stage_loop(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Réception : tâches I/O async (1/pair) + UN thread de décodage RT partagé
+// Réception : UN fil prioritaire qui lit, déchiffre, décode et masque
 // ═══════════════════════════════════════════════════════════════════
 //
-// Pourquoi ce split (0.5.3-2, fix « injouable Windows ») :
+// Pourquoi un fil RT (0.5.3-2, fix « injouable Windows ») :
 // Le décodage Opus alimente le jitter buffer (`push_samples`) ; le callback de
 // SORTIE le draine. Si le décodage tourne en priorité NORMALE (ancien
 // `recv_decode_task` sur le pool tokio), Windows le préempte ~10-15 ms → le
@@ -5037,44 +5021,24 @@ fn voice_encode_stage_loop(
 // self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
 // clément). La réception audio DOIT tourner sur un thread RT — jamais normal.
 //
-// Design (validé en triple revue senior ; réception reprise au Lot 1-D3) :
-//   - `recv_thread` (UN seul std::thread, promu comme le décodage, toutes les
-//     sockets par `mio`) : recv UDP + horodatage d'arrivée + comedia punch +
-//     activité. Forwarde le paquet brut via un MPSC. Jusqu'en 0.6.6-6 c'était
-//     une tâche tokio ordinaire par pair — qui lisait les paquets 6 à 11 ms en
-//     retard (banc du 28/09/2026).
-//   - `decode_rt_loop` (UN seul std::thread, RT) : décode pour TOUS les pairs
-//     (HashMap d'état). Promotion « event-driven » (MMCSS Windows / QoS macOS
-//     SEUL, PAS le workgroup → pas de sur-population). Seul écrivain du mixer côté
-//     pairs (add/remove/push tous depuis ce thread) → zéro race, zéro contention
-//     mutex ×N (1 thread partagé, pas thread-par-stream).
+// Pourquoi UN seul fil (Lot 1-D4, 0.6.6-9) :
+//   - jusqu'en 0.6.6-6, la lecture se faisait dans une tâche tokio ordinaire
+//     par pair : paquets lus 6,5 à 11 ms en retard (banc du 28/09/2026) ;
+//   - 0.6.6-7/-8 : fil de lecture prioritaire DÉDIÉ + fil de décodage
+//     prioritaire, reliés par un canal. La lecture était corrigée, mais le
+//     paquet attendait jusqu'à 5,5 ms dans le canal avant d'être décodé (Mac,
+//     `decode_queue_ms`) ; lecture en priorité normale : attente courte mais
+//     lecture lente et réveil du décodage jusqu'à 10 ms en retard (A/B,
+//     deux essais concordants). Déduit : un passage de relais entre deux fils
+//     qui se retiennent l'un l'autre.
+//   - donc `recv_thread` fait TOUT, à la suite : lecture (horodatage), déchif-
+//     frement, décodage, push au mixer, échéances de masquage. Plus de canal,
+//     plus de passage de relais, un réveil de fil de moins par paquet.
+//
+// `RxCore` (ci-dessous) est la partie sans socket : l'état de décodage de tous
+// les pairs (HashMap d'état), seul écrivain du mixer côté pairs (add/remove/
+// push depuis ce fil) → zéro race, zéro contention mutex ×N.
 // Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
-
-/// Message du fil de réception (`recv_thread`) vers le thread de décodage RT partagé.
-enum DecodeMsg {
-    /// Paquet RTP déchiffré, horodaté à l'arrivée (avant tout parse/file).
-    /// `epoch` = génération du flux émetteur (cf. re-add même producer).
-    Packet {
-        producer_id: Arc<str>,
-        epoch: u64,
-        recv_instant: std::time::Instant,
-        /// Lot 1-D2 — attente entre la réception du paquet par le SYSTÈME et sa
-        /// lecture par le fil de réception (`None` : pas d'horodatage). Mesure seule.
-        stack_delay: Option<std::time::Duration>,
-        buf: Vec<u8>,
-        /// Lot C — nature du flux (constante pour le producteur) : détermine
-        /// l'étage de mix au 1er paquet (`mixer.add_stream(kind)`).
-        kind: StreamKind,
-    },
-    /// Pair retiré : envoyé en DERNIER par le fil de réception → le thread
-    /// retire l'état + le stream mixer APRÈS le dernier paquet du pair (ordre
-    /// garanti : le fil de réception est l'unique émetteur des paquets).
-    /// `epoch` : on n'honore le Remove que s'il matche la génération courante
-    /// (sinon un Remove d'une ancienne connexion supprimerait un stream re-créé).
-    Remove { producer_id: Arc<str>, epoch: u64 },
-    /// Arrêt complet (stop_all).
-    Shutdown,
-}
 
 /// Le dernier masquage à l'échéance, tel qu'il faut le connaître pour juger
 /// son retardataire.
@@ -5118,17 +5082,11 @@ pub struct HoleCounts {
 struct Arrived {
     read_at: std::time::Instant,
     in_system_at: Option<std::time::Instant>,
-    /// Quand le thread de décodage l'a pris dans le canal (0.6.6-8).
-    dequeued_at: std::time::Instant,
 }
 
 impl Arrived {
-    fn new(
-        read_at: std::time::Instant,
-        stack_delay: Option<std::time::Duration>,
-        dequeued_at: std::time::Instant,
-    ) -> Self {
-        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)), dequeued_at }
+    fn new(read_at: std::time::Instant, stack_delay: Option<std::time::Duration>) -> Self {
+        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)) }
     }
 }
 
@@ -5143,9 +5101,9 @@ struct PushMark {
     last_received: Option<std::time::Instant>,
 }
 
-/// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
+/// État de décodage par pair — détenu UNIQUEMENT par le fil de réception.
 struct DecodeState {
-    /// Génération du flux (cf. epoch dans `DecodeMsg`).
+    /// Génération du flux (cf. `PipelineState::recv_epoch`).
     epoch: u64,
     /// Nature du flux : les trous de la voix (qui se tait légitimement) ne se
     /// journalisent pas comme ceux de l'instrument.
@@ -5236,6 +5194,12 @@ struct DecodeState {
 }
 
 impl DecodeState {
+    /// Le masquage examine-t-il ce flux à `now` ? Une échéance armée et passée,
+    /// et, si un rendez-vous a été posé pour elle, ce rendez-vous atteint.
+    fn examined_at(&self, now: std::time::Instant) -> bool {
+        self.next_deadline.is_some_and(|d| now >= d) && self.next_check.is_none_or(|c| now >= c)
+    }
+
     fn new(producer_id: &str, epoch: u64, kind: StreamKind) -> Option<Self> {
         let decoder = match MusicDecoder::new() {
             Ok(d) => d,
@@ -5283,51 +5247,137 @@ impl DecodeState {
     }
 }
 
-/// Chemin de réception mesuré par le thread de décodage : lecture → push
-/// (`path`), dont l'attente dans le canal (`queue`) et le traitement
-/// (`process`). Histogrammes vidés à 1 Hz par le relevé perfstats.
-#[derive(Clone)]
-struct RecvHists {
-    path: Arc<Mutex<Histogram>>,
-    queue: Arc<Mutex<Histogram>>,
-    process: Arc<Mutex<Histogram>>,
-}
-
-/// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
-struct DecodeThread {
-    /// MPSC vers le thread (paquets + lifecycle). Cloné pour le fil de réception.
-    tx: Sender<DecodeMsg>,
-    /// Pool de buffers recyclés. Cloné pour le fil de réception.
-    pool_rx: Receiver<Vec<u8>>,
-    join: std::thread::JoinHandle<()>,
-}
-
-/// Démarre le thread de décodage RT unique (lazy, au 1er stream). Faillible
-/// (cohérent avec le spawn de l'encoder thread) : une erreur OS de création de
-/// thread est propagée au lieu de paniquer.
-fn spawn_decode_thread(
+/// Lot 1-D4 (0.6.6-9) — la réception de TOUS les pairs, sans socket : état de
+/// décodage, push au mixer, échéances de masquage. Détenue par le fil de
+/// réception (`recv_thread`), qui l'appelle pour chaque paquet lu puis à chaque
+/// réveil — sur le même fil, à la suite, sans canal. Séparée des sockets pour
+/// être testée telle quelle.
+struct RxCore {
+    states: HashMap<Arc<str>, DecodeState>,
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: RecvHists,
-    decode_wake_late: Arc<Mutex<Histogram>>,
-    // Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
-    // et non la durée d'une trame, qui dit combien le tampon doit contenir pour
-    // survivre au prochain tirage (cf. `conceal_due_streams`).
+    /// Lecture → push (cf. `PerfHandles::recv_path`).
+    recv_path: Arc<Mutex<Histogram>>,
+    /// Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
+    /// et non la durée d'une trame, qui dit combien le tampon doit contenir pour
+    /// survivre au prochain tirage (cf. `conceal_due_streams`).
     output_frames: Arc<std::sync::atomic::AtomicU32>,
-) -> std::io::Result<DecodeThread> {
-    // Data MPSC : fil de réception → décodage. 256 = large (décode ≫ arrivée).
-    let (tx, rx) = bounded::<DecodeMsg>(256);
-    // Pool : buffers MTU réutilisés → zéro alloc/dealloc sur le thread RT.
-    let (pool_tx, pool_rx) = bounded::<Vec<u8>>(128);
-    for _ in 0..128 {
-        let _ = pool_tx.try_send(Vec::with_capacity(2048));
+}
+
+impl RxCore {
+    fn new(
+        mixer: Arc<AudioMixer>,
+        net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+        recv_path: Arc<Mutex<Histogram>>,
+        output_frames: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
+        Self { states: HashMap::new(), mixer, net_stats_by_producer, recv_path, output_frames }
     }
-    let join = std::thread::Builder::new()
-        .name("audio-decode".into())
-        .spawn(move || {
-            decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path, decode_wake_late, output_frames)
-        })?;
-    Ok(DecodeThread { tx, pool_rx, join })
+
+    /// Bloc de sortie en ms — relu à chaque réveil : il change si la sortie est
+    /// rouverte.
+    fn output_block_ms(&self) -> f64 {
+        output_block_ms(&self.output_frames)
+    }
+
+    /// Un paquet lu et déchiffré de `producer_id` : (re)création de l'état selon
+    /// la génération, puis décodage et push. `recv_instant` = lecture du paquet
+    /// (JAMAIS un `Instant::now()` pris plus loin : la gigue en serait faussée).
+    #[allow(clippy::too_many_arguments)]
+    fn on_packet(
+        &mut self,
+        producer_id: &Arc<str>,
+        epoch: u64,
+        kind: StreamKind,
+        recv_instant: std::time::Instant,
+        stack_delay: Option<std::time::Duration>,
+        buf: &[u8],
+        output_block_ms: f64,
+    ) {
+        let needs_create = match self.states.get(producer_id) {
+            Some(st) if st.epoch == epoch => false,
+            // Paquet d'une génération PÉRIMÉE alors qu'une plus récente est là :
+            // ignoré. (Impossible tant que le retrait d'un flux passe avant l'ajout
+            // du suivant, ce que garantit l'ordre des commandes du fil — gardé
+            // pour ne jamais dépendre de cet ordre.)
+            Some(st) if st.epoch > epoch => return,
+            // Génération plus RÉCENTE que l'état présent → l'ancienne est
+            // supersédée : on retire son stream avant d'en recréer un.
+            Some(_) => {
+                self.mixer.remove_stream(producer_id);
+                true
+            }
+            None => true,
+        };
+        if needs_create {
+            let Some(st) = DecodeState::new(producer_id, epoch, kind) else { return };
+            self.mixer.add_stream(producer_id, kind);
+            self.states.insert(producer_id.clone(), st);
+        }
+        let st = self.states.get_mut(producer_id).expect("état présent ou créé juste au-dessus");
+        decode_one_packet(
+            st,
+            producer_id,
+            recv_instant,
+            buf,
+            &self.mixer,
+            &self.net_stats_by_producer,
+            &self.recv_path,
+            output_block_ms,
+            stack_delay,
+        );
+    }
+
+    /// Pair retiré, après son dernier paquet (le fil a désinscrit sa socket).
+    /// N'honore le retrait que pour la génération courante : celui d'une
+    /// ancienne connexion (re-add même producer) ne doit PAS supprimer le
+    /// stream re-créé par la nouvelle.
+    fn remove(&mut self, producer_id: &str, epoch: u64) {
+        if self.states.get(producer_id).map(|st| st.epoch) == Some(epoch) {
+            self.states.remove(producer_id);
+            self.mixer.remove_stream(producer_id);
+            // Sans ça, un peer disparu laisserait un ppm fantôme dans la
+            // map → PerfStats continuerait à mentionner ce peer mort.
+            self.net_stats_by_producer.lock().remove(producer_id);
+        }
+    }
+
+    /// Le masquage examinera-t-il ce flux (de cette génération) à `now` ? Le fil
+    /// relit alors sa socket d'abord : un paquet déjà dans la machine ne doit
+    /// jamais être remplacé par une trame inventée (M0).
+    fn conceal_due(&self, producer_id: &str, epoch: u64, now: std::time::Instant) -> bool {
+        self.states.get(producer_id).is_some_and(|st| st.epoch == epoch && st.examined_at(now))
+    }
+
+    /// Décide et agit pour chaque flux dont l'échéance est passée.
+    fn conceal(&mut self, now: std::time::Instant, output_block_ms: f64) {
+        conceal_due_streams(&mut self.states, &self.mixer, output_block_ms, now);
+    }
+
+    /// Jusqu'à quand dormir pour le prochain examen de masquage.
+    fn next_wait(&self, now: std::time::Instant) -> std::time::Duration {
+        next_wait(&self.states, now)
+    }
+
+    /// Une échéance de masquage est armée : le prochain réveil compte (Lot 1-C).
+    fn deadline_armed(&self) -> bool {
+        self.states.values().any(|st| st.next_deadline.is_some())
+    }
+}
+
+impl Drop for RxCore {
+    /// Fin du fil, quel qu'en soit le chemin (arrêt, attente des sockets en
+    /// erreur) : aucun pair ne reste dans le mixer ni dans les perf-stats.
+    /// Sépare les locks (jamais les deux en même temps).
+    fn drop(&mut self) {
+        for id in self.states.keys() {
+            self.mixer.remove_stream(id);
+        }
+        let mut ns = self.net_stats_by_producer.lock();
+        for id in self.states.keys() {
+            ns.remove(&**id);
+        }
+    }
 }
 
 /// Lot 1.4 — durée de la rampe d'arrivée d'un flux (ms). Assez long pour que
@@ -5336,7 +5386,7 @@ fn spawn_decode_thread(
 const JOIN_FADE_MS: usize = 300;
 /// Au-delà de ce retard, le paquet attendu n'est plus « en retard » : le flux
 /// est tari (talkback coupé, pair parti). On désarme l'échéance plutôt que de
-/// tenir le thread de décodage éveillé pour un son qui ne viendra pas ;
+/// tenir le fil de réception éveillé pour un son qui ne viendra pas ;
 /// l'arrivée d'un paquet la réarme. Large devant le plafond de masquage
 /// (7,5 ms) et devant toute excursion réseau plausible.
 const STALE_MS: f64 = 200.0;
@@ -5434,7 +5484,7 @@ fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
 /// paquet décodé, ou celui dont l'arrivée révèle une perte) ; `None` pour une
 /// trame inventée à l'échéance, qu'aucun paquet n'accompagne.
 ///
-/// Tourne sur le thread de décodage : le tirage n'a fait que relever
+/// Tourne sur le fil de réception : le tirage n'a fait que relever
 /// `HoleAtPull`, tout le reste se fait ici.
 fn note_push(
     st: &mut DecodeState,
@@ -5527,11 +5577,11 @@ fn report_hole(
         (Some(a), Some(prev)) => ms(a.read_at.saturating_duration_since(prev)),
         _ => -1.0,
     };
-    // Du paquet arrivé à son push : le retard du décodage.
+    // Du paquet lu à son push : le retard du décodage. Depuis 0.6.6-9, lecture
+    // et décodage se suivent sur le même fil : plus d'attente dans un canal à
+    // découper (les champs `decode_queue_ms` / `decode_process_ms` de la
+    // 0.6.6-8 sont retirés).
     let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.read_at)));
-    // 0.6.6-8 — ce retard, découpé : attente dans le canal, puis traitement.
-    let decode_queue_ms = arrived.map_or(-1.0, |a| ms(a.dequeued_at.saturating_duration_since(a.read_at)));
-    let decode_process_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.dequeued_at)));
     // Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
     // depuis le dernier push : si elle vaut à peu près l'écart d'arrivée, les
     // paquets étaient dans la machine et la réception les a lus en retard.
@@ -5559,8 +5609,6 @@ fn report_hole(
                 target_ms = h.target_ms,
                 arrival_gap_ms,
                 decode_delay_ms,
-                decode_queue_ms,
-                decode_process_ms,
                 stack_delay_ms,
                 conceal_wait = wait,
                 "TROU"
@@ -5578,7 +5626,7 @@ fn report_hole(
 
 /// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
 ///
-/// Tourne sur le thread de décodage, JAMAIS dans le callback audio : il ne fait
+/// Tourne sur le fil de réception, JAMAIS dans le callback audio : il ne fait
 /// que trouver des échantillons de plus dans son tampon, exactement comme si le
 /// paquet était arrivé.
 fn conceal_due_streams(
@@ -5593,10 +5641,10 @@ fn conceal_due_streams(
         // ce serait compter des tours de boucle (jusqu'à 400/s par flux muet) et
         // non des événements, ce qui écraserait les autres raisons à l'analyse.
         // Ce sont les DÉSARMEMENTS qui sont comptés, là où ils ont lieu.
-        let Some(deadline) = st.next_deadline else { continue };
-        if now < deadline || st.next_check.is_some_and(|c| now < c) {
+        if !st.examined_at(now) {
             continue;
         }
+        let Some(deadline) = st.next_deadline else { continue };
         let late_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0;
         // Flux inconnu du mixer (retiré entre-temps) : 0 ms, donc la décision se
         // fait comme sur un tampon vide — et le push suivant ne trouvera personne.
@@ -5717,191 +5765,10 @@ fn conceal_due_streams(
     }
 }
 
-/// Boucle du thread de décodage RT. Promu en tête. Multiplexe tous les pairs.
-fn decode_rt_loop(
-    rx: Receiver<DecodeMsg>,
-    pool_tx: Sender<Vec<u8>>,
-    mixer: Arc<AudioMixer>,
-    net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: RecvHists,
-    decode_wake_late: Arc<Mutex<Histogram>>,
-    output_frames: Arc<std::sync::atomic::AtomicU32>,
-) {
-    // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
-    // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
-    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv("décodage");
-
-    let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
-
-    loop {
-        // Lot 1.2 — on n'attend plus un paquet indéfiniment : on attend jusqu'au
-        // PROCHAIN EXAMEN UTILE. Sans ça, un paquet en retard ne réveille
-        // personne, le tampon se vide et la sortie joue du silence — le trou sec
-        // que ce chantier supprime.
-        let slept_at = std::time::Instant::now();
-        let wait = next_wait(&states, slept_at);
-        // Lot 1-C — une échéance est armée : ce réveil est celui dont dépend le
-        // masquage. (Sans échéance, on dort 100 ms en attendant un paquet : son
-        // heure de réveil n'importe à personne.)
-        let deadline_armed = states.values().any(|st| st.next_deadline.is_some());
-        let block_ms = output_block_ms(&output_frames);
-        match rx.recv_timeout(wait) {
-            Ok(msg) => {
-                if handle_decode_msg(msg, &mut states, &pool_tx, &mixer, &net_stats_by_producer, &recv_path, block_ms)
-                    .is_break()
-                {
-                    break;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Lot 1-C — de combien le réveil a dépassé l'instant prévu : c'est
-                // l'imprécision que `conceal::WAKE_SLACK_MS` doit couvrir, mesurée
-                // ici avec la vraie primitive d'attente de ce thread.
-                if deadline_armed {
-                    let late = slept_at.elapsed().saturating_sub(wait);
-                    decode_wake_late.lock().observe(late.as_secs_f32() * 1000.0);
-                }
-            }
-            // Tous les émetteurs partis : plus rien n'arrivera jamais.
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-        if drain_then_conceal(
-            &rx,
-            &mut states,
-            &pool_tx,
-            &mixer,
-            &net_stats_by_producer,
-            &recv_path,
-            block_ms,
-            std::time::Instant::now,
-        )
-        .is_break()
-        {
-            break;
-        }
-    }
-
-    // Shutdown : nettoie les streams mixer + net_stats restants (Remove non
-    // encore traités). Sépare les locks (jamais les deux en même temps).
-    {
-        for id in states.keys() {
-            mixer.remove_stream(id);
-        }
-    }
-    {
-        let mut ns = net_stats_by_producer.lock();
-        for id in states.keys() {
-            ns.remove(&**id);
-        }
-    }
-}
-
-/// Après chaque réveil : traiter TOUT ce qui est déjà arrivé, PUIS décider de
-/// masquer, à l'heure d'après ce vidage (`now` est lu une fois la file vide).
-///
-/// M0 (21/09/2026) — avant, la décision passait avant le message reçu, et sans
-/// regarder le reste de la file : un paquet déjà là — voire déjà dans la main —
-/// était remplacé par une trame inventée, puis écarté comme « en retard ». La
-/// marge maximale mesurée au banc (2,40 ms, soit le seuil de l'époque) était la
-/// signature de ce cas. La file est bornée, le vidage aussi.
-#[allow(clippy::too_many_arguments)]
-fn drain_then_conceal(
-    rx: &Receiver<DecodeMsg>,
-    states: &mut HashMap<Arc<str>, DecodeState>,
-    pool_tx: &Sender<Vec<u8>>,
-    mixer: &Arc<AudioMixer>,
-    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &RecvHists,
-    output_block_ms: f64,
-    now: impl Fn() -> std::time::Instant,
-) -> std::ops::ControlFlow<()> {
-    while let Ok(msg) = rx.try_recv() {
-        handle_decode_msg(msg, states, pool_tx, mixer, net_stats_by_producer, recv_path, output_block_ms)?;
-    }
-    conceal_due_streams(states, mixer, output_block_ms, now());
-    std::ops::ControlFlow::Continue(())
-}
-
-/// Traite UN message du thread de décodage. `Break` = arrêt demandé.
-fn handle_decode_msg(
-    msg: DecodeMsg,
-    states: &mut HashMap<Arc<str>, DecodeState>,
-    pool_tx: &Sender<Vec<u8>>,
-    mixer: &Arc<AudioMixer>,
-    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &RecvHists,
-    output_block_ms: f64,
-) -> std::ops::ControlFlow<()> {
-    match msg {
-        DecodeMsg::Shutdown => return std::ops::ControlFlow::Break(()),
-        DecodeMsg::Remove { producer_id, epoch } => {
-            // N'honore le Remove que pour la génération courante : un Remove
-            // d'une ancienne connexion (re-add même producer) ne doit PAS
-            // supprimer le stream re-créé par la nouvelle génération.
-            if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
-                states.remove(&producer_id);
-                mixer.remove_stream(&producer_id);
-                // Sans ça, un peer disparu laisserait un ppm fantôme dans la
-                // map → PerfStats continuerait à mentionner ce peer mort.
-                net_stats_by_producer.lock().remove(&*producer_id);
-            }
-        }
-        DecodeMsg::Packet { producer_id, epoch, recv_instant, stack_delay, buf, kind } => {
-            // Lot 1-D3 (0.6.6-8) — le décodage prend le paquet MAINTENANT : ce
-            // qui précède est de l'attente dans le canal.
-            let dequeued_at = std::time::Instant::now();
-            // (Re)création de l'état + du stream mixer selon la génération.
-            let needs_create = match states.get(&producer_id) {
-                Some(st) if st.epoch == epoch => false,
-                // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
-                // traîne après un re-add) → ignoré.
-                Some(st) if st.epoch > epoch => {
-                    let _ = pool_tx.try_send(buf);
-                    return std::ops::ControlFlow::Continue(());
-                }
-                // Génération plus RÉCENTE que l'état présent → l'ancienne est
-                // supersédée : on retire son stream avant d'en recréer un.
-                Some(_) => {
-                    mixer.remove_stream(&producer_id);
-                    true
-                }
-                None => true,
-            };
-            if needs_create {
-                match DecodeState::new(&producer_id, epoch, kind) {
-                    Some(st) => {
-                        mixer.add_stream(&producer_id, kind);
-                        states.insert(producer_id.clone(), st);
-                    }
-                    None => {
-                        let _ = pool_tx.try_send(buf);
-                        return std::ops::ControlFlow::Continue(());
-                    }
-                }
-            }
-            let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
-            decode_one_packet(
-                st,
-                &producer_id,
-                recv_instant,
-                &buf,
-                mixer,
-                net_stats_by_producer,
-                recv_path,
-                output_block_ms,
-                stack_delay,
-                dequeued_at,
-            );
-            // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
-            let _ = pool_tx.try_send(buf);
-        }
-    }
-    std::ops::ControlFlow::Continue(())
-}
-
 /// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
-/// thread RT. `recv_instant` = arrivée réseau horodatée par le fil de réception
-/// (JAMAIS un `Instant::now()` ici, sinon le délai de file polluerait la gigue).
+/// fil de réception. `recv_instant` = lecture du paquet, horodatée avant tout
+/// traitement (JAMAIS un `Instant::now()` ici, sinon le délai de traitement
+/// polluerait la gigue).
 #[allow(clippy::too_many_arguments)]
 fn decode_one_packet(
     st: &mut DecodeState,
@@ -5910,10 +5777,9 @@ fn decode_one_packet(
     buf: &[u8],
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &RecvHists,
+    recv_path: &Arc<Mutex<Histogram>>,
     output_block_ms: f64,
     stack_delay: Option<std::time::Duration>,
-    dequeued_at: std::time::Instant,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
     st.pkt_count += 1;
@@ -5922,7 +5788,7 @@ fn decode_one_packet(
         let d_ms = d.as_secs_f64() * 1000.0;
         st.stack_delay_max_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms.max(d_ms) } else { d_ms };
     }
-    let arrived = Arrived::new(recv_instant, stack_delay, dequeued_at);
+    let arrived = Arrived::new(recv_instant, stack_delay);
     if st.pkt_count == 1 {
         tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
     } else if st.pkt_count.is_multiple_of(5000) {
@@ -6075,14 +5941,11 @@ fn decode_one_packet(
         }
     }
 
-    // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
-    // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.
+    // Décode le paquet + push. recv_path = lecture → juste avant push (parse +
+    // décode) : doit lire ~0,1 ms si le fil tient.
     if let Some(pcm) = st.decoder.decode(payload) {
         let before_push = std::time::Instant::now();
-        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
-        recv_path.path.lock().observe(ms(before_push.saturating_duration_since(recv_instant)));
-        recv_path.queue.lock().observe(ms(dequeued_at.saturating_duration_since(recv_instant)));
-        recv_path.process.lock().observe(ms(before_push.saturating_duration_since(dequeued_at)));
+        recv_path.lock().observe(before_push.saturating_duration_since(recv_instant).as_secs_f32() * 1000.0);
         let report = if st.fade_in_remaining > 0 {
             // Lot 1.4 — la rampe s'applique à une copie, dans un tampon de
             // travail gardé par le flux (aucune allocation une fois sa taille
@@ -6743,7 +6606,7 @@ mod conceal_loop_tests {
     /// Un flux dont la sortie est EN LECTURE, tampon VIDE : le cas où le masquage
     /// a un sens. Un flux neuf, jamais amorcé, n'en a pas — la sortie n'y lit
     /// rien (cf. `Wait::Repriming`).
-    fn flux_en_lecture(mixer: &AudioMixer) {
+    pub(super) fn flux_en_lecture(mixer: &AudioMixer) {
         const BLOC: usize = 64 * 2;
         mixer.add_stream("peer-test", StreamKind::Instrument);
         mixer.push_samples("peer-test", &vec![0.0f32; 48_000 / 10 * 2]); // 100 ms
@@ -6765,7 +6628,7 @@ mod conceal_loop_tests {
         assert!(p.playing && p.buffered_ms == 0.0, "{p:?}");
     }
 
-    fn state(now: Instant) -> DecodeState {
+    pub(super) fn state(now: Instant) -> DecodeState {
         let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.seq.on_packet(1000);
         // Chauffe l'estimateur de gigue avec un flux parfaitement régulier
@@ -6876,26 +6739,8 @@ mod conceal_loop_tests {
         assert!(s.next_deadline.is_some(), "l'échéance continue d'avancer");
     }
 
-    /// Un vrai paquet Opus (2,5 ms de silence) numéroté `seq`, tel qu'il sort
-    /// du réseau.
-    fn paquet(seq: u16) -> Vec<u8> {
-        let enc = MusicEncoder::new().expect("encodeur Opus");
-        let pcm = vec![0.0f32; enc.frame_size() * 2];
-        let mut out = vec![0u8; 1500];
-        let n = enc.encode(&pcm, &mut out).expect("encodage");
-        let header = RtpHeader {
-            payload_type: 111,
-            sequence: seq,
-            timestamp: u32::from(seq) * 120,
-            ssrc: 1,
-            marker: false,
-        };
-        rtp::build_packet(&header, &out[..n])
-    }
-
-    fn hists() -> RecvHists {
-        let h = || Arc::new(Mutex::new(Histogram::new(16)));
-        RecvHists { path: h(), queue: h(), process: h() }
+    fn hist() -> Arc<Mutex<Histogram>> {
+        Arc::new(Mutex::new(Histogram::new(16)))
     }
 
     fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
@@ -6905,110 +6750,11 @@ mod conceal_loop_tests {
     /// Comme `recevoir`, avec l'attente système → lecture du paquet (Lot 1-D2).
     fn recevoir_horodate(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant, stack_delay: Option<Duration>) {
         let stats = Arc::new(Mutex::new(HashMap::new()));
-        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &hists(), BLOC_ASIO_MS, stack_delay, at);
+        decode_one_packet(st, "peer-test", at, &recv_thread::tests::paquet(seq), mixer, &stats, &hist(), BLOC_ASIO_MS, stack_delay);
     }
 
-    // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
-
-    struct Banc {
-        mixer: Arc<AudioMixer>,
-        states: HashMap<Arc<str>, DecodeState>,
-        tx: Sender<DecodeMsg>,
-        rx: Receiver<DecodeMsg>,
-        pool_tx: Sender<Vec<u8>>,
-        _pool_rx: Receiver<Vec<u8>>,
-        stats: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-        recv_path: RecvHists,
-    }
-
-    /// Un flux connu, tampon VIDE, échéance dépassée bien au-delà de la grâce :
-    /// sans rien d'autre, on masquerait.
-    fn banc(now: Instant) -> Banc {
-        let mixer = Arc::new(AudioMixer::new());
-        flux_en_lecture(&mixer);
-        let mut st = state(now);
-        st.next_deadline = Some(now - Duration::from_millis(10));
-        let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
-        states.insert(Arc::from("peer-test"), st);
-        let (tx, rx) = bounded(64);
-        let (pool_tx, pool_rx) = bounded(64);
-        Banc {
-            mixer,
-            states,
-            tx,
-            rx,
-            pool_tx,
-            _pool_rx: pool_rx,
-            stats: Arc::new(Mutex::new(HashMap::new())),
-            recv_path: hists(),
-        }
-    }
-
-    fn passe(b: &mut Banc, now: Instant) -> std::ops::ControlFlow<()> {
-        drain_then_conceal(
-            &b.rx, &mut b.states, &b.pool_tx, &b.mixer, &b.stats, &b.recv_path, BLOC_ASIO_MS,
-            || now,
-        )
-    }
-
-    fn envoyer(b: &Banc, seq: u16, recv_instant: Instant) {
-        b.tx.send(DecodeMsg::Packet {
-            producer_id: Arc::from("peer-test"),
-            epoch: 1,
-            recv_instant,
-            stack_delay: None,
-            buf: paquet(seq),
-            kind: StreamKind::Instrument,
-        })
-        .unwrap();
-    }
-
-    /// LE cas du banc : le paquet attendu est déjà dans la file quand le thread
-    /// se réveille en retard. Avant M0, on inventait une trame, puis on jetait
-    /// le vrai paquet comme « en retard » — un masquage prématuré sur deux
-    /// plateformes, et le son inventé à la place du vrai.
-    #[test]
-    fn un_paquet_deja_dans_la_file_nest_jamais_remplace() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        envoyer(&b, 1001, now - Duration::from_millis(1));
-
-        assert!(passe(&mut b, now).is_continue());
-        let s = b.states.values().next().unwrap();
-        assert_eq!(s.concealed_underrun_frames, 0, "rien d'inventé : le vrai paquet était là");
-        assert_eq!(s.seq.counters().late, 0, "et il n'a pas été écarté");
-        assert!(b.mixer.playout("peer-test").unwrap().buffered_ms > 0.0, "il est dans le tampon");
-    }
-
-    #[test]
-    fn toute_la_file_passe_pas_seulement_le_premier() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        for (i, seq) in (1001..=1004).enumerate() {
-            envoyer(&b, seq, now - Duration::from_micros(4_000 - 1_000 * i as u64));
-        }
-        assert!(passe(&mut b, now).is_continue());
-        let s = b.states.values().next().unwrap();
-        assert_eq!(s.concealed_underrun_frames, 0);
-        assert!(b.rx.is_empty(), "la file est vidée avant la décision");
-    }
-
-    #[test]
-    fn sans_rien_dans_la_file_le_masquage_part_toujours() {
-        // Le contrôle : M0 ne doit pas désarmer le masquage d'un vrai retard.
-        let now = Instant::now();
-        let mut b = banc(now);
-        assert!(passe(&mut b, now).is_continue());
-        assert_eq!(b.states.values().next().unwrap().concealed_underrun_frames, 1);
-    }
-
-    #[test]
-    fn un_arret_dans_la_file_arrete_la_boucle() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        b.tx.send(DecodeMsg::Shutdown).unwrap();
-        assert!(passe(&mut b, now).is_break());
-    }
+    // M0 (21/09/2026, « ce qui est arrivé passe avant la décision ») : testé
+    // avec la vraie socket dans `recv_thread::tests` depuis le Lot 1-D4.
 
     // ─── M2 (21/09/2026) : ne revenir que quand l'attente peut changer ─────
 
@@ -7604,23 +7350,20 @@ mod conceal_loop_tests {
         assert!(st.pending_hole.is_none());
     }
 
-    /// 0.6.6-8 : le chemin lecture → push est découpé en attente dans le canal
-    /// et traitement, et les deux parts s'additionnent.
+    /// Le chemin de réception se mesure de la LECTURE du paquet (`recv_instant`)
+    /// au push : un paquet lu il y a 3 ms compte au moins 3 ms.
     #[test]
-    fn le_chemin_de_reception_se_decoupe_en_attente_et_traitement() {
+    fn le_chemin_de_reception_se_mesure_de_la_lecture_au_push() {
         let mixer = Arc::new(AudioMixer::new());
         flux_en_lecture(&mixer);
         let mut st = state(Instant::now());
-        let h = hists();
-        let lu = Instant::now();
-        std::thread::sleep(Duration::from_millis(3)); // le paquet attend dans le canal
-        let pris = Instant::now();
+        let h = hist();
+        let lu = Instant::now() - Duration::from_millis(3);
         let stats = Arc::new(Mutex::new(HashMap::new()));
-        decode_one_packet(&mut st, "peer-test", lu, &paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None, pris);
-        let (path, queue, process) = (h.path.lock().flush(), h.queue.lock().flush(), h.process.lock().flush());
-        assert_eq!((path.count, queue.count, process.count), (1, 1, 1));
-        assert!(queue.max_ms >= 3.0, "attente {} ms", queue.max_ms);
-        assert!((queue.max_ms + process.max_ms - path.max_ms).abs() < 0.05, "les parts s'additionnent");
+        decode_one_packet(&mut st, "peer-test", lu, &recv_thread::tests::paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None);
+        let path = h.lock().flush();
+        assert_eq!(path.count, 1);
+        assert!(path.max_ms >= 3.0, "lecture → push {} ms", path.max_ms);
     }
 
     /// Un tirage plein ne produit rien à analyser.

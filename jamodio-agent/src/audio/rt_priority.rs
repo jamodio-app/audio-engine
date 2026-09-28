@@ -261,8 +261,13 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
     }
 }
 
-/// Promeut le thread courant pour le **décodage de réception** (thread unique
-/// partagé, alimenté par l'arrivée réseau). Variante « event-driven » de
+/// Contrat de calcul du fil de réception sur macOS (`THREAD_TIME_CONSTRAINT_POLICY`,
+/// par période de 2,5 ms). Public pour que la mesure du travail par réveil
+/// (`PerfHandles::recv_work_over_budget`) compte contre la MÊME valeur.
+pub const AUDIO_RECV_COMPUTATION: std::time::Duration = std::time::Duration::from_micros(300);
+
+/// Promeut le thread courant pour la **réception** (fil unique qui lit,
+/// déchiffre et décode tous les flux reçus, alimenté par l'arrivée réseau). Variante « event-driven » de
 /// [`promote_thread_for_audio`] :
 ///
 /// - **macOS** : `THREAD_TIME_CONSTRAINT_POLICY` **léger** (computation 0,3 ms,
@@ -275,13 +280,13 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
 ///   ce chemin event-driven) ; le time-constraint dédié (computation faible,
 ///   preemptible) donne la priorité sans sur-réserver ni fausse deadline device.
 /// - **Windows** : MMCSS « Pro Audio » + `AvSetMmThreadPriority(CRITICAL)` (durci
-///   2026-09, identique à l'émission). Un seul thread de décodage → pas de souci
+///   2026-09, identique à l'émission). Un seul fil de réception → pas de souci
 ///   de budget MMCSS.
 /// - **Linux/autres** : `thread_priority` best-effort.
 ///
 /// Même garde anti-double-promotion par thread, même contrat de Drop (sur le
-/// même thread). `thread` nomme le fil dans le journal (« décodage »,
-/// « réception ») : deux fils sont promus ainsi depuis 0.6.6-7.
+/// même thread). `thread` nomme le fil dans le journal. Depuis 0.6.6-9, un seul
+/// fil est promu ainsi (réception et décodage réunis, Lot 1-D4).
 pub fn promote_thread_for_audio_recv(thread: &'static str) -> RtPriorityHandle {
     let already = PROMOTION_ACTIVE.with(|c| {
         let prev = c.get();
@@ -519,7 +524,8 @@ mod macos_fallback {
     /// (2,5 ms = une période entière) car le décode n'a pas de deadline I/O dure et
     /// peut décoder une petite rafale de paquets en file sans être throttlé.
     pub fn apply_recv() -> io::Result<()> {
-        apply_time_constraint(300_000.0, 2_500_000.0) // computation 0,3 ms · constraint 2,5 ms
+        // computation 0,3 ms · constraint 2,5 ms
+        apply_time_constraint(super::AUDIO_RECV_COMPUTATION.as_nanos() as f64, 2_500_000.0)
     }
 
     /// Applique QoS USER_INTERACTIVE + `THREAD_TIME_CONSTRAINT_POLICY` au thread
