@@ -6687,6 +6687,10 @@ mod teardown_tests {
     }
 }
 
+// Lot B0-bis du banc « N musiciens » : la réception à N flux en temps simulé.
+#[cfg(test)]
+mod scale_tests;
+
 #[cfg(test)]
 mod conceal_loop_tests {
     use super::*;

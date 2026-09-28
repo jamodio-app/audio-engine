@@ -1,0 +1,27 @@
+[package]
+name = "jamodio-bench"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Jamodio-Proprietary"
+publish = false
+description = "Banc « N musiciens » : faux serveur + pilote contre le VRAI Audio Engine installé"
+
+# Outil de test interne. Il n'est PAS livré avec l'Audio Engine (le bundle Tauri
+# ne compile que `jamodio-agent`) ; il n'a donc pas de numéro de version produit
+# à suivre (`npm run version:agent:*` ne le touche pas).
+
+[[bin]]
+name = "session-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Le code réseau de l'agent lui-même (SRTP, RTP, Opus) : le banc parle au produit
+# avec ses propres briques, pas avec une réimplémentation.
+jamodio-audio-core = { path = "../jamodio-audio-core" }
+tokio = { version = "1", features = ["full"] }
+# Client WebSocket vers l'agent (déjà dans l'arbre des dépendances, via axum).
+tokio-tungstenite = "0.24"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

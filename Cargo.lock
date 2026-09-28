@@ -2647,6 +2647,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jamodio-bench"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "jamodio-audio-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "jamodio-vst3-host"
 version = "0.6.6-5"
 dependencies = [
