@@ -1141,6 +1141,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
             // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
             let recv_path_snap = pl.perfstats.recv_path.lock().flush();
+            // 0.6.6-8 — ce chemin découpé : attente dans le canal / traitement.
+            let recv_queue_snap = pl.perfstats.recv_queue.lock().flush();
+            let recv_process_snap = pl.perfstats.recv_process.lock().flush();
             // Lot 1-C — retard du réveil du thread de décodage sur l'instant prévu.
             let decode_wake_late_snap = pl.perfstats.decode_wake_late.lock().flush();
             // Lot 1-D2 — attente entre la réception d'un paquet par le système et sa lecture.
@@ -1625,6 +1628,10 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 recv_path_p50_ms = recv_path_snap.p50_ms,
                 recv_path_p99_ms = recv_path_snap.p99_ms,
                 recv_path_max_ms = recv_path_snap.max_ms,
+                recv_queue_p99_ms = recv_queue_snap.p99_ms,
+                recv_queue_max_ms = recv_queue_snap.max_ms,
+                recv_process_p99_ms = recv_process_snap.p99_ms,
+                recv_process_max_ms = recv_process_snap.max_ms,
                 // Lot 1-C — de combien le thread de décodage se réveille APRÈS
                 // l'instant prévu quand une échéance de masquage est armée. La
                 // marge de réveil du masquage (`WAKE_SLACK_MS`) doit le couvrir.

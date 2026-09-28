@@ -147,8 +147,17 @@ fn recv_loop(
     stack_delay_hist: Arc<Mutex<Histogram>>,
 ) {
     // Même promotion que le décodage : bande temps réel (macOS, contrainte de
-    // temps légère), MMCSS « Pro Audio » (Windows).
-    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv();
+    // temps légère), MMCSS « Pro Audio » (Windows) — sauf interrupteur de banc
+    // `recv-thread-normal` (expérience A/B, cf. `bench_flags`), dit au journal.
+    let _rt = if crate::bench_flags::BenchFlags::load().recv_thread_normal {
+        tracing::warn!(
+            target: "jamodio::bench",
+            "fil de réception laissé en priorité NORMALE (interrupteur de banc recv-thread-normal)"
+        );
+        None
+    } else {
+        Some(crate::audio::rt_priority::promote_thread_for_audio_recv("réception"))
+    };
     let mut streams: HashMap<Token, Stream> = HashMap::new();
     let mut next_token = 1usize;
     let mut events = Events::with_capacity(64);

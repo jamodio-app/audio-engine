@@ -37,6 +37,12 @@ pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
+    /// Lot 1-D3 (0.6.6-8) — laisse le fil de RÉCEPTION en priorité normale (il
+    /// est promu comme le décodage par défaut). Expérience A/B du banc du 28/09 :
+    /// sur Mac, la 0.6.6-7 a fait apparaître des pics lecture → décodage de 5 à
+    /// 6 ms ; deux fils temps réel qui se gênent sont une hypothèse à trancher
+    /// avec le même binaire. Lu au démarrage du fil de réception.
+    pub recv_thread_normal: bool,
 }
 
 impl BenchFlags {
@@ -90,6 +96,7 @@ impl BenchFlags {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
+                "recv-thread-normal" => flags.recv_thread_normal = on,
                 other => tracing::warn!(
                     target: "jamodio::bench",
                     flag = other,
@@ -136,6 +143,9 @@ impl BenchFlags {
         let mut active = Vec::new();
         if self.no_rtcp {
             active.push("no-rtcp");
+        }
+        if self.recv_thread_normal {
+            active.push("recv-thread-normal");
         }
         active
     }
@@ -211,6 +221,14 @@ mod tests {
     fn un_fichier_propre_ne_signale_rien() {
         let (_, issues) = BenchFlags::entries("# commentaire\n\nno-rtcp = 1\n");
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn le_fil_de_reception_peut_rester_en_priorite_normale() {
+        let f = BenchFlags::parse("recv-thread-normal = 1\n");
+        assert!(f.recv_thread_normal && !f.no_rtcp);
+        assert_eq!(f.active(), vec!["recv-thread-normal"]);
+        assert!(!BenchFlags::parse("recv-thread-normal = 0").recv_thread_normal);
     }
 
     /// Une faute de frappe ne doit jamais activer un réglage ni en cacher un.

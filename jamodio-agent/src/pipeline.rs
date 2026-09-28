@@ -1084,6 +1084,13 @@ pub struct PerfHandles {
     /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
     /// bug Windows que ce thread RT corrige).
     pub recv_path: Arc<Mutex<Histogram>>,
+    /// Lot 1-D3 (0.6.6-8) — `recv_path` découpé : attente du paquet dans le canal
+    /// avant que le décodage ne le prenne (fil de décodage indisponible), puis
+    /// traitement (parse + décodage Opus) jusqu'au push. Au banc du 28/09 (Mac,
+    /// 0.6.6-7), des pics de 5 à 6 ms lecture → push sont apparus : ces deux
+    /// mesures disent lequel des deux les porte.
+    pub recv_queue: Arc<Mutex<Histogram>>,
+    pub recv_process: Arc<Mutex<Histogram>>,
     /// Lot 1-C (23/09/2026) — retard du RÉVEIL du thread de décodage sur
     /// l'instant prévu, quand il dort jusqu'à une échéance de masquage (ms).
     /// C'est l'imprécision que `conceal::WAKE_SLACK_MS` est censé couvrir ;
@@ -1161,6 +1168,8 @@ impl PerfHandles {
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_queue: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_process: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             decode_wake_late: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             recv_stack_delay: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3370,7 +3379,11 @@ impl PipelineState {
                 spawn_decode_thread(
                     self.mixer.clone(),
                     self.perfstats.net_stats_by_producer.clone(),
-                    self.perfstats.recv_path.clone(),
+                    RecvHists {
+                        path: self.perfstats.recv_path.clone(),
+                        queue: self.perfstats.recv_queue.clone(),
+                        process: self.perfstats.recv_process.clone(),
+                    },
                     self.perfstats.decode_wake_late.clone(),
                     self.perfstats.output_frames.clone(),
                 )
@@ -5105,11 +5118,17 @@ pub struct HoleCounts {
 struct Arrived {
     read_at: std::time::Instant,
     in_system_at: Option<std::time::Instant>,
+    /// Quand le thread de décodage l'a pris dans le canal (0.6.6-8).
+    dequeued_at: std::time::Instant,
 }
 
 impl Arrived {
-    fn new(read_at: std::time::Instant, stack_delay: Option<std::time::Duration>) -> Self {
-        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)) }
+    fn new(
+        read_at: std::time::Instant,
+        stack_delay: Option<std::time::Duration>,
+        dequeued_at: std::time::Instant,
+    ) -> Self {
+        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)), dequeued_at }
     }
 }
 
@@ -5264,6 +5283,16 @@ impl DecodeState {
     }
 }
 
+/// Chemin de réception mesuré par le thread de décodage : lecture → push
+/// (`path`), dont l'attente dans le canal (`queue`) et le traitement
+/// (`process`). Histogrammes vidés à 1 Hz par le relevé perfstats.
+#[derive(Clone)]
+struct RecvHists {
+    path: Arc<Mutex<Histogram>>,
+    queue: Arc<Mutex<Histogram>>,
+    process: Arc<Mutex<Histogram>>,
+}
+
 /// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
 struct DecodeThread {
     /// MPSC vers le thread (paquets + lifecycle). Cloné pour le fil de réception.
@@ -5279,7 +5308,7 @@ struct DecodeThread {
 fn spawn_decode_thread(
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: Arc<Mutex<Histogram>>,
+    recv_path: RecvHists,
     decode_wake_late: Arc<Mutex<Histogram>>,
     // Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
     // et non la durée d'une trame, qui dit combien le tampon doit contenir pour
@@ -5500,6 +5529,9 @@ fn report_hole(
     };
     // Du paquet arrivé à son push : le retard du décodage.
     let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.read_at)));
+    // 0.6.6-8 — ce retard, découpé : attente dans le canal, puis traitement.
+    let decode_queue_ms = arrived.map_or(-1.0, |a| ms(a.dequeued_at.saturating_duration_since(a.read_at)));
+    let decode_process_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.dequeued_at)));
     // Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
     // depuis le dernier push : si elle vaut à peu près l'écart d'arrivée, les
     // paquets étaient dans la machine et la réception les a lus en retard.
@@ -5527,6 +5559,8 @@ fn report_hole(
                 target_ms = h.target_ms,
                 arrival_gap_ms,
                 decode_delay_ms,
+                decode_queue_ms,
+                decode_process_ms,
                 stack_delay_ms,
                 conceal_wait = wait,
                 "TROU"
@@ -5689,13 +5723,13 @@ fn decode_rt_loop(
     pool_tx: Sender<Vec<u8>>,
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: Arc<Mutex<Histogram>>,
+    recv_path: RecvHists,
     decode_wake_late: Arc<Mutex<Histogram>>,
     output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) {
     // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
     // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
-    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv();
+    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv("décodage");
 
     let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
 
@@ -5777,7 +5811,7 @@ fn drain_then_conceal(
     pool_tx: &Sender<Vec<u8>>,
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &Arc<Mutex<Histogram>>,
+    recv_path: &RecvHists,
     output_block_ms: f64,
     now: impl Fn() -> std::time::Instant,
 ) -> std::ops::ControlFlow<()> {
@@ -5795,7 +5829,7 @@ fn handle_decode_msg(
     pool_tx: &Sender<Vec<u8>>,
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &Arc<Mutex<Histogram>>,
+    recv_path: &RecvHists,
     output_block_ms: f64,
 ) -> std::ops::ControlFlow<()> {
     match msg {
@@ -5813,6 +5847,9 @@ fn handle_decode_msg(
             }
         }
         DecodeMsg::Packet { producer_id, epoch, recv_instant, stack_delay, buf, kind } => {
+            // Lot 1-D3 (0.6.6-8) — le décodage prend le paquet MAINTENANT : ce
+            // qui précède est de l'attente dans le canal.
+            let dequeued_at = std::time::Instant::now();
             // (Re)création de l'état + du stream mixer selon la génération.
             let needs_create = match states.get(&producer_id) {
                 Some(st) if st.epoch == epoch => false,
@@ -5853,6 +5890,7 @@ fn handle_decode_msg(
                 recv_path,
                 output_block_ms,
                 stack_delay,
+                dequeued_at,
             );
             // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
             let _ = pool_tx.try_send(buf);
@@ -5872,9 +5910,10 @@ fn decode_one_packet(
     buf: &[u8],
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &Arc<Mutex<Histogram>>,
+    recv_path: &RecvHists,
     output_block_ms: f64,
     stack_delay: Option<std::time::Duration>,
+    dequeued_at: std::time::Instant,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
     st.pkt_count += 1;
@@ -5883,7 +5922,7 @@ fn decode_one_packet(
         let d_ms = d.as_secs_f64() * 1000.0;
         st.stack_delay_max_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms.max(d_ms) } else { d_ms };
     }
-    let arrived = Arrived::new(recv_instant, stack_delay);
+    let arrived = Arrived::new(recv_instant, stack_delay, dequeued_at);
     if st.pkt_count == 1 {
         tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
     } else if st.pkt_count.is_multiple_of(5000) {
@@ -6039,8 +6078,11 @@ fn decode_one_packet(
     // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
     // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.
     if let Some(pcm) = st.decoder.decode(payload) {
-        let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
-        recv_path.lock().observe(recv_path_ms);
+        let before_push = std::time::Instant::now();
+        let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
+        recv_path.path.lock().observe(ms(before_push.saturating_duration_since(recv_instant)));
+        recv_path.queue.lock().observe(ms(dequeued_at.saturating_duration_since(recv_instant)));
+        recv_path.process.lock().observe(ms(before_push.saturating_duration_since(dequeued_at)));
         let report = if st.fade_in_remaining > 0 {
             // Lot 1.4 — la rampe s'applique à une copie, dans un tampon de
             // travail gardé par le flux (aucune allocation une fois sa taille
@@ -6851,6 +6893,11 @@ mod conceal_loop_tests {
         rtp::build_packet(&header, &out[..n])
     }
 
+    fn hists() -> RecvHists {
+        let h = || Arc::new(Mutex::new(Histogram::new(16)));
+        RecvHists { path: h(), queue: h(), process: h() }
+    }
+
     fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
         recevoir_horodate(st, mixer, seq, at, None);
     }
@@ -6858,8 +6905,7 @@ mod conceal_loop_tests {
     /// Comme `recevoir`, avec l'attente système → lecture du paquet (Lot 1-D2).
     fn recevoir_horodate(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant, stack_delay: Option<Duration>) {
         let stats = Arc::new(Mutex::new(HashMap::new()));
-        let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
-        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path, BLOC_ASIO_MS, stack_delay);
+        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &hists(), BLOC_ASIO_MS, stack_delay, at);
     }
 
     // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
@@ -6872,7 +6918,7 @@ mod conceal_loop_tests {
         pool_tx: Sender<Vec<u8>>,
         _pool_rx: Receiver<Vec<u8>>,
         stats: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-        recv_path: Arc<Mutex<Histogram>>,
+        recv_path: RecvHists,
     }
 
     /// Un flux connu, tampon VIDE, échéance dépassée bien au-delà de la grâce :
@@ -6894,7 +6940,7 @@ mod conceal_loop_tests {
             pool_tx,
             _pool_rx: pool_rx,
             stats: Arc::new(Mutex::new(HashMap::new())),
-            recv_path: Arc::new(Mutex::new(Histogram::new(16))),
+            recv_path: hists(),
         }
     }
 
@@ -7556,6 +7602,25 @@ mod conceal_loop_tests {
         recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
         assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
         assert!(st.pending_hole.is_none());
+    }
+
+    /// 0.6.6-8 : le chemin lecture → push est découpé en attente dans le canal
+    /// et traitement, et les deux parts s'additionnent.
+    #[test]
+    fn le_chemin_de_reception_se_decoupe_en_attente_et_traitement() {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        let mut st = state(Instant::now());
+        let h = hists();
+        let lu = Instant::now();
+        std::thread::sleep(Duration::from_millis(3)); // le paquet attend dans le canal
+        let pris = Instant::now();
+        let stats = Arc::new(Mutex::new(HashMap::new()));
+        decode_one_packet(&mut st, "peer-test", lu, &paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None, pris);
+        let (path, queue, process) = (h.path.lock().flush(), h.queue.lock().flush(), h.process.lock().flush());
+        assert_eq!((path.count, queue.count, process.count), (1, 1, 1));
+        assert!(queue.max_ms >= 3.0, "attente {} ms", queue.max_ms);
+        assert!((queue.max_ms + process.max_ms - path.max_ms).abs() < 0.05, "les parts s'additionnent");
     }
 
     /// Un tirage plein ne produit rien à analyser.

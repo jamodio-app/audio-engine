@@ -280,8 +280,9 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
 /// - **Linux/autres** : `thread_priority` best-effort.
 ///
 /// Même garde anti-double-promotion par thread, même contrat de Drop (sur le
-/// même thread).
-pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
+/// même thread). `thread` nomme le fil dans le journal (« décodage »,
+/// « réception ») : deux fils sont promus ainsi depuis 0.6.6-7.
+pub fn promote_thread_for_audio_recv(thread: &'static str) -> RtPriorityHandle {
     let already = PROMOTION_ACTIVE.with(|c| {
         let prev = c.get();
         if !prev {
@@ -292,7 +293,8 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
     if already {
         tracing::warn!(
             target: "jamodio::rt_priority",
-            "double promotion détectée sur ce thread (recv) — handle no-op."
+            thread,
+            "double promotion détectée sur ce thread — handle no-op."
         );
         return make_none_handle();
     }
@@ -309,8 +311,9 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
             Ok(()) => {
                 tracing::info!(
                     target: "jamodio::rt_priority",
+            thread,
                     method = "macos-time-constraint",
-                    "decode thread promoted via QoS + THREAD_TIME_CONSTRAINT_POLICY (light)"
+                    "thread promoted via QoS + THREAD_TIME_CONSTRAINT_POLICY (light)"
                 );
                 RtPriorityHandle {
                     method: PromotionMethod::MacOsTimeConstraint,
@@ -321,6 +324,7 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
             Err(e) => {
                 tracing::warn!(
                     target: "jamodio::rt_priority",
+            thread,
                     error = %e,
                     "macos time-constraint (recv) failed — fallback QoS USER_INTERACTIVE seul"
                 );
@@ -333,8 +337,9 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
                     Err(e2) => {
                         tracing::warn!(
                             target: "jamodio::rt_priority",
+            thread,
                             error = %e2,
-                            "macos QoS fallback failed too — decode thread at normal priority"
+                            "macos QoS fallback failed too — thread at normal priority"
                         );
                         make_none_handle()
                     }
@@ -349,9 +354,10 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
             Ok(h) => {
                 tracing::info!(
                     target: "jamodio::rt_priority",
+            thread,
                     method = "windows-mmcss",
                     task = "Pro Audio",
-                    "decode thread promoted via MMCSS Pro Audio"
+                    "thread promoted via MMCSS Pro Audio"
                 );
                 RtPriorityHandle {
                     method: PromotionMethod::WindowsMmcss,
@@ -362,8 +368,9 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
             Err(e) => {
                 tracing::warn!(
                     target: "jamodio::rt_priority",
+            thread,
                     error = %e,
-                    "windows MMCSS failed (recv) — decode thread at normal priority"
+                    "windows MMCSS failed (recv) — thread at normal priority"
                 );
                 make_none_handle()
             }
@@ -383,8 +390,9 @@ pub fn promote_thread_for_audio_recv() -> RtPriorityHandle {
             Err(e) => {
                 tracing::warn!(
                     target: "jamodio::rt_priority",
+            thread,
                     error = ?e,
-                    "thread-priority refused (recv) — decode thread at normal priority"
+                    "thread-priority refused (recv) — thread at normal priority"
                 );
                 make_none_handle()
             }
@@ -694,7 +702,7 @@ mod tests {
     /// Elle ne rejoint JAMAIS le workgroup (→ jamais `MacOsWorkgroup`).
     #[test]
     fn promote_recv_then_drop_is_safe() {
-        let h = promote_thread_for_audio_recv();
+        let h = promote_thread_for_audio_recv("test");
         let m = h.method();
         assert!(matches!(
             m,

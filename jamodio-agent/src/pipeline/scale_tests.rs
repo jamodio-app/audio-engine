@@ -58,7 +58,8 @@ struct Outcome {
 fn simulate(n: usize, secs: f64, stall: Option<(f64, f64)>) -> Outcome {
     let mixer = Arc::new(AudioMixer::new());
     let stats = Arc::new(Mutex::new(HashMap::new()));
-    let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
+    let h = || Arc::new(Mutex::new(Histogram::new(16)));
+    let recv_path = RecvHists { path: h(), queue: h(), process: h() };
     let payload = payload();
     let ids: Vec<String> = (0..n).map(|i| format!("peer-{i}")).collect();
     let mut states: Vec<DecodeState> = ids
@@ -91,7 +92,7 @@ fn simulate(n: usize, secs: f64, stall: Option<(f64, f64)>) -> Outcome {
             });
             let pkt = packet(&payload, seq);
             for (st, id) in states.iter_mut().zip(&ids) {
-                decode_one_packet(st, id, at(recv_us), &pkt, &mixer, &stats, &recv_path, BLOCK_US / 1000.0, None);
+                decode_one_packet(st, id, at(recv_us), &pkt, &mixer, &stats, &recv_path, BLOCK_US / 1000.0, None, at(recv_us));
             }
             seq = seq.wrapping_add(1);
             next_frame_us += FRAME_US;
