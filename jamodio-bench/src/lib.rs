@@ -8,6 +8,7 @@
 
 pub mod driver;
 pub mod profile;
+pub mod relay;
 pub mod report;
 pub mod rt;
 pub mod run;

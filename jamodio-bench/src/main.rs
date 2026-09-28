@@ -23,6 +23,7 @@ session-bench — banc « N musiciens » contre l'Audio Engine installé
 
   session-bench devices
   session-bench plugins                        (plugins connus de l'Audio Engine)
+  session-bench relay [--listen IP] [--port N] (SECONDE machine : relais du mode réseau)
   session-bench scenario                       (écrit le scénario par défaut en JSON)
   session-bench selftest [FLUX] [SECONDES]     (précision du banc seul, sans Audio Engine ; défaut 8 flux, 30 s)
   session-bench run [options]
@@ -44,6 +45,8 @@ Options de run :
                           (nom exact, cf. plugins) — la charge réelle du musicien
   --seed N                graine (même graine = mêmes retards et pertes)
   --agent URL             WebSocket de l'Audio Engine (défaut ws://127.0.0.1:9876)
+  --relay IP:PORT         mode réseau : les flux passent par le relais lancé sur
+                          une seconde machine (session-bench relay)
   --out DOSSIER           où écrire les résultats (défaut bench-results/<date>)
   --save-scenario FICHIER écrit le scénario final avant de lancer
 ";
@@ -54,6 +57,7 @@ async fn main() {
     let code = match args.first().map(String::as_str) {
         Some("devices") => devices(&Scenario::default().agent_url).await,
         Some("plugins") => plugins(&Scenario::default().agent_url).await,
+        Some("relay") => relay(&args[1..]),
         Some("scenario") => match serde_json::to_string_pretty(&Scenario::default()) {
             Ok(j) => {
                 println!("{j}");
@@ -111,6 +115,27 @@ async fn plugins(url: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// La seconde machine du mode réseau : relaie les flux entre le banc et
+/// l'agent de la machine mesurée.
+fn relay(args: &[String]) -> Result<(), String> {
+    let mut listen = None;
+    let mut port = jamodio_bench::relay::DEFAULT_PORT;
+    let mut it = args.iter();
+    while let Some(opt) = it.next() {
+        let v = it.next().ok_or(format!("{opt} attend une valeur"))?;
+        match opt.as_str() {
+            "--listen" => listen = Some(v.parse().map_err(|e| format!("--listen {v} : {e}"))?),
+            "--port" => port = v.parse().map_err(|e| format!("--port {v} : {e}"))?,
+            other => return Err(format!("option inconnue : {other}")),
+        }
+    }
+    let listen = match listen {
+        Some(ip) => ip,
+        None => jamodio_bench::scenario::primary_local_ip()?,
+    };
+    jamodio_bench::relay::serve(listen, port)
 }
 
 async fn run(args: &[String]) -> Result<(), String> {
@@ -192,6 +217,7 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
             "--plugin" => scenario.plugin = Some(val()?),
             "--output" => scenario.output_device = Some(val()?),
             "--agent" => scenario.agent_url = val()?,
+            "--relay" => scenario.relay = Some(val()?),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--save-scenario" => save = Some(PathBuf::from(val()?)),
             other => return Err(format!("option inconnue : {other}\n\n{USAGE}")),

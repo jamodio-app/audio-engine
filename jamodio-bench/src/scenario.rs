@@ -57,6 +57,11 @@ pub struct Scenario {
     pub server_ip: String,
     /// WebSocket de l'Audio Engine.
     pub agent_url: String,
+    /// Mode « réseau local » (B0.2) : contrôle du relais `IP:PORT` lancé sur une
+    /// SECONDE machine (`session-bench relay`). Les flux passent alors par le
+    /// vrai réseau et la carte réseau de la machine mesurée. `None` = local.
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 impl Default for Scenario {
@@ -76,6 +81,7 @@ impl Default for Scenario {
             seed: 1,
             server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),
+            relay: None,
         }
     }
 }
@@ -107,6 +113,10 @@ impl Scenario {
                 Err(_) => return Err(format!("server_ip illisible : {}", self.server_ip)),
             }
         }
+        if let Some(r) = &self.relay {
+            r.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("relay « {r} » : {e} (attendu IP:PORT)"))?;
+        }
         if self.peers.is_empty() {
             return Err("au moins un profil de musicien".into());
         }
@@ -133,9 +143,10 @@ impl Scenario {
         &self.peers[(musician as usize - 2) % self.peers.len()]
     }
 
-    /// Flux sans gigue ni perte : le faux serveur tournant sur la même machine
-    /// que l'agent (seul mode existant), tout trou y est de cause locale.
-    pub fn is_local_regular(&self) -> bool {
+    /// Flux simulés sans gigue ni perte. Les causes réception, décodage et
+    /// consommation sont locales par définition, en mode local comme à travers
+    /// le relais : le critère 1 peut juger dès que les flux sont réguliers.
+    pub fn is_regular(&self) -> bool {
         self.peers
             .iter()
             .all(|p| p.jitter == crate::profile::Jitter::None && p.loss_pct == 0.0)
@@ -171,7 +182,7 @@ mod tests {
         let s = Scenario::default();
         s.validate().unwrap();
         assert_eq!((s.from_musicians, s.to_musicians), (2, 9));
-        assert!(s.is_local_regular());
+        assert!(s.is_regular());
         assert_eq!(s.total_secs(), 8 * 300);
     }
 
@@ -206,6 +217,7 @@ mod tests {
             Scenario { peers: vec![], ..Scenario::default() },
             Scenario { server_ip: "127.0.0.1".into(), ..Scenario::default() },
             Scenario { server_ip: "pas-une-ip".into(), ..Scenario::default() },
+            Scenario { relay: Some("10.0.0.2".into()), ..Scenario::default() },
             Scenario {
                 peers: vec![PeerProfile { loss_pct: 150.0, ..PeerProfile::preset("regular").unwrap() }],
                 ..Scenario::default()
@@ -225,6 +237,6 @@ mod tests {
         assert_eq!(s.peer(2).name, "ethernet");
         assert_eq!(s.peer(3).name, "wifi");
         assert_eq!(s.peer(4).name, "ethernet");
-        assert!(!s.is_local_regular(), "de la gigue simulée : pas « local régulier »");
+        assert!(!s.is_regular(), "de la gigue simulée : pas « réguliers »");
     }
 }

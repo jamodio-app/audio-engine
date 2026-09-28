@@ -72,6 +72,9 @@ pub struct MachineRow {
     pub sender_late_max_ms: f64,
     pub up_instrument: UplinkWindow,
     pub up_voice: Option<UplinkWindow>,
+    /// Mode relais : délai ajouté par le relais (p99, max), en ms ; `NaN` en local.
+    pub relay_delay_p99_ms: f64,
+    pub relay_delay_max_ms: f64,
 }
 
 /// Lignes « flux » d'un message `perf-stats`. `names` : identifiant du flux →
@@ -101,6 +104,7 @@ pub fn machine_row(
     sender: &SenderWindow,
     up_instrument: UplinkWindow,
     up_voice: Option<UplinkWindow>,
+    relay_delay_ms: Option<(f64, f64)>,
 ) -> MachineRow {
     let num = |k: &str| perf.and_then(|p| p[k].as_f64()).unwrap_or(f64::NAN);
     let mut late = sender.late_us.clone();
@@ -124,6 +128,8 @@ pub fn machine_row(
         sender_late_max_ms: pct(1.0),
         up_instrument,
         up_voice,
+        relay_delay_p99_ms: relay_delay_ms.map_or(f64::NAN, |d| d.0),
+        relay_delay_max_ms: relay_delay_ms.map_or(f64::NAN, |d| d.1),
     }
 }
 
@@ -157,7 +163,8 @@ pub fn machine_csv(rows: &[MachineRow]) -> String {
     let mut s = String::from(
         "t_s,musicians,cpu_pct,callback_deficit_out,output_block_frames,sender_sent,sender_errors,\
 sender_late_p99_ms,sender_late_max_ms,up_instr_packets,up_instr_max_gap_ms,up_instr_gaps_over_10ms,\
-up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10ms,up_voice_seq_missing\n",
+up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10ms,up_voice_seq_missing,\
+relay_delay_p99_ms,relay_delay_max_ms\n",
     );
     let up = |w: Option<&UplinkWindow>| match w {
         Some(w) => format!(
@@ -172,7 +179,7 @@ up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10m
     for r in rows {
         let _ = writeln!(
             s,
-            "{:.1},{},{},{},{},{},{},{},{},{},{}",
+            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.t_s,
             r.musicians,
             fmt(r.cpu_pct),
@@ -184,6 +191,8 @@ up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10m
             fmt(r.sender_late_max_ms),
             up(Some(&r.up_instrument)),
             up(r.up_voice.as_ref()),
+            fmt(r.relay_delay_p99_ms),
+            fmt(r.relay_delay_max_ms),
         );
     }
     s
@@ -367,10 +376,10 @@ pub struct Criterion {
 
 /// Les quatre critères validés le 28/09/2026.
 ///
-/// - `local_regular` : banc en mode local ET flux sans gigue ni perte — seule
-///   situation où un trou est forcément de cause locale (critère 1).
+/// - `regular` : flux simulés sans gigue ni perte (critère 1 : sans gigue
+///   simulée, une cause locale ne peut pas être confondue avec le réseau).
 /// - `voice_sent` : le talkback de l'agent était envoyé (critère 3).
-pub fn criteria(steps: &[StepSummary], local_regular: bool, voice_sent: bool) -> Vec<Criterion> {
+pub fn criteria(steps: &[StepSummary], regular: bool, voice_sent: bool) -> Vec<Criterion> {
     let mut out = Vec::new();
 
     // 1. Zéro trou de cause locale (réception, décodage, consommation). La
@@ -382,16 +391,16 @@ pub fn criteria(steps: &[StepSummary], local_regular: bool, voice_sent: bool) ->
         .sum();
     out.push(Criterion {
         id: 1,
-        text: "zéro trou de cause locale (réception, décodage, consommation), mode local, flux réguliers",
-        verdict: if !local_regular || !local.is_finite() {
+        text: "zéro trou de cause locale (réception, décodage, consommation), flux réguliers",
+        verdict: if !regular || !local.is_finite() {
             Verdict::NotApplicable
         } else if local == 0.0 {
             Verdict::Holds
         } else {
             Verdict::Fails
         },
-        detail: if !local_regular {
-            "scénario avec réseau ou gigue simulée : un trou n'y est pas forcément local".into()
+        detail: if !regular {
+            "scénario avec gigue ou pertes simulées : critère réservé aux flux réguliers".into()
         } else if !local.is_finite() {
             "l'Audio Engine ne mesure pas toutes les causes locales (réception : 0.6.6-6 et plus)".into()
         } else {

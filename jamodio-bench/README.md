@@ -61,9 +61,16 @@ Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
 - **Talkback envoyé** (`--send-voice`) : l'agent n'envoie de la voix que s'il
   entend quelqu'un. Parler, ou faire jouer un son dans le micro, pendant le banc ;
   sinon le critère 3 reste « sans objet ».
-- **Mode réseau local** (faux serveur sur une autre machine) : pas encore. Le
-  WebSocket de l'agent n'écoute que la machine locale ; il faudra un relais sur la
-  seconde machine (étape suivante du plan).
+- **Mode réseau** (`--relay`) : en local, les paquets ne passent ni par la
+  carte réseau ni par son pilote. Pour les y faire passer, lancer le RELAIS sur
+  une seconde machine du même réseau, puis le banc avec `--relay` :
+  ```text
+  (seconde machine)   cargo run --release -p jamodio-bench -- relay
+  (machine mesurée)   cargo run --release -p jamodio-bench -- run --relay IP-DU-RELAIS:51900 …
+  ```
+  Le relais ne lit ni ne modifie rien (chiffrement de bout en bout banc ↔
+  agent) ; il mesure son propre délai, que le résumé rappelle (« Relais »).
+  Autoriser `session-bench` dans le pare-feu des deux machines.
 - Test automatique associé, sans matériel :
   `cargo test -p jamodio-agent scale_tests` (garde-fou) et
   `cargo test -p jamodio-agent constat_hoquet -- --ignored --nocapture` (constat).

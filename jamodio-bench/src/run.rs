@@ -8,6 +8,7 @@
 use crate::driver::{AgentLink, CaptureParams, StreamParams, VoiceParams};
 use crate::report::{self, MachineRow, PeerRow, StepSummary};
 use crate::scenario::Scenario;
+use crate::relay::RelayClient;
 use crate::server::{Downlink, Kind, Payloads, SenderLoop, Uplink};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -64,12 +65,24 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     };
     let ip = server_ip.as_str();
     println!("Faux serveur sur {ip} (cette machine)");
+    // Mode relais : l'agent joint le RELAIS (seconde machine), qui renvoie au
+    // banc ; sinon il joint directement le banc.
+    let mut relay = match scenario.relay.as_deref() {
+        Some(addr) => {
+            let r = RelayClient::connect(addr).await?;
+            println!("Relais {addr} : les flux passent par le réseau.");
+            Some(r)
+        }
+        None => None,
+    };
+    let agent_ip = relay.as_ref().map_or(server_ip.clone(), |r| r.ip.to_string());
     let up_instrument = Uplink::bind(ip)?;
+    let up_port = agent_port(&mut relay, ip, up_instrument.port()).await?;
     let keys = agent
         .start_capture(&CaptureParams {
             ssrc: 0x4A4D_0001,
-            server_ip: ip,
-            server_port: up_instrument.port(),
+            server_ip: &agent_ip,
+            server_port: up_port,
             input_device: Some(&input),
             channel_index: scenario.channel_index,
             server_keys: &up_instrument.server_keys,
@@ -98,11 +111,12 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     let up_voice = match scenario.send_voice_channel {
         Some(channel) => {
             let up = Uplink::bind(ip)?;
+            let port = agent_port(&mut relay, ip, up.port()).await?;
             let keys = agent
                 .start_voice(&VoiceParams {
                     ssrc: 0x4A4D_0002,
-                    server_ip: ip,
-                    server_port: up.port(),
+                    server_ip: &agent_ip,
+                    server_port: port,
                     channel_index: channel,
                     server_keys: &up.server_keys,
                 })
@@ -147,12 +161,13 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 let voice = kind == Kind::Voice;
                 let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
                 let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
+                let port = agent_port(&mut relay, ip, link.port()).await?;
                 let keys = agent
                     .add_stream(&StreamParams {
                         producer_id: &pid,
                         peer_id: &format!("bench-{m}"),
-                        server_ip: ip,
-                        server_port: link.port(),
+                        server_ip: &agent_ip,
+                        server_port: port,
                         voice,
                         server_keys: &link.server_keys,
                     })
@@ -187,6 +202,13 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 }
                 peer_rows.extend(rows);
             }
+            let relay_delay = match relay.as_mut() {
+                Some(r) => {
+                    let st = r.stats().await?;
+                    Some((f64::from(st.delay_p99_us) / 1000.0, f64::from(st.delay_max_us) / 1000.0))
+                }
+                None => None,
+            };
             let row = report::machine_row(
                 last_perf.as_ref(),
                 t,
@@ -194,6 +216,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 &sender.take_window(),
                 up_instrument.take_window(),
                 up_voice.as_ref().map(|u| u.take_window()),
+                relay_delay,
             );
             progress(musicians, t - start_s, &row, &peer_rows);
             machine_rows.push(row);
@@ -228,7 +251,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         .filter(|s| s.end_s - s.start_s > scenario.warmup_secs as f64)
         .map(|s| report::summarize(&peer_rows, &machine_rows, s.musicians, s.start_s + scenario.warmup_secs as f64, s.end_s))
         .collect();
-    let criteria = report::criteria(&summaries, scenario.is_local_regular(), scenario.send_voice_channel.is_some());
+    let criteria = report::criteria(&summaries, scenario.is_regular(), scenario.send_voice_channel.is_some());
     let status = match &end {
         End::Complete => "complète".to_string(),
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
@@ -240,9 +263,17 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
         None => "inconnue".into(),
     };
+    let relay_precision = match &scenario.relay {
+        Some(addr) => {
+            let (p, _) = report::precision(&machine_rows.iter().map(|r| r.relay_delay_max_ms).collect::<Vec<_>>());
+            format!("{addr} — {p}")
+        }
+        None => "aucun (mode local)".into(),
+    };
     let header = vec![
         ("Campagne".to_string(), status),
         ("Précision du banc".to_string(), precision),
+        ("Relais (réseau)".to_string(), relay_precision),
         ("Priorité des fils du banc".to_string(), priority),
         ("Scénario".to_string(), scenario.name.clone()),
         ("Audio Engine".to_string(), format!("{agent_version} ({agent_os})")),
@@ -250,11 +281,15 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         ("Entrée / sortie".to_string(), format!("{input} / {output}")),
         (
             "Mode".to_string(),
-            if scenario.is_local_regular() {
-                "local, flux réguliers : tout trou est de cause locale".into()
-            } else {
-                format!("local, gigue/pertes simulées ; profils : {}", profile_list(&scenario))
-            },
+            format!(
+                "{}, {}",
+                if scenario.relay.is_some() { "réseau (relais)" } else { "local" },
+                if scenario.is_regular() {
+                    "flux réguliers".to_string()
+                } else {
+                    format!("gigue/pertes simulées ; profils : {}", profile_list(&scenario))
+                }
+            ),
         ),
         ("Plugin inséré".to_string(), plugin_line),
         ("Talkback envoyé".to_string(), scenario.send_voice_channel.map_or("non".into(), |c| format!("canal {}", c + 1))),
@@ -275,6 +310,18 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     match end {
         End::AgentError(e) => Err(format!("campagne arrêtée par l'Audio Engine : {e} (résultats partiels dans {})", out_dir.display())),
         _ => Ok(path),
+    }
+}
+
+/// Le port que l'agent doit joindre pour ce transport du banc : celui du relais
+/// en mode réseau, le sien sinon.
+async fn agent_port(relay: &mut Option<RelayClient>, bind_ip: &str, bench_port: u16) -> Result<u16, String> {
+    match relay {
+        Some(r) => {
+            let bench: std::net::SocketAddr = format!("{bind_ip}:{bench_port}").parse().map_err(|e| format!("{e}"))?;
+            r.open(bench).await
+        }
+        None => Ok(bench_port),
     }
 }
 
