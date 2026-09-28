@@ -341,6 +341,11 @@ pub struct UplinkWindow {
     pub undecryptable: u64,
 }
 
+/// Écart entre deux paquets d'un flux régulier au-delà duquel on compte une
+/// coupure : ce que les autres entendraient (4 trames manquantes). Même seuil
+/// pour ce que reçoit le banc et ce qui arrive au relais.
+pub const CUT_GAP_US: u64 = 10_000;
+
 /// Un transport MONTANT : reçoit l'instrument ou le talkback de l'agent.
 pub struct Uplink {
     socket: UdpSocket,
@@ -405,7 +410,7 @@ impl Uplink {
             if let Some((prev_at, prev_seq)) = last {
                 let gap = at.duration_since(prev_at).as_micros() as u64;
                 w.max_gap_us = w.max_gap_us.max(gap);
-                if gap > 10_000 {
+                if gap > CUT_GAP_US {
                     w.gaps_over_10ms += 1;
                 }
                 let step = h.sequence.wrapping_sub(prev_seq);

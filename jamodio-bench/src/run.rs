@@ -8,7 +8,7 @@
 use crate::driver::{AgentLink, CaptureParams, StreamParams, VoiceParams};
 use crate::report::{self, MachineRow, PeerRow, StepSummary};
 use crate::scenario::Scenario;
-use crate::relay::RelayClient;
+use crate::relay::{RelayClient, Transport};
 use crate::server::{Downlink, Kind, Payloads, SenderLoop, Uplink};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -76,8 +76,10 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         None => None,
     };
     let agent_ip = relay.as_ref().map_or(server_ip.clone(), |r| r.ip.to_string());
+    // Mode relais : nature de chaque transport, pour lire ce qu'il mesure.
+    let mut relay_roles: HashMap<std::net::SocketAddr, Transport> = HashMap::new();
     let up_instrument = Uplink::bind(ip)?;
-    let up_port = agent_port(&mut relay, ip, up_instrument.port()).await?;
+    let up_port = agent_port(&mut relay, &mut relay_roles, Transport::UpInstrument, ip, up_instrument.port()).await?;
     let keys = agent
         .start_capture(&CaptureParams {
             ssrc: 0x4A4D_0001,
@@ -111,7 +113,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     let up_voice = match scenario.send_voice_channel {
         Some(channel) => {
             let up = Uplink::bind(ip)?;
-            let port = agent_port(&mut relay, ip, up.port()).await?;
+            let port = agent_port(&mut relay, &mut relay_roles, Transport::UpVoice, ip, up.port()).await?;
             let keys = agent
                 .start_voice(&VoiceParams {
                     ssrc: 0x4A4D_0002,
@@ -161,7 +163,8 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 let voice = kind == Kind::Voice;
                 let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
                 let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
-                let port = agent_port(&mut relay, ip, link.port()).await?;
+                let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
+                let port = agent_port(&mut relay, &mut relay_roles, role, ip, link.port()).await?;
                 let keys = agent
                     .add_stream(&StreamParams {
                         producer_id: &pid,
@@ -202,10 +205,14 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 }
                 peer_rows.extend(rows);
             }
-            let relay_delay = match relay.as_mut() {
+            let relay_window = match relay.as_mut() {
                 Some(r) => {
                     let st = r.stats().await?;
-                    Some((f64::from(st.delay_p99_us) / 1000.0, f64::from(st.delay_max_us) / 1000.0))
+                    Some(report::RelayWindow {
+                        delay_p99_ms: f64::from(st.delay_p99_us) / 1000.0,
+                        delay_max_ms: f64::from(st.delay_max_us) / 1000.0,
+                        arrivals: report::relay_arrivals(&st.ports, &relay_roles),
+                    })
                 }
                 None => None,
             };
@@ -216,7 +223,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 &sender.take_window(),
                 up_instrument.take_window(),
                 up_voice.as_ref().map(|u| u.take_window()),
-                relay_delay,
+                relay_window,
             );
             progress(musicians, t - start_s, &row, &peer_rows);
             machine_rows.push(row);
@@ -315,10 +322,17 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
 
 /// Le port que l'agent doit joindre pour ce transport du banc : celui du relais
 /// en mode réseau, le sien sinon.
-async fn agent_port(relay: &mut Option<RelayClient>, bind_ip: &str, bench_port: u16) -> Result<u16, String> {
+async fn agent_port(
+    relay: &mut Option<RelayClient>,
+    roles: &mut HashMap<std::net::SocketAddr, Transport>,
+    role: Transport,
+    bind_ip: &str,
+    bench_port: u16,
+) -> Result<u16, String> {
     match relay {
         Some(r) => {
             let bench: std::net::SocketAddr = format!("{bind_ip}:{bench_port}").parse().map_err(|e| format!("{e}"))?;
+            roles.insert(bench, role);
             r.open(bench).await
         }
         None => Ok(bench_port),
@@ -396,8 +410,12 @@ fn progress(musicians: u32, t_step: f64, m: &MachineRow, peers: &[PeerRow]) {
         targets.push(r.get("bufferTargetMs"));
     }
     let target = targets.iter().copied().filter(|v| v.is_finite()).fold(f64::NAN, f64::max);
+    // Mode relais : coupures déjà présentes EN ARRIVANT au relais (aller).
+    let relay = m.relay_in.map_or(String::new(), |a| {
+        format!(" | coupures à l'arrivée au relais {} (reçus) / {} (envoyé)", a.down_gaps_over_10ms, a.up_gaps_over_10ms)
+    });
     println!(
-        "[{musicians} mus. {:>4.0} s] trous cumulés {:>4.0} | cible max {:>5.1} ms | CPU {:>5.1} % | banc en retard max {:>5.2} ms",
+        "[{musicians} mus. {:>4.0} s] trous cumulés {:>4.0} | cible max {:>5.1} ms | CPU {:>5.1} % | banc en retard max {:>5.2} ms{relay}",
         t_step, underruns, target, m.cpu_pct, m.sender_late_max_ms
     );
 }

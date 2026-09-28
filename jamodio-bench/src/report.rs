@@ -7,7 +7,9 @@
 //!
 //! Tout est calculé ici, sans réseau ni carte son : testable aux bords.
 
+use crate::relay::{PortWindow, Transport};
 use crate::server::{SenderWindow, UplinkWindow};
+use std::net::SocketAddr;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -75,6 +77,57 @@ pub struct MachineRow {
     /// Mode relais : délai ajouté par le relais (p99, max), en ms ; `NaN` en local.
     pub relay_delay_p99_ms: f64,
     pub relay_delay_max_ms: f64,
+    /// Mode relais : régularité de ce qui arrive AU relais (trajet aller).
+    pub relay_in: Option<RelayArrivals>,
+}
+
+/// Mode relais, une seconde : ce qui arrive au relais depuis la machine
+/// mesurée (trajet ALLER), flux instrument seulement — la voix se tait par
+/// nature, ses écarts ne disent rien du réseau.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RelayArrivals {
+    /// Instruments que le banc envoie à l'agent (les « musiciens simulés »).
+    pub down_max_gap_ms: f64,
+    pub down_gaps_over_10ms: u64,
+    /// Combien de ces flux ont eu au moins une coupure dans la seconde : un
+    /// blocage commun les touche tous à la fois.
+    pub down_flows_with_gap: u32,
+    /// Instrument que l'agent envoie.
+    pub up_max_gap_ms: f64,
+    pub up_gaps_over_10ms: u64,
+}
+
+/// Ce que dit le relais d'une seconde, rapporté aux transports du banc
+/// (`roles` : transport du banc → nature). Un port inconnu est ignoré.
+pub fn relay_arrivals(ports: &[PortWindow], roles: &HashMap<SocketAddr, Transport>) -> RelayArrivals {
+    let mut a = RelayArrivals::default();
+    let ms = |us: u64| us as f64 / 1000.0;
+    for p in ports {
+        match roles.get(&p.bench) {
+            Some(Transport::DownInstrument) => {
+                a.down_max_gap_ms = a.down_max_gap_ms.max(ms(p.from_bench.max_gap_us));
+                a.down_gaps_over_10ms += p.from_bench.gaps_over_10ms;
+                if p.from_bench.gaps_over_10ms > 0 {
+                    a.down_flows_with_gap += 1;
+                }
+            }
+            Some(Transport::UpInstrument) => {
+                a.up_max_gap_ms = a.up_max_gap_ms.max(ms(p.from_agent.max_gap_us));
+                a.up_gaps_over_10ms += p.from_agent.gaps_over_10ms;
+            }
+            Some(Transport::DownVoice | Transport::UpVoice) | None => {}
+        }
+    }
+    a
+}
+
+/// Mode relais : le relevé d'une seconde (délai propre du relais, en ms, et
+/// arrivées au relais).
+#[derive(Debug, Clone, Copy)]
+pub struct RelayWindow {
+    pub delay_p99_ms: f64,
+    pub delay_max_ms: f64,
+    pub arrivals: RelayArrivals,
 }
 
 /// Lignes « flux » d'un message `perf-stats`. `names` : identifiant du flux →
@@ -104,7 +157,7 @@ pub fn machine_row(
     sender: &SenderWindow,
     up_instrument: UplinkWindow,
     up_voice: Option<UplinkWindow>,
-    relay_delay_ms: Option<(f64, f64)>,
+    relay: Option<RelayWindow>,
 ) -> MachineRow {
     let num = |k: &str| perf.and_then(|p| p[k].as_f64()).unwrap_or(f64::NAN);
     let mut late = sender.late_us.clone();
@@ -128,8 +181,9 @@ pub fn machine_row(
         sender_late_max_ms: pct(1.0),
         up_instrument,
         up_voice,
-        relay_delay_p99_ms: relay_delay_ms.map_or(f64::NAN, |d| d.0),
-        relay_delay_max_ms: relay_delay_ms.map_or(f64::NAN, |d| d.1),
+        relay_delay_p99_ms: relay.map_or(f64::NAN, |r| r.delay_p99_ms),
+        relay_delay_max_ms: relay.map_or(f64::NAN, |r| r.delay_max_ms),
+        relay_in: relay.map(|r| r.arrivals),
     }
 }
 
@@ -164,8 +218,20 @@ pub fn machine_csv(rows: &[MachineRow]) -> String {
         "t_s,musicians,cpu_pct,callback_deficit_out,output_block_frames,sender_sent,sender_errors,\
 sender_late_p99_ms,sender_late_max_ms,up_instr_packets,up_instr_max_gap_ms,up_instr_gaps_over_10ms,\
 up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10ms,up_voice_seq_missing,\
-relay_delay_p99_ms,relay_delay_max_ms\n",
+relay_delay_p99_ms,relay_delay_max_ms,relay_in_down_max_gap_ms,relay_in_down_gaps_over_10ms,\
+relay_in_down_flows_with_gap,relay_in_up_max_gap_ms,relay_in_up_gaps_over_10ms\n",
     );
+    let relay_in = |a: Option<&RelayArrivals>| match a {
+        Some(a) => format!(
+            "{},{},{},{},{}",
+            fmt(a.down_max_gap_ms),
+            a.down_gaps_over_10ms,
+            a.down_flows_with_gap,
+            fmt(a.up_max_gap_ms),
+            a.up_gaps_over_10ms
+        ),
+        None => ",,,,".into(),
+    };
     let up = |w: Option<&UplinkWindow>| match w {
         Some(w) => format!(
             "{},{},{},{}",
@@ -179,7 +245,7 @@ relay_delay_p99_ms,relay_delay_max_ms\n",
     for r in rows {
         let _ = writeln!(
             s,
-            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.t_s,
             r.musicians,
             fmt(r.cpu_pct),
@@ -193,6 +259,7 @@ relay_delay_p99_ms,relay_delay_max_ms\n",
             up(r.up_voice.as_ref()),
             fmt(r.relay_delay_p99_ms),
             fmt(r.relay_delay_max_ms),
+            relay_in(r.relay_in.as_ref()),
         );
     }
     s
@@ -251,6 +318,9 @@ pub struct StepSummary {
     pub sender_late_max_ms: f64,
     pub up_instrument_gaps: u64,
     pub up_voice_gaps: Option<u64>,
+    /// Mode relais : coupures déjà présentes à l'ARRIVÉE au relais (trajet
+    /// aller) — instruments envoyés par le banc, instrument envoyé par l'agent.
+    pub relay_in_gaps: Option<(u64, u64)>,
 }
 
 /// Seuil d'une seconde « en retard » pour la sortie : 1 % des callbacks
@@ -325,6 +395,10 @@ pub fn summarize(peers: &[PeerRow], machine: &[MachineRow], musicians: u32, from
         })
         .count() as u32;
     let voice_gaps = m.iter().filter_map(|r| r.up_voice.as_ref().map(|w| w.gaps_over_10ms)).reduce(|a, b| a + b);
+    let relay_in_gaps = m
+        .iter()
+        .filter_map(|r| r.relay_in.map(|a| (a.down_gaps_over_10ms, a.up_gaps_over_10ms)))
+        .reduce(|x, y| (x.0 + y.0, x.1 + y.1));
     StepSummary {
         musicians,
         seconds: to_s - from_s,
@@ -343,6 +417,7 @@ pub fn summarize(peers: &[PeerRow], machine: &[MachineRow], musicians: u32, from
         sender_late_max_ms: percentile(m.iter().map(|r| r.sender_late_max_ms).collect(), 1.0),
         up_instrument_gaps: m.iter().map(|r| r.up_instrument.gaps_over_10ms).sum(),
         up_voice_gaps: voice_gaps,
+        relay_in_gaps,
     }
 }
 
@@ -476,13 +551,14 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
         "\n## Par palier (instruments reçus)\n\n\
 | Musiciens | Trous/min | arrivée | réception | décodage | consommation | séquence | non classé | après « tampon tient » \
 | Cible médiane (ms) | Cible p95 (ms) | dont gigue / anti-trou / réactif (ms) | CPU méd. / max (%) \
-| Sortie en retard (s) | Retard max du banc (ms) | Coupures instrument envoyé | Coupures voix envoyée |\n\
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+| Sortie en retard (s) | Retard max du banc (ms) | Coupures instrument envoyé | Coupures voix envoyée \
+| Coupures à l'arrivée au relais (reçus / envoyé) |\n\
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for st in steps {
         let _ = writeln!(
             s,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} / {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} / {} | {} / {} | {} | {} | {} | {} | {} |",
             st.musicians,
             cell(st.underruns_per_min),
             cell(st.holes_per_min[0]),
@@ -503,6 +579,7 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
             cell(st.sender_late_max_ms),
             st.up_instrument_gaps,
             st.up_voice_gaps.map_or("—".into(), |g| g.to_string()),
+            st.relay_in_gaps.map_or("—".into(), |(d, u)| format!("{d} / {u}")),
         );
     }
     s.push_str("\n## Critères (validés le 28/09/2026)\n\n");
@@ -514,6 +591,16 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
 calendrier. S'il approche la queue de gigue du profil, c'est le banc qui fait la gigue, \
 pas le réseau simulé — à lire avant tout le reste.\n",
     );
+    if steps.iter().any(|st| st.relay_in_gaps.is_some()) {
+        s.push_str(
+            "\n« Coupures à l'arrivée au relais » : écarts de plus de 10 ms entre deux paquets d'un même \
+flux instrument, vus EN ARRIVANT au relais (datés par son système quand il le permet). Tout ce \
+qui y arrive vient de la machine mesurée : présentes ici, les coupures naissent À L'ALLER \
+(envoi de la machine mesurée, câble, réception du relais) ; absentes ici mais présentes dans les \
+trous « arrivée » de l'agent, elles naissent AU RETOUR (envoi du relais, câble, réception de la \
+machine mesurée).\n",
+        );
+    }
     s
 }
 
@@ -594,6 +681,7 @@ mod tests {
             sender_late_max_ms: 0.5,
             up_instrument_gaps: 0,
             up_voice_gaps: None,
+            relay_in_gaps: None,
         }
     }
 
@@ -630,6 +718,63 @@ mod tests {
         assert!(precision(&v).0.starts_with("À SURVEILLER"));
         assert!(precision(&[0.3, 2.0, 4.0]).0.starts_with("INSUFFISANTE"));
         assert!(!precision(&[]).1);
+    }
+
+    /// Seuls les flux instrument comptent, chacun dans son sens ; un blocage
+    /// commun se voit au nombre de flux touchés dans la seconde.
+    #[test]
+    fn les_arrivees_au_relais_se_lisent_par_sens_et_par_nature() {
+        use crate::relay::GapWindow;
+        let addr = |p: u16| -> SocketAddr { format!("192.168.1.20:{p}").parse().unwrap() };
+        let gw = |max_gap_us: u64, gaps: u64| GapWindow { packets: 400, max_gap_us, gaps_over_10ms: gaps };
+        let port = |p: u16, from_bench: GapWindow, from_agent: GapWindow| PortWindow { bench: addr(p), from_bench, from_agent };
+        let roles = HashMap::from([
+            (addr(1), Transport::DownInstrument),
+            (addr(2), Transport::DownInstrument),
+            (addr(3), Transport::DownVoice),
+            (addr(4), Transport::UpInstrument),
+        ]);
+        let ports = [
+            port(1, gw(16_000, 1), gw(100_000, 1)), // perçages de l'agent : pas du trajet mesuré
+            port(2, gw(17_500, 2), GapWindow::default()),
+            port(3, gw(900_000, 5), GapWindow::default()), // voix : se tait par nature
+            port(4, GapWindow::default(), gw(12_000, 1)),
+            port(9, gw(50_000, 9), GapWindow::default()), // port inconnu
+        ];
+        let a = relay_arrivals(&ports, &roles);
+        assert_eq!(
+            a,
+            RelayArrivals {
+                down_max_gap_ms: 17.5,
+                down_gaps_over_10ms: 3,
+                down_flows_with_gap: 2,
+                up_max_gap_ms: 12.0,
+                up_gaps_over_10ms: 1
+            }
+        );
+    }
+
+    #[test]
+    fn le_resume_ne_parle_du_relais_qu_en_mode_relais() {
+        let local = markdown(&[], &[step(2, 5.0, 0.0)], &[]);
+        assert!(local.contains("| — |") && !local.contains("« Coupures à l'arrivée au relais » :"));
+        let mut st = step(2, 5.0, 0.0);
+        st.relay_in_gaps = Some((12, 3));
+        let relais = markdown(&[], &[st], &[]);
+        assert!(relais.contains("| 12 / 3 |") && relais.contains("naissent À L'ALLER"), "{relais}");
+    }
+
+    #[test]
+    fn le_csv_machine_a_autant_de_colonnes_en_local_qu_en_relais() {
+        let local = MachineRow::default();
+        let relais = MachineRow {
+            relay_in: Some(RelayArrivals { down_max_gap_ms: 16.0, down_gaps_over_10ms: 2, down_flows_with_gap: 2, up_max_gap_ms: 3.0, up_gaps_over_10ms: 0 }),
+            ..Default::default()
+        };
+        let csv = machine_csv(&[local, relais]);
+        let n: Vec<usize> = csv.lines().map(|l| l.split(',').count()).collect();
+        assert!(n.iter().all(|&c| c == n[0]), "{csv}");
+        assert!(csv.lines().nth(2).unwrap().ends_with(",16.000,2,2,3.000,0"), "{csv}");
     }
 
     #[test]

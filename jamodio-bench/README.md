@@ -70,6 +70,10 @@ Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
   ```
   Le relais ne lit ni ne modifie rien (chiffrement de bout en bout banc ↔
   agent) ; il mesure son propre délai, que le résumé rappelle (« Relais »).
+  Il mesure aussi les **coupures déjà présentes en arrivant chez lui** (colonne
+  « Coupures à l'arrivée au relais », et à l'écran pendant le banc) : tout ce
+  qui y arrive vient de la machine mesurée, donc présentes → elles naissent à
+  l'ALLER ; absentes alors que l'agent a des trous « arrivée » → au RETOUR.
   Autoriser `session-bench` dans le pare-feu des deux machines.
 - Test automatique associé, sans matériel :
   `cargo test -p jamodio-agent scale_tests` (garde-fou) et

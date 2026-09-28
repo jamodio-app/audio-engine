@@ -23,7 +23,17 @@
 //! entre le banc et l'agent). Le relais MESURE son propre délai (heure de
 //! réception par le système → réexpédition) : s'il ajoute de la gigue, le
 //! résumé du banc le dit au lieu de l'imputer au réseau ou à l'agent.
+//!
+//! Il mesure aussi la RÉGULARITÉ de ce qui lui arrive, sens par sens (écarts
+//! entre paquets d'un même flux, datés par le système quand il le permet).
+//! Banc et agent tournent sur la machine mesurée : tout ce qui arrive au relais
+//! a fait le trajet ALLER (machine mesurée → relais). Banc du 28/09 (NUC →
+//! Mac en Ethernet) : blocages de 10 à 20 ms sur tous les flux à la fois, sans
+//! savoir s'ils naissent à l'aller ou au retour — des écarts déjà présents à
+//! l'arrivée au relais les placent à l'aller (envoi de la machine mesurée,
+//! câble, réception du relais), leur absence au retour.
 
+use crate::server::CUT_GAP_US;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -60,12 +70,68 @@ pub struct Reply {
     pub delay_p99_us: u32,
     #[serde(default)]
     pub delay_max_us: u32,
+    /// Régularité des arrivées, port par port (un port = un transport du banc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortWindow>,
+}
+
+/// Nature d'un transport du banc, pour lire les mesures du relais : « Down » =
+/// flux que le banc envoie à l'agent (un musicien simulé), « Up » = flux que
+/// l'agent envoie au banc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    DownInstrument,
+    DownVoice,
+    UpInstrument,
+    UpVoice,
+}
+
+/// Arrivées d'un sens sur la fenêtre : paquets, plus grand écart entre deux
+/// paquets consécutifs, écarts de plus de `CUT_GAP_US`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapWindow {
+    pub packets: u64,
+    pub max_gap_us: u64,
+    pub gaps_over_10ms: u64,
+}
+
+/// Les deux sens d'un port de relais : ce qui arrive du banc (flux « reçus »
+/// par l'agent) et ce qui arrive de l'agent (son instrument, son talkback, ses
+/// perçages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortWindow {
+    /// Transport du banc servi par ce port (tel qu'il l'a demandé).
+    pub bench: SocketAddr,
+    pub from_bench: GapWindow,
+    pub from_agent: GapWindow,
+}
+
+/// Écarts entre arrivées successives d'UN sens d'UN port. Fonction pure du
+/// temps donné : testée sans réseau.
+#[derive(Default)]
+struct GapTracker {
+    last: Option<Instant>,
+}
+
+impl GapTracker {
+    fn observe(&mut self, at: Instant, w: &mut GapWindow) {
+        w.packets += 1;
+        if let Some(prev) = self.last {
+            let gap = at.saturating_duration_since(prev).as_micros().min(u64::MAX as u128) as u64;
+            w.max_gap_us = w.max_gap_us.max(gap);
+            if gap > CUT_GAP_US {
+                w.gaps_over_10ms += 1;
+            }
+        }
+        self.last = Some(at);
+    }
 }
 
 /// Mesures partagées par les ports de relais d'une session de contrôle.
 #[derive(Default)]
 struct Window {
     delays_us: Vec<u32>,
+    ports: std::collections::HashMap<SocketAddr, PortWindow>,
 }
 
 /// Lance le relais : écoute le contrôle sur `listen:port`, une session de banc
@@ -125,10 +191,19 @@ fn session(stream: TcpStream, listen: IpAddr) -> Result<(), String> {
 }
 
 fn take_stats(window: &Mutex<Window>) -> Reply {
-    let mut d = std::mem::take(&mut window.lock().unwrap().delays_us);
+    let (mut d, ports) = {
+        let mut w = window.lock().unwrap();
+        (std::mem::take(&mut w.delays_us), std::mem::take(&mut w.ports))
+    };
     d.sort_unstable();
     let pct = |p: f64| d.get(((d.len().max(1) - 1) as f64 * p).round() as usize).copied().unwrap_or(0);
-    Reply { forwarded: d.len() as u64, delay_p99_us: pct(0.99), delay_max_us: pct(1.0), ..Reply::default() }
+    Reply {
+        forwarded: d.len() as u64,
+        delay_p99_us: pct(0.99),
+        delay_max_us: pct(1.0),
+        ports: ports.into_values().collect(),
+        ..Reply::default()
+    }
 }
 
 /// Ouvre un port de relais pour le transport `bench` et lance son fil.
@@ -155,6 +230,7 @@ fn forward(socket: UdpSocket, bench: SocketAddr, stop: Arc<AtomicBool>, window: 
     let _ = crate::rt::promote_current_thread();
     let stamped = jamodio_audio_core::net::rx_timestamp::enable(raw(&socket)).is_ok();
     let mut agent: Option<SocketAddr> = None;
+    let (mut from_bench, mut from_agent) = (GapTracker::default(), GapTracker::default());
     let mut buf = [0u8; 2048];
     while !stop.load(Ordering::Relaxed) {
         let r = if stamped {
@@ -172,7 +248,10 @@ fn forward(socket: UdpSocket, bench: SocketAddr, stop: Arc<AtomicBool>, window: 
             // Délai de lecture écoulé sans paquet : on revérifie `stop`.
             Err(_) => continue,
         };
-        let to = if r.from == bench {
+        // Arrivée datée par le système quand il le permet, sinon à la lecture.
+        let arrived_at = r.stack_delay.and_then(|d| read_at.checked_sub(d)).unwrap_or(read_at);
+        let is_bench = r.from == bench;
+        let to = if is_bench {
             match agent {
                 Some(a) => a,
                 None => continue, // l'agent n'a pas encore percé
@@ -181,9 +260,21 @@ fn forward(socket: UdpSocket, bench: SocketAddr, stop: Arc<AtomicBool>, window: 
             agent = Some(r.from);
             bench
         };
-        if socket.send_to(&buf[..r.len], to).is_ok() {
-            let delay = read_at.elapsed() + r.stack_delay.unwrap_or_default();
-            window.lock().unwrap().delays_us.push(delay.as_micros().min(u32::MAX as u128) as u32);
+        let sent = socket.send_to(&buf[..r.len], to).is_ok();
+        let delay = read_at.elapsed() + r.stack_delay.unwrap_or_default();
+        let mut w = window.lock().unwrap();
+        let port = w.ports.entry(bench).or_insert(PortWindow {
+            bench,
+            from_bench: GapWindow::default(),
+            from_agent: GapWindow::default(),
+        });
+        if is_bench {
+            from_bench.observe(arrived_at, &mut port.from_bench);
+        } else {
+            from_agent.observe(arrived_at, &mut port.from_agent);
+        }
+        if sent {
+            w.delays_us.push(delay.as_micros().min(u32::MAX as u128) as u32);
         }
     }
 }
@@ -286,6 +377,49 @@ mod tests {
         let st = client.stats().await.unwrap();
         assert_eq!(st.forwarded, 2);
         assert!(st.delay_max_us < 100_000, "{st:?}");
+        // Chaque sens est compté sur le port du transport du banc.
+        assert_eq!(st.ports.len(), 1, "{st:?}");
+        let p = st.ports[0];
+        assert_eq!(p.bench, bench.local_addr().unwrap());
+        assert_eq!((p.from_bench.packets, p.from_agent.packets), (1, 1));
+
+        // Un blocage de l'envoi du banc (≥ 30 ms : un sommeil n'est jamais plus
+        // court que demandé) se voit à l'ARRIVÉE au relais.
+        bench.send_to(b"a", relay).unwrap();
+        agent.recv_from(&mut buf).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        bench.send_to(b"b", relay).unwrap();
+        agent.recv_from(&mut buf).unwrap();
+        let st = client.stats().await.unwrap();
+        let p = st.ports[0];
+        assert_eq!(p.from_bench.packets, 2);
+        // (≥ 1 : l'écart avec le paquet précédent, avant le relevé, dépend de
+        // la vitesse de la machine de test — on ne suppose aucune durée.)
+        assert!(p.from_bench.gaps_over_10ms >= 1 && p.from_bench.max_gap_us >= 30_000, "{p:?}");
+        assert_eq!(p.from_agent, GapWindow::default(), "rien n'est venu de l'agent : fenêtre vide");
+    }
+
+    #[test]
+    fn un_ecart_se_mesure_entre_deux_arrivees_du_meme_sens() {
+        let t0 = Instant::now();
+        let at = |us: u64| t0 + Duration::from_micros(us);
+        let (mut g, mut w) = (GapTracker::default(), GapWindow::default());
+        // Flux régulier (2,5 ms), puis un blocage de 15 ms, puis régulier.
+        for us in [0, 2_500, 5_000, 20_000, 22_500] {
+            g.observe(at(us), &mut w);
+        }
+        assert_eq!(w, GapWindow { packets: 5, max_gap_us: 15_000, gaps_over_10ms: 1 });
+        // Exactement 10 ms n'est pas une coupure (même seuil que le banc).
+        let (mut g, mut w) = (GapTracker::default(), GapWindow::default());
+        g.observe(at(0), &mut w);
+        g.observe(at(10_000), &mut w);
+        assert_eq!(w.gaps_over_10ms, 0);
+    }
+
+    #[test]
+    fn une_reponse_d_un_ancien_relais_se_lit_sans_ports() {
+        let r: Reply = serde_json::from_str(r#"{"forwarded":3,"delay_p99_us":10,"delay_max_us":12}"#).unwrap();
+        assert!(r.ports.is_empty());
     }
 
     #[test]
