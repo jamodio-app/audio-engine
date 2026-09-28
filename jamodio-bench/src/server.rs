@@ -290,8 +290,39 @@ fn send_loop(
             .map(|s| s.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::from_micros(FRAME_US))
             .min(Duration::from_millis(5));
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
+        wait_precisely(Instant::now() + wait);
+    }
+}
+
+/// Marge de fin d'attente tenue ACTIVEMENT (Windows seulement).
+///
+/// Le réveil d'un `sleep` Windows déborde, même en MMCSS : 0,4 ms médian et
+/// jusqu'à ~1 ms (sonde du 19/09/2026), et le `selftest` du NUC (28/09/2026)
+/// a vu le banc envoyer jusqu'à 2,2 ms en retard presque chaque seconde. Le
+/// banc dort donc jusqu'à `SPIN_MARGIN` avant l'échéance, puis la tient en
+/// tournant. Coût : jusqu'à `SPIN_MARGIN` de calcul par échéance (une toutes les
+/// 2,5 ms avec des flux alignés) — le prix d'un banc plus précis que ce qu'il
+/// mesure ; `selftest` en donne le résultat. macOS n'en a pas besoin (réveil à
+/// ~0,1 ms en priorité temps réel) : attente simple.
+#[cfg(windows)]
+const SPIN_MARGIN: Duration = Duration::from_micros(1_200);
+
+fn wait_precisely(until: Instant) {
+    #[cfg(windows)]
+    {
+        let now = Instant::now();
+        if until > now + SPIN_MARGIN {
+            std::thread::sleep(until - now - SPIN_MARGIN);
+        }
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let now = Instant::now();
+        if until > now {
+            std::thread::sleep(until - now);
         }
     }
 }
