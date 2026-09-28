@@ -7487,16 +7487,23 @@ mod conceal_loop_tests {
     /// avant le trou — la réception de l'agent l'a lu trop tard.
     #[test]
     fn un_paquet_dans_la_machine_mais_lu_apres_le_trou_accuse_la_reception() {
+        // L'heure d'arrivée dans la machine est prise AVANT le trou : le test ne
+        // dépend d'aucune durée (la CI a déjà fait durer une pause de 5 ms plus
+        // de 20 ms, 28/09/2026).
         let (mixer, mut st) = apres_un_paquet();
+        let dans_la_machine = Instant::now();
         tirer_jusqu_au_trou(&mixer);
-        std::thread::sleep(Duration::from_millis(5));
-        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
         assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
         // Arrivé dans la machine APRÈS le trou : en amont.
         let (mixer, mut st) = apres_un_paquet();
         tirer_jusqu_au_trou(&mixer);
-        std::thread::sleep(Duration::from_millis(5));
-        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_micros(100)));
+        let dans_la_machine = Instant::now();
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
         assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
     }
 
@@ -7538,13 +7545,15 @@ mod conceal_loop_tests {
     #[test]
     fn un_trou_releve_par_un_masquage_se_classe_au_paquet_suivant() {
         let (mixer, mut st) = apres_un_paquet();
+        let dans_la_machine = Instant::now();
         tirer_jusqu_au_trou(&mixer);
         let r = mixer.push_samples("peer-test", &vec![0.0f32; 240]).unwrap();
         note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
         assert_eq!(st.holes, HoleCounts::default(), "pas encore classé");
         assert!(st.pending_hole.is_some());
-        std::thread::sleep(Duration::from_millis(5));
-        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
         assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
         assert!(st.pending_hole.is_none());
     }
