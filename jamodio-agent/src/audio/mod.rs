@@ -7,6 +7,8 @@ pub mod asio_host;
 pub mod asio_probe;
 /// Diagnostic des craquements : blocs audio en retard ou hors budget (cf. module).
 pub mod callback_health;
+/// Le rate réellement livré par un pilote contredit-il celui qu'il déclare ? (cf. module)
+pub mod rate_check;
 pub mod buffer_policy;
 pub mod buffer_size;
 pub mod com_exec;
@@ -18,6 +20,8 @@ pub mod hardware_presence;
 pub mod host;
 pub mod capture;
 pub mod voice_capture;
+/// File capture → étage voix bornée en durée + surveillance de saturation (cf. module).
+pub mod voice_tap;
 pub mod output_pair;
 pub mod playback;
 pub mod midi;

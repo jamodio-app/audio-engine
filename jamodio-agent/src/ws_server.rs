@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
+use crate::audio::rate_check::{resolve_measured_rate, RateSample, RateVerdict};
 use crate::pipeline::{PipelineState, ProducerNetStats};
 
 /// Timeout sur les locks `pipeline.lock().await` dans les handlers heartbeat.
@@ -1160,6 +1161,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let capturing_now = matches!(pl.state, AgentState::Capturing);
             // Ce que le musicien ENTEND (sortie casque), pic de la seconde.
             let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
+            // Talkback : coût de l'isolation de voix et voix perdue devant l'étage
+            // voix sur la fenêtre (cf. `audio::voice_tap`). Zéros hors talkback.
+            let voice_stage = pl.perfstats.voice_stage.drain();
             // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
             // callback correspondant n'a pas encore tourné : on publie alors
             // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
@@ -1651,6 +1655,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // lignes se distinguent.
                 output_clip_samples = clip_samples,
                 output_total_samples = total_samples,
+                // Talkback — charge de l'isolation en % d'un cœur (> 100 % =
+                // l'étage voix ne suit pas le temps réel), pire bloc, voix perdue.
+                voice_iso_load_pct = voice_stage.iso_load_pct,
+                voice_iso_max_block_ms = voice_stage.iso_max_block_ms,
+                voice_dropped_ms = voice_stage.dropped_ms,
                 pid = std::process::id(),
                 "perfstats snapshot"
             );
@@ -2312,15 +2321,11 @@ async fn audio_liveness_supervisor(
     // + erreur browser. Débounce (N fenêtres consécutives) pour ne JAMAIS tuer une
     // session saine sur un glitch de mesure transitoire. Cas le plus fréquent (44,1
     // avec kAsioResetRequest) reste capté en amont par le chemin reset (rate_drift_stop).
+    // La décision (tolérance, rattachement à un rate standard, exclusion des trous
+    // de livraison) est celle de l'ouverture : `audio::rate_check`, une seule règle.
     const DETECTOR_WINDOW: Duration = Duration::from_secs(2);
-    // Tolérance relative : au-delà = écart franc. Mesure sur 2 s (~1500 callbacks
-    // à 48 k/64) → précision ~0,1 %, donc 6 % est très au-dessus du bruit ET capte
-    // un vrai 44,1 (écart 8,1 %) — le cas « driver qui ment/dérive vers 44,1 ».
-    // Les re-clocks grossiers (11025=77 %, 33438=30 %) sont a fortiori captés.
-    const DETECTOR_TOLERANCE: f64 = 0.06;
-    // Nb de fenêtres consécutives en écart avant hard-stop (anti-faux-positif).
-    const DETECTOR_DEBOUNCE: u32 = 2;
     let mut detector_prev_cap = 0u64;
+    let mut detector_prev_stall_us = 0u64;
     let mut detector_window_start = Instant::now();
     let mut detector_mismatch_streak: u32 = 0;
 
@@ -2387,7 +2392,7 @@ async fn audio_liveness_supervisor(
         }
 
         // Observation atomique (lock bref).
-        let (state_capturing, has_stream, has_output, cap, out, input_device) = {
+        let (state_capturing, has_stream, has_output, cap, out, stall_us, input_device) = {
             let pl = pipeline.lock().await;
             (
                 matches!(pl.state, AgentState::Capturing),
@@ -2395,6 +2400,7 @@ async fn audio_liveness_supervisor(
                 pl.has_playback_stream(),
                 pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
                 pl.perfstats.output_callbacks.load(Ordering::Relaxed),
+                pl.perfstats.callback_health.stall_us_total(),
                 pl.input_device_name(),
             )
         };
@@ -2427,6 +2433,8 @@ async fn audio_liveness_supervisor(
             last_default_out = None; // hors session : oublie la base de suivi OS
             silent_rebuilds = 0;     // rien à reprocher à la prochaine interface
             detector_prev_cap = cap; // re-base le détecteur à l'entrée en session
+            detector_prev_stall_us = stall_us;
+            detector_mismatch_streak = 0; // aucune fenêtre d'une session passée ne compte
             detector_window_start = Instant::now();
             last_disruption = Instant::now(); // hors capture : rien de jugeable
             continue;
@@ -2434,8 +2442,17 @@ async fn audio_liveness_supervisor(
 
         // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE. Toutes les
         // `DETECTOR_WINDOW`, on déduit le rate réel du driver de son débit de
-        // callbacks et on le confronte au 48 kHz assumé. Écart franc PERSISTANT
-        // (débounce) = re-clock silencieux → HARD-STOP. Sondage hors thread audio.
+        // callbacks et on le confronte au 48 kHz assumé. Livraison PERSISTANTE à
+        // un autre rate standard (débounce) = re-clock silencieux → HARD-STOP.
+        // Sondage hors thread audio.
+        //
+        // Le temps passé dans des TROUS de livraison est exclu de la mesure, comme
+        // à l'ouverture : cas Guillaume H. (UR22C, 26/09/2026, agent 0.6.6-2), le
+        // pilote Yamaha fait en session des trous de ~300 ms (notre callback
+        // < 0,5 ms) ; une fenêtre de 2 s en contenant un « mesurait » 41 644 Hz,
+        // deux fenêtres de suite coupaient la session en accusant une interface
+        // restée à 48 kHz. Le trou est un défaut réel (il s'entend et se trace en
+        // « CALLBACK AUDIO IRRÉGULIER »), pas un changement de fréquence.
         if detector_window_start.elapsed() >= DETECTOR_WINDOW {
             // Fenêtre traversée par une INTERRUPTION (reconstruction, flatline,
             // mode dégradé) → mesure faite sur du silence : on la JETTE et on
@@ -2445,8 +2462,6 @@ async fn audio_liveness_supervisor(
                 detector_window_start.elapsed(),
                 last_disruption.elapsed(),
             );
-            let elapsed = detector_window_start.elapsed().as_secs_f64();
-            let cb_delta = cap.saturating_sub(detector_prev_cap);
             // `input_frames` = frames RÉELLEMENT livrés par callback (publié à
             // chaque callback, cf. `capture::log_first_callback`), donc robuste au
             // cas où le driver ASIO ignore notre `Fixed(N)` et délivre sa propre
@@ -2459,43 +2474,52 @@ async fn audio_liveness_supervisor(
                     pl.perfstats.input_frames.load(Ordering::Relaxed),
                 )
             };
-            // Détecteur inerte tant que la géométrie n'est pas connue (frames = 0
-            // avant le 1er callback) ou que le rate assumé est nul (pas encore de
-            // capture confirmée).
-            let mut hard_stop_sr: Option<u32> = None;
-            if window_clean && assumed_sr > 0 && frames_per_cb > 0 && elapsed > 0.0 && cb_delta > 0 {
-                let cb_per_sec = cb_delta as f64 / elapsed;
-                let measured_sr = cb_per_sec * frames_per_cb as f64;
-                let rel_err = (measured_sr - assumed_sr as f64).abs() / assumed_sr as f64;
-                if rel_err > DETECTOR_TOLERANCE {
-                    detector_mismatch_streak += 1;
-                    tracing::warn!(
-                        target: "jamodio::ws",
-                        assumed_sr,
-                        measured_sr = measured_sr as u32,
-                        frames_per_cb,
-                        cb_per_sec = cb_per_sec as u32,
-                        streak = detector_mismatch_streak,
-                        "dérive de rate détectée (débit de callbacks ≠ 48 kHz assumé)"
-                    );
-                    if detector_mismatch_streak >= DETECTOR_DEBOUNCE {
-                        hard_stop_sr = Some(measured_sr as u32);
-                    }
-                } else {
-                    detector_mismatch_streak = 0; // fenêtre saine → reset du débounce
-                }
-            } else if !window_clean {
-                // Interruption dans la fenêtre : la mesure ne veut rien dire, et le
-                // débounce ne doit RIEN garder d'une fenêtre jetée.
-                detector_mismatch_streak = 0;
+            let sample = RateSample {
+                declared_sr: assumed_sr,
+                frames_per_cb,
+                callbacks: cap.saturating_sub(detector_prev_cap),
+                window_us: detector_window_start.elapsed().as_micros() as u64,
+                stall_us: stall_us.saturating_sub(detector_prev_stall_us),
+            };
+            // Interruption dans la fenêtre : la mesure ne veut rien dire, et le
+            // débounce ne doit RIEN garder d'une fenêtre jetée.
+            let verdict = if window_clean {
+                resolve_measured_rate(&sample)
+            } else {
+                RateVerdict::NotMeasurable
+            };
+            let hard_stop_sr = drift_detector_step(&mut detector_mismatch_streak, verdict);
+            match verdict {
+                RateVerdict::Lies { actual_sr, measured_sr } => tracing::warn!(
+                    target: "jamodio::ws",
+                    assumed_sr,
+                    actual_sr,
+                    measured_sr,
+                    frames_per_cb,
+                    callbacks = sample.callbacks,
+                    stall_ms = sample.stall_us / 1000,
+                    streak = detector_mismatch_streak,
+                    "dérive de rate détectée (le pilote livre un autre rate standard que le 48 kHz assumé)"
+                ),
+                RateVerdict::Inconclusive { measured_sr } => tracing::warn!(
+                    target: "jamodio::ws",
+                    assumed_sr,
+                    measured_sr,
+                    frames_per_cb,
+                    callbacks = sample.callbacks,
+                    stall_ms = sample.stall_us / 1000,
+                    "cadence de callbacks hors de tout rate standard — mesure non concluante, session conservée"
+                ),
+                RateVerdict::Confirmed { .. } | RateVerdict::NotMeasurable => {}
             }
             detector_prev_cap = cap;
+            detector_prev_stall_us = stall_us;
             detector_window_start = Instant::now();
 
-            if let Some(measured) = hard_stop_sr {
+            if let Some(actual_sr) = hard_stop_sr {
                 tracing::warn!(
                     target: "jamodio::ws",
-                    measured_sr = measured,
+                    actual_sr,
                     "dérive de rate CONFIRMÉE — HARD-STOP de la capture (R4)"
                 );
                 { pipeline.lock().await.stop_all(); }
@@ -2504,11 +2528,10 @@ async fn audio_liveness_supervisor(
                         reason: "rate-drift-48khz".into(),
                         request_id: None,
                         requested_device: None,
-                        detail: Some(format!("~{} Hz", measured)),
+                        detail: Some(format!("{} Hz", actual_sr)),
                     })
                     .await;
                 session_active = false;
-                detector_mismatch_streak = 0;
                 continue;
             }
         }
@@ -2904,6 +2927,30 @@ async fn audio_liveness_supervisor(
 /// à 48 kHz d'en être sortie.
 fn drift_window_is_clean(window_elapsed: Duration, since_disruption: Duration) -> bool {
     since_disruption >= window_elapsed
+}
+
+/// Nombre de fenêtres CONSÉCUTIVES où le pilote livre un autre rate standard avant
+/// le hard-stop (anti-faux-positif).
+const DRIFT_DEBOUNCE: u32 = 2;
+
+/// Débounce du détecteur de dérive en session : rend le rate réellement livré
+/// quand il faut arrêter la capture, `None` sinon.
+///
+/// Seul un verdict `Lies` (rate STANDARD ≠ assumé) fait avancer le compteur ; tout
+/// autre verdict le remet à zéro. Une mesure non concluante ou inexploitable n'est
+/// pas une preuve : elle ne peut ni couper la session, ni s'ajouter à une preuve
+/// précédente. L'appelant remet le compteur à zéro à l'entrée en session.
+fn drift_detector_step(streak: &mut u32, verdict: RateVerdict) -> Option<u32> {
+    match verdict {
+        RateVerdict::Lies { actual_sr, .. } => {
+            *streak += 1;
+            (*streak >= DRIFT_DEBOUNCE).then_some(actual_sr)
+        }
+        RateVerdict::Confirmed { .. } | RateVerdict::Inconclusive { .. } | RateVerdict::NotMeasurable => {
+            *streak = 0;
+            None
+        }
+    }
 }
 
 /// Lot 0 — journalise ce que le SYSTÈME dit du matériel de la session, pilote ASIO
@@ -4311,7 +4358,8 @@ mod runaway_tests {
 /// un `Arc` à synchronisation interne, le gain voix un simple atomique.
 #[cfg(test)]
 mod derive_de_rate_tests {
-    use super::drift_window_is_clean;
+    use super::{drift_detector_step, drift_window_is_clean};
+    use crate::audio::rate_check::{resolve_measured_rate, RateSample, RateVerdict};
     use std::time::Duration;
 
     const WINDOW: Duration = Duration::from_secs(2);
@@ -4343,6 +4391,47 @@ mod derive_de_rate_tests {
         }
         // Une fois la fenêtre entièrement postérieure, on juge de nouveau.
         assert!(drift_window_is_clean(WINDOW, Duration::from_millis(2_001)));
+    }
+
+    const MENT: RateVerdict = RateVerdict::Lies { actual_sr: 44_100, measured_sr: 44_090 };
+
+    #[test]
+    fn deux_fenetres_consecutives_a_un_autre_rate_arretent_la_capture() {
+        let mut streak = 0;
+        assert_eq!(drift_detector_step(&mut streak, MENT), None);
+        assert_eq!(drift_detector_step(&mut streak, MENT), Some(44_100));
+    }
+
+    #[test]
+    fn une_mesure_non_probante_rompt_la_serie() {
+        for rompt in [
+            RateVerdict::Confirmed { measured_sr: 48_000 },
+            RateVerdict::Inconclusive { measured_sr: 41_644 },
+            RateVerdict::NotMeasurable,
+        ] {
+            let mut streak = 0;
+            assert_eq!(drift_detector_step(&mut streak, MENT), None);
+            assert_eq!(drift_detector_step(&mut streak, rompt), None, "{rompt:?}");
+            assert_eq!(streak, 0, "{rompt:?} remet la série à zéro");
+            assert_eq!(drift_detector_step(&mut streak, MENT), None, "{rompt:?}");
+        }
+    }
+
+    /// Cas Guillaume H. (26/09/2026, agent 0.6.6-2) : deux fenêtres de suite avec un
+    /// trou de ~300 ms du pilote Yamaha (14:46:10 puis 14:46:12 UTC). Avant : 40 910
+    /// puis 41 644 Hz mesurés, hard-stop, sortie du studio. Attendu : session gardée.
+    #[test]
+    fn trous_du_pilote_en_session_ne_coupent_plus_la_repetition() {
+        let fenetres = [
+            RateSample { declared_sr: 48_000, frames_per_cb: 48, callbacks: 1_704, window_us: 2_000_000, stall_us: 294_245 },
+            RateSample { declared_sr: 48_000, frames_per_cb: 48, callbacks: 1_952, window_us: 2_250_000, stall_us: 297_579 },
+        ];
+        let mut streak = 0;
+        for f in fenetres {
+            let verdict = resolve_measured_rate(&f);
+            assert!(matches!(verdict, RateVerdict::Confirmed { .. }), "{verdict:?}");
+            assert_eq!(drift_detector_step(&mut streak, verdict), None);
+        }
     }
 
     #[test]
