@@ -86,13 +86,16 @@ pub struct MachineRow {
 /// nature, ses écarts ne disent rien du réseau.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RelayArrivals {
-    /// Instruments que le banc envoie à l'agent (les « musiciens simulés »).
+    /// Instruments que le banc envoie à l'agent (les « musiciens simulés ») :
+    /// paquets arrivés au relais (0 = rien de mesuré, jamais « aucune coupure »).
+    pub down_packets: u64,
     pub down_max_gap_ms: f64,
     pub down_gaps_over_10ms: u64,
     /// Combien de ces flux ont eu au moins une coupure dans la seconde : un
     /// blocage commun les touche tous à la fois.
     pub down_flows_with_gap: u32,
     /// Instrument que l'agent envoie.
+    pub up_packets: u64,
     pub up_max_gap_ms: f64,
     pub up_gaps_over_10ms: u64,
 }
@@ -105,6 +108,7 @@ pub fn relay_arrivals(ports: &[PortWindow], roles: &HashMap<SocketAddr, Transpor
     for p in ports {
         match roles.get(&p.bench) {
             Some(Transport::DownInstrument) => {
+                a.down_packets += p.from_bench.packets;
                 a.down_max_gap_ms = a.down_max_gap_ms.max(ms(p.from_bench.max_gap_us));
                 a.down_gaps_over_10ms += p.from_bench.gaps_over_10ms;
                 if p.from_bench.gaps_over_10ms > 0 {
@@ -112,6 +116,7 @@ pub fn relay_arrivals(ports: &[PortWindow], roles: &HashMap<SocketAddr, Transpor
                 }
             }
             Some(Transport::UpInstrument) => {
+                a.up_packets += p.from_agent.packets;
                 a.up_max_gap_ms = a.up_max_gap_ms.max(ms(p.from_agent.max_gap_us));
                 a.up_gaps_over_10ms += p.from_agent.gaps_over_10ms;
             }
@@ -218,19 +223,21 @@ pub fn machine_csv(rows: &[MachineRow]) -> String {
         "t_s,musicians,cpu_pct,callback_deficit_out,output_block_frames,sender_sent,sender_errors,\
 sender_late_p99_ms,sender_late_max_ms,up_instr_packets,up_instr_max_gap_ms,up_instr_gaps_over_10ms,\
 up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10ms,up_voice_seq_missing,\
-relay_delay_p99_ms,relay_delay_max_ms,relay_in_down_max_gap_ms,relay_in_down_gaps_over_10ms,\
-relay_in_down_flows_with_gap,relay_in_up_max_gap_ms,relay_in_up_gaps_over_10ms\n",
+relay_delay_p99_ms,relay_delay_max_ms,relay_in_down_packets,relay_in_down_max_gap_ms,relay_in_down_gaps_over_10ms,\
+relay_in_down_flows_with_gap,relay_in_up_packets,relay_in_up_max_gap_ms,relay_in_up_gaps_over_10ms\n",
     );
     let relay_in = |a: Option<&RelayArrivals>| match a {
         Some(a) => format!(
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
+            a.down_packets,
             fmt(a.down_max_gap_ms),
             a.down_gaps_over_10ms,
             a.down_flows_with_gap,
+            a.up_packets,
             fmt(a.up_max_gap_ms),
             a.up_gaps_over_10ms
         ),
-        None => ",,,,".into(),
+        None => ",,,,,,".into(),
     };
     let up = |w: Option<&UplinkWindow>| match w {
         Some(w) => format!(
@@ -320,7 +327,8 @@ pub struct StepSummary {
     pub up_voice_gaps: Option<u64>,
     /// Mode relais : coupures déjà présentes à l'ARRIVÉE au relais (trajet
     /// aller) — instruments envoyés par le banc, instrument envoyé par l'agent.
-    pub relay_in_gaps: Option<(u64, u64)>,
+    /// `None` pour un sens où aucun paquet n'a été mesuré : jamais un faux 0.
+    pub relay_in_gaps: Option<(Option<u64>, Option<u64>)>,
 }
 
 /// Seuil d'une seconde « en retard » pour la sortie : 1 % des callbacks
@@ -395,10 +403,16 @@ pub fn summarize(peers: &[PeerRow], machine: &[MachineRow], musicians: u32, from
         })
         .count() as u32;
     let voice_gaps = m.iter().filter_map(|r| r.up_voice.as_ref().map(|w| w.gaps_over_10ms)).reduce(|a, b| a + b);
-    let relay_in_gaps = m
-        .iter()
-        .filter_map(|r| r.relay_in.map(|a| (a.down_gaps_over_10ms, a.up_gaps_over_10ms)))
-        .reduce(|x, y| (x.0 + y.0, x.1 + y.1));
+    let relay_in: Vec<RelayArrivals> = m.iter().filter_map(|r| r.relay_in).collect();
+    let measured = |packets: fn(&RelayArrivals) -> u64, gaps: fn(&RelayArrivals) -> u64| {
+        (relay_in.iter().map(packets).sum::<u64>() > 0).then(|| relay_in.iter().map(gaps).sum::<u64>())
+    };
+    let relay_in_gaps = (!relay_in.is_empty()).then(|| {
+        (
+            measured(|a| a.down_packets, |a| a.down_gaps_over_10ms),
+            measured(|a| a.up_packets, |a| a.up_gaps_over_10ms),
+        )
+    });
     StepSummary {
         musicians,
         seconds: to_s - from_s,
@@ -579,7 +593,10 @@ pub fn markdown(header: &[(String, String)], steps: &[StepSummary], criteria: &[
             cell(st.sender_late_max_ms),
             st.up_instrument_gaps,
             st.up_voice_gaps.map_or("—".into(), |g| g.to_string()),
-            st.relay_in_gaps.map_or("—".into(), |(d, u)| format!("{d} / {u}")),
+            st.relay_in_gaps.map_or("—".into(), |(d, u)| {
+                let side = |g: Option<u64>| g.map_or("non mesuré".into(), |g| g.to_string());
+                format!("{} / {}", side(d), side(u))
+            }),
         );
     }
     s.push_str("\n## Critères (validés le 28/09/2026)\n\n");
@@ -745,13 +762,17 @@ mod tests {
         assert_eq!(
             a,
             RelayArrivals {
+                down_packets: 800,
                 down_max_gap_ms: 17.5,
                 down_gaps_over_10ms: 3,
                 down_flows_with_gap: 2,
+                up_packets: 400,
                 up_max_gap_ms: 12.0,
                 up_gaps_over_10ms: 1
             }
         );
+        // Aucun port reconnu : rien de mesuré, pas « aucune coupure ».
+        assert_eq!(relay_arrivals(&ports, &HashMap::new()), RelayArrivals::default());
     }
 
     #[test]
@@ -759,22 +780,43 @@ mod tests {
         let local = markdown(&[], &[step(2, 5.0, 0.0)], &[]);
         assert!(local.contains("| — |") && !local.contains("« Coupures à l'arrivée au relais » :"));
         let mut st = step(2, 5.0, 0.0);
-        st.relay_in_gaps = Some((12, 3));
+        st.relay_in_gaps = Some((Some(12), Some(3)));
         let relais = markdown(&[], &[st], &[]);
         assert!(relais.contains("| 12 / 3 |") && relais.contains("naissent À L'ALLER"), "{relais}");
+    }
+
+    /// Un sens où le relais n'a vu aucun paquet se dit « non mesuré » : un 0
+    /// laisserait croire que ce trajet est propre.
+    #[test]
+    fn un_sens_sans_paquet_au_relais_se_dit_non_mesure() {
+        let row = |a: RelayArrivals| MachineRow { t_s: 40.0, musicians: 2, relay_in: Some(a), ..Default::default() };
+        let vide = summarize(&[], &[row(RelayArrivals::default())], 2, 30.0, 90.0);
+        assert_eq!(vide.relay_in_gaps, Some((None, None)));
+        let md = markdown(&[], &[vide], &[]);
+        assert!(md.contains("| non mesuré / non mesuré |"), "{md}");
+        let propre = RelayArrivals { down_packets: 3200, up_packets: 400, down_max_gap_ms: 2.9, up_max_gap_ms: 2.8, ..Default::default() };
+        assert_eq!(summarize(&[], &[row(propre)], 2, 30.0, 90.0).relay_in_gaps, Some((Some(0), Some(0))));
     }
 
     #[test]
     fn le_csv_machine_a_autant_de_colonnes_en_local_qu_en_relais() {
         let local = MachineRow::default();
         let relais = MachineRow {
-            relay_in: Some(RelayArrivals { down_max_gap_ms: 16.0, down_gaps_over_10ms: 2, down_flows_with_gap: 2, up_max_gap_ms: 3.0, up_gaps_over_10ms: 0 }),
+            relay_in: Some(RelayArrivals {
+                down_packets: 3200,
+                down_max_gap_ms: 16.0,
+                down_gaps_over_10ms: 2,
+                down_flows_with_gap: 2,
+                up_packets: 400,
+                up_max_gap_ms: 3.0,
+                up_gaps_over_10ms: 0,
+            }),
             ..Default::default()
         };
         let csv = machine_csv(&[local, relais]);
         let n: Vec<usize> = csv.lines().map(|l| l.split(',').count()).collect();
         assert!(n.iter().all(|&c| c == n[0]), "{csv}");
-        assert!(csv.lines().nth(2).unwrap().ends_with(",16.000,2,2,3.000,0"), "{csv}");
+        assert!(csv.lines().nth(2).unwrap().ends_with(",3200,16.000,2,2,400,3.000,0"), "{csv}");
     }
 
     #[test]

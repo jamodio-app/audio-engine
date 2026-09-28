@@ -412,7 +412,12 @@ fn progress(musicians: u32, t_step: f64, m: &MachineRow, peers: &[PeerRow]) {
     let target = targets.iter().copied().filter(|v| v.is_finite()).fold(f64::NAN, f64::max);
     // Mode relais : coupures déjà présentes EN ARRIVANT au relais (aller).
     let relay = m.relay_in.map_or(String::new(), |a| {
-        format!(" | coupures à l'arrivée au relais {} (reçus) / {} (envoyé)", a.down_gaps_over_10ms, a.up_gaps_over_10ms)
+        let side = |packets: u64, gaps: u64| if packets == 0 { "non mesuré".to_string() } else { gaps.to_string() };
+        format!(
+            " | coupures à l'arrivée au relais {} (reçus) / {} (envoyé)",
+            side(a.down_packets, a.down_gaps_over_10ms),
+            side(a.up_packets, a.up_gaps_over_10ms)
+        )
     });
     println!(
         "[{musicians} mus. {:>4.0} s] trous cumulés {:>4.0} | cible max {:>5.1} ms | CPU {:>5.1} % | banc en retard max {:>5.2} ms{relay}",
