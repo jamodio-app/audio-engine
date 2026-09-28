@@ -49,6 +49,9 @@ Options de run :
                           une seconde machine (session-bench relay)
   --out DOSSIER           où écrire les résultats (défaut bench-results/<date>)
   --save-scenario FICHIER écrit le scénario final avant de lancer
+  --no-mmcss              Windows : fils du banc en priorité TIME_CRITICAL, sans MMCSS
+                          (à coupler avec « no-mmcss = 1 » dans le bench-flags de
+                          l'Audio Engine) ; noté dans le résumé
 ";
 
 #[tokio::main]
@@ -220,6 +223,7 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
             "--relay" => scenario.relay = Some(val()?),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--save-scenario" => save = Some(PathBuf::from(val()?)),
+            "--no-mmcss" => scenario.no_mmcss = true,
             other => return Err(format!("option inconnue : {other}\n\n{USAGE}")),
         }
     }
@@ -255,7 +259,15 @@ mod tests {
         assert_eq!(s.send_voice_channel, Some(1), "canal 2 → index 1");
         assert_eq!(s.channel_index, Some(0));
         assert_eq!(out, Some(PathBuf::from("r")));
+        assert!(!s.no_mmcss, "MMCSS par défaut");
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn no_mmcss_se_pose_sans_valeur() {
+        let (s, _, _) = parse_run(&args("--no-mmcss --to 3")).unwrap();
+        assert!(s.no_mmcss);
+        assert_eq!(s.to_musicians, 3, "l'option suivante reste lue");
     }
 
     #[test]

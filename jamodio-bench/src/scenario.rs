@@ -62,6 +62,13 @@ pub struct Scenario {
     /// vrai réseau et la carte réseau de la machine mesurée. `None` = local.
     #[serde(default)]
     pub relay: Option<String>,
+    /// Windows : les fils du banc prennent la priorité de fil la plus haute
+    /// (`THREAD_PRIORITY_TIME_CRITICAL`) au lieu de MMCSS « Pro Audio ». Pendant
+    /// de l'interrupteur `no-mmcss` de l'Audio Engine (Lot W1,
+    /// PLAN-FREINAGE-RESEAU-WINDOWS-2026-09) : sans lui, les fils MMCSS du banc
+    /// déclencheraient à eux seuls le freinage réseau qu'on veut mesurer.
+    #[serde(default)]
+    pub no_mmcss: bool,
 }
 
 impl Default for Scenario {
@@ -82,6 +89,7 @@ impl Default for Scenario {
             server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),
             relay: None,
+            no_mmcss: false,
         }
     }
 }

@@ -37,6 +37,8 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
 
     println!("Préparation des trames Opus…");
     let payloads = (Payloads::encode(220.0)?, Payloads::encode(330.0)?);
+    // Avant tout fil du banc : leur promotion en dépend.
+    crate::rt::set_without_mmcss(scenario.no_mmcss);
     let mut sender = SenderLoop::start(payloads.0, payloads.1);
     let stop = Arc::new(AtomicBool::new(false));
     let mut listeners = Vec::new();
@@ -282,6 +284,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         ("Précision du banc".to_string(), precision),
         ("Relais (réseau)".to_string(), relay_precision),
         ("Priorité des fils du banc".to_string(), priority),
+        ("Freinage réseau Windows (registre)".to_string(), crate::rt::multimedia_profile()),
         ("Scénario".to_string(), scenario.name.clone()),
         ("Audio Engine".to_string(), format!("{agent_version} ({agent_os})")),
         ("Machine".to_string(), machine_name()),

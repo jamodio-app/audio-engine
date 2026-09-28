@@ -33,3 +33,6 @@ mach2 = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# Lecture du réglage du freinage réseau de Windows pour l'en-tête du résumé
+# (cf. `rt::multimedia_profile`) — même crate que l'agent.
+winreg = "0.52"

@@ -2529,6 +2529,14 @@ impl PipelineState {
             ChannelSel::Default
         };
 
+        // Interrupteurs de banc (fichier `bench-flags`, à côté des journaux),
+        // lus et journalisés à chaque capture — cf. `bench_flags`. Lus AVANT le
+        // lancement des fils audio : `no-mmcss` décide de leur promotion (Lot W1,
+        // PLAN-FREINAGE-RESEAU-WINDOWS-2026-09).
+        let bench = crate::bench_flags::BenchFlags::load();
+        bench.log();
+        crate::audio::rt_priority::set_bench_without_mmcss(bench.no_mmcss);
+
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         //
         // SELF-MONITOR : on enregistre un stream local dans le mixer AVANT de
@@ -2591,13 +2599,11 @@ impl PipelineState {
         // Voie B — rapports RTCP du flux instrument (pertes, gigue et aller-retour
         // UDP vus par le SFU), dans une tâche tokio hors du thread audio.
         // Interrupteur de DIAGNOSTIC du banc (PROTOCOLE-BANC-LATENCE §8) : le
-        // fichier `bench-flags`, à côté des journaux, coupe la tâche pour
-        // comparer avec le même binaire l'envoi du son avec et sans RTCP. Une
-        // variable d'environnement ne convenait pas : relancé depuis le studio,
-        // l'Audio Engine n'en héritait pas, et quatre sessions de banc ont été
-        // perdues sans que rien ne le dise (14/09).
-        let bench = crate::bench_flags::BenchFlags::load();
-        bench.log();
+        // fichier `bench-flags` (lu plus haut) coupe la tâche pour comparer avec
+        // le même binaire l'envoi du son avec et sans RTCP. Une variable
+        // d'environnement ne convenait pas : relancé depuis le studio, l'Audio
+        // Engine n'en héritait pas, et quatre sessions de banc ont été perdues
+        // sans que rien ne le dise (14/09).
         // Lot V — une veille en pleine session est une panne audio (pilote ASIO
         // dégradé au réveil) : on pose une demande de maintien éveillé pour la
         // durée de la session, écran compris sous Windows (son rallumage coûte

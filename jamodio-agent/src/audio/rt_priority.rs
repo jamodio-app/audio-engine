@@ -20,6 +20,9 @@
 //! - **Windows** : `AvSetMmThreadCharacteristicsW("Pro Audio")` (MMCSS) +
 //!   `AvSetMmThreadPriority(CRITICAL)` (durci 2026-09 — sommet de la plage MMCSS,
 //!   immunise contre la préemption UI/vidéo). L'API officielle DAW, dispo Vista+.
+//!   Interrupteur de banc `no-mmcss` (Lot W1, PLAN-FREINAGE-RESEAU-WINDOWS-2026-09) :
+//!   priorité de fil `THREAD_PRIORITY_TIME_CRITICAL` seule, sans MMCSS — mesure
+//!   seulement, jamais le comportement par défaut.
 //! - **Linux/autres** : conserve `thread_priority::Crossplatform(95)` —
 //!   utilisable sur Linux avec `CAP_SYS_NICE`, no-op sinon. Ce n'est pas
 //!   une cible production mais le code reste fonctionnel pour les CI tests.
@@ -33,6 +36,7 @@
 //! drop implicite en fin de boucle.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Détails sur la méthode retenue pour la promotion RT. Loggué via tracing
 /// à `info` pour qu'on puisse confirmer dans `agent.log` lequel des chemins
@@ -58,6 +62,9 @@ pub enum PromotionMethod {
     MacOsQos,
     /// Windows — `AvSetMmThreadCharacteristicsW("Pro Audio")` (MMCSS).
     WindowsMmcss,
+    /// Windows — `SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL)` sans MMCSS.
+    /// Seulement sous l'interrupteur de banc `no-mmcss` (cf. [`set_bench_without_mmcss`]).
+    WindowsThreadPriority,
     /// Linux/autres — `thread_priority::Crossplatform` (best-effort,
     /// nécessite `CAP_SYS_NICE` sur Linux). Ne s'applique pas sur macOS.
     Generic,
@@ -77,6 +84,7 @@ impl PromotionMethod {
             Self::MacOsTimeConstraint => "macos-time-constraint",
             Self::MacOsQos => "macos-qos",
             Self::WindowsMmcss => "windows-mmcss",
+            Self::WindowsThreadPriority => "windows-thread-priority",
             Self::Generic => "generic",
             Self::None => "none",
         }
@@ -90,6 +98,9 @@ pub struct RtPriorityHandle {
     workgroup: Option<jamodio_au_host::workgroup::AudioWorkgroup>,
     #[cfg(target_os = "windows")]
     mmcss_handle: windows_sys::Win32::Foundation::HANDLE,
+    /// Priorité du fil avant `WindowsThreadPriority`, rendue au `Drop`.
+    #[cfg(target_os = "windows")]
+    prev_thread_priority: i32,
     // Garde anti-double-drop sur le même thread (paranoïa : on log si
     // quelqu'un crée deux handles dans le même thread, ce qui empilerait
     // les promotions et compliquerait le revert).
@@ -125,6 +136,25 @@ impl RtPriorityHandle {
 // peut maintenant promote indépendamment, comme attendu.
 thread_local! {
     static PROMOTION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+// ─── Interrupteur de banc `no-mmcss` (Windows) ─────────────────────
+//
+// Lot W1 (PLAN-FREINAGE-RESEAU-WINDOWS-2026-09) : le freinage réseau de Windows
+// (`NetworkThrottlingIndex`) s'applique quand des fils MMCSS tournent. Pour
+// mesurer s'il disparaît quand AUCUN de nos fils n'est MMCSS, le banc peut
+// demander la priorité de fil la plus haute de Windows à la place. Posé à chaque
+// début de capture depuis le fichier `bench-flags`, AVANT le lancement des fils ;
+// lu par chaque fil au moment de sa promotion, et chaque fil journalise la méthode
+// obtenue — c'est ce journal qui fait foi. Le fil de réception, créé au premier
+// flux reçu et gardé d'une session à l'autre, garde la méthode de sa création :
+// relancer l'Audio Engine après avoir changé le fichier.
+static WINDOWS_WITHOUT_MMCSS: AtomicBool = AtomicBool::new(false);
+
+/// Choisit la méthode Windows des PROCHAINES promotions (interrupteur de banc
+/// `no-mmcss`). Sans effet hors de Windows.
+pub fn set_bench_without_mmcss(on: bool) {
+    WINDOWS_WITHOUT_MMCSS.store(on, Ordering::Relaxed);
 }
 
 /// Promeut le thread courant en priorité audio RT. Best-effort selon l'OS.
@@ -205,29 +235,8 @@ pub fn promote_thread_for_audio(output_device_name: Option<&str>) -> RtPriorityH
     #[cfg(target_os = "windows")]
     {
         let _ = output_device_name; // ignored on Windows
-        match windows_mmcss::apply() {
-            Ok(h) => {
-                tracing::info!(
-                    target: "jamodio::rt_priority",
-                    method = "windows-mmcss",
-                    task = "Pro Audio",
-                    "thread promoted via MMCSS Pro Audio"
-                );
-                RtPriorityHandle {
-                    method: PromotionMethod::WindowsMmcss,
-                    mmcss_handle: h,
-                    _not_sync: std::marker::PhantomData,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "jamodio::rt_priority",
-                    error = %e,
-                    "windows MMCSS failed — running at normal priority"
-                );
-                make_none_handle()
-            }
-        }
+        let current = std::thread::current();
+        promote_windows(current.name().unwrap_or("?"))
     }
 
     // Linux / autres : best-effort thread-priority (=existing behavior).
@@ -355,31 +364,7 @@ pub fn promote_thread_for_audio_recv(thread: &'static str) -> RtPriorityHandle {
 
     #[cfg(target_os = "windows")]
     {
-        match windows_mmcss::apply() {
-            Ok(h) => {
-                tracing::info!(
-                    target: "jamodio::rt_priority",
-            thread,
-                    method = "windows-mmcss",
-                    task = "Pro Audio",
-                    "thread promoted via MMCSS Pro Audio"
-                );
-                RtPriorityHandle {
-                    method: PromotionMethod::WindowsMmcss,
-                    mmcss_handle: h,
-                    _not_sync: std::marker::PhantomData,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "jamodio::rt_priority",
-            thread,
-                    error = %e,
-                    "windows MMCSS failed (recv) — thread at normal priority"
-                );
-                make_none_handle()
-            }
-        }
+        promote_windows(thread)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -412,7 +397,69 @@ fn make_none_handle() -> RtPriorityHandle {
         workgroup: None,
         #[cfg(target_os = "windows")]
         mmcss_handle: 0 as windows_sys::Win32::Foundation::HANDLE,
+        #[cfg(target_os = "windows")]
+        prev_thread_priority: 0,
         _not_sync: std::marker::PhantomData,
+    }
+}
+
+/// Promotion Windows, commune à tous nos fils audio : MMCSS « Pro Audio »
+/// (défaut), ou priorité de fil seule sous l'interrupteur de banc `no-mmcss`.
+/// Chaque issue est journalisée avec le nom du fil : un échec n'est jamais muet.
+#[cfg(target_os = "windows")]
+fn promote_windows(thread: &str) -> RtPriorityHandle {
+    if WINDOWS_WITHOUT_MMCSS.load(Ordering::Relaxed) {
+        return match windows_thread_priority::apply() {
+            Ok(prev) => {
+                tracing::warn!(
+                    target: "jamodio::rt_priority",
+                    thread,
+                    method = "windows-thread-priority",
+                    "fil promu SANS MMCSS (THREAD_PRIORITY_TIME_CRITICAL) — interrupteur de banc no-mmcss"
+                );
+                RtPriorityHandle {
+                    method: PromotionMethod::WindowsThreadPriority,
+                    mmcss_handle: 0 as windows_sys::Win32::Foundation::HANDLE,
+                    prev_thread_priority: prev,
+                    _not_sync: std::marker::PhantomData,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "jamodio::rt_priority",
+                    thread,
+                    error = %e,
+                    "SetThreadPriority(TIME_CRITICAL) refusé — fil en priorité normale"
+                );
+                make_none_handle()
+            }
+        };
+    }
+    match windows_mmcss::apply(thread) {
+        Ok(h) => {
+            tracing::info!(
+                target: "jamodio::rt_priority",
+                thread,
+                method = "windows-mmcss",
+                task = "Pro Audio",
+                "thread promoted via MMCSS Pro Audio"
+            );
+            RtPriorityHandle {
+                method: PromotionMethod::WindowsMmcss,
+                mmcss_handle: h,
+                prev_thread_priority: 0,
+                _not_sync: std::marker::PhantomData,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "jamodio::rt_priority",
+                thread,
+                error = %e,
+                "windows MMCSS failed — thread at normal priority"
+            );
+            make_none_handle()
+        }
     }
 }
 
@@ -445,6 +492,10 @@ impl Drop for RtPriorityHandle {
                         }
                     }
                 }
+            }
+            PromotionMethod::WindowsThreadPriority => {
+                #[cfg(target_os = "windows")]
+                windows_thread_priority::restore(self.prev_thread_priority);
             }
             PromotionMethod::Generic => {
                 // thread-priority n'expose pas de revert. Le thread va mourir
@@ -644,7 +695,7 @@ mod windows_mmcss {
         0,
     ];
 
-    pub fn apply() -> io::Result<HANDLE> {
+    pub fn apply(thread: &str) -> io::Result<HANDLE> {
         let mut task_index: u32 = 0;
         // SAFETY : pointeur sur littéral statique valide pour la durée du
         // process ; out-param task_index borrow exclusif.
@@ -661,18 +712,60 @@ mod windows_mmcss {
         // SOMMET de la plage MMCSS (CRITICAL) pour l'immuniser contre la préemption
         // par les threads UI/vidéo du navigateur (racine mesurée des pics
         // `recv_path`). Non-fatal : si l'appel échoue, le thread reste en Pro Audio
-        // NORMAL (déjà mieux que rien) — on garde le handle.
+        // NORMAL — on garde le handle, et on le DIT au journal (avertissement : un
+        // niveau `debug` n'y figurait pas, l'échec était muet).
         // SAFETY : `h` est un handle MMCSS valide (non-NULL vérifié ci-dessus) ;
         // AVRT_PRIORITY_CRITICAL est une valeur d'enum documentée.
         let prio_ok = unsafe { AvSetMmThreadPriority(h, AVRT_PRIORITY_CRITICAL) };
         if prio_ok == 0 {
-            tracing::debug!(
+            tracing::warn!(
                 target: "jamodio::rt_priority",
+                thread,
                 error = %io::Error::last_os_error(),
-                "AvSetMmThreadPriority(CRITICAL) échoué — thread en Pro Audio NORMAL"
+                "AvSetMmThreadPriority(CRITICAL) échoué — fil en Pro Audio NORMAL"
             );
         }
         Ok(h)
+    }
+}
+
+// ─── Windows : priorité de fil seule (interrupteur de banc `no-mmcss`) ───
+
+#[cfg(target_os = "windows")]
+mod windows_thread_priority {
+    use std::io;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+
+    /// `THREAD_PRIORITY_ERROR_RETURN` (winbase.h) : `GetThreadPriority` en échec.
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = 0x7FFF_FFFF;
+
+    /// Monte le fil courant à `THREAD_PRIORITY_TIME_CRITICAL` (le haut de la
+    /// classe de priorité du processus, sans MMCSS). Rend la priorité d'avant.
+    pub fn apply() -> io::Result<i32> {
+        // SAFETY : pseudo-handle du fil courant, toujours valide sur ce fil.
+        let prev = unsafe { GetThreadPriority(GetCurrentThread()) };
+        if prev == THREAD_PRIORITY_ERROR_RETURN {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY : idem ; valeur d'enum documentée.
+        if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(prev)
+    }
+
+    /// Rend la priorité d'avant (appelé au `Drop`, sur le même fil).
+    pub fn restore(prev: i32) {
+        // SAFETY : pseudo-handle du fil courant.
+        if unsafe { SetThreadPriority(GetCurrentThread(), prev) } == 0 {
+            tracing::warn!(
+                target: "jamodio::rt_priority",
+                error = %io::Error::last_os_error(),
+                "priorité du fil non rendue"
+            );
+        }
     }
 }
 
@@ -696,6 +789,7 @@ mod tests {
             PromotionMethod::MacOsWorkgroup
                 | PromotionMethod::MacOsTimeConstraint
                 | PromotionMethod::WindowsMmcss
+                | PromotionMethod::WindowsThreadPriority
                 | PromotionMethod::Generic
                 | PromotionMethod::None
         ));
@@ -715,6 +809,7 @@ mod tests {
             PromotionMethod::MacOsTimeConstraint
                 | PromotionMethod::MacOsQos
                 | PromotionMethod::WindowsMmcss
+                | PromotionMethod::WindowsThreadPriority
                 | PromotionMethod::Generic
                 | PromotionMethod::None
         ));
@@ -782,5 +877,33 @@ mod tests {
             n == 0 || n == 3,
             "attendu 0 ou 3 threads promus, obtenu {n} (régression v0.4.5 = 1)"
         );
+    }
+
+    /// Interrupteur de banc `no-mmcss` : sous Windows, AUCUN fil n'est promu en
+    /// MMCSS (priorité de fil seule, ou normale si refusée — jamais MMCSS) ; hors
+    /// de Windows, sans effet. Les autres tests acceptent les deux méthodes
+    /// Windows : l'interrupteur est global au processus.
+    #[test]
+    fn no_mmcss_ne_promeut_jamais_en_mmcss() {
+        set_bench_without_mmcss(true);
+        let methods = std::thread::spawn(|| {
+            let a = promote_thread_for_audio(None).method();
+            let r = promote_thread_for_audio_recv("test").method();
+            (a, r)
+        })
+        .join()
+        .unwrap();
+        set_bench_without_mmcss(false);
+        for m in [methods.0, methods.1] {
+            assert!(!matches!(m, PromotionMethod::WindowsMmcss), "MMCSS malgré no-mmcss : {m:?}");
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(m, PromotionMethod::WindowsThreadPriority | PromotionMethod::None),
+                    "méthode inattendue sous no-mmcss : {m:?}"
+                );
+            } else {
+                assert!(!matches!(m, PromotionMethod::WindowsThreadPriority));
+            }
+        }
     }
 }
