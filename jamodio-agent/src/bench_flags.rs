@@ -37,12 +37,10 @@ pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
-    /// Lot 1-D3 (0.6.6-8) — laisse le fil de RÉCEPTION en priorité normale (il
-    /// est promu comme le décodage par défaut). Expérience A/B du banc du 28/09 :
-    /// sur Mac, la 0.6.6-7 a fait apparaître des pics lecture → décodage de 5 à
-    /// 6 ms ; deux fils temps réel qui se gênent sont une hypothèse à trancher
-    /// avec le même binaire. Lu au démarrage du fil de réception.
-    pub recv_thread_normal: bool,
+    // `recv-thread-normal` (0.6.6-8, expérience A/B du 28/09) est retiré en
+    // 0.6.6-9 : lecture et décodage sont un seul fil, qu'on ne laisse jamais en
+    // priorité normale. Un fichier qui le contient encore le voit signalé
+    // « inconnu — ignoré » au journal.
 }
 
 impl BenchFlags {
@@ -96,7 +94,6 @@ impl BenchFlags {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
-                "recv-thread-normal" => flags.recv_thread_normal = on,
                 other => tracing::warn!(
                     target: "jamodio::bench",
                     flag = other,
@@ -143,9 +140,6 @@ impl BenchFlags {
         let mut active = Vec::new();
         if self.no_rtcp {
             active.push("no-rtcp");
-        }
-        if self.recv_thread_normal {
-            active.push("recv-thread-normal");
         }
         active
     }
@@ -223,12 +217,11 @@ mod tests {
         assert!(issues.is_empty());
     }
 
+    /// L'interrupteur de l'expérience A/B du 28/09, retiré en 0.6.6-9, n'active
+    /// plus rien.
     #[test]
-    fn le_fil_de_reception_peut_rester_en_priorite_normale() {
-        let f = BenchFlags::parse("recv-thread-normal = 1\n");
-        assert!(f.recv_thread_normal && !f.no_rtcp);
-        assert_eq!(f.active(), vec!["recv-thread-normal"]);
-        assert!(!BenchFlags::parse("recv-thread-normal = 0").recv_thread_normal);
+    fn l_ancien_interrupteur_recv_thread_normal_n_active_rien() {
+        assert_eq!(BenchFlags::parse("recv-thread-normal = 1\n"), BenchFlags::default());
     }
 
     /// Une faute de frappe ne doit jamais activer un réglage ni en cacher un.
