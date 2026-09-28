@@ -174,6 +174,8 @@ pub struct SenderWindow {
 pub struct SenderLoop {
     add_tx: Sender<(Arc<Downlink>, Box<dyn Iterator<Item = Frame> + Send>)>,
     pub window: Arc<Mutex<SenderWindow>>,
+    /// Priorité obtenue par le fil d'envoi (cf. `rt`), pour le résumé.
+    pub priority: Arc<OnceLock<Result<&'static str, String>>>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
     listeners: Vec<std::thread::JoinHandle<()>>,
@@ -184,14 +186,18 @@ impl SenderLoop {
         let (add_tx, add_rx) = std::sync::mpsc::channel();
         let window = Arc::new(Mutex::new(SenderWindow::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let priority = Arc::new(OnceLock::new());
         let join = {
-            let (window, stop) = (window.clone(), stop.clone());
+            let (window, stop, priority) = (window.clone(), stop.clone(), priority.clone());
             std::thread::Builder::new()
                 .name("bench-send".into())
-                .spawn(move || send_loop(add_rx, instrument, voice, window, stop))
+                .spawn(move || {
+                    let _ = priority.set(crate::rt::promote_current_thread());
+                    send_loop(add_rx, instrument, voice, window, stop)
+                })
                 .expect("fil d'envoi du banc")
         };
-        Self { add_tx, window, stop, join: Some(join), listeners: Vec::new() }
+        Self { add_tx, window, priority, stop, join: Some(join), listeners: Vec::new() }
     }
 
     /// Ajoute un flux : il part dès que l'agent a percé ET rendu ses clés.
@@ -339,8 +345,11 @@ impl Uplink {
         std::mem::take(&mut *self.window.lock().unwrap())
     }
 
-    /// Reçoit et mesure jusqu'à `stop`. Les rapports RTCP sont ignorés.
+    /// Reçoit et mesure jusqu'à `stop`. Les rapports RTCP sont ignorés. Le fil
+    /// est promu comme celui d'envoi : un réveil tardif du banc se lirait
+    /// sinon comme une coupure de l'agent.
     pub fn listen(self: Arc<Self>, stop: Arc<AtomicBool>) {
+        let _ = crate::rt::promote_current_thread();
         let mut last: Option<(Instant, u16)> = None;
         let mut buf = vec![0u8; 2048];
         while !stop.load(Ordering::Relaxed) {

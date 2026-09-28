@@ -2652,10 +2652,12 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "jamodio-audio-core",
+ "mach2",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@
 //! session-bench run --profiles regular,wifi --peer-voice bursts --send-voice 1
 //! session-bench run --scenario mon-test.json
 //! session-bench scenario > mon-test.json    # scénario par défaut, à modifier
+//! session-bench selftest 8 30               # précision du banc seul, avant une campagne
 //! ```
 //!
 //! L'Audio Engine doit tourner (pré-version ≥ 0.6.6-1 pour la cause des trous) ;
@@ -22,6 +23,7 @@ session-bench — banc « N musiciens » contre l'Audio Engine installé
 
   session-bench devices
   session-bench scenario                       (écrit le scénario par défaut en JSON)
+  session-bench selftest [FLUX] [SECONDES]     (précision du banc seul, sans Audio Engine ; défaut 8 flux, 30 s)
   session-bench run [options]
 
 Options de run :
@@ -55,6 +57,16 @@ async fn main() {
             Err(e) => Err(e.to_string()),
         },
         Some("run") => run(&args[1..]).await,
+        Some("selftest") => {
+            let streams = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(8);
+            let secs = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(30);
+            println!("Précision du banc seul : {streams} flux, {secs} s (aucun Audio Engine sollicité).");
+            match tokio::task::spawn_blocking(move || jamodio_bench::run::selftest(streams, secs)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(e.to_string()),
+            }
+        }
         _ => {
             eprint!("{USAGE}");
             std::process::exit(2);

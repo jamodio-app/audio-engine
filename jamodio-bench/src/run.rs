@@ -201,7 +201,6 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     let _ = agent.stop();
     tokio::time::sleep(Duration::from_millis(300)).await;
     stop.store(true, Ordering::Relaxed);
-    drop(sender);
     for l in listeners {
         let _ = l.join();
     }
@@ -218,8 +217,16 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
         End::AgentError(e) => format!("ARRÊTÉE PAR L'AUDIO ENGINE : {e}"),
     };
+    let (precision, _) = report::precision(&machine_rows.iter().map(|r| r.sender_late_max_ms).collect::<Vec<_>>());
+    let priority = match sender.priority.get() {
+        Some(Ok(p)) => p.to_string(),
+        Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
+        None => "inconnue".into(),
+    };
     let header = vec![
         ("Campagne".to_string(), status),
+        ("Précision du banc".to_string(), precision),
+        ("Priorité des fils du banc".to_string(), priority),
         ("Scénario".to_string(), scenario.name.clone()),
         ("Audio Engine".to_string(), format!("{agent_version} ({agent_os})")),
         ("Machine".to_string(), machine_name()),
@@ -242,6 +249,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     write(out_dir, "peers.csv", &report::peers_csv(&peer_rows))?;
     write(out_dir, "machine.csv", &report::machine_csv(&machine_rows))?;
     write(out_dir, "scenario.json", &serde_json::to_string_pretty(&scenario).map_err(|e| e.to_string())?)?;
+    drop(sender);
     let summary = report::markdown(&header, &summaries, &criteria);
     let path = out_dir.join("resume.md");
     write(out_dir, "resume.md", &summary)?;
@@ -273,10 +281,15 @@ fn profile_list(s: &Scenario) -> String {
     s.peers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
+/// Nom de la machine (`hostname` existe sous macOS comme sous Windows).
 fn machine_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "machine".into())
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "inconnue".into())
 }
 
 fn write(dir: &Path, name: &str, content: &str) -> Result<(), String> {
@@ -298,4 +311,74 @@ fn progress(musicians: u32, t_step: f64, m: &MachineRow, peers: &[PeerRow]) {
         "[{musicians} mus. {:>4.0} s] trous cumulés {:>4.0} | cible max {:>5.1} ms | CPU {:>5.1} % | banc en retard max {:>5.2} ms",
         t_step, underruns, target, m.cpu_pct, m.sender_late_max_ms
     );
+}
+
+/// Mesure la précision du BANC SEUL, sans Audio Engine : `streams` flux
+/// réguliers envoyés sur la machine à des récepteurs du banc, pendant `secs`
+/// secondes. À lancer avant une campagne : si le banc n'est pas assez précis
+/// sur cette machine, la campagne ne pourra pas conclure.
+pub fn selftest(streams: u32, secs: u64) -> Result<bool, String> {
+    use crate::profile::PeerProfile;
+    use jamodio_audio_core::net::srtp::SrtpParameters;
+    use std::net::UdpSocket;
+
+    let mut sender = SenderLoop::start(Payloads::encode(220.0)?, Payloads::encode(330.0)?);
+    let stop = Arc::new(AtomicBool::new(false));
+    let gaps: Arc<std::sync::Mutex<Vec<f64>>> = Arc::default();
+    let mut receivers = Vec::new();
+    for i in 0..streams {
+        let link = Downlink::bind("127.0.0.1", format!("selftest-{i}"), Kind::Instrument, u64::from(i))?;
+        link.set_agent_keys(&SrtpParameters::generate_aead_aes_256_gcm())?;
+        let rx = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        rx.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+        // Le « perçage » : un en-tête RTP suffit au faux serveur pour apprendre l'adresse.
+        let mut punch = [0u8; 12];
+        punch[0] = 0x80;
+        punch[1] = crate::server::PAYLOAD_TYPE;
+        rx.send_to(&punch, ("127.0.0.1", link.port())).map_err(|e| e.to_string())?;
+        sender.add(link, &PeerProfile::preset("regular").expect("préréglage"), u64::from(i));
+        let (stop, gaps) = (stop.clone(), gaps.clone());
+        receivers.push(std::thread::spawn(move || {
+            let _ = crate::rt::promote_current_thread();
+            let mut buf = [0u8; 2048];
+            let mut last: Option<Instant> = None;
+            let mut worst = 0.0f64;
+            while !stop.load(Ordering::Relaxed) {
+                if rx.recv_from(&mut buf).is_ok() {
+                    let now = Instant::now();
+                    if let Some(l) = last {
+                        worst = worst.max(now.duration_since(l).as_secs_f64() * 1000.0);
+                    }
+                    last = Some(now);
+                }
+            }
+            gaps.lock().unwrap().push(worst);
+        }));
+    }
+    let mut maxima = Vec::new();
+    for s in 1..=secs {
+        std::thread::sleep(Duration::from_secs(1));
+        let w = sender.take_window();
+        let mut late = w.late_us.clone();
+        late.sort_unstable();
+        let pct = |p: f64| late.get(((late.len().max(1) - 1) as f64 * p).round() as usize).map_or(f64::NAN, |&v| v as f64 / 1000.0);
+        let max = pct(1.0);
+        maxima.push(max);
+        println!("[{s:>3} s] {} paquets | retard d'envoi p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms", w.sent, pct(0.5), pct(0.99), max);
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in receivers {
+        let _ = r.join();
+    }
+    let priority = match sender.priority.get() {
+        Some(Ok(p)) => p.to_string(),
+        Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
+        None => "inconnue".into(),
+    };
+    let (verdict, ok) = report::precision(&maxima);
+    let worst_gap = gaps.lock().unwrap().iter().copied().fold(0.0, f64::max);
+    println!("\nPriorité des fils du banc : {priority}");
+    println!("Plus grand écart entre deux paquets reçus (2,5 ms attendus) : {worst_gap:.2} ms");
+    println!("Précision du banc : {verdict}");
+    Ok(ok)
 }

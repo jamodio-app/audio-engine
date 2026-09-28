@@ -17,6 +17,7 @@ grandit. Plan et critères : `internal-docs/plans/PLAN-BANC-N-MUSICIENS-2026-09.
 ## Lancer
 
 ```text
+cargo run --release -p jamodio-bench -- selftest          # d'abord : précision du banc seul
 cargo run --release -p jamodio-bench -- devices
 cargo run --release -p jamodio-bench -- run
 cargo run --release -p jamodio-bench -- run --profile ethernet --to 6 --step-secs 120
@@ -45,6 +46,11 @@ Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
 
 ## À savoir
 
+- **Précision du banc** : ses fils tournent en priorité temps réel (macOS) ou
+  MMCSS « Pro Audio » (Windows) — en priorité normale, le premier essai (28/09)
+  envoyait jusqu'à 26 ms en retard et créait lui-même les trous qu'il mesurait.
+  `selftest` la mesure sans l'Audio Engine ; le résumé de chaque campagne la
+  rappelle (« SUFFISANTE » si aucun envoi n'a eu plus de 1 ms de retard).
 - **« Retard max du banc »** : si le faux serveur envoie lui-même en retard,
   c'est lui qui fait la gigue. À regarder en premier.
 - **Talkback envoyé** (`--send-voice`) : l'agent n'envoie de la voix que s'il

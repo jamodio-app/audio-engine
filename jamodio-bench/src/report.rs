@@ -188,6 +188,36 @@ up_instr_seq_missing,up_voice_packets,up_voice_max_gap_ms,up_voice_gaps_over_10m
     s
 }
 
+/// Au-delà de ce retard d'envoi, le FAUX SERVEUR crée lui-même de la gigue du
+/// même ordre que ce qu'on mesure : c'est le délai de grâce minimal du masquage
+/// (`conceal::GRACE_MIN_MS`) et la moitié de la queue de gigue Ethernet simulée.
+pub const BENCH_LATE_OK_MS: f64 = 1.0;
+
+/// Précision du banc sur une campagne, à partir du pire retard de chaque seconde.
+pub fn precision(max_late_per_second_ms: &[f64]) -> (String, bool) {
+    let v: Vec<f64> = max_late_per_second_ms.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return ("aucun envoi mesuré".into(), false);
+    }
+    let bad = v.iter().filter(|&&x| x > BENCH_LATE_OK_MS).count();
+    let worst = v.iter().copied().fold(0.0, f64::max);
+    let ok = bad == 0;
+    let verdict = if ok {
+        "SUFFISANTE"
+    } else if bad * 100 <= v.len() {
+        "À SURVEILLER"
+    } else {
+        "INSUFFISANTE — les trous « arrivée » et « séquence » peuvent venir du banc"
+    };
+    (
+        format!(
+            "{verdict} ({bad} seconde(s) sur {} avec un envoi en retard de plus de {BENCH_LATE_OK_MS} ms ; pire {worst:.2} ms)",
+            v.len()
+        ),
+        ok,
+    )
+}
+
 /// Résumé d'un palier (N musiciens), sur sa fenêtre de mesure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepSummary {
@@ -572,6 +602,16 @@ mod tests {
         assert_eq!(c[0].verdict, Verdict::NotApplicable);
         let c = criteria(&[step(2, 5.0, f64::NAN)], true, false);
         assert_eq!(c[0].verdict, Verdict::NotApplicable);
+    }
+
+    #[test]
+    fn la_precision_du_banc_se_dit_en_toutes_lettres() {
+        assert!(precision(&[0.2, 0.5, 0.9]).0.starts_with("SUFFISANTE"));
+        let mut v = vec![0.3; 199];
+        v.push(3.0);
+        assert!(precision(&v).0.starts_with("À SURVEILLER"));
+        assert!(precision(&[0.3, 2.0, 4.0]).0.starts_with("INSUFFISANTE"));
+        assert!(!precision(&[]).1);
     }
 
     #[test]

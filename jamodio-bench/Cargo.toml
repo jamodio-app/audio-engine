@@ -25,3 +25,11 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+
+# Priorité temps réel des fils du banc (cf. src/rt.rs) : le banc doit être plus
+# précis que ce qu'il mesure.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

@@ -9,6 +9,7 @@
 pub mod driver;
 pub mod profile;
 pub mod report;
+pub mod rt;
 pub mod run;
 pub mod scenario;
 pub mod server;
