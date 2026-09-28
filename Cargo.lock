@@ -2585,6 +2585,7 @@ dependencies = [
  "libc",
  "mach2",
  "midir",
+ "mio",
  "objc2",
  "opener",
  "parking_lot",
@@ -2628,6 +2629,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hound",
  "libc",
+ "mio",
  "ndarray",
  "parking_lot",
  "ringbuf",
@@ -3217,6 +3219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]

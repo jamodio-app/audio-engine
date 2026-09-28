@@ -21,7 +21,7 @@ use jamodio_audio_core::perfstats::Histogram;
 use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::audio::midi::CapturedMidiEvent;
-use crate::recv_activity::{RecvActivity, SILENCE_LOG_AFTER_MS};
+use crate::recv_activity::RecvActivity;
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::voice_isolation::{IsolationConfig, VoiceIsolator};
@@ -764,7 +764,10 @@ pub struct PipelineState {
     /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
     /// `None` = pas de stream reçu en cours.
     decode_thread: Option<DecodeThread>,
-    /// 0.5.3-2 — compteur de génération des io tasks de réception. Incrémenté à
+    /// Lot 1-D3 — fil de réception dédié (priorité audio), démarré avec le
+    /// thread de décodage : il lit TOUTES les sockets reçues.
+    recv_thread: Option<recv_thread::RecvThread>,
+    /// 0.5.3-2 — compteur de génération des flux reçus. Incrémenté à
     /// chaque `add_stream` ; permet au thread de décodage de distinguer un Remove
     /// d'une ancienne connexion d'un re-add du même `producer_id` (race évitée).
     recv_epoch: u64,
@@ -974,9 +977,10 @@ pub struct PipelineState {
     pub perfstats: PerfHandles,
 }
 
-/// Un flux reçu d'un pair : la tâche I/O à arrêter, son type, et son activité.
+/// Un flux reçu d'un pair : sa génération (pour le retirer du fil de
+/// réception), son type, et son activité.
 struct RecvStream {
-    stop: tokio::sync::oneshot::Sender<()>,
+    epoch: u64,
     kind: StreamKind,
     activity: Arc<RecvActivity>,
 }
@@ -1075,7 +1079,7 @@ pub struct PerfHandles {
     /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
     pub emit_burst: Arc<Mutex<Histogram>>,
     /// 0.5.3-2 — latence du chemin de RÉCEPTION : de l'arrivée réseau (horodatée
-    /// dans `recv_io_task`) à juste avant `push_samples` (file MPSC + parse +
+    /// par le fil de réception) à juste avant `push_samples` (file MPSC + parse +
     /// décode Opus). Miroir de `send_path_latency`. Doit lire ~0,1-0,5 ms si le
     /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
     /// bug Windows que ce thread RT corrige).
@@ -1086,7 +1090,7 @@ pub struct PerfHandles {
     /// jusqu'ici elle n'avait été mesurée que hors de l'agent.
     pub decode_wake_late: Arc<Mutex<Histogram>>,
     /// Lot 1-D2 — attente entre la réception d'un paquet par le système et sa
-    /// lecture par la tâche de réception (ms). Nourri par `recv_io_task`.
+    /// lecture par le fil de réception (ms), qui la nourrit.
     pub recv_stack_delay: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     /// 0.5.3-4 — LIVENESS du callback CPAL d'ENTRÉE : incrémenté d'1 à chaque
@@ -1372,6 +1376,7 @@ impl PipelineState {
             uplink: None,
             recv_streams: HashMap::new(),
             decode_thread: None,
+            recv_thread: None,
             recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
@@ -2033,6 +2038,12 @@ impl PipelineState {
             // Fin de session : les réglages d'écoute des pairs partent avec eux.
             // (Hot-swap d'entrée : on garde la réception, donc aussi ses réglages.)
             self.mixer.clear_stream_settings();
+            // Le fil de réception d'abord : il envoie au décodage le `Remove` de
+            // chaque flux APRÈS son dernier paquet, puis se termine ; le décodage
+            // reçoit ensuite son arrêt.
+            if let Some(rt) = self.recv_thread.take() {
+                rt.shutdown();
+            }
             if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
                 let _ = tx.send(DecodeMsg::Shutdown);
                 drop(tx);
@@ -3341,15 +3352,14 @@ impl PipelineState {
         let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp)?);
 
         // Create UDP receiver
-        let receiver = RtpReceiver::new(srtp_ctx)
-            .await
-            .map_err(|e| format!("UDP bind: {}", e))?;
+        let receiver = RtpReceiver::new(srtp_ctx).map_err(|e| format!("UDP bind: {}", e))?;
         let local_port = receiver.local_addr().map_err(|e| format!("{}", e))?.port();
 
         // Note : pas de punch synchrone ici. Le punch SRTP serait rejeté par le SFU
         // tant que celui-ci n'a pas reçu nos clés via connect-plain-transport
-        // (qui n'est envoyé par le browser qu'après cette réponse). On punch en boucle
-        // dans recv_io_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
+        // (qui n'est envoyé par le browser qu'après cette réponse). Le fil de
+        // réception perce en boucle jusqu'au 1er paquet reçu (=> comedia activé
+        // côté SFU).
 
         // 0.5.3-2 — lazy-start du thread de décodage RT partagé (au 1er stream).
         // Le stream mixer N'EST PLUS créé ici : le thread de décodage le crée au
@@ -3372,25 +3382,36 @@ impl PipelineState {
             .as_ref()
             .expect("decode thread démarré juste au-dessus");
 
-        // Stop signal pour la tâche I/O de ce pair.
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // Lot 1-D3 — le fil de réception dédié démarre avec le décodage (il lui
+        // transmet les paquets par le même canal).
+        if self.recv_thread.is_none() {
+            self.recv_thread = Some(
+                recv_thread::RecvThread::spawn(
+                    decode.tx.clone(),
+                    decode.pool_rx.clone(),
+                    self.perfstats.recv_stack_delay.clone(),
+                )
+                .map_err(|e| format!("spawn recv thread: {}", e))?,
+            );
+        }
         let activity = Arc::new(RecvActivity::new(std::time::Instant::now()));
-        self.recv_streams.insert(
-            producer_id.clone(),
-            RecvStream { stop: stop_tx, kind: media_tag, activity: activity.clone() },
-        );
-
-        // Spawn la tâche I/O async (recv UDP + horodatage + punch + silence).
-        // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
-        let tx = decode.tx.clone();
-        let pool_rx = decode.pool_rx.clone();
-        let stack_delay_hist = self.perfstats.recv_stack_delay.clone();
-        let pid: Arc<str> = Arc::from(producer_id.as_str());
         self.recv_epoch = self.recv_epoch.wrapping_add(1);
         let epoch = self.recv_epoch;
-        tokio::spawn(async move {
-            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, activity, tx, pool_rx, stop_rx, stack_delay_hist).await;
-        });
+        self.recv_streams.insert(
+            producer_id.clone(),
+            RecvStream { epoch, kind: media_tag, activity: activity.clone() },
+        );
+        self.recv_thread
+            .as_ref()
+            .expect("fil de réception démarré juste au-dessus")
+            .send(recv_thread::RecvCmd::Add(recv_thread::NewStream {
+                producer_id: Arc::from(producer_id.as_str()),
+                epoch,
+                kind: media_tag,
+                receiver,
+                sfu_addr,
+                activity,
+            }));
 
         // Start playback if not running. Résolution + ouverture sur le thread
         // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
@@ -3426,11 +3447,17 @@ impl PipelineState {
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
-        // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
-        // thread de décodage qui retire l'état + le stream mixer + net_stats,
-        // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
+        // Le fil de réception désinscrit la socket puis envoie `Remove` au thread
+        // de décodage, qui retire l'état + le stream mixer + net_stats APRÈS le
+        // dernier paquet du pair (même émetteur → ordre garanti, zéro 'unknown
+        // stream').
         if let Some(stream) = self.recv_streams.remove(producer_id) {
-            let _ = stream.stop.send(());
+            if let Some(rt) = &self.recv_thread {
+                rt.send(recv_thread::RecvCmd::Remove {
+                    producer_id: Arc::from(producer_id),
+                    epoch: stream.epoch,
+                });
+            }
         }
     }
 
@@ -4997,9 +5024,12 @@ fn voice_encode_stage_loop(
 // self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
 // clément). La réception audio DOIT tourner sur un thread RT — jamais normal.
 //
-// Design (validé en triple revue senior) :
-//   - `recv_io_task` (async tokio, 1/pair) : recv UDP + horodatage d'arrivée +
-//     comedia punch + idle-timeout fantôme. Forwarde le paquet brut via un MPSC.
+// Design (validé en triple revue senior ; réception reprise au Lot 1-D3) :
+//   - `recv_thread` (UN seul std::thread, promu comme le décodage, toutes les
+//     sockets par `mio`) : recv UDP + horodatage d'arrivée + comedia punch +
+//     activité. Forwarde le paquet brut via un MPSC. Jusqu'en 0.6.6-6 c'était
+//     une tâche tokio ordinaire par pair — qui lisait les paquets 6 à 11 ms en
+//     retard (banc du 28/09/2026).
 //   - `decode_rt_loop` (UN seul std::thread, RT) : décode pour TOUS les pairs
 //     (HashMap d'état). Promotion « event-driven » (MMCSS Windows / QoS macOS
 //     SEUL, PAS le workgroup → pas de sur-population). Seul écrivain du mixer côté
@@ -5007,25 +5037,25 @@ fn voice_encode_stage_loop(
 //     mutex ×N (1 thread partagé, pas thread-par-stream).
 // Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
-/// Message d'une `recv_io_task` vers le thread de décodage RT partagé.
+/// Message du fil de réception (`recv_thread`) vers le thread de décodage RT partagé.
 enum DecodeMsg {
     /// Paquet RTP déchiffré, horodaté à l'arrivée (avant tout parse/file).
-    /// `epoch` = génération de l'io task émettrice (cf. re-add même producer).
+    /// `epoch` = génération du flux émetteur (cf. re-add même producer).
     Packet {
         producer_id: Arc<str>,
         epoch: u64,
         recv_instant: std::time::Instant,
         /// Lot 1-D2 — attente entre la réception du paquet par le SYSTÈME et sa
-        /// lecture par `recv_io_task` (`None` : pas d'horodatage). Mesure seule.
+        /// lecture par le fil de réception (`None` : pas d'horodatage). Mesure seule.
         stack_delay: Option<std::time::Duration>,
         buf: Vec<u8>,
         /// Lot C — nature du flux (constante pour le producteur) : détermine
         /// l'étage de mix au 1er paquet (`mixer.add_stream(kind)`).
         kind: StreamKind,
     },
-    /// Pair terminé (stop ou idle-timeout) : envoyé en DERNIER par l'io task →
-    /// le thread retire l'état + le stream mixer APRÈS le dernier paquet du pair
-    /// (ordre garanti : l'io task est l'unique émetteur de ce producteur).
+    /// Pair retiré : envoyé en DERNIER par le fil de réception → le thread
+    /// retire l'état + le stream mixer APRÈS le dernier paquet du pair (ordre
+    /// garanti : le fil de réception est l'unique émetteur des paquets).
     /// `epoch` : on n'honore le Remove que s'il matche la génération courante
     /// (sinon un Remove d'une ancienne connexion supprimerait un stream re-créé).
     Remove { producer_id: Arc<str>, epoch: u64 },
@@ -5096,7 +5126,7 @@ struct PushMark {
 
 /// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
 struct DecodeState {
-    /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
+    /// Génération du flux (cf. epoch dans `DecodeMsg`).
     epoch: u64,
     /// Nature du flux : les trous de la voix (qui se tait légitimement) ne se
     /// journalisent pas comme ceux de l'instrument.
@@ -5163,6 +5193,10 @@ struct DecodeState {
     /// Lot 1-A — état au dernier `push`, et trous comptés par cause.
     last_push: Option<PushMark>,
     holes: HoleCounts,
+    /// Trou relevé par une trame de MASQUAGE (aucun vrai paquet ne l'accompagne) :
+    /// classé au prochain vrai paquet, seul à savoir quand il est arrivé — avec
+    /// l'état du push qui précédait le trou.
+    pending_hole: Option<(HoleAtPull, Option<PushMark>)>,
     /// Lecture (`recv_instant`) du dernier paquet ÉCARTÉ (tardif, doublon,
     /// saut). Seul un écart survenu AVANT un trou peut en être la cause.
     last_discard: Option<std::time::Instant>,
@@ -5213,6 +5247,7 @@ impl DecodeState {
             last_wait: None,
             last_push: None,
             holes: HoleCounts::default(),
+            pending_hole: None,
             last_discard: None,
             stack_delay_max_ms: f64::NAN,
             deadline_disarmed: 0,
@@ -5231,9 +5266,9 @@ impl DecodeState {
 
 /// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
 struct DecodeThread {
-    /// MPSC vers le thread (paquets + lifecycle). Cloné dans chaque io task.
+    /// MPSC vers le thread (paquets + lifecycle). Cloné pour le fil de réception.
     tx: Sender<DecodeMsg>,
-    /// Pool de buffers recyclés. Cloné dans chaque io task (côté réception).
+    /// Pool de buffers recyclés. Cloné pour le fil de réception.
     pool_rx: Receiver<Vec<u8>>,
     join: std::thread::JoinHandle<()>,
 }
@@ -5251,7 +5286,7 @@ fn spawn_decode_thread(
     // survivre au prochain tirage (cf. `conceal_due_streams`).
     output_frames: Arc<std::sync::atomic::AtomicU32>,
 ) -> std::io::Result<DecodeThread> {
-    // Data MPSC : N io tasks → 1 thread. 256 = large (décode ≫ arrivée).
+    // Data MPSC : fil de réception → décodage. 256 = large (décode ≫ arrivée).
     let (tx, rx) = bounded::<DecodeMsg>(256);
     // Pool : buffers MTU réutilisés → zéro alloc/dealloc sur le thread RT.
     let (pool_tx, pool_rx) = bounded::<Vec<u8>>(128);
@@ -5380,8 +5415,24 @@ fn note_push(
     arrived: Option<Arrived>,
     output_block_ms: f64,
 ) {
+    // Un trou en attente (relevé par une trame de masquage) se classe au premier
+    // vrai paquet qui suit. S'il en survient un second avant, le premier se
+    // classe tel quel : sa cause restera « arrivée » sans détail.
+    if let Some(a) = arrived {
+        if let Some((h, base)) = st.pending_hole.take() {
+            report_hole(st, producer_id, &h, base, Some(a), now, output_block_ms);
+        }
+    }
     if let Some(h) = report.hole {
-        report_hole(st, producer_id, &h, arrived, now, output_block_ms);
+        if arrived.is_none() {
+            if let Some((old, base)) = st.pending_hole.take() {
+                report_hole(st, producer_id, &old, base, None, now, output_block_ms);
+            }
+            st.pending_hole = Some((h, st.last_push));
+        } else {
+            let base = st.last_push;
+            report_hole(st, producer_id, &h, base, arrived, now, output_block_ms);
+        }
     }
     let last_received = arrived.map(|a| a.read_at).or(st.last_push.and_then(|p| p.last_received));
     st.last_push = Some(PushMark {
@@ -5398,6 +5449,8 @@ fn report_hole(
     st: &mut DecodeState,
     producer_id: &str,
     h: &HoleAtPull,
+    // Le push qui précédait le trou : point de départ de l'analyse.
+    base: Option<PushMark>,
     arrived: Option<Arrived>,
     now: std::time::Instant,
     output_block_ms: f64,
@@ -5405,7 +5458,7 @@ fn report_hole(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     // Pas de push connu avant le trou (flux recréé entre-temps) : les faits
     // manquent, on le dit.
-    let facts = st.last_push.map(|p| HoleFacts {
+    let facts = base.map(|p| HoleFacts {
         fill_at_last_push_ms: p.fill_after_ms,
         // Trou relevé AVANT le push de référence : horloges incohérentes, la
         // classification rendra `Unclassified`.
@@ -5428,7 +5481,7 @@ fn report_hole(
     // Ce que le masquage avait décidé depuis le dernier push (sinon : rien).
     let wait = st
         .last_wait
-        .filter(|(_, at)| st.last_push.is_some_and(|p| *at >= p.at))
+        .filter(|(_, at)| base.is_some_and(|p| *at >= p.at))
         .map(|(w, _)| w);
     if wait == Some(Wait::BufferHolds) {
         st.holes.after_buffer_holds += 1;
@@ -5441,7 +5494,7 @@ fn report_hole(
     let since_push_ms = facts.map_or(-1.0, |f| f.since_last_push_ms);
     let consumed_ms = facts.map_or(-1.0, |f| f.consumed_since_push_ms);
     // Écart entre les deux arrivées qui encadrent le trou.
-    let arrival_gap_ms = match (arrived, st.last_push.and_then(|p| p.last_received)) {
+    let arrival_gap_ms = match (arrived, base.and_then(|p| p.last_received)) {
         (Some(a), Some(prev)) => ms(a.read_at.saturating_duration_since(prev)),
         _ => -1.0,
     };
@@ -5809,7 +5862,7 @@ fn handle_decode_msg(
 }
 
 /// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
-/// thread RT. `recv_instant` = arrivée réseau horodatée par `recv_io_task`
+/// thread RT. `recv_instant` = arrivée réseau horodatée par le fil de réception
 /// (JAMAIS un `Instant::now()` ici, sinon le délai de file polluerait la gigue).
 #[allow(clippy::too_many_arguments)]
 fn decode_one_packet(
@@ -5847,7 +5900,7 @@ fn decode_one_packet(
     let arrival = st.seq.on_packet(header.sequence);
 
     // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
-    // (celui horodaté dans recv_io_task) pour drift ET gigue. Un paquet en retard
+    // (celui horodaté par le fil de réception) pour drift ET gigue. Un paquet en retard
     // y entre : son retard EST de la gigue. Un double ou un saut non confirmé non.
     if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late) {
         st.drift.observe(header.timestamp, recv_instant);
@@ -6005,132 +6058,6 @@ fn decode_one_packet(
     }
 }
 
-/// Tâche I/O de réception (async tokio, 1 par pair). Recv UDP + horodatage +
-/// comedia punch + activité (silence). Ne décode RIEN : forwarde le paquet brut au
-/// thread de décodage RT. S'arrête UNIQUEMENT sur `remove_stream` (ou arrêt du
-/// thread de décodage) et envoie alors un `Remove` terminal.
-#[allow(clippy::too_many_arguments)]
-async fn recv_io_task(
-    receiver: RtpReceiver,
-    sfu_addr: SocketAddr,
-    producer_id: Arc<str>,
-    epoch: u64,
-    kind: StreamKind,
-    activity: Arc<RecvActivity>,
-    tx: Sender<DecodeMsg>,
-    pool_rx: Receiver<Vec<u8>>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-    stack_delay_hist: Arc<Mutex<Histogram>>,
-) {
-    let short = &producer_id[..8.min(producer_id.len())];
-
-    // Punch périodique pour comedia : on retry jusqu'au 1er paquet entrant.
-    // 100 ms × 30 = 3 s (marge pour le connect-plain-transport du browser).
-    let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut punch_remaining: u32 = 30;
-
-    // Silence : un flux qui se tait n'est JAMAIS terminé ici (cf. `recv_activity`) —
-    // sa fin vient du navigateur (`remove-stream`). On journalise seulement le début
-    // et la fin d'un silence de l'INSTRUMENT (~400 paquets/s en continu, même quand
-    // le musicien ne joue pas) ; la voix se tait légitimement dès que personne ne
-    // parle.
-    let mut silence_check = tokio::time::interval(std::time::Duration::from_secs(1));
-    silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut silence_logged = false;
-    let mut got_first = false;
-    // N13 — erreurs de réception qui S'ENCHAÎNENT (remis à zéro dès qu'un paquet
-    // passe). Une erreur isolée ne dit rien (cf. `recv_error_backoff`).
-    let mut consecutive_recv_errors: u32 = 0;
-
-    // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
-    let mut buf: Vec<u8> = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
-
-    loop {
-        tokio::select! {
-            _ = &mut stop_rx => break,
-            _ = punch_interval.tick(), if punch_remaining > 0 => {
-                let _ = receiver.punch(sfu_addr).await;
-                punch_remaining -= 1;
-            }
-            _ = silence_check.tick(), if matches!(kind, StreamKind::Instrument) => {
-                let silent_ms = activity.silent_ms(std::time::Instant::now());
-                if !silence_logged && got_first && silent_ms >= SILENCE_LOG_AFTER_MS {
-                    tracing::warn!(target: "jamodio::recv", producer = short, silent_ms, "aucun paquet reçu — flux conservé, reprise automatique à leur retour");
-                    silence_logged = true;
-                }
-            }
-            result = receiver.recv(&mut buf) => {
-                match result {
-                    Ok(r) if r.len > 0 => {
-                        // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
-                        let recv_instant = std::time::Instant::now();
-                        // Lot 1-D2 — attente système → lecture (mesure seule).
-                        if let Some(d) = r.stack_delay {
-                            stack_delay_hist.lock().observe(d.as_secs_f32() * 1000.0);
-                        }
-                        if silence_logged {
-                            let silent_ms = activity.silent_ms(recv_instant);
-                            tracing::info!(target: "jamodio::recv", producer = short, silent_ms, "paquets revenus après un silence");
-                            silence_logged = false;
-                        }
-                        activity.mark_packet(recv_instant);
-                        consecutive_recv_errors = 0;
-                        // 1er paquet valide : comedia activé → on stoppe les punches.
-                        if !got_first {
-                            got_first = true;
-                            punch_remaining = 0;
-                        }
-                        // Échange le buffer plein contre un neuf (pool) et envoie
-                        // le plein au thread de décodage.
-                        let fresh = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
-                        let full = std::mem::replace(&mut buf, fresh);
-                        if tx
-                            .send(DecodeMsg::Packet {
-                                producer_id: producer_id.clone(),
-                                epoch,
-                                recv_instant,
-                                stack_delay: r.stack_delay,
-                                buf: full,
-                                kind,
-                            })
-                            .is_err()
-                        {
-                            break; // thread de décodage parti (shutdown)
-                        }
-                    }
-                    // len == 0 : RTCP filtré / échec SRTP (déjà loggé) → on réutilise buf.
-                    Ok(_) => {}
-                    Err(e) => {
-                        activity.mark_recv_error();
-                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
-                        // Une erreur isolée est journalisée (elle reste un fait) ;
-                        // une rafale ne l'est plus qu'au début, sinon le journal
-                        // devient illisible au moment précis où on le lit.
-                        if consecutive_recv_errors <= 3 {
-                            tracing::warn!(
-                                target: "jamodio::recv",
-                                producer = %producer_id,
-                                error = %e,
-                                consecutive = consecutive_recv_errors,
-                                "erreur de réception UDP"
-                            );
-                        }
-                        let wait = crate::recv_activity::recv_error_backoff(consecutive_recv_errors);
-                        if !wait.is_zero() {
-                            tokio::time::sleep(wait).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Message terminal : le thread retire l'état + le stream mixer + l'entrée
-    // net_stats de ce pair, APRÈS notre dernier paquet (ordre garanti — émetteur
-    // unique) → zéro 'unknown stream', zéro ppm fantôme.
-    let _ = tx.send(DecodeMsg::Remove { producer_id, epoch });
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Chantier A (v0.4.12) — tests PluginControl (load/unload non-bloquant)
@@ -6748,6 +6675,9 @@ mod teardown_tests {
         eprintln!("OK: teardown réel → 0 callback fantôme (run={running})");
     }
 }
+
+// Lot 1-D3 — fil de réception dédié (priorité audio), toutes sockets par `mio`.
+mod recv_thread;
 
 // Lot B0-bis du banc « N musiciens » : la réception à N flux en temps simulé.
 #[cfg(test)]
@@ -7601,6 +7531,22 @@ mod conceal_loop_tests {
         recevoir(st, &mixer, 1002, Instant::now());
         assert_eq!(st.holes.after_buffer_holds, 1);
         assert_eq!(st.holes.consumption, 1);
+    }
+
+    /// Un trou relevé par une trame de MASQUAGE attend le vrai paquet suivant
+    /// pour être classé (banc du 28/09 : deux trous « arrivée » sans aucun fait).
+    #[test]
+    fn un_trou_releve_par_un_masquage_se_classe_au_paquet_suivant() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 240]).unwrap();
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        assert_eq!(st.holes, HoleCounts::default(), "pas encore classé");
+        assert!(st.pending_hole.is_some());
+        std::thread::sleep(Duration::from_millis(5));
+        recevoir_horodate(&mut st, &mixer, 1002, Instant::now(), Some(Duration::from_millis(20)));
+        assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
+        assert!(st.pending_hole.is_none());
     }
 
     /// Un tirage plein ne produit rien à analyser.

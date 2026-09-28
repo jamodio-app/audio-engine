@@ -394,37 +394,43 @@ mod tests {
 
     /// Le faux serveur parle au RÉCEPTEUR DE L'AGENT (même code) : perçage,
     /// chiffrement croisé, cadence tenue.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn le_recepteur_de_l_agent_recoit_les_flux_du_faux_serveur() {
+    #[test]
+    fn le_recepteur_de_l_agent_recoit_les_flux_du_faux_serveur() {
         let link = Downlink::bind("127.0.0.1", "p1".into(), Kind::Instrument, 1).unwrap();
         let agent_keys = SrtpParameters::generate_aead_aes_256_gcm();
         // Côté agent : ses clés en local, celles du serveur en distant.
         let agent_ctx = Arc::new(SrtpContext::new(&agent_keys, &link.server_keys).unwrap());
-        let receiver = RtpReceiver::new(agent_ctx).await.unwrap();
+        let receiver = RtpReceiver::new(agent_ctx).unwrap();
         link.set_agent_keys(&agent_keys).unwrap();
 
         let mut sender = SenderLoop::start(Payloads::encode(220.0).unwrap(), Payloads::encode(440.0).unwrap());
         sender.add(link.clone(), &PeerProfile::preset("regular").unwrap(), 1);
         let sfu: SocketAddr = format!("127.0.0.1:{}", link.port()).parse().unwrap();
-        receiver.punch(sfu).await.unwrap();
+        receiver.punch(sfu).unwrap();
 
+        // Lecture non bloquante, comme le fil de réception de l'agent (sans son
+        // attente `mio` : une courte pause quand la socket est vide).
         let mut buf = Vec::with_capacity(2048);
         let mut seqs = Vec::new();
         let t = Instant::now();
         while seqs.len() < 200 && t.elapsed() < Duration::from_secs(5) {
-            let r = tokio::time::timeout(Duration::from_secs(2), receiver.recv(&mut buf))
-                .await
-                .expect("le flux arrive")
-                .unwrap();
-            assert!(r.len > 12, "paquet déchiffré par l'agent");
-            // Lot 1-D2 : sous macOS le système horodate toujours. Sous Windows
-            // cela dépend de la machine (la VM de CI n'horodate pas la boucle
-            // locale, 28/09/2026) : l'agent le dit au journal, le test ne
-            // l'exige pas.
-            if cfg!(target_os = "macos") {
-                assert!(r.stack_delay.is_some(), "attente système → lecture mesurée");
+            match receiver.read(&mut buf) {
+                Ok(r) => {
+                    assert!(r.len > 12, "paquet déchiffré par l'agent");
+                    // Lot 1-D2 : sous macOS le système horodate toujours. Sous
+                    // Windows cela dépend de la machine (la VM de CI n'horodate
+                    // pas la boucle locale, 28/09/2026) : l'agent le dit au
+                    // journal, le test ne l'exige pas.
+                    if cfg!(target_os = "macos") {
+                        assert!(r.stack_delay.is_some(), "attente système → lecture mesurée");
+                    }
+                    seqs.push(rtp::parse_header(&buf).unwrap().0.sequence);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_micros(200))
+                }
+                Err(e) => panic!("{e}"),
             }
-            seqs.push(rtp::parse_header(&buf).unwrap().0.sequence);
         }
         assert_eq!(seqs.len(), 200);
         assert!(seqs.windows(2).all(|w| w[1] == w[0].wrapping_add(1)), "numérotation continue");

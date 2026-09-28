@@ -15,6 +15,9 @@ parking_lot = "0.12"       # Verrous fins du mixer (RwLock map + Mutex par flux)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
+# Lot 1-D3 — attente de la réception sur un fil DÉDIÉ (kqueue / IOCP), hors du
+# runtime tokio. Déjà dans l'arbre (tokio en dépend), même version.
+mio = { version = "1", features = ["os-poll", "net"] }
 base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
 getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres
 zeroize = "1"              # Efface les clés SRTP décodées de la mémoire au drop

@@ -17,6 +17,9 @@ cpal = "0.15"
 # resampler n'y est autorisé. Déjà présent dans l'arbre via DeepFilterNet.
 rubato = "0.14"
 tokio = { version = "1", features = ["full"] }
+# Lot 1-D3 — fil de réception dédié : attente de toutes les sockets reçues
+# (kqueue / IOCP) hors du runtime tokio. Même version que celle de tokio.
+mio = { version = "1", features = ["os-poll", "net"] }
 axum = { version = "0.7", features = ["ws"] }
 # socket2 : bind du serveur WS avec SO_REUSEADDR (tokio ne le pose pas sur
 # Windows) → permet de re-binder le port 9876 immédiatement après un
