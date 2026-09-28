@@ -158,6 +158,34 @@ impl AgentLink {
         keys_of(&port)
     }
 
+    /// Liste des plugins connus de l'agent. Un inventaire en cours rend une
+    /// liste partielle : on attend qu'il finisse (2 min au plus), plutôt que de
+    /// conclure « absent » sur une liste incomplète.
+    pub async fn plugins(&self) -> Result<Vec<Value>, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let list = self.request(json!({ "type": "list-plugins" }), "plugin-list".into()).await?;
+            let items = list["items"].as_array().cloned().unwrap_or_default();
+            if list["scanning"].as_bool() != Some(true) {
+                return Ok(items);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("inventaire des plugins toujours en cours après 2 min".into());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Charge un plugin inséré sur l'instrument, comme le studio. Rend la
+    /// confirmation de l'agent (nom, latence) ; un refus arrête le banc.
+    pub async fn load_plugin(&self, plugin_ref: &Value) -> Result<Value, String> {
+        self.request(
+            json!({ "type": "load-instrument-plugin", "pluginRef": plugin_ref }),
+            "instrument-plugin".into(),
+        )
+        .await
+    }
+
     pub fn remove_stream(&self, producer_id: &str) -> Result<(), String> {
         self.send(json!({ "type": "remove-stream", "producerId": producer_id }))
     }
@@ -215,6 +243,18 @@ fn dispatch(
         }
         "devices" => {
             resolve("devices".into(), Ok(v));
+        }
+        "plugin-list" => {
+            resolve("plugin-list".into(), Ok(v));
+        }
+        "instrument-plugin-loaded" => {
+            resolve("instrument-plugin".into(), Ok(v));
+        }
+        "instrument-plugin-error" => {
+            let msg = format!("plugin refusé : {}", v["message"].as_str().unwrap_or("?"));
+            if !resolve("instrument-plugin".into(), Err(msg.clone())) {
+                let _ = err_tx.send(msg);
+            }
         }
         "rejected" => {
             let _ = err_tx.send(format!(
@@ -403,6 +443,28 @@ mod tests {
         // Une erreur sans demande en attente remonte au banc.
         dispatch(json!({ "type": "error", "message": "rate" }), &pending, &out, &perf_tx, &err_tx, &mut hello);
         assert_eq!(err_rx.recv().await.unwrap(), "rate");
+    }
+
+    #[test]
+    fn le_chargement_d_un_plugin_est_celui_du_studio() {
+        let r = json!({ "format": "vst3", "path": "C:/VST3/AmpliTube 5.vst3", "uid": "ABCD" });
+        let v = json!({ "type": "load-instrument-plugin", "pluginRef": r });
+        assert!(matches!(as_agent_reads(v), BrowserMessage::LoadInstrumentPlugin { .. }));
+        assert!(matches!(as_agent_reads(json!({ "type": "list-plugins" })), BrowserMessage::ListPlugins));
+    }
+
+    /// Un plugin refusé fait échouer la demande — jamais un banc « chargé » à vide.
+    #[tokio::test]
+    async fn un_plugin_refuse_fait_echouer_la_demande() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert("instrument-plugin".into(), tx);
+        let (out, _o) = mpsc::unbounded_channel();
+        let (perf_tx, _p) = mpsc::unbounded_channel();
+        let (err_tx, _e) = mpsc::unbounded_channel();
+        let mut hello = None;
+        dispatch(json!({ "type": "instrument-plugin-error", "message": "latence trop grande" }), &pending, &out, &perf_tx, &err_tx, &mut hello);
+        assert!(rx.await.unwrap().unwrap_err().contains("latence trop grande"));
     }
 
     #[test]

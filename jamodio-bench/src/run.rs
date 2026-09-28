@@ -78,6 +78,23 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     up_instrument.set_agent_keys(&keys)?;
     listeners.push(spawn_listen(up_instrument.clone(), stop.clone()));
 
+    // Plugin inséré : la charge réelle du musicien, dans l'Audio Engine.
+    let plugin_line = match scenario.plugin.as_deref() {
+        None => "aucun".to_string(),
+        Some(name) => {
+            let items = agent.plugins().await?;
+            let plugin_ref = pick_plugin(&items, name)?;
+            let loaded = agent.load_plugin(&plugin_ref).await?;
+            let line = format!(
+                "{} (latence déclarée {} échantillons)",
+                loaded["name"].as_str().unwrap_or(name),
+                loaded["latencySamples"]
+            );
+            println!("Plugin chargé : {line}");
+            line
+        }
+    };
+
     let up_voice = match scenario.send_voice_channel {
         Some(channel) => {
             let up = Uplink::bind(ip)?;
@@ -239,6 +256,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 format!("local, gigue/pertes simulées ; profils : {}", profile_list(&scenario))
             },
         ),
+        ("Plugin inséré".to_string(), plugin_line),
         ("Talkback envoyé".to_string(), scenario.send_voice_channel.map_or("non".into(), |c| format!("canal {}", c + 1))),
         ("Fichiers".to_string(), "peers.csv (flux, 1 ligne/s), machine.csv (machine et faux serveur), scenario.json".into()),
         ("Journal de l'Audio Engine".to_string(), "à joindre (lignes TROU, perfstats)".into()),
@@ -275,6 +293,23 @@ fn pick_device(list: &Value, wanted: Option<&str>, what: &str) -> Result<String,
         .and_then(|d| d["id"].as_str())
         .map(str::to_string)
         .ok_or_else(|| format!("aucun périphérique de {what} par défaut : le préciser (session-bench devices)"))
+}
+
+/// Le plugin nommé, par son nom EXACT (sans tenir compte des majuscules).
+/// Absent ou ambigu : erreur qui cite les plugins connus — pas d'à-peu-près.
+fn pick_plugin(items: &[Value], name: &str) -> Result<Value, String> {
+    let found: Vec<&Value> = items
+        .iter()
+        .filter(|p| p["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one["pluginRef"].clone()),
+        [] => {
+            let names: Vec<&str> = items.iter().filter_map(|p| p["name"].as_str()).collect();
+            Err(format!("plugin « {name} » introuvable. Connus : {}", names.join(", ")))
+        }
+        _ => Err(format!("plusieurs plugins s'appellent « {name} » : préciser (session-bench plugins)")),
+    }
 }
 
 fn profile_list(s: &Scenario) -> String {
@@ -381,4 +416,26 @@ pub fn selftest(streams: u32, secs: u64) -> Result<bool, String> {
     println!("Plus grand écart entre deux paquets reçus (2,5 ms attendus) : {worst_gap:.2} ms");
     println!("Précision du banc : {verdict}");
     Ok(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn liste() -> Vec<Value> {
+        vec![
+            json!({ "name": "AmpliTube 5", "pluginRef": { "format": "vst3", "path": "a", "uid": "1" } }),
+            json!({ "name": "Reverb", "pluginRef": { "format": "vst3", "path": "b", "uid": "2" } }),
+            json!({ "name": "Reverb", "pluginRef": { "format": "vst3", "path": "c", "uid": "3" } }),
+        ]
+    }
+
+    #[test]
+    fn un_plugin_se_choisit_par_son_nom_exact() {
+        assert_eq!(pick_plugin(&liste(), "amplitube 5").unwrap()["uid"], "1");
+        let e = pick_plugin(&liste(), "AmpliTube").unwrap_err();
+        assert!(e.contains("introuvable") && e.contains("AmpliTube 5"), "{e}");
+        assert!(pick_plugin(&liste(), "Reverb").unwrap_err().contains("plusieurs"));
+    }
 }

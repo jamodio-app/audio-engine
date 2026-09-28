@@ -41,6 +41,11 @@ pub struct Scenario {
     /// Canal de l'instrument (0 = canal 1) ; `None` = le choix de l'agent.
     #[serde(default)]
     pub channel_index: Option<u8>,
+    /// Plugin inséré sur l'instrument, chargé DANS l'Audio Engine comme en
+    /// session (nom exact, tel que `session-bench plugins` l'affiche). C'est la
+    /// charge réelle d'un musicien (ex. AmpliTube) ; `None` = aucun.
+    #[serde(default)]
+    pub plugin: Option<String>,
     /// Graine : la même graine rejoue exactement les mêmes retards et pertes.
     pub seed: u64,
     /// Adresse du faux serveur telle que l'agent doit la joindre. `"auto"` =
@@ -67,6 +72,7 @@ impl Default for Scenario {
             input_device: None,
             output_device: None,
             channel_index: None,
+            plugin: None,
             seed: 1,
             server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),

@@ -19,6 +19,8 @@ grandit. Plan et critères : `internal-docs/plans/PLAN-BANC-N-MUSICIENS-2026-09.
 ```text
 cargo run --release -p jamodio-bench -- selftest          # d'abord : précision du banc seul
 cargo run --release -p jamodio-bench -- devices
+cargo run --release -p jamodio-bench -- plugins
+cargo run --release -p jamodio-bench -- run --input "…" --output "…" --plugin "AmpliTube 5"
 cargo run --release -p jamodio-bench -- run
 cargo run --release -p jamodio-bench -- run --profile ethernet --to 6 --step-secs 120
 cargo run --release -p jamodio-bench -- run --profiles regular,wifi --peer-voice bursts --send-voice 2
@@ -53,6 +55,9 @@ Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
   rappelle (« SUFFISANTE » si aucun envoi n'a eu plus de 1 ms de retard).
 - **« Retard max du banc »** : si le faux serveur envoie lui-même en retard,
   c'est lui qui fait la gigue. À regarder en premier.
+- **Plugin** (`--plugin`) : chargé DANS l'Audio Engine sur l'instrument, comme
+  en session — c'est la charge réelle du musicien. Ne pas lancer le plugin en
+  standalone : il prendrait lui-même l'interface ASIO.
 - **Talkback envoyé** (`--send-voice`) : l'agent n'envoie de la voix que s'il
   entend quelqu'un. Parler, ou faire jouer un son dans le micro, pendant le banc ;
   sinon le critère 3 reste « sans objet ».

@@ -22,6 +22,7 @@ const USAGE: &str = "\
 session-bench — banc « N musiciens » contre l'Audio Engine installé
 
   session-bench devices
+  session-bench plugins                        (plugins connus de l'Audio Engine)
   session-bench scenario                       (écrit le scénario par défaut en JSON)
   session-bench selftest [FLUX] [SECONDES]     (précision du banc seul, sans Audio Engine ; défaut 8 flux, 30 s)
   session-bench run [options]
@@ -38,6 +39,8 @@ Options de run :
   --send-voice CANAL      l'Audio Engine envoie aussi son talkback (canal 1, 2…)
   --input ID / --output ID  périphériques (format idx:nom, cf. devices)
   --channel CANAL         canal de l'instrument (1, 2…)
+  --plugin NOM            charge ce plugin sur l'instrument, dans l'Audio Engine
+                          (nom exact, cf. plugins) — la charge réelle du musicien
   --seed N                graine (même graine = mêmes retards et pertes)
   --agent URL             WebSocket de l'Audio Engine (défaut ws://127.0.0.1:9876)
   --out DOSSIER           où écrire les résultats (défaut bench-results/<date>)
@@ -49,6 +52,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("devices") => devices(&Scenario::default().agent_url).await,
+        Some("plugins") => plugins(&Scenario::default().agent_url).await,
         Some("scenario") => match serde_json::to_string_pretty(&Scenario::default()) {
             Ok(j) => {
                 println!("{j}");
@@ -91,6 +95,19 @@ async fn devices(url: &str) -> Result<(), String> {
                 dev["channels"]
             );
         }
+    }
+    Ok(())
+}
+
+async fn plugins(url: &str) -> Result<(), String> {
+    let agent = AgentLink::connect(url).await?;
+    for p in agent.plugins().await? {
+        println!(
+            "  {}  ({}){}",
+            p["name"].as_str().unwrap_or("?"),
+            p["manufacturer"].as_str().unwrap_or("?"),
+            if p["incompatible"].as_bool() == Some(true) { "  [latence trop grande pour le direct]" } else { "" }
+        );
     }
     Ok(())
 }
@@ -171,6 +188,7 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
             "--send-voice" => scenario.send_voice_channel = Some(channel(&val()?)?),
             "--channel" => scenario.channel_index = Some(channel(&val()?)?),
             "--input" => scenario.input_device = Some(val()?),
+            "--plugin" => scenario.plugin = Some(val()?),
             "--output" => scenario.output_device = Some(val()?),
             "--agent" => scenario.agent_url = val()?,
             "--out" => out = Some(PathBuf::from(val()?)),
