@@ -441,7 +441,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let h = RtpHeader { payload_type: PAYLOAD_TYPE, sequence: i, timestamp: 0, ssrc: 7, marker: false };
-            sender.send_blocking(rtp::build_packet(&h, &[0u8; 100])).unwrap();
+            // Envoi non bloquant de l'agent : un `WouldBlock` (tampon d'envoi du
+            // système momentanément plein) ferait perdre la trame — l'agent la
+            // laisse tomber, ce test doit rester déterministe : on réessaie.
+            loop {
+                match sender.send_blocking(rtp::build_packet(&h, &[0u8; 100])) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_micros(200)).await
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
             tokio::time::sleep(Duration::from_micros(2_500)).await;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;

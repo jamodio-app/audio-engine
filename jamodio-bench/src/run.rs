@@ -33,7 +33,6 @@ enum End {
 
 pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> {
     scenario.validate()?;
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("dossier {} : {e}", out_dir.display()))?;
 
     println!("Préparation des trames Opus…");
     let payloads = (Payloads::encode(220.0)?, Payloads::encode(330.0)?);
@@ -59,7 +58,12 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     println!("Entrée : {input} — sortie : {output}");
 
     // Capture instrument, envoyée au transport montant du banc.
-    let ip = scenario.server_ip.as_str();
+    let server_ip = match scenario.server_ip.as_str() {
+        "auto" => crate::scenario::primary_local_ip()?.to_string(),
+        ip => ip.to_string(),
+    };
+    let ip = server_ip.as_str();
+    println!("Faux serveur sur {ip} (cette machine)");
     let up_instrument = Uplink::bind(ip)?;
     let keys = agent
         .start_capture(&CaptureParams {
@@ -111,6 +115,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     let mut machine_rows: Vec<MachineRow> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
     let mut end = End::Complete;
+    let mut warned_no_holes = false;
 
     'campaign: for musicians in scenario.from_musicians..=scenario.to_musicians {
         // Musiciens à ajouter pour atteindre ce palier (tous au premier).
@@ -156,7 +161,14 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 last_perf = Some(p);
             }
             if let Some(p) = &last_perf {
-                peer_rows.extend(report::peer_rows(p, t, musicians, &names));
+                let rows = report::peer_rows(p, t, musicians, &names);
+                if !warned_no_holes && rows.iter().any(|r| r.get("holesArrival").is_nan()) {
+                    // Le numéro de version ne suffit pas à le savoir (la 0.6.6-2
+                    // est plus récente que la -1 sans en avoir les mesures).
+                    println!("⚠ Cet Audio Engine ne mesure pas la cause des trous : installer la pré-version 0.6.6-5 ou plus récente. Le banc continue, ces colonnes resteront vides.");
+                    warned_no_holes = true;
+                }
+                peer_rows.extend(rows);
             }
             let row = report::machine_row(
                 last_perf.as_ref(),
@@ -217,13 +229,16 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
             if scenario.is_local_regular() {
                 "local, flux réguliers : tout trou est de cause locale".into()
             } else {
-                format!("serveur {} ; profils : {}", scenario.server_ip, profile_list(&scenario))
+                format!("local, gigue/pertes simulées ; profils : {}", profile_list(&scenario))
             },
         ),
         ("Talkback envoyé".to_string(), scenario.send_voice_channel.map_or("non".into(), |c| format!("canal {}", c + 1))),
         ("Fichiers".to_string(), "peers.csv (flux, 1 ligne/s), machine.csv (machine et faux serveur), scenario.json".into()),
         ("Journal de l'Audio Engine".to_string(), "à joindre (lignes TROU, perfstats)".into()),
     ];
+    // Le dossier n'est créé qu'ici : une campagne qui n'a jamais démarré ne
+    // laisse pas de dossier vide qu'on prendrait pour un résultat.
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("dossier {} : {e}", out_dir.display()))?;
     write(out_dir, "peers.csv", &report::peers_csv(&peer_rows))?;
     write(out_dir, "machine.csv", &report::machine_csv(&machine_rows))?;
     write(out_dir, "scenario.json", &serde_json::to_string_pretty(&scenario).map_err(|e| e.to_string())?)?;

@@ -43,7 +43,12 @@ pub struct Scenario {
     pub channel_index: Option<u8>,
     /// Graine : la même graine rejoue exactement les mêmes retards et pertes.
     pub seed: u64,
-    /// Adresse du faux serveur telle que l'agent doit la joindre.
+    /// Adresse du faux serveur telle que l'agent doit la joindre. `"auto"` =
+    /// l'adresse réseau de CETTE machine (192.168.x.x…). Jamais 127.0.0.1 :
+    /// l'Audio Engine livré refuse d'envoyer le son vers le bouclage (aucun vrai
+    /// serveur n'y est — protection contre le détournement du micro, revue du
+    /// 12/07/2026) ; les paquets vers l'adresse réseau de la machine restent sur
+    /// la machine, ce qui garde le mode local.
     pub server_ip: String,
     /// WebSocket de l'Audio Engine.
     pub agent_url: String,
@@ -63,7 +68,7 @@ impl Default for Scenario {
             output_device: None,
             channel_index: None,
             seed: 1,
-            server_ip: "127.0.0.1".into(),
+            server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),
         }
     }
@@ -84,6 +89,17 @@ impl Scenario {
         }
         if self.step_secs < 30 {
             return Err("palier de 30 s au moins (sinon rien de mesurable)".into());
+        }
+        if self.server_ip != "auto" {
+            match self.server_ip.parse::<std::net::IpAddr>() {
+                Ok(ip) if ip.is_loopback() || ip.is_unspecified() => {
+                    return Err(format!(
+                        "server_ip {ip} : l'Audio Engine refuse le bouclage — mettre \"auto\" ou l'adresse réseau de la machine"
+                    ))
+                }
+                Ok(_) => {}
+                Err(_) => return Err(format!("server_ip illisible : {}", self.server_ip)),
+            }
         }
         if self.peers.is_empty() {
             return Err("au moins un profil de musicien".into());
@@ -111,20 +127,33 @@ impl Scenario {
         &self.peers[(musician as usize - 2) % self.peers.len()]
     }
 
-    /// Mode local ET flux sans gigue ni perte : tout trou y est de cause locale.
+    /// Flux sans gigue ni perte : le faux serveur tournant sur la même machine
+    /// que l'agent (seul mode existant), tout trou y est de cause locale.
     pub fn is_local_regular(&self) -> bool {
-        let loopback = self.server_ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-        loopback
-            && self
-                .peers
-                .iter()
-                .all(|p| p.jitter == crate::profile::Jitter::None && p.loss_pct == 0.0)
+        self.peers
+            .iter()
+            .all(|p| p.jitter == crate::profile::Jitter::None && p.loss_pct == 0.0)
     }
 
     /// Durée totale de la campagne.
     pub fn total_secs(&self) -> u64 {
         u64::from(self.to_musicians - self.from_musicians + 1) * self.step_secs
     }
+}
+
+/// Adresse réseau de cette machine : celle par laquelle elle sortirait vers
+/// internet. Aucun paquet n'est envoyé (un `connect` UDP ne fait que choisir la
+/// route).
+pub fn primary_local_ip() -> Result<std::net::IpAddr, String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    // TEST-NET-1 (RFC 5737) : jamais routé, seulement consulté pour la route.
+    sock.connect("192.0.2.1:9")
+        .map_err(|e| format!("aucune route réseau : brancher le réseau ({e})"))?;
+    let ip = sock.local_addr().map_err(|e| e.to_string())?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err("aucune adresse réseau locale : brancher le réseau (Wi-Fi ou câble)".into());
+    }
+    Ok(ip)
 }
 
 #[cfg(test)]
@@ -169,6 +198,8 @@ mod tests {
             Scenario { to_musicians: 40, ..Scenario::default() },
             Scenario { warmup_secs: 300, ..Scenario::default() },
             Scenario { peers: vec![], ..Scenario::default() },
+            Scenario { server_ip: "127.0.0.1".into(), ..Scenario::default() },
+            Scenario { server_ip: "pas-une-ip".into(), ..Scenario::default() },
             Scenario {
                 peers: vec![PeerProfile { loss_pct: 150.0, ..PeerProfile::preset("regular").unwrap() }],
                 ..Scenario::default()
