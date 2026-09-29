@@ -202,6 +202,7 @@ jobs:
       # en brouillon (`publish` dépend de ce job). Cf. le script.
       - name: Test de bout en bout de l'installeur (freinage réseau)
         if: matrix.runner == 'windows-2022'
+        timeout-minutes: 20
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

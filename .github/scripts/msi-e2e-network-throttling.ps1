@@ -10,8 +10,12 @@
 
 param(
   [Parameter(Mandatory)] [string] $Msi,
-  [Parameter(Mandatory)] [string] $OldMsi
+  [Parameter(Mandatory)] [string] $OldMsi,
+  # Journaux msiexec (/l*v) : conservés par le workflow en cas d'échec.
+  [string] $LogDir = 'msi-logs',
+  [int] $TimeoutMs = 300000
 )
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $ErrorActionPreference = 'Stop'
 
 $ProfileKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
@@ -35,11 +39,24 @@ function Assert($cond, $what) {
   Write-Host "  ok — $what"
 }
 function Invoke-Msi([string[]] $arguments, [int[]] $expected, [string] $log) {
-  $p = Start-Process msiexec.exe -ArgumentList ($arguments + @('/qn', '/norestart', '/l*v', $log)) -Wait -PassThru
+  $log = Join-Path $LogDir $log
+  Write-Host "  [$(Get-Date -Format HH:mm:ss)] msiexec $($arguments -join ' ')"
+  # PAS de `Start-Process -Wait` : il attend aussi tous les descendants, et un
+  # programme resté ouvert après l'installation bloquerait le test sans fin.
+  $p = Start-Process msiexec.exe -ArgumentList ($arguments + @('/qn', '/norestart', '/l*v', $log)) -PassThru
+  if (-not $p.WaitForExit($TimeoutMs)) {
+    Write-Host "  BLOQUÉ après $($TimeoutMs / 1000) s — programmes en cours :"
+    Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'msiexec|jamodio|Jamodio|WebView|EdgeUpdate|setup' } |
+      ForEach-Object { Write-Host "    $($_.ProcessId) $($_.Name) :: $($_.CommandLine)" }
+    if (Test-Path $log) { Get-Content $log -Tail 80 | Write-Host }
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    throw "msiexec $($arguments -join ' ') : bloqué"
+  }
   if ($expected -notcontains $p.ExitCode) {
     Get-Content $log -Tail 60 | Write-Host
     throw "msiexec $($arguments -join ' ') : code $($p.ExitCode), attendu $($expected -join ' ou ')"
   }
+  Write-Host "  [$(Get-Date -Format HH:mm:ss)] code $($p.ExitCode)"
   $p.ExitCode
 }
 

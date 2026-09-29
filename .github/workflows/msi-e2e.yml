@@ -1,0 +1,48 @@
+name: MSI e2e
+
+# Test de bout en bout de l'installeur Windows (freinage réseau, Lot W3) sur un
+# MSI DÉJÀ construit — celui d'une release, brouillon compris — sans rebuild ni
+# nouveau tag. Le même script tourne dans release.yml, où il bloque la
+# publication. Cf. .github/scripts/msi-e2e-network-throttling.ps1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag dont l'installeur est testé (ex. v0.6.6-11)"
+        required: true
+
+permissions:
+  contents: write  # lire les assets d'une release en brouillon
+
+jobs:
+  e2e:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Installeur testé et version publiée
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:TAG -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir new-msi
+          if ($LASTEXITCODE -ne 0) { throw "téléchargement de $env:TAG échoué" }
+          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir old-msi
+          if ($LASTEXITCODE -ne 0) { throw "téléchargement de la version publiée échoué" }
+          Get-ChildItem new-msi, old-msi | Format-Table Name, Length
+      - name: Test de bout en bout
+        shell: pwsh
+        run: |
+          $new = Get-ChildItem new-msi -Filter '*.msi' | Select-Object -First 1
+          $old = Get-ChildItem old-msi -Filter '*.msi' | Select-Object -First 1
+          ./.github/scripts/msi-e2e-network-throttling.ps1 -Msi $new.FullName -OldMsi $old.FullName
+      - name: Journaux msiexec
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msi-logs
+          path: msi-logs
