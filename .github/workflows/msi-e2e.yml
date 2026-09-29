@@ -12,7 +12,10 @@ on:
         description: "Tag dont l'installeur est testé (ex. v0.6.6-11) ; vide = la release la plus récente, brouillon compris"
         required: false
   # Toute modification du test le fait tourner sur la release la plus récente.
+  # Branches seulement : au push d'un tag, l'installeur n'est pas encore construit
+  # (release.yml le teste lui-même).
   push:
+    branches: ['**']
     paths:
       - '.github/scripts/msi-e2e-network-throttling.ps1'
       - '.github/workflows/msi-e2e.yml'
