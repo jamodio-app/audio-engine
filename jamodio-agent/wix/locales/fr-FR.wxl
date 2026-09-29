@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Textes propres à Jamodio ; Tauri complète avec ses chaînes par défaut. -->
+<!-- Textes propres à Jamodio ; Tauri complète avec ses chaînes par défaut
+     (en anglais) — d'où la traduction ici de celles que le musicien voit. -->
 <WixLocalization Culture="fr-fr" xmlns="http://schemas.microsoft.com/wix/2006/localization">
   <String Id="WelcomeDlgDescription">[ProductName] va être installé sur votre ordinateur.&#13;&#10;&#13;&#10;Jamodio ajuste un réglage réseau de Windows pour réduire la latence et les micro-coupures (jusqu'à environ 10 ms). Ce réglage est retiré si vous désinstallez Jamodio.&#13;&#10;&#13;&#10;Cliquez sur Suivant pour continuer.</String>
+  <String Id="LaunchApp">Lancer Jamodio Audio Engine</String>
+  <String Id="DowngradeErrorMessage">Une version plus récente de Jamodio Audio Engine est déjà installée.</String>
 </WixLocalization>
