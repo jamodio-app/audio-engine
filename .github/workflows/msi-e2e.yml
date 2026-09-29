@@ -9,8 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag dont l'installeur est testé (ex. v0.6.6-11)"
-        required: true
+        description: "Tag dont l'installeur est testé (ex. v0.6.6-11) ; vide = la release la plus récente, brouillon compris"
+        required: false
+  # Toute modification du test le fait tourner sur la release la plus récente.
+  push:
+    paths:
+      - '.github/scripts/msi-e2e-network-throttling.ps1'
+      - '.github/workflows/msi-e2e.yml'
 
 permissions:
   contents: write  # lire les assets d'une release en brouillon
@@ -29,6 +34,10 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not $env:TAG) {
+            $env:TAG = gh release list -R $env:REPO --limit 1 --json tagName -q '.[0].tagName'
+          }
+          Write-Host "Installeur testé : $env:TAG"
           gh release download $env:TAG -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir new-msi
           if ($LASTEXITCODE -ne 0) { throw "téléchargement de $env:TAG échoué" }
           gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir old-msi
