@@ -228,6 +228,13 @@ pub enum BrowserMessage {
         /// son étage de mix (cf. `StreamKind`). Absent = vieux web = instrument.
         #[serde(rename = "mediaTag", default)]
         media_tag: StreamKind,
+        /// Identifiant de la demande, choisi par le browser et renvoyé tel quel
+        /// dans `LocalPort` et l'erreur corrélée (même règle que `StartCapture`) :
+        /// la réponse tardive d'un essai abandonné ne peut jamais servir un essai
+        /// plus récent sur le même flux. Absent = ancien browser (corrélation par
+        /// `producerId`, comme avant).
+        #[serde(rename = "requestId", default)]
+        request_id: Option<String>,
     },
     RemoveStream {
         #[serde(rename = "producerId")]
@@ -889,8 +896,9 @@ pub enum AgentMessage {
         port: u16,
         #[serde(rename = "srtpParameters")]
         srtp_parameters: SrtpParameters,
-        /// `requestId` du `StartCapture` servi (absent pour voix et flux reçus,
-        /// corrélés par `producer_id`).
+        /// `requestId` de la demande servie (`StartCapture`, ou `AddStream`
+        /// depuis 0.6.6-13) ; absent pour la voix et pour un studio qui ne l'a
+        /// pas envoyé (corrélation par `producer_id`).
         #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
@@ -990,6 +998,21 @@ pub enum AgentMessage {
     },
     /// Sprint INSERT (S1) — ack du UnloadInstrumentPlugin.
     InstrumentPluginUnloaded,
+    /// 0.6.6-13 — état du plugin d'instrument envoyé à CHAQUE connexion, qu'un
+    /// plugin soit chargé ou non (`plugin: null`), une fois terminé un éventuel
+    /// chargement encore en cours. Le studio sait ainsi ce qui tourne vraiment,
+    /// sans deviner à partir d'une absence de message. Distinct de
+    /// `InstrumentPluginUnloaded`, que le studio lit comme un retrait VOULU
+    /// (il efface alors le plugin enregistré pour le studio).
+    InstrumentPluginState {
+        plugin: Option<LoadedPluginWire>,
+        bypass: bool,
+    },
+    /// 0.6.6-13 — état de la fenêtre de l'éditeur du plugin d'instrument :
+    /// `opening` dès la demande, `open` une fois affichée, `closed`, `failed`.
+    InstrumentPluginEditor {
+        state: crate::plugin_host::EditorState,
+    },
     /// Sprint INSERT (S1) — erreur typée (load failed, plugin not found, etc).
     InstrumentPluginError {
         message: String,
@@ -1222,6 +1245,34 @@ pub enum AgentMessage {
     },
 }
 
+/// Plugin d'instrument chargé, tel que décrit dans `InstrumentPluginState`
+/// (mêmes champs que `InstrumentPluginLoaded`, hors `bypass`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadedPluginWire {
+    pub name: String,
+    #[serde(rename = "pluginRef")]
+    pub plugin_ref: PluginRef,
+    #[serde(rename = "latencySamples")]
+    pub latency_samples: u32,
+    #[serde(rename = "hasEditor")]
+    pub has_editor: bool,
+}
+
+/// Capacités annoncées dans `Hello.capabilities` : le studio adapte son
+/// comportement à ce que l'Audio Engine sait faire, sans déduire quoi que ce
+/// soit de son numéro de version.
+pub mod capability {
+    /// `InstrumentPluginState` envoyé à chaque connexion.
+    pub const INSTRUMENT_PLUGIN_STATE: &str = "instrument-plugin-state";
+    /// `InstrumentPluginEditor` envoyé à chaque changement de la fenêtre.
+    pub const PLUGIN_EDITOR_EVENTS: &str = "plugin-editor-events";
+    /// `AddStream.requestId` renvoyé dans la réponse.
+    pub const ADD_STREAM_REQUEST_ID: &str = "add-stream-request-id";
+    /// Les messages de plugin ont leur propre file : un chargement ne retarde
+    /// plus les autres messages.
+    pub const PLUGIN_QUEUE: &str = "plugin-queue";
+}
+
 impl AgentMessage {
     /// Erreur générique NON corrélée. Le browser la log sans rejeter les autres
     /// requêtes en vol (cf. `key` sur `AgentMessage::Error`). À utiliser quand
@@ -1230,8 +1281,9 @@ impl AgentMessage {
         AgentMessage::Error { message: message.into(), key: None }
     }
 
-    /// Erreur CORRÉLÉE à une requête browser précise (clé = `producer_id` pour
-    /// `AddStream`, `""` pour `StartCapture`). Le browser rejette uniquement la
+    /// Erreur CORRÉLÉE à une requête browser précise (clé = `requestId` de la
+    /// demande quand le browser l'envoie ; sinon `producer_id` pour `AddStream`,
+    /// `""` pour `StartCapture`). Le browser rejette uniquement la
     /// requête sur cette clé → un handler lent n'empoisonne plus ses voisins.
     pub fn error_keyed(message: impl Into<String>, key: impl Into<String>) -> Self {
         AgentMessage::Error { message: message.into(), key: Some(key.into()) }
@@ -1780,6 +1832,59 @@ mod tests {
             serde_json::to_value(AgentMessage::OutputRestored { device: "d".into() }).unwrap()["type"],
             "output-restored"
         );
+    }
+
+    #[test]
+    fn add_stream_request_id_is_optional_on_the_wire() {
+        let with: BrowserMessage = serde_json::from_str(
+            r#"{"type":"add-stream","producerId":"p1","sfuIp":"1.2.3.4","sfuPort":4000,"payloadType":111,
+                "srtpParameters":{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"},"requestId":"r-7"}"#,
+        )
+        .unwrap();
+        assert!(matches!(with, BrowserMessage::AddStream { request_id: Some(ref r), .. } if r == "r-7"));
+        let without: BrowserMessage = serde_json::from_str(
+            r#"{"type":"add-stream","producerId":"p1","sfuIp":"1.2.3.4","sfuPort":4000,"payloadType":111,
+                "srtpParameters":{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(without, BrowserMessage::AddStream { request_id: None, .. }));
+    }
+
+    #[test]
+    fn instrument_plugin_state_says_none_explicitly() {
+        let none = serde_json::to_value(AgentMessage::InstrumentPluginState { plugin: None, bypass: false }).unwrap();
+        assert_eq!(none["type"], "instrument-plugin-state");
+        assert!(none["plugin"].is_null(), "aucun plugin = null explicite, pas un champ absent");
+        let some = serde_json::to_value(AgentMessage::InstrumentPluginState {
+            plugin: Some(LoadedPluginWire {
+                name: "AmpliTube 5".into(),
+                plugin_ref: PluginRef::Vst3 { path: "C:/AmpliTube 5.vst3".into(), uid: "41".into() },
+                latency_samples: 7,
+                has_editor: true,
+            }),
+            bypass: true,
+        })
+        .unwrap();
+        assert_eq!(some["plugin"]["name"], "AmpliTube 5");
+        assert_eq!(some["plugin"]["pluginRef"]["format"], "vst3");
+        assert_eq!(some["plugin"]["latencySamples"], 7);
+        assert_eq!(some["plugin"]["hasEditor"], true);
+        assert_eq!(some["bypass"], true);
+    }
+
+    #[test]
+    fn instrument_plugin_editor_states_on_the_wire() {
+        use crate::plugin_host::EditorState;
+        for (state, wire) in [
+            (EditorState::Opening, "opening"),
+            (EditorState::Open, "open"),
+            (EditorState::Closed, "closed"),
+            (EditorState::Failed, "failed"),
+        ] {
+            let v = serde_json::to_value(AgentMessage::InstrumentPluginEditor { state }).unwrap();
+            assert_eq!(v["type"], "instrument-plugin-editor");
+            assert_eq!(v["state"], wire);
+        }
     }
 
     #[test]

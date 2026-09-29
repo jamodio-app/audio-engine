@@ -18,7 +18,7 @@ use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::net::uplink;
 use jamodio_audio_core::perfstats::Histogram;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
+use jamodio_audio_core::plugin_host::{EditorState, MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::audio::midi::CapturedMidiEvent;
 use crate::recv_activity::RecvActivity;
@@ -925,6 +925,12 @@ pub struct PipelineState {
     /// après reload de page (le plugin reste actif côté agent).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
+    /// 0.6.6-13 — états de la fenêtre d'éditeur du plugin (ouverture, ouverte,
+    /// fermée, échec), publiés par l'hôte. Chaque connexion WS s'y abonne et les
+    /// transmet au studio. Aucun lecteur = état perdu sans conséquence (la
+    /// fenêtre, elle, vit sa vie).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub editor_events: tokio::sync::broadcast::Sender<EditorState>,
     /// S2 — source d'entrée actuelle. Audio = CPAL classique. Midi(device_id)
     /// = ouvre un MIDI input via midir, force le signal audio à zéro (le mic
     /// reste ouvert pour la cadence d'horloge 48k/128) et passe les events
@@ -1364,12 +1370,73 @@ impl PluginControl {
         );
         Ok((name, latency, has_editor))
     }
+
+    /// S1.5 — plugin actuellement chargé (None si aucun) et son contournement,
+    /// pour dire l'état au studio à la connexion.
+    pub fn snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
+        let info = self.instrument_plugin_info.lock().clone()?;
+        let bypass = self
+            .instrument_plugin_bypass
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some((info, bypass))
+    }
+
+    pub fn set_bypass(&self, bypass: bool) {
+        self.instrument_plugin_bypass
+            .store(bypass, std::sync::atomic::Ordering::Relaxed);
+        // S5 — un geste du musicien (« Réactiver » ou A/B) vaut prise de
+        // connaissance d'une surcharge : l'alerte peut à nouveau partir si le
+        // plugin repique. Remis à zéro dans les deux sens (couper à la main
+        // n'appelle pas d'alerte).
+        self.plugin_auto_bypass_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ouvre la fenêtre de l'éditeur (asynchrone côté hôte : l'avancement est
+    /// publié sur `PipelineState::editor_events`).
+    pub fn open_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.plugin_host
+            .lock()
+            .open_editor(handle)
+            .map_err(|e| format!("{e}"))
+    }
+
+    pub fn close_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.plugin_host
+            .lock()
+            .close_editor(handle)
+            .map_err(|e| format!("{e}"))
+    }
+}
+
+/// Branche l'hôte de plugins sur le canal des états de fenêtre d'éditeur.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn with_editor_events<H: PluginHost>(
+    mut host: H,
+    events: &tokio::sync::broadcast::Sender<EditorState>,
+) -> H {
+    let events = events.clone();
+    host.set_editor_listener(Arc::new(move |_handle, state| {
+        // Sans lecteur (aucun studio connecté), l'état se perd : rien à faire.
+        let _ = events.send(state);
+    }));
+    host
 }
 
 const CHANNELS: usize = 2;
 
 impl PipelineState {
     pub fn new(mixer: Arc<AudioMixer>) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let editor_events = tokio::sync::broadcast::channel::<EditorState>(16).0;
         Self {
             keep_awake: None,
             timer_resolution: None,
@@ -1421,9 +1488,9 @@ impl PipelineState {
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
-            plugin_host: Arc::new(Mutex::new(AuHost::new())),
+            plugin_host: Arc::new(Mutex::new(with_editor_events(AuHost::new(), &editor_events))),
             #[cfg(target_os = "windows")]
-            plugin_host: Arc::new(Mutex::new(Vst3Host::new())),
+            plugin_host: Arc::new(Mutex::new(with_editor_events(Vst3Host::new(), &editor_events))),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1434,6 +1501,8 @@ impl PipelineState {
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_info: Arc::new(Mutex::new(None)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            editor_events,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             input_source: Arc::new(Mutex::new(InputSource::Audio)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1698,57 +1767,6 @@ impl PipelineState {
         }
     }
 
-
-    /// S1.5 — Snapshot pour resync au reconnect WS. Retourne None si aucun
-    /// plugin actuellement chargé. Le bypass est dans le AtomicBool dédié.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn get_instrument_plugin_snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
-        let info = self.instrument_plugin_info.lock().clone()?;
-        let bypass = self
-            .instrument_plugin_bypass
-            .load(std::sync::atomic::Ordering::Relaxed);
-        Some((info, bypass))
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn set_instrument_plugin_bypass(&self, bypass: bool) {
-        self.instrument_plugin_bypass
-            .store(bypass, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset flag overload : un toggle manuel (= action user
-        // explicite, via UI "Réactiver" ou bypass A/B) signifie que
-        // l'user a pris connaissance et acte. Le perfstats_task peut
-        // à nouveau émettre un overload si le plugin re-spike après.
-        // On reset DANS LES DEUX SENS (bypass=true et bypass=false) car
-        // un toggle vers true = pas un overload-detection automatique
-        // (= l'user a choisi de muter manuellement, il n'a pas besoin
-        // du toast d'alerte).
-        self.plugin_auto_bypass_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn open_instrument_plugin_editor(&self) -> Result<(), String> {
-        let handle = self
-            .instrument_plugin_handle
-            .lock()
-            .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.plugin_host
-            .lock()
-            .open_editor(handle)
-            .map_err(|e| format!("{e}"))
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn close_instrument_plugin_editor(&self) -> Result<(), String> {
-        let handle = self
-            .instrument_plugin_handle
-            .lock()
-            .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.plugin_host
-            .lock()
-            .close_editor(handle)
-            .map_err(|e| format!("{e}"))
-    }
 
     /// Bascule la tranche instrument en PRIVÉ. On continue de S'ENTENDRE ; les
     /// autres musiciens n'entendent plus rien, et la tranche sort du FICHIER
@@ -7451,5 +7469,58 @@ mod plugin_scan_guard_tests {
         assert!(matches!(*pl.plugin_scan_cache.lock(), PluginScanCache::Scanning));
         drop(super::ScanStuckGuard(pl.plugin_scan_cache.clone()));
         assert!(pl.begin_scan(), "un nouvel inventaire redevient possible");
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod editor_events_tests {
+    use super::*;
+    use jamodio_audio_core::plugin_host::{EditorListener, PluginError};
+
+    /// Hôte minimal : il ne fait que garder l'écouteur qu'on lui donne.
+    #[derive(Default)]
+    struct HoteFactice {
+        listener: Option<EditorListener>,
+    }
+
+    impl PluginHost for HoteFactice {
+        fn load(&mut self, _: &PluginRef, _: u32) -> Result<PluginHandle, PluginError> {
+            Err(PluginError::NotFound)
+        }
+        fn unload(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn process_stereo(&mut self, _: PluginHandle, _: &mut [f32], _: &mut [f32], _: &[MidiEvent]) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn latency_samples(&self, _: PluginHandle) -> u32 {
+            0
+        }
+        fn open_editor(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn close_editor(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn set_editor_listener(&mut self, listener: EditorListener) {
+            self.listener = Some(listener);
+        }
+    }
+
+    /// Ce que l'hôte signale sur sa fenêtre arrive sur le canal que chaque
+    /// connexion écoute ; sans personne à l'écoute, rien ne casse.
+    #[test]
+    fn les_etats_de_l_hote_arrivent_sur_le_canal() {
+        let (events, _) = tokio::sync::broadcast::channel::<EditorState>(4);
+        let host = with_editor_events(HoteFactice::default(), &events);
+        let listener = host.listener.clone().expect("écouteur posé");
+        listener(PluginHandle(1), EditorState::Opening); // personne n'écoute encore
+        let mut rx = events.subscribe();
+        listener(PluginHandle(1), EditorState::Open);
+        listener(PluginHandle(1), EditorState::Closed);
+        assert_eq!(rx.try_recv().unwrap(), EditorState::Open);
+        assert_eq!(rx.try_recv().unwrap(), EditorState::Closed);
+        assert!(rx.try_recv().is_err());
     }
 }

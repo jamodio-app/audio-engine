@@ -89,6 +89,11 @@ struct Entry {
     // permet à la fenêtre de SUIVRE la taille réelle du plugin (layout async,
     // chargement différé, resize interne). nil si pas d'éditeur ouvert.
     __strong id editor_frame_observer;
+    // Ouverture de l'éditeur lancée, fenêtre pas encore affichée (la
+    // construction est asynchrone et peut durer plusieurs secondes). Un
+    // second clic pendant ce temps est ignoré : il lançait une seconde
+    // construction, donc une seconde fenêtre.
+    bool editor_opening = false;
     AudioComponentDescription desc;
     std::vector<float> in_l, in_r;      // copie de l'input par bloc (callback)
     uint32_t max_frames;
@@ -262,12 +267,26 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
 
 } // anonymous namespace
 
+// États de fenêtre d'éditeur transmis à Rust (miroir de `EditorState`).
+enum : int32_t {
+    JMO_EDITOR_OPENING = 0,
+    JMO_EDITOR_OPEN = 1,
+    JMO_EDITOR_CLOSED = 2,
+    JMO_EDITOR_FAILED = 3,
+};
+typedef void (*JmoEditorCb)(void *ctx, uint32_t handle_id, int32_t state);
+
 @interface JmoAuHost : NSObject {
 @public
     std::unordered_map<uint32_t, std::unique_ptr<Entry>> entries;
     uint32_t next_id;
     os_unfair_lock lock;
+    // Rappel des états de fenêtre d'éditeur (posé par Rust). Appelé depuis le
+    // main thread ou le thread de la demande ; ne bloque jamais.
+    JmoEditorCb editor_cb;
+    void *editor_ctx;
 }
+- (void)emitEditor:(uint32_t)hid state:(int32_t)state;
 @end
 
 @implementation JmoAuHost
@@ -276,8 +295,16 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     if ((self = [super init])) {
         next_id = 1;
         lock = OS_UNFAIR_LOCK_INIT;
+        editor_cb = nullptr;
+        editor_ctx = nullptr;
     }
     return self;
+}
+
+- (void)emitEditor:(uint32_t)hid state:(int32_t)state {
+    JmoEditorCb cb = editor_cb;
+    void *ctx = editor_ctx;
+    if (cb) cb(ctx, hid, state);
 }
 
 
@@ -585,6 +612,9 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
     // `dispatch_sync` brut serait incorrect ici : il deadlocke en CI car les
     // fonctions `#[test]` Rust tournent sur des threads worker, pas le main.
     Entry *e = entry.get();
+    // Les observers sont retirés ci-dessous : la fermeture de la fenêtre par le
+    // retrait du plugin est donc dite ici, une seule fois.
+    const bool had_editor = e->editor_window != nil || e->editor_opening;
     jmo_run_on_main_sync(^{
         // Retirer l'observer AVANT de fermer la window : sinon il survit à
         // l'Entry (et son block re-résoudrait par handle_id, désormais absent
@@ -612,6 +642,9 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
             e->au_inst = nullptr;
         }
     });
+    // Une ouverture encore en route s'abandonne d'elle-même (Entry absente) sans
+    // rien dire : c'est ici que la fermeture est annoncée, une seule fois.
+    if (had_editor) [self emitEditor:handle_id state:JMO_EDITOR_CLOSED];
     return 0;
 }
 
@@ -816,7 +849,8 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
                 usingBlock:^(NSNotification *_Nonnull __unused note) {
         os_unfair_lock_lock(&self->lock);
         auto it2 = self->entries.find(hid);
-        if (it2 != self->entries.end()) {
+        bool known = it2 != self->entries.end();
+        if (known) {
             Entry *e2 = it2->second.get();
             if (e2->editor_frame_observer) {
                 [[NSNotificationCenter defaultCenter] removeObserver:e2->editor_frame_observer];
@@ -826,6 +860,7 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
             e2->editor_window = nil;
         }
         os_unfair_lock_unlock(&self->lock);
+        if (known) [self emitEditor:hid state:JMO_EDITOR_CLOSED];
     }];
 
     // Assignation finale sous lock + re-check : l'unload a pu passer pendant la
@@ -838,7 +873,9 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
         e->editor_view = view;
         e->editor_close_observer = closeObserver;
         e->editor_frame_observer = frameObserver;
+        e->editor_opening = false;
         os_unfair_lock_unlock(&self->lock);
+        [self emitEditor:hid state:JMO_EDITOR_OPEN];
     } else {
         os_unfair_lock_unlock(&self->lock);
         [[NSNotificationCenter defaultCenter] removeObserver:closeObserver];
@@ -850,19 +887,32 @@ static void jmo_run_on_main_sync(dispatch_block_t block) {
 }
 
 - (int)openEditor:(uint32_t)handle_id {
+    os_unfair_lock_lock(&lock);
     auto it = entries.find(handle_id);
-    if (it == entries.end()) return -1;
+    if (it == entries.end()) {
+        os_unfair_lock_unlock(&lock);
+        return -1;
+    }
     Entry *e = it->second.get();
-    if (e->editor_window) {
+    if (e->editor_opening) {
+        // Déjà en construction : le studio affiche « Ouverture… », rien à relancer.
+        os_unfair_lock_unlock(&lock);
+        return 0;
+    }
+    NSWindow *w = e->editor_window;
+    if (!w) e->editor_opening = true;
+    os_unfair_lock_unlock(&lock);
+    if (w) {
         // Déjà ouverte → bring to front + activate l'app sinon la window
         // reste derrière Chrome/Tauri/etc. (bug observé en test E2E).
-        NSWindow *w = e->editor_window;
         dispatch_async(dispatch_get_main_queue(), ^{
             [NSApp activateIgnoringOtherApps:YES];
             [w makeKeyAndOrderFront:nil];
         });
         return 0;
     }
+
+    [self emitEditor:handle_id state:JMO_EDITOR_OPENING];
 
     // Path hybride (S1.7) :
     // - AU v3 → requestViewControllerWithCompletionHandler: → UI custom du
@@ -1202,6 +1252,14 @@ int au_host_close_editor(void *p, uint32_t handle_id) {
     if (!p) return -1;
     JmoAuHost *h = (__bridge JmoAuHost *)p;
     return [h closeEditor:handle_id];
+}
+
+// Pose (ou retire, cb = NULL) le rappel des états de fenêtre d'éditeur.
+void au_host_set_editor_callback(void *p, JmoEditorCb cb, void *ctx) {
+    if (!p) return;
+    JmoAuHost *h = (__bridge JmoAuHost *)p;
+    h->editor_cb = cb;
+    h->editor_ctx = ctx;
 }
 
 // fourcc helper exposé pour debug.

@@ -129,6 +129,28 @@ pub enum PluginError {
     InvalidHandle,
 }
 
+/// Où en est la fenêtre de l'éditeur d'un plugin. L'ouverture est asynchrone
+/// (fil de l'interface) et peut durer : AmpliTube construit la sienne en 11 s à
+/// sa première ouverture sur le NUC (29/09/2026). Sans ces états, le musicien
+/// clique et ne voit rien pendant tout ce temps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorState {
+    /// Demande prise en compte, la fenêtre se construit.
+    Opening,
+    /// Fenêtre affichée.
+    Open,
+    /// Fenêtre fermée (croix du musicien, fermeture demandée, plugin retiré).
+    Closed,
+    /// La fenêtre n'a pas pu être construite.
+    Failed,
+}
+
+/// Reçoit chaque changement d'état d'une fenêtre d'éditeur, depuis n'importe
+/// quel fil (celui de l'interface le plus souvent). Doit rendre la main tout de
+/// suite : ni verrou long, ni attente.
+pub type EditorListener = std::sync::Arc<dyn Fn(PluginHandle, EditorState) + Send + Sync>;
+
 /// Hôte plugin audio. Une instance vit pendant toute la durée du studio agent.
 /// Les méthodes `load`/`unload`/`open_editor` sont appelées depuis le main thread.
 /// `process_stereo` est appelé depuis le thread audio RT (CPAL callback) — ne doit
@@ -168,6 +190,13 @@ pub trait PluginHost: Send {
 
     /// Ferme la fenêtre éditeur si ouverte. No-op sinon.
     fn close_editor(&mut self, handle: PluginHandle) -> Result<(), PluginError>;
+
+    /// Branche l'écouteur des états de fenêtre d'éditeur (cf. `EditorState`).
+    /// `Opening` part quand une ouverture est lancée (pas quand une fenêtre déjà
+    /// ouverte est seulement ramenée au premier plan), `Open` quand elle est
+    /// affichée, `Closed` à sa fermeture, `Failed` si elle n'a pas pu se
+    /// construire. Remplace l'écouteur précédent.
+    fn set_editor_listener(&mut self, listener: EditorListener);
 }
 
 #[cfg(test)]

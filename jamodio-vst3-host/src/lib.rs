@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use jamodio_audio_core::plugin_host::{
-    latency_exceeds_live_budget, MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo,
-    PluginRef,
+    latency_exceeds_live_budget, EditorListener, MidiEvent, PluginError, PluginHandle, PluginHost,
+    PluginInfo, PluginRef,
 };
 
 use crate::editor::EditorWindow;
@@ -58,6 +58,8 @@ const SAMPLE_RATE: f64 = 48_000.0;
 pub struct Vst3Host {
     next_handle: AtomicU32,
     entries: HashMap<u32, Entry>,
+    /// Reçoit les états des fenêtres d'éditeur (cf. `PluginHost::set_editor_listener`).
+    editor_listener: Option<EditorListener>,
 }
 
 struct Entry {
@@ -87,6 +89,7 @@ impl Vst3Host {
         Self {
             next_handle: AtomicU32::new(0),
             entries: HashMap::new(),
+            editor_listener: None,
         }
     }
 }
@@ -367,7 +370,11 @@ impl PluginHost for Vst3Host {
         }
         let title = format!("{} — Jamodio", entry.instance.class.name);
         let module = entry.module.clone();
-        let editor = EditorWindow::open(&entry.instance, module, &title)
+        let notify = self.editor_listener.clone().map(|listener| {
+            let notify: editor::EditorNotify = Arc::new(move |state| listener(handle, state));
+            notify
+        });
+        let editor = EditorWindow::open(&entry.instance, module, &title, notify)
             .map_err(PluginError::Process)?;
         entry.editor = Some(editor);
         Ok(())
@@ -380,6 +387,10 @@ impl PluginHost for Vst3Host {
             .ok_or(PluginError::InvalidHandle)?;
         entry.editor = None; // Drop → close()
         Ok(())
+    }
+
+    fn set_editor_listener(&mut self, listener: EditorListener) {
+        self.editor_listener = Some(listener);
     }
 }
 

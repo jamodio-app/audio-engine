@@ -8,8 +8,8 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use base64::Engine;
 use jamodio_audio_core::protocol::{
-    AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf, RecvStreamPerf,
-    RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
+    capability, AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
+    RecvStreamPerf, RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
 };
 use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
@@ -120,7 +120,15 @@ fn make_hello() -> AgentMessage {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        capabilities: vec![],
+        capabilities: [
+            capability::INSTRUMENT_PLUGIN_STATE,
+            capability::PLUGIN_EDITOR_EVENTS,
+            capability::ADD_STREAM_REQUEST_ID,
+            capability::PLUGIN_QUEUE,
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect(),
     }
 }
 
@@ -576,6 +584,187 @@ async fn midi_device_list_reply() -> AgentMessage {
     }
 }
 
+/// Messages du navigateur qui touchent au plugin d'instrument. Ils passent par
+/// la FILE DES PLUGINS de la connexion (cf. `OrderedQueue`), jamais par la
+/// boucle des messages : un chargement natif dure de 0,4 à 5 s (AmpliTube, NUC,
+/// 29/09/2026 : 5,2 s) et, traité en ligne, il retenait tout ce qui suivait —
+/// l'`add-stream` d'un musicien qui arrivait avait expiré côté studio.
+///
+/// Le contournement et l'éditeur y passent aussi : ils visent le plugin chargé,
+/// donc ils doivent venir APRÈS le chargement demandé avant eux (un contournement
+/// traité pendant le chargement serait écrasé par sa remise à zéro).
+///
+/// Le clavier virtuel (`PlayMidiNote`) n'y passe pas : une note n'a de sens que
+/// tout de suite, et elle ne bloque jamais (`try_lock`).
+fn is_plugin_message(msg: &BrowserMessage) -> bool {
+    matches!(
+        msg,
+        BrowserMessage::LoadInstrumentPlugin { .. }
+            | BrowserMessage::UnloadInstrumentPlugin
+            | BrowserMessage::SetInstrumentPluginBypass { .. }
+            | BrowserMessage::OpenInstrumentPluginEditor
+            | BrowserMessage::CloseInstrumentPluginEditor
+    )
+}
+
+/// File de travaux traités UN PAR UN, dans l'ordre d'arrivée, par une tâche à
+/// elle : celui qui dépose n'attend jamais.
+///
+/// Fermeture (`close`) : le travail en cours va au bout — un appel natif ne
+/// s'interrompt pas —, ceux qui n'ont pas commencé sont abandonnés et notés au
+/// journal, puis la tâche se termine d'elle-même. Rien ne survit à la connexion.
+struct OrderedQueue<T> {
+    tx: tokio_mpsc::UnboundedSender<(T, String)>,
+    closed: Arc<AtomicBool>,
+}
+
+impl<T: Send + 'static> OrderedQueue<T> {
+    /// `run` traite un travail ; `kind` le nomme dans le journal.
+    fn spawn<F, Fut>(run: F) -> (Self, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(T) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel::<(T, String)>();
+        let closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = closed.clone();
+        let worker = tokio::spawn(async move {
+            while let Some((item, kind)) = rx.recv().await {
+                if worker_closed.load(Ordering::SeqCst) {
+                    tracing::info!(
+                        target: "jamodio::plugin",
+                        message = %kind,
+                        "demande abandonnée : connexion fermée avant son tour"
+                    );
+                    continue;
+                }
+                run(item).await;
+            }
+        });
+        (Self { tx, closed }, worker)
+    }
+
+    /// Dépose un travail. Après `close`, ou si la tâche n'est plus là, il est
+    /// abandonné (et dit au journal).
+    fn push(&self, item: T, kind: String) {
+        if self.closed.load(Ordering::SeqCst) || self.tx.send((item, kind.clone())).is_err() {
+            tracing::info!(target: "jamodio::plugin", message = %kind, "demande abandonnée : connexion fermée");
+        }
+    }
+
+    fn close(self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // `self.tx` part avec `self` : la tâche vide la file puis s'arrête.
+    }
+}
+
+/// File des plugins d'une connexion : chaque message y est traité par
+/// `handle_message` et ses réponses partent vers le navigateur quand elles sont
+/// prêtes.
+fn spawn_plugin_queue(
+    handle: &WsServerHandle,
+    out_tx: &tokio_mpsc::Sender<AgentMessage>,
+) -> (OrderedQueue<BrowserMessage>, tokio::task::JoinHandle<()>) {
+    let handle = handle.clone();
+    let out_tx = out_tx.clone();
+    OrderedQueue::spawn(move |msg: BrowserMessage| {
+        let handle = handle.clone();
+        let out_tx = out_tx.clone();
+        async move {
+            let responses = handle_message(
+                msg,
+                &handle.pipeline,
+                &handle.mixer,
+                &handle.voice_gain,
+                &handle.send_gain_instrument,
+                &handle.send_gain_voice,
+            )
+            .await;
+            for resp in responses {
+                if out_tx.send(resp).await.is_err() {
+                    break; // connexion fermée entre-temps
+                }
+            }
+        }
+    })
+}
+
+/// Exécute une opération native de plugin (chargement, retrait) hors du runtime
+/// async, en tenant le verrou des opérations plugin JUSQU'AU VRAI RETOUR de
+/// l'appel. Si la tâche qui attend est annulée (connexion fermée), l'appel
+/// natif continue et le verrou reste tenu : aucune autre opération ne peut
+/// démarrer en parallèle sur l'hôte.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn run_plugin_op<T, F>(ops: &'static tokio::sync::Mutex<()>, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = ops.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let _held_until_the_native_call_returns = guard;
+        work()
+    })
+    .await
+    // `spawn_blocking` n'échoue que si le travail panique : c'est une erreur de
+    // l'opération, pas une raison de faire tomber la connexion.
+    .map_err(|e| format!("plugin task failed: {e}"))
+}
+
+/// État du plugin d'instrument pour `InstrumentPluginState`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn plugin_state_message(ctrl: &crate::pipeline::PluginControl) -> AgentMessage {
+    match ctrl.snapshot() {
+        Some((info, bypass)) => AgentMessage::InstrumentPluginState {
+            plugin: Some(jamodio_audio_core::protocol::LoadedPluginWire {
+                name: info.name,
+                plugin_ref: info.plugin_ref,
+                latency_samples: info.latency_samples,
+                has_editor: info.has_editor,
+            }),
+            bypass,
+        },
+        None => AgentMessage::InstrumentPluginState { plugin: None, bypass: false },
+    }
+}
+
+/// Envoie l'état du plugin quand AUCUNE opération plugin n'est en cours : un
+/// chargement lancé par la connexion précédente (studio rechargé pendant le
+/// chargement) est ainsi fini avant qu'on dise ce qui tourne. Ne retient rien :
+/// les messages de la connexion continuent d'être traités pendant l'attente.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn send_plugin_state_when_idle(
+    ops: &'static tokio::sync::Mutex<()>,
+    ctrl: crate::pipeline::PluginControl,
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
+) {
+    let _idle = ops.lock().await;
+    let msg = plugin_state_message(&ctrl);
+    let _ = out_tx.send(msg).await;
+    tracing::info!(target: "jamodio::ws", "état du plugin envoyé au studio");
+}
+
+/// Relaie au studio chaque étape de la fenêtre d'éditeur du plugin.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn forward_editor_events(
+    mut editor_rx: broadcast::Receiver<jamodio_audio_core::plugin_host::EditorState>,
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
+) {
+    loop {
+        match editor_rx.recv().await {
+            Ok(state) => {
+                tracing::info!(target: "jamodio::plugin", ?state, "fenêtre du plugin");
+                if out_tx.send(AgentMessage::InstrumentPluginEditor { state }).await.is_err() {
+                    break;
+                }
+            }
+            // Quelques états sautés : le suivant fait foi.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
 /// `true` si on doit continuer la receive loop, `false` si on doit la
 /// quitter (envoi sortant cassé). Partagé entre la branche `is_internal`
@@ -584,6 +773,7 @@ async fn handle_one_message(
     msg: Message,
     handle: &WsServerHandle,
     out_tx: &tokio_mpsc::Sender<AgentMessage>,
+    plugin_queue: &OrderedQueue<BrowserMessage>,
 ) -> bool {
     let Message::Text(text) = msg else { return true };
 
@@ -638,6 +828,13 @@ async fn handle_one_message(
         tokio::spawn(async move {
             let _ = out_tx.send(midi_device_list_reply().await).await;
         });
+        return true;
+    }
+
+    // Plugin d'instrument : dans la file des plugins, dans l'ordre, sans que la
+    // boucle l'attende (cf. `is_plugin_message`).
+    if is_plugin_message(&browser_msg) {
+        plugin_queue.push(browser_msg, message_kind(&text));
         return true;
     }
 
@@ -722,11 +919,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // push l'état pour que l'UI affiche directement [● bypass][nom][✕] au
     // lieu de "+ FX" trompeur. Le browser reçoit le même message que pour
     // un load fresh, plus rien à modifier côté handler.
+    // 0.6.6-13 — gardé pour les studios qui ne lisent pas encore
+    // `InstrumentPluginState` (envoyé plus bas, qui dit AUSSI « aucun plugin »).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        let pl = handle.pipeline.lock().await;
-        if let Some((info, bypass)) = pl.get_instrument_plugin_snapshot() {
-            drop(pl);
+        let ctrl = handle.pipeline.lock().await.plugin_control();
+        if let Some((info, bypass)) = ctrl.snapshot() {
             let resync = AgentMessage::InstrumentPluginLoaded {
                 name: info.name,
                 plugin_ref: info.plugin_ref,
@@ -772,6 +970,22 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
     // Channel for outgoing messages (from message handler + periodic tasks)
     let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(64);
+
+    // File des plugins de CETTE connexion (cf. `is_plugin_message`).
+    let (plugin_queue, _plugin_worker) = spawn_plugin_queue(&handle, &out_tx);
+
+    // 0.6.6-13 — état du plugin (chargé OU aucun), dès qu'aucune opération
+    // plugin n'est en cours ; puis chaque étape de la fenêtre d'éditeur.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let (plugin_state_task, editor_task) = {
+        let (ctrl, editor_rx) = {
+            let pl = handle.pipeline.lock().await;
+            (pl.plugin_control(), pl.editor_events.subscribe())
+        };
+        let state_task = tokio::spawn(send_plugin_state_when_idle(plugin_ops_lock(), ctrl, out_tx.clone()));
+        let editor_task = tokio::spawn(forward_editor_events(editor_rx, out_tx.clone()));
+        (state_task, editor_task)
+    };
 
     // Subscribe au broadcast shutdown (auto-update).
     let mut shutdown_rx = handle.shutdown_tx.subscribe();
@@ -1967,7 +2181,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                             );
                         }
 
-                        if !handle_one_message(msg, &handle, &out_tx).await {
+                        if !handle_one_message(msg, &handle, &out_tx, &plugin_queue).await {
                             break;
                         }
                     }
@@ -1990,6 +2204,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     send_task.abort();
     shutdown_task.abort();
     progress_task.abort();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        plugin_state_task.abort();
+        editor_task.abort();
+    }
+    // Le travail plugin en cours va au bout (appel natif), les suivants sont
+    // abandonnés ; la tâche de la file se termine d'elle-même.
+    plugin_queue.close();
 
     // v0.4.3 — Cleanup pipeline UNIQUEMENT pour les clients externes
     // qui ont été PROMUS (= ont envoyé au moins un BrowserMessage et donc
@@ -2111,15 +2333,26 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
 }
 
 /// Chantier A (v0.4.12) — sérialise les opérations plugin LENTES (load/unload
-/// natif AU/VST3, 0,4–4 s). Tenu HORS du lock `PipelineState` et du chemin
+/// natif AU/VST3, 0,4–5 s). Tenu HORS du lock `PipelineState` et du chemin
 /// audio → ne gèle rien. Garantit qu'on n'exécute jamais deux init/teardown
 /// natifs concurrents (course handle ↔ instance) même si le browser spamme.
+/// 0.6.6-13 — tenu jusqu'au vrai retour de l'appel natif (`run_plugin_op`) ;
+/// contournement, éditeur et état envoyé à la connexion l'attendent aussi.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static PLUGIN_OPS_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn plugin_ops_lock() -> &'static tokio::sync::Mutex<()> {
     PLUGIN_OPS_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Bundle plugin (cf. `PluginControl`), obtenu en tenant le verrou pipeline le
+/// temps d'un clonage d'`Arc`. `None` si le pipeline reste pris (surcharge).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn plugin_control(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+) -> Option<crate::pipeline::PluginControl> {
+    Some(lock_pipeline_wait(pipeline).await?.plugin_control())
 }
 
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,
@@ -3355,29 +3588,33 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, media_tag, .. } => {
+        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, media_tag, request_id, .. } => {
             tracing::info!(
                 target: "jamodio::ws",
                 producer = &producer_id[..8.min(producer_id.len())],
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 ?media_tag,
+                request_id = request_id.as_deref().unwrap_or("-"),
                 "AddStream"
             );
+            // Erreurs corrélées à la DEMANDE (`requestId`), ou au `producer_id`
+            // pour un studio qui ne l'envoie pas encore.
+            let request_key = request_id.clone().unwrap_or_else(|| producer_id.clone());
             // Setup critique du montage d'un flux entrant (join d'un peer) : on
             // ATTEND le lock, jamais de drop (sinon flux jamais monté → peer muet,
-            // cf. symptôme A "ghost/orphan"). Erreurs corrélées au producer_id
-            // → le browser rejette SEULEMENT cette requête (pas ses voisines).
+            // cf. symptôme A "ghost/orphan"). Erreurs corrélées → le browser
+            // rejette SEULEMENT cette requête (pas ses voisines).
             let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
-                return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
+                return vec![AgentMessage::error_keyed("agent overloaded", request_key)];
             };
             match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters, media_tag).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id,
-                    request_id: None,
+                    request_id,
                     port: local_port,
                     srtp_parameters: agent_srtp,
                 }],
-                Err(e) => vec![AgentMessage::error_keyed(e, producer_id)],
+                Err(e) => vec![AgentMessage::error_keyed(e, request_key)],
             }
         }
 
@@ -3892,34 +4129,27 @@ async fn handle_message(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 // Chantier A — on ne tient PAS le lock PipelineState pendant le
-                // load natif (0,4–4 s) : on clone le bundle d'Arcs (cheap) puis
+                // load natif (0,4–5 s) : on clone le bundle d'Arcs (cheap) puis
                 // on relâche immédiatement. Le thread audio passe en dry
                 // (handle=None + try_lock) et perfstats_task n'est pas bloqué.
-                // Setup critique : on ATTEND le lock COURT (juste cloner le
-                // bundle d'Arcs). Le load natif lent (0,4–4 s) se fait ensuite
-                // HORS lock (spawn_blocking) — cf. plus bas.
-                let ctrl = {
-                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
-                        return vec![AgentMessage::InstrumentPluginError {
-                            message: "agent overloaded".into(),
-                        }];
-                    };
-                    pl.plugin_control()
+                // 0.6.6-13 — et ce message vient de la FILE DES PLUGINS : la
+                // boucle des messages ne l'attend plus (cf. `is_plugin_message`).
+                let Some(ctrl) = plugin_control(pipeline).await else {
+                    return vec![AgentMessage::InstrumentPluginError {
+                        message: "agent overloaded".into(),
+                    }];
                 };
-                // Sérialise vs un autre load/unload en cours, puis exécute le
-                // load natif sur le pool blocking (ne bloque pas le runtime
-                // tokio ni les autres handlers/tasks).
-                let _ops = plugin_ops_lock().lock().await;
                 let pref = plugin_ref.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || ctrl.load(&pref)).await;
-                // `spawn_blocking` ne panique que si la task panique : on traite
-                // le JoinError comme une erreur de chargement plutôt que de
-                // propager un panic dans le handler WS.
-                let result = match result {
-                    Ok(inner) => inner,
-                    Err(join_err) => Err(format!("plugin load task failed: {join_err}")),
-                };
+                let started = std::time::Instant::now();
+                let result = run_plugin_op(plugin_ops_lock(), move || ctrl.load(&pref))
+                    .await
+                    .and_then(|inner| inner);
+                tracing::info!(
+                    target: "jamodio::plugin",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    ok = result.is_ok(),
+                    "chargement de plugin traité (hors de la boucle des messages)"
+                );
                 match result {
                     Ok((name, latency_samples, has_editor)) => {
                         vec![AgentMessage::InstrumentPluginLoaded {
@@ -3966,20 +4196,15 @@ async fn handle_message(
         BrowserMessage::UnloadInstrumentPlugin => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                // Chantier A — même principe que le load : clone le bundle,
-                // relâche le lock PipelineState, teardown natif sur le pool
-                // blocking (le thread audio est déjà passé en dry dès que
-                // PluginControl::unload pose handle=None).
-                // Setup critique : on ATTEND le lock COURT (clone du bundle),
-                // le teardown natif lent se fait ensuite HORS lock.
-                let ctrl = {
-                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
-                        return vec![];
-                    };
-                    pl.plugin_control()
+                // Chantier A — même principe que le load : teardown natif hors
+                // du lock PipelineState (le thread audio est déjà passé en dry
+                // dès que PluginControl::unload pose handle=None).
+                let Some(ctrl) = plugin_control(pipeline).await else {
+                    return vec![];
                 };
-                let _ops = plugin_ops_lock().lock().await;
-                let _ = tokio::task::spawn_blocking(move || ctrl.unload()).await;
+                if let Err(e) = run_plugin_op(plugin_ops_lock(), move || ctrl.unload()).await {
+                    tracing::error!(target: "jamodio::plugin", error = %e, "retrait du plugin interrompu");
+                }
                 vec![AgentMessage::InstrumentPluginUnloaded]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3988,13 +4213,17 @@ async fn handle_message(
             }
         }
 
+        // Contournement et éditeur : APRÈS toute opération plugin en cours
+        // (verrou des opérations), jamais pendant — l'hôte est alors occupé par
+        // le chargement natif, et un contournement posé pendant serait écrasé.
         BrowserMessage::SetInstrumentPluginBypass { bypass } => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                pl.set_instrument_plugin_bypass(bypass);
+                let _ops = plugin_ops_lock().lock().await;
+                ctrl.set_bypass(bypass);
                 vec![]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -4007,10 +4236,13 @@ async fn handle_message(
         BrowserMessage::OpenInstrumentPluginEditor => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                if let Err(message) = pl.open_instrument_plugin_editor() {
+                let _ops = plugin_ops_lock().lock().await;
+                // L'hôte ouvre la fenêtre de façon asynchrone et publie son
+                // avancement (`InstrumentPluginEditor`) : l'appel rend tout de suite.
+                if let Err(message) = ctrl.open_editor() {
                     return vec![AgentMessage::InstrumentPluginError { message }];
                 }
                 vec![]
@@ -4024,10 +4256,11 @@ async fn handle_message(
         BrowserMessage::CloseInstrumentPluginEditor => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                let _ = pl.close_instrument_plugin_editor();
+                let _ops = plugin_ops_lock().lock().await;
+                let _ = ctrl.close_editor();
                 vec![]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -4647,5 +4880,271 @@ mod etat_latche_tests {
         assert!(lire(&send_gain_instrument) >= 0.01, "borné en bas");
         regle(f32::NAN).await;
         assert_eq!(lire(&send_gain_instrument), 1.0, "NaN → neutre");
+    }
+}
+
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod file_des_plugins_tests {
+    //! 0.6.6-13 — un chargement de plugin ne retient plus les autres messages
+    //! (session du 29/09/2026 : 5,2 s de chargement d'AmpliTube, l'`add-stream`
+    //! d'un musicien expirait côté studio).
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::time::Duration;
+
+    /// Les tests qui tiennent le verrou GLOBAL des opérations plugin passent un
+    /// par un (les autres utilisent un verrou à eux).
+    static SERIE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn serveur() -> WsServerHandle {
+        let mixer = Arc::new(AudioMixer::new());
+        let pipeline = PipelineState::new(mixer.clone());
+        let voice_gain = pipeline.voice_gain.clone();
+        let send_gain_instrument = pipeline.send_gain_instrument.clone();
+        let send_gain_voice = pipeline.send_gain_voice.clone();
+        WsServerHandle::new(
+            Arc::new(tokio::sync::Mutex::new(pipeline)),
+            mixer,
+            voice_gain,
+            send_gain_instrument,
+            send_gain_voice,
+        )
+    }
+
+    fn texte(json: &str) -> Message {
+        Message::Text(json.to_string())
+    }
+
+    fn verrou_a_part() -> &'static tokio::sync::Mutex<()> {
+        Box::leak(Box::new(tokio::sync::Mutex::new(())))
+    }
+
+    /// Plugin absent du scan : refusé dès que son tour vient (aucun appel natif).
+    const CHARGER: &str = r#"{"type":"load-instrument-plugin","pluginRef":{"format":"au","auType":"aufx","subtype":"zzzz","manufacturer":"zzzz"}}"#;
+    /// Adresse SFU invalide : réponse immédiate, sans réseau.
+    const RECEVOIR: &str = r#"{"type":"add-stream","producerId":"pair-1","sfuIp":"pas-une-ip","sfuPort":4000,"payloadType":111,"srtpParameters":{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"},"requestId":"essai-1"}"#;
+
+    #[tokio::test]
+    async fn un_chargement_en_cours_ne_retient_pas_l_arrivee_d_un_musicien() {
+        let _serie = SERIE.lock().await;
+        let h = serveur();
+        let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(16);
+        let (file, _tache) = spawn_plugin_queue(&h, &out_tx);
+
+        // Un chargement natif est en cours (verrou des opérations plugin tenu).
+        let natif = plugin_ops_lock().lock().await;
+        // Délai explicite : sans la file, la boucle attendrait le chargement
+        // (ici indéfiniment) — c'est exactement le défaut du 29/09.
+        let boucle = async {
+            assert!(handle_one_message(texte(CHARGER), &h, &out_tx, &file).await);
+            assert!(handle_one_message(texte(RECEVOIR), &h, &out_tx, &file).await);
+        };
+        tokio::time::timeout(Duration::from_millis(100), boucle)
+            .await
+            .expect("la boucle des messages a attendu le chargement en cours");
+        // L'arrivée du musicien a sa réponse tout de suite…
+        match out_rx.try_recv() {
+            Ok(AgentMessage::Error { key, .. }) => assert_eq!(key.as_deref(), Some("essai-1")),
+            autre => panic!("réponse à add-stream attendue, reçu {autre:?}"),
+        }
+        // … le chargement, lui, attend son tour.
+        assert!(out_rx.try_recv().is_err(), "le chargement ne doit pas avoir répondu");
+
+        drop(natif);
+        let reponse = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("le chargement répond une fois l'opération précédente finie")
+            .unwrap();
+        assert!(matches!(reponse, AgentMessage::InstrumentPluginError { .. }), "{reponse:?}");
+    }
+
+    #[tokio::test]
+    async fn la_file_traite_dans_l_ordre_un_travail_a_la_fois() {
+        let journal: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let j = journal.clone();
+        let (file, _tache) = OrderedQueue::spawn(move |(nom, ms): (&'static str, u64)| {
+            let j = j.clone();
+            async move {
+                j.lock().push(format!("début {nom}"));
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                j.lock().push(format!("fin {nom}"));
+            }
+        });
+        file.push(("charger", 150), "charger".into());
+        file.push(("contourner", 0), "contourner".into());
+        file.push(("retirer", 0), "retirer".into());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while journal.lock().len() < 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("les trois travaux passent");
+        assert_eq!(
+            *journal.lock(),
+            ["début charger", "fin charger", "début contourner", "fin contourner", "début retirer", "fin retirer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fermer_pendant_un_chargement_le_laisse_finir_et_abandonne_la_suite() {
+        let journal: Arc<parking_lot::Mutex<Vec<&'static str>>> = Arc::default();
+        let (liberer, attente) = tokio::sync::oneshot::channel::<()>();
+        let attente = Arc::new(tokio::sync::Mutex::new(Some(attente)));
+        let j = journal.clone();
+        let (file, tache) = OrderedQueue::spawn(move |nom: &'static str| {
+            let (j, attente) = (j.clone(), attente.clone());
+            async move {
+                j.lock().push(nom);
+                if nom == "charger" {
+                    if let Some(rx) = attente.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    j.lock().push("charger fini");
+                }
+            }
+        });
+        file.push("charger", "charger".into());
+        file.push("contourner", "contourner".into());
+        while journal.lock().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        file.close();
+        liberer.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tache)
+            .await
+            .expect("la tâche de la file se termine d'elle-même")
+            .unwrap();
+        assert_eq!(*journal.lock(), ["charger", "charger fini"], "le contournement est abandonné");
+    }
+
+    #[tokio::test]
+    async fn le_verrou_reste_tenu_jusqu_au_retour_de_l_appel_natif() {
+        let ops = verrou_a_part();
+        let (liberer, attente) = std::sync::mpsc::channel::<()>();
+        let tache = tokio::spawn(run_plugin_op(ops, move || {
+            let _ = attente.recv(); // appel natif long
+        }));
+        while ops.try_lock().is_ok() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // La connexion se ferme : la tâche qui attendait est annulée…
+        tache.abort();
+        let _ = tache.await;
+        // … mais l'appel natif n'a pas rendu : aucune autre opération ne démarre.
+        assert!(ops.try_lock().is_err(), "verrou relâché alors que l'appel natif tourne encore");
+        liberer.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ops.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("le verrou se libère au retour de l'appel natif");
+    }
+
+    #[tokio::test]
+    async fn l_etat_du_plugin_part_apres_l_operation_en_cours_et_dit_aucun() {
+        let ops = verrou_a_part();
+        let h = serveur();
+        let ctrl = h.pipeline.lock().await.plugin_control();
+        let (tx, mut rx) = tokio_mpsc::channel::<AgentMessage>(4);
+        let natif = ops.lock().await;
+        let _tache = tokio::spawn(send_plugin_state_when_idle(ops, ctrl, tx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "l'état attend la fin de l'opération en cours");
+        drop(natif);
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert!(
+            matches!(msg, AgentMessage::InstrumentPluginState { plugin: None, bypass: false }),
+            "aucun plugin = dit explicitement : {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_stream_renvoie_l_identifiant_de_la_demande_ou_le_flux() {
+        let h = serveur();
+        let appel = |request_id: Option<&str>| {
+            let h = h.clone();
+            let request_id = request_id.map(str::to_string);
+            async move {
+                handle_message(
+                    BrowserMessage::AddStream {
+                        producer_id: "pair-1".into(),
+                        producer_peer_id: None,
+                        sfu_ip: "pas-une-ip".into(),
+                        sfu_port: 4000,
+                        payload_type: 111,
+                        srtp_parameters: serde_json::from_str(
+                            r#"{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"}"#,
+                        )
+                        .unwrap(),
+                        media_tag: Default::default(),
+                        request_id,
+                    },
+                    &h.pipeline,
+                    &h.mixer,
+                    &h.voice_gain,
+                    &h.send_gain_instrument,
+                    &h.send_gain_voice,
+                )
+                .await
+            }
+        };
+        let cle = |r: Vec<AgentMessage>| match r.as_slice() {
+            [AgentMessage::Error { key, .. }] => key.clone(),
+            autre => panic!("erreur corrélée attendue : {autre:?}"),
+        };
+        assert_eq!(cle(appel(Some("essai-2")).await).as_deref(), Some("essai-2"));
+        assert_eq!(cle(appel(None).await).as_deref(), Some("pair-1"), "ancien studio : clé = flux");
+    }
+
+    #[tokio::test]
+    async fn les_etats_de_la_fenetre_partent_vers_le_studio() {
+        use jamodio_audio_core::plugin_host::EditorState;
+        let (etats, rx) = broadcast::channel::<EditorState>(4);
+        let (tx, mut out) = tokio_mpsc::channel::<AgentMessage>(4);
+        let _tache = tokio::spawn(forward_editor_events(rx, tx));
+        etats.send(EditorState::Opening).unwrap();
+        etats.send(EditorState::Open).unwrap();
+        for attendu in [EditorState::Opening, EditorState::Open] {
+            let msg = tokio::time::timeout(Duration::from_secs(1), out.recv()).await.unwrap().unwrap();
+            assert!(
+                matches!(msg, AgentMessage::InstrumentPluginEditor { state } if state == attendu),
+                "{msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn le_hello_annonce_ce_que_l_audio_engine_sait_faire() {
+        let AgentMessage::Hello { capabilities, .. } = make_hello() else { panic!("Hello attendu") };
+        for c in [
+            capability::INSTRUMENT_PLUGIN_STATE,
+            capability::PLUGIN_EDITOR_EVENTS,
+            capability::ADD_STREAM_REQUEST_ID,
+            capability::PLUGIN_QUEUE,
+        ] {
+            assert!(capabilities.iter().any(|x| x == c), "capacité absente : {c}");
+        }
+    }
+
+    #[test]
+    fn seuls_les_messages_de_plugin_passent_par_la_file() {
+        let parse = |j: &str| serde_json::from_str::<BrowserMessage>(j).unwrap();
+        for j in [
+            CHARGER,
+            r#"{"type":"unload-instrument-plugin"}"#,
+            r#"{"type":"set-instrument-plugin-bypass","bypass":true}"#,
+            r#"{"type":"open-instrument-plugin-editor"}"#,
+            r#"{"type":"close-instrument-plugin-editor"}"#,
+        ] {
+            assert!(is_plugin_message(&parse(j)), "{j}");
+        }
+        for j in [RECEVOIR, r#"{"type":"play-midi-note","status":144,"data1":60,"data2":100}"#] {
+            assert!(!is_plugin_message(&parse(j)), "{j}");
+        }
     }
 }
