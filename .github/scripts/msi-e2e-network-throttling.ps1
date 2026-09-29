@@ -20,16 +20,22 @@ $ErrorActionPreference = 'Stop'
 
 $ProfileKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
 $Memory  = 'HKLM:\SOFTWARE\Jamodio\AudioEngine'
-$Off     = '-1'  # ffffffff, lu en entier signé par PowerShell
+$Off     = '4294967295'  # ffffffff, tel que PowerShell relit un DWORD (non signé)
 
 function Get-Nti {
   $v = (Get-ItemProperty -Path $ProfileKey -Name NetworkThrottlingIndex -ErrorAction SilentlyContinue).NetworkThrottlingIndex
-  # Toujours un texte : 'absent', '10', '-1' (= ffffffff) — comparaisons sans conversion.
-  if ($null -eq $v) { 'absent' } else { "$([int]$v)" }
+  # Toujours un texte : 'absent', '10', '4294967295' — comparaisons sans conversion.
+  if ($null -eq $v) { 'absent' } else { "$v" }
 }
-function Set-Nti($v) {
-  if ("$v" -eq 'absent') { Remove-ItemProperty -Path $ProfileKey -Name NetworkThrottlingIndex -ErrorAction SilentlyContinue }
-  else { New-ItemProperty -Path $ProfileKey -Name NetworkThrottlingIndex -PropertyType DWord -Value ([int]$v) -Force | Out-Null }
+function Set-Nti([string] $v) {
+  $key = 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+  if ($v -eq 'absent') {
+    Remove-ItemProperty -Path $ProfileKey -Name NetworkThrottlingIndex -ErrorAction SilentlyContinue
+  } else {
+    # reg.exe accepte 0xffffffff comme tout DWORD, sans question de signe.
+    reg.exe add $key /v NetworkThrottlingIndex /t REG_DWORD /d $v /f | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "reg add $v : échec" }
+  }
 }
 function Get-Memory($name) {
   (Get-ItemProperty -Path $Memory -Name $name -ErrorAction SilentlyContinue).$name
@@ -91,7 +97,7 @@ Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'absent-uninstall.log' | Out-Null
 Assert ((Get-Nti) -eq 'absent') 'valeur retirée comme à l''origine'
 
 Write-Host '▸ 5. Déjà désactivé avant nous'
-Set-Nti $Off
+Set-Nti '0xffffffff'
 $code = Invoke-Msi @('/i', $Msi) @(0, $Reboot) 'off-install.log'
 Assert ($code -eq 0) 'aucun redémarrage demandé'
 Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'off-uninstall.log' | Out-Null
