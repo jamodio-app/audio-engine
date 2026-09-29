@@ -12,6 +12,7 @@ mod logging;
 mod cf_string;
 mod machine_health;
 mod net_interface;
+mod net_throttling;
 mod pipeline;
 mod plugin_scan;
 mod device_loss;
@@ -351,6 +352,18 @@ fn main() {
         plugin_scan::worker::run();
     }
 
+    // Étape d'installeur (Lot W3 du freinage réseau de Windows) : lancé par le
+    // MSI en compte système, AVANT tout le reste — ni journal fichier (il
+    // atterrirait dans le profil système), ni Tauri, ni port 9876. L'issue est
+    // écrite dans le registre et reportée au journal au lancement suivant.
+    // Cf. `net_throttling` et `wix/network-throttling.wxs`.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--network-throttling") {
+            std::process::exit(net_throttling::installer_step(args.get(i + 1).map(String::as_str)));
+        }
+    }
+
     // Relance « attendue » (bouton « Redémarrer l'agent » → ws_server::
     // spawn_awaited_relaunch). On a été spawné DÉTACHÉ par l'ancien process
     // pendant qu'il s'éteignait. On attend qu'il soit mort — donc que le verrou
@@ -373,6 +386,9 @@ fn main() {
     // sans cette exemption, la minuterie fine de session serait ignorée et les
     // masquages partiraient jusqu'à 15 ms en retard. Cf. `timer_precision`.
     timer_precision::exempt_process_from_timer_throttling();
+
+    // Freinage réseau de Windows : état au journal (support, validation W4).
+    net_throttling::log_state("lancement");
 
     // Filet de diagnostic crash (0.5.11) : un panic Rust part par DÉFAUT sur
     // stderr — jeté sur une app GUI Windows → invisible dans `agent.log` (donc

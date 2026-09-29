@@ -196,6 +196,26 @@ jobs:
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
+      # Freinage réseau de Windows (Lot W3) : le VRAI MSI, installé, mis à jour
+      # depuis la version publiée, réinstallé, désinstallé sur ce runner jetable,
+      # la valeur du registre vérifiée à chaque étape. Échec = la release reste
+      # en brouillon (`publish` dépend de ce job). Cf. le script.
+      - name: Test de bout en bout de l'installeur (freinage réseau)
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem "target/${{ matrix.target }}/release/bundle/msi" -Filter '*_x64_fr-FR.msi' | Select-Object -First 1
+          if (-not $msi) { throw "MSI introuvable" }
+          # Dernière version PUBLIÉE (« latest ») : le point de départ des musiciens équipés.
+          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir old-msi
+          if ($LASTEXITCODE -ne 0) { throw "téléchargement de la version publiée échoué ($LASTEXITCODE)" }
+          $old = Get-ChildItem old-msi -Filter '*.msi' | Select-Object -First 1
+          ./.github/scripts/msi-e2e-network-throttling.ps1 -Msi $msi.FullName -OldMsi $old.FullName
+
       # Symboles de débogage Windows (.pdb) : la table adresse → nom de fonction.
       # Sans elle, une trace ETW ou un crash ne montre que « jamodio-agent.exe+0x… »
       # (diagnostic des gels du 22/09/2026 : threads de l'agent impossibles à

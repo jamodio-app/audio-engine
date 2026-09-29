@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Freinage réseau de Windows (NetworkThrottlingIndex) — Lot W3 de
+  PLAN-FREINAGE-RESEAU-WINDOWS-2026-09 (dépôt du site).
+
+  Toute la logique vit dans l'Audio Engine (`src/net_throttling.rs`, testée) :
+  l'installeur ne fait que l'appeler, en compte système, après la copie des
+  fichiers (`install`) et, à la vraie désinstallation seulement, avant leur
+  suppression (`uninstall`). Pendant une mise à jour, l'ancien produit est
+  retiré avec UPGRADINGPRODUCTCODE : la valeur d'origine n'est PAS remise.
+
+  Le réglage n'agit qu'après un redémarrage (mesuré le 29/09) : Windows le
+  propose seulement si la valeur lue avant l'installation n'était pas déjà
+  ffffffff — donc une seule fois. Une mise à jour lancée par l'Audio Engine
+  passe `/passive /promptrestart` : la question est posée, jamais imposée.
+
+  Un échec de l'étape n'empêche pas l'installation (l'Audio Engine fonctionne
+  sans) ; il est écrit dans le registre et reporté au journal au lancement.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <Property Id="JMO_NTI_BEFORE">
+      <RegistrySearch Id="JmoNtiBefore" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+                      Name="NetworkThrottlingIndex" Type="raw" Win64="yes" />
+    </Property>
+
+    <CustomAction Id="JmoNetThrottlingInstall" FileKey="Path"
+                  ExeCommand="--network-throttling install"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="JmoNetThrottlingUninstall" FileKey="Path"
+                  ExeCommand="--network-throttling uninstall"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="JmoNetThrottlingInstall" After="InstallFiles">NOT REMOVE="ALL"</Custom>
+      <Custom Action="JmoNetThrottlingUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <!-- Valeur DWORD lue en « #nombre » ; ffffffff peut s'écrire signée ou non. -->
+      <ScheduleReboot After="InstallFinalize"><![CDATA[NOT REMOVE="ALL" AND JMO_NTI_BEFORE <> "#-1" AND JMO_NTI_BEFORE <> "#4294967295"]]></ScheduleReboot>
+    </InstallExecuteSequence>
+
+    <!-- Référencé par `componentGroupRefs` (tauri.conf.json) : c'est ce qui fait
+         entrer ce fragment dans le MSI. -->
+    <ComponentGroup Id="JmoNetThrottling">
+      <Component Id="JmoNetThrottlingMarker" Directory="INSTALLDIR" Guid="*" Win64="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
+                       Name="NetworkThrottlingManaged" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

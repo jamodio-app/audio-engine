@@ -2536,6 +2536,8 @@ impl PipelineState {
         let bench = crate::bench_flags::BenchFlags::load();
         bench.log();
         crate::audio::rt_priority::set_bench_without_mmcss(bench.no_mmcss);
+        // Freinage réseau de Windows : l'état EN VIGUEUR pour cette session.
+        crate::net_throttling::log_state("capture");
 
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         //

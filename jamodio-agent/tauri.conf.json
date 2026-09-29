@@ -68,9 +68,22 @@
         "type": "embedBootstrapper"
       },
       "wix": {
-        "language": ["fr-FR", "en-US"],
+        "language": {
+          "fr-FR": {
+            "localePath": "wix/locales/fr-FR.wxl"
+          },
+          "en-US": {
+            "localePath": "wix/locales/en-US.wxl"
+          }
+        },
         "bannerPath": "icons/wix/banner.bmp",
-        "dialogImagePath": "icons/wix/dialog.bmp"
+        "dialogImagePath": "icons/wix/dialog.bmp",
+        "fragmentPaths": [
+          "wix/network-throttling.wxs"
+        ],
+        "componentGroupRefs": [
+          "JmoNetThrottling"
+        ]
       }
     }
   },
