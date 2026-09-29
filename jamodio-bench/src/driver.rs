@@ -186,6 +186,16 @@ impl AgentLink {
         .await
     }
 
+    /// Retire le plugin inséré, comme le ✕ du studio. L'Audio Engine garde un
+    /// plugin d'une connexion à l'autre (voulu : un rechargement de la page ne
+    /// coupe pas le son) — le banc doit donc rendre ce qu'il a chargé, sinon le
+    /// musicien joue ensuite à travers sans l'avoir choisi (vécu le 29/09).
+    pub async fn unload_plugin(&self) -> Result<(), String> {
+        self.request(json!({ "type": "unload-instrument-plugin" }), "instrument-plugin-unload".into())
+            .await
+            .map(|_| ())
+    }
+
     pub fn remove_stream(&self, producer_id: &str) -> Result<(), String> {
         self.send(json!({ "type": "remove-stream", "producerId": producer_id }))
     }
@@ -249,6 +259,9 @@ fn dispatch(
         }
         "instrument-plugin-loaded" => {
             resolve("instrument-plugin".into(), Ok(v));
+        }
+        "instrument-plugin-unloaded" => {
+            resolve("instrument-plugin-unload".into(), Ok(v));
         }
         "instrument-plugin-error" => {
             let msg = format!("plugin refusé : {}", v["message"].as_str().unwrap_or("?"));
@@ -451,6 +464,24 @@ mod tests {
         let v = json!({ "type": "load-instrument-plugin", "pluginRef": r });
         assert!(matches!(as_agent_reads(v), BrowserMessage::LoadInstrumentPlugin { .. }));
         assert!(matches!(as_agent_reads(json!({ "type": "list-plugins" })), BrowserMessage::ListPlugins));
+    }
+
+    /// Le retrait est celui du ✕ du studio, et sa confirmation débloque l'attente.
+    #[tokio::test]
+    async fn le_retrait_du_plugin_est_celui_du_studio_et_se_confirme() {
+        assert!(matches!(
+            as_agent_reads(json!({ "type": "unload-instrument-plugin" })),
+            BrowserMessage::UnloadInstrumentPlugin
+        ));
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().unwrap().insert("instrument-plugin-unload".into(), tx);
+        let (out, _o) = mpsc::unbounded_channel();
+        let (perf_tx, _p) = mpsc::unbounded_channel();
+        let (err_tx, _e) = mpsc::unbounded_channel();
+        let mut hello = None;
+        dispatch(json!({ "type": "instrument-plugin-unloaded" }), &pending, &out, &perf_tx, &err_tx, &mut hello);
+        assert!(rx.await.unwrap().is_ok());
     }
 
     /// Un plugin refusé fait échouer la demande — jamais un banc « chargé » à vide.

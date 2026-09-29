@@ -30,6 +30,9 @@ enum End {
     Complete,
     Interrupted,
     AgentError(String),
+    /// Erreur du banc lui-même pendant la campagne (ajout d'un flux, relais…) :
+    /// la sortie propre (flux, plugin, capture) a lieu quand même.
+    BenchError(String),
 }
 
 pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> {
@@ -95,23 +98,6 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     up_instrument.set_agent_keys(&keys)?;
     listeners.push(spawn_listen(up_instrument.clone(), stop.clone()));
 
-    // Plugin inséré : la charge réelle du musicien, dans l'Audio Engine.
-    let plugin_line = match scenario.plugin.as_deref() {
-        None => "aucun".to_string(),
-        Some(name) => {
-            let items = agent.plugins().await?;
-            let plugin_ref = pick_plugin(&items, name)?;
-            let loaded = agent.load_plugin(&plugin_ref).await?;
-            let line = format!(
-                "{} (latence déclarée {} échantillons)",
-                loaded["name"].as_str().unwrap_or(name),
-                loaded["latencySamples"]
-            );
-            println!("Plugin chargé : {line}");
-            line
-        }
-    };
-
     let up_voice = match scenario.send_voice_channel {
         Some(channel) => {
             let up = Uplink::bind(ip)?;
@@ -132,6 +118,27 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         None => None,
     };
 
+    // Plugin inséré : la charge réelle du musicien, dans l'Audio Engine.
+    // Chargé en DERNIER avant la campagne : toute erreur de préparation qui
+    // précède ne peut pas laisser un plugin inséré derrière le banc.
+    let mut plugin_loaded = false;
+    let mut plugin_line = match scenario.plugin.as_deref() {
+        None => "aucun".to_string(),
+        Some(name) => {
+            let items = agent.plugins().await?;
+            let plugin_ref = pick_plugin(&items, name)?;
+            let loaded = agent.load_plugin(&plugin_ref).await?;
+            let line = format!(
+                "{} (latence déclarée {} échantillons)",
+                loaded["name"].as_str().unwrap_or(name),
+                loaded["latencySamples"]
+            );
+            println!("Plugin chargé : {line}");
+            plugin_loaded = true;
+            line
+        }
+    };
+
     // Ctrl-C : on arrête proprement ET on écrit ce qu'on a.
     let interrupted = Arc::new(AtomicBool::new(false));
     {
@@ -149,103 +156,122 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     let mut peer_rows: Vec<PeerRow> = Vec::new();
     let mut machine_rows: Vec<MachineRow> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
-    let mut end = End::Complete;
     let mut warned_no_holes = false;
 
-    'campaign: for musicians in scenario.from_musicians..=scenario.to_musicians {
-        // Musiciens à ajouter pour atteindre ce palier (tous au premier).
-        let first_new = if musicians == scenario.from_musicians { 2 } else { musicians };
-        for m in first_new..=musicians {
-            let profile = scenario.peer(m).clone();
-            let mut kinds = vec![Kind::Instrument];
-            if profile.voice.is_some() {
-                kinds.push(Kind::Voice);
+    // La campagne dans un bloc : une erreur du banc (`?`) en sort sans sauter
+    // la sortie propre qui suit — flux retirés, plugin rendu, capture arrêtée.
+    let campaign: Result<End, String> = async {
+        let mut end = End::Complete;
+        'campaign: for musicians in scenario.from_musicians..=scenario.to_musicians {
+            // Musiciens à ajouter pour atteindre ce palier (tous au premier).
+            let first_new = if musicians == scenario.from_musicians { 2 } else { musicians };
+            for m in first_new..=musicians {
+                let profile = scenario.peer(m).clone();
+                let mut kinds = vec![Kind::Instrument];
+                if profile.voice.is_some() {
+                    kinds.push(Kind::Voice);
+                }
+                for kind in kinds {
+                    let voice = kind == Kind::Voice;
+                    let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
+                    let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
+                    let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
+                    let port = agent_port(&mut relay, &mut relay_roles, role, ip, link.port()).await?;
+                    let keys = agent
+                        .add_stream(&StreamParams {
+                            producer_id: &pid,
+                            peer_id: &format!("bench-{m}"),
+                            server_ip: &agent_ip,
+                            server_port: port,
+                            voice,
+                            server_keys: &link.server_keys,
+                        })
+                        .await?;
+                    link.set_agent_keys(&keys)?;
+                    sender.add(link, &profile, scenario.seed.wrapping_add(u64::from(m)));
+                    names.insert(pid.clone(), (format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }), voice));
+                    producers.push(pid);
+                }
             }
-            for kind in kinds {
-                let voice = kind == Kind::Voice;
-                let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
-                let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
-                let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
-                let port = agent_port(&mut relay, &mut relay_roles, role, ip, link.port()).await?;
-                let keys = agent
-                    .add_stream(&StreamParams {
-                        producer_id: &pid,
-                        peer_id: &format!("bench-{m}"),
-                        server_ip: &agent_ip,
-                        server_port: port,
-                        voice,
-                        server_keys: &link.server_keys,
-                    })
-                    .await?;
-                link.set_agent_keys(&keys)?;
-                sender.add(link, &profile, scenario.seed.wrapping_add(u64::from(m)));
-                names.insert(pid.clone(), (format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }), voice));
-                producers.push(pid);
-            }
-        }
-        let start_s = t0.elapsed().as_secs_f64();
-        steps.push(Step { musicians, start_s, end_s: start_s });
-        println!("── {musicians} musiciens ({} flux reçus)", producers.len());
+            let start_s = t0.elapsed().as_secs_f64();
+            steps.push(Step { musicians, start_s, end_s: start_s });
+            println!("── {musicians} musiciens ({} flux reçus)", producers.len());
 
-        let step_end = Instant::now() + Duration::from_secs(scenario.step_secs);
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.tick().await;
-        while Instant::now() < step_end {
+            let step_end = Instant::now() + Duration::from_secs(scenario.step_secs);
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.tick().await;
-            let t = t0.elapsed().as_secs_f64();
-            let mut last_perf: Option<Value> = None;
-            while let Ok(p) = agent.perf.try_recv() {
-                last_perf = Some(p);
-            }
-            if let Some(p) = &last_perf {
-                let rows = report::peer_rows(p, t, musicians, &names);
-                if !warned_no_holes && rows.iter().any(|r| r.get("holesArrival").is_nan()) {
-                    // Le numéro de version ne suffit pas à le savoir (la 0.6.6-2
-                    // est plus récente que la -1 sans en avoir les mesures).
-                    println!("⚠ Cet Audio Engine ne mesure pas la cause des trous : installer la pré-version 0.6.6-5 ou plus récente. Le banc continue, ces colonnes resteront vides.");
-                    warned_no_holes = true;
+            while Instant::now() < step_end {
+                tick.tick().await;
+                let t = t0.elapsed().as_secs_f64();
+                let mut last_perf: Option<Value> = None;
+                while let Ok(p) = agent.perf.try_recv() {
+                    last_perf = Some(p);
                 }
-                peer_rows.extend(rows);
-            }
-            let relay_window = match relay.as_mut() {
-                Some(r) => {
-                    let st = r.stats().await?;
-                    Some(report::RelayWindow {
-                        delay_p99_ms: f64::from(st.delay_p99_us) / 1000.0,
-                        delay_max_ms: f64::from(st.delay_max_us) / 1000.0,
-                        arrivals: report::relay_arrivals(&st.ports, &relay_roles),
-                    })
+                if let Some(p) = &last_perf {
+                    let rows = report::peer_rows(p, t, musicians, &names);
+                    if !warned_no_holes && rows.iter().any(|r| r.get("holesArrival").is_nan()) {
+                        // Le numéro de version ne suffit pas à le savoir (la 0.6.6-2
+                        // est plus récente que la -1 sans en avoir les mesures).
+                        println!("⚠ Cet Audio Engine ne mesure pas la cause des trous : installer la pré-version 0.6.6-5 ou plus récente. Le banc continue, ces colonnes resteront vides.");
+                        warned_no_holes = true;
+                    }
+                    peer_rows.extend(rows);
                 }
-                None => None,
-            };
-            let row = report::machine_row(
-                last_perf.as_ref(),
-                t,
-                musicians,
-                &sender.take_window(),
-                up_instrument.take_window(),
-                up_voice.as_ref().map(|u| u.take_window()),
-                relay_window,
-            );
-            progress(musicians, t - start_s, &row, &peer_rows);
-            machine_rows.push(row);
-            if let Some(last) = steps.last_mut() {
-                last.end_s = t;
-            }
-            if let Ok(e) = agent.errors.try_recv() {
-                end = End::AgentError(e);
-                break 'campaign;
-            }
-            if interrupted.load(Ordering::Relaxed) {
-                end = End::Interrupted;
-                break 'campaign;
+                let relay_window = match relay.as_mut() {
+                    Some(r) => {
+                        let st = r.stats().await?;
+                        Some(report::RelayWindow {
+                            delay_p99_ms: f64::from(st.delay_p99_us) / 1000.0,
+                            delay_max_ms: f64::from(st.delay_max_us) / 1000.0,
+                            arrivals: report::relay_arrivals(&st.ports, &relay_roles),
+                        })
+                    }
+                    None => None,
+                };
+                let row = report::machine_row(
+                    last_perf.as_ref(),
+                    t,
+                    musicians,
+                    &sender.take_window(),
+                    up_instrument.take_window(),
+                    up_voice.as_ref().map(|u| u.take_window()),
+                    relay_window,
+                );
+                progress(musicians, t - start_s, &row, &peer_rows);
+                machine_rows.push(row);
+                if let Some(last) = steps.last_mut() {
+                    last.end_s = t;
+                }
+                if let Ok(e) = agent.errors.try_recv() {
+                    end = End::AgentError(e);
+                    break 'campaign;
+                }
+                if interrupted.load(Ordering::Relaxed) {
+                    end = End::Interrupted;
+                    break 'campaign;
+                }
             }
         }
+        Ok(end)
     }
+    .await;
+    let end = campaign.unwrap_or_else(End::BenchError);
 
-    // Arrêt : flux retirés, capture arrêtée, fils du banc rendus.
+    // Arrêt : flux retirés, plugin rendu, capture arrêtée, fils du banc rendus.
     for pid in &producers {
         let _ = agent.remove_stream(pid);
+    }
+    if plugin_loaded {
+        plugin_line = match agent.unload_plugin().await {
+            Ok(()) => {
+                println!("Plugin retiré de l'Audio Engine.");
+                format!("{plugin_line} — retiré à la fin")
+            }
+            Err(e) => {
+                println!("⚠ Plugin NON retiré ({e}) : le retirer dans le studio (✕) ou quitter l'Audio Engine.");
+                format!("{plugin_line} — NON RETIRÉ à la fin ({e}) : le retirer dans le studio ou quitter l'Audio Engine")
+            }
+        };
     }
     let _ = agent.stop();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -265,6 +291,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
         End::Complete => "complète".to_string(),
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
         End::AgentError(e) => format!("ARRÊTÉE PAR L'AUDIO ENGINE : {e}"),
+        End::BenchError(e) => format!("ARRÊTÉE PAR UNE ERREUR DU BANC : {e}"),
     };
     let (precision, _) = report::precision(&machine_rows.iter().map(|r| r.sender_late_max_ms).collect::<Vec<_>>());
     let priority = match sender.priority.get() {
@@ -319,6 +346,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     println!("\n{summary}");
     match end {
         End::AgentError(e) => Err(format!("campagne arrêtée par l'Audio Engine : {e} (résultats partiels dans {})", out_dir.display())),
+        End::BenchError(e) => Err(format!("campagne arrêtée par une erreur du banc : {e} (résultats partiels dans {})", out_dir.display())),
         _ => Ok(path),
     }
 }
