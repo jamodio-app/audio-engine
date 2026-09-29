@@ -1417,6 +1417,25 @@ impl PluginControl {
     }
 }
 
+/// Plus grand studio : BAND, 10 musiciens (spec `internal-docs/decisions/
+/// TIERS-AND-LIMITS.md`, `server/plan-limits-sfu.js` côté web).
+pub const LARGEST_STUDIO_MUSICIANS: usize = 10;
+/// Flux reçus par musicien : son instrument ET sa voix (talkback via l'Audio
+/// Engine depuis le Lot C, 0.5.10-4).
+pub const STREAMS_PER_MUSICIAN: usize = 2;
+/// Garde-fou anti-DoS (review pré-BETA, 13/07) sur les flux reçus : contextes
+/// SRTP + sockets UDP. Il était de 16, posé avant que la voix passe par l'Audio
+/// Engine : un studio BAND complet en demande 9 × 2 = 18 → les deux derniers
+/// étaient refusés (constaté dans le code le 29/09/2026, jamais en session).
+/// 32 ≈ le double : la marge des transitions (un musicien qui change
+/// d'interface envoie son nouveau flux avant que l'ancien soit fermé ; un
+/// musicien qui revient avant la fermeture de son ancienne connexion).
+pub const MAX_RECV_STREAMS: usize = 32;
+const _: () = assert!(
+    MAX_RECV_STREAMS >= (LARGEST_STUDIO_MUSICIANS - 1) * STREAMS_PER_MUSICIAN,
+    "un studio complet doit toujours tenir dans la limite de flux reçus"
+);
+
 /// Branche l'hôte de plugins sur le canal des états de fenêtre d'éditeur.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn with_editor_events<H: PluginHost>(
@@ -1425,6 +1444,9 @@ fn with_editor_events<H: PluginHost>(
 ) -> H {
     let events = events.clone();
     host.set_editor_listener(Arc::new(move |_handle, state| {
+        // Journal ICI, une seule fois : les connexions qui relaient l'état (le
+        // studio, la fenêtre interne de l'Audio Engine) ne le réécrivent pas.
+        tracing::info!(target: "jamodio::plugin", ?state, "fenêtre du plugin");
         // Sans lecteur (aucun studio connecté), l'état se perd : rien à faire.
         let _ = events.send(state);
     }));
@@ -3368,11 +3390,8 @@ impl PipelineState {
         self.remove_stream(&producer_id);
 
         // Garde-fou anti-DoS (review pré-BETA) : borne le nombre de flux entrants
-        // (contextes SRTP + sockets UDP). Un client légitime en monte ≤ quelques
-        // (nombre de pairs) ; ce cap dur évite l'exhaustion mémoire/fd par un flot
-        // d'AddStream. Le remove ci-dessus garantit qu'un ré-ajout du même
-        // producer ne compte pas double.
-        const MAX_RECV_STREAMS: usize = 16;
+        // (contextes SRTP + sockets UDP), cf. `MAX_RECV_STREAMS`. Le remove
+        // ci-dessus garantit qu'un ré-ajout du même producer ne compte pas double.
         if self.recv_streams.len() >= MAX_RECV_STREAMS {
             return Err(format!("too many streams (max {})", MAX_RECV_STREAMS));
         }
@@ -7522,5 +7541,40 @@ mod editor_events_tests {
         assert_eq!(rx.try_recv().unwrap(), EditorState::Open);
         assert_eq!(rx.try_recv().unwrap(), EditorState::Closed);
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod limite_flux_recus_tests {
+    use super::*;
+
+    fn cles() -> SrtpParameters {
+        SrtpParameters::generate_aead_aes_256_gcm()
+    }
+
+    /// Studio BAND complet : 9 autres musiciens × (instrument + voix) = 18 flux,
+    /// tous acceptés ; au-delà de la limite, refus explicite (garde-fou anti-DoS).
+    /// Vrai `add_stream` : sockets UDP locales, contextes SRTP, fil de réception.
+    #[tokio::test]
+    async fn un_studio_band_complet_tient_et_la_limite_reste_un_garde_fou() {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let complet = (LARGEST_STUDIO_MUSICIANS - 1) * STREAMS_PER_MUSICIAN;
+        assert_eq!(complet, 18);
+        for i in 0..MAX_RECV_STREAMS {
+            let kind = if i % 2 == 0 { StreamKind::Instrument } else { StreamKind::Voice };
+            pl.add_stream(format!("pair-{i}"), "127.0.0.1".into(), 40000, cles(), kind)
+                .await
+                .unwrap_or_else(|e| panic!("flux {i} refusé alors que la limite est {MAX_RECV_STREAMS} : {e}"));
+        }
+        let refus = pl
+            .add_stream("un-de-trop".into(), "127.0.0.1".into(), 40000, cles(), StreamKind::Instrument)
+            .await
+            .expect_err("au-delà de la limite, refus");
+        assert!(refus.contains("too many streams"), "{refus}");
+        // Le ré-ajout d'un flux existant ne compte pas double.
+        pl.add_stream("pair-0".into(), "127.0.0.1".into(), 40000, cles(), StreamKind::Instrument)
+            .await
+            .expect("ré-ajout du même flux accepté");
+        pl.stop_all();
     }
 }

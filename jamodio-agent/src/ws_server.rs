@@ -753,7 +753,8 @@ async fn forward_editor_events(
     loop {
         match editor_rx.recv().await {
             Ok(state) => {
-                tracing::info!(target: "jamodio::plugin", ?state, "fenêtre du plugin");
+                // Journal à la source (`pipeline::with_editor_events`), pas ici :
+                // chaque connexion relaie, une seule écrit.
                 if out_tx.send(AgentMessage::InstrumentPluginEditor { state }).await.is_err() {
                     break;
                 }
