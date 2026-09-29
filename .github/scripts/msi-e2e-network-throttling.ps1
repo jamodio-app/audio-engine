@@ -13,7 +13,7 @@ param(
   [Parameter(Mandatory)] [string] $OldMsi,
   # Journaux msiexec (/l*v) : conservés par le workflow en cas d'échec.
   [string] $LogDir = 'msi-logs',
-  [int] $TimeoutMs = 300000
+  [int] $TimeoutMs = 120000
 )
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $ErrorActionPreference = 'Stop'
@@ -47,9 +47,13 @@ function Assert($cond, $what) {
 function Invoke-Msi([string[]] $arguments, [int[]] $expected, [string] $log) {
   $log = Join-Path $LogDir $log
   Write-Host "  [$(Get-Date -Format HH:mm:ss)] msiexec $($arguments -join ' ')"
-  # PAS de `Start-Process -Wait` : il attend aussi tous les descendants, et un
-  # programme resté ouvert après l'installation bloquerait le test sans fin.
-  $p = Start-Process msiexec.exe -ArgumentList ($arguments + @('/qn', '/norestart', '/l*v', $log)) -PassThru
+  # Chaque argument entre guillemets s'il contient un espace : Start-Process
+  # joint la liste SANS les ajouter, et msiexec, recevant un chemin coupé
+  # (« …\Jamodio Audio Engine_x.msi »), ouvre sa fenêtre d'aide et attend un clic
+  # — blocage vécu deux fois (0.6.6-11, 0.6.6-12). Attente bornée, jamais `-Wait`.
+  $all = ($arguments + @('/qn', '/norestart', '/l*v', $log)) |
+    ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }
+  $p = Start-Process msiexec.exe -ArgumentList ($all -join ' ') -PassThru
   if (-not $p.WaitForExit($TimeoutMs)) {
     Write-Host "  BLOQUÉ après $($TimeoutMs / 1000) s — programmes en cours :"
     Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'msiexec|jamodio|Jamodio|WebView|EdgeUpdate|setup' } |

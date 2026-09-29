@@ -41,16 +41,18 @@ jobs:
             $env:TAG = gh release list -R $env:REPO --limit 1 --json tagName -q '.[0].tagName'
           }
           Write-Host "Installeur testé : $env:TAG"
-          gh release download $env:TAG -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir new-msi
+          gh release download $env:TAG -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir 'new msi'
           if ($LASTEXITCODE -ne 0) { throw "téléchargement de $env:TAG échoué" }
-          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir old-msi
+          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir 'old msi'
           if ($LASTEXITCODE -ne 0) { throw "téléchargement de la version publiée échoué" }
-          Get-ChildItem new-msi, old-msi | Format-Table Name, Length
+          Get-ChildItem 'new msi', 'old msi' | Format-Table Name, Length
+      # Dossiers AVEC espace : le MSI construit par release.yml vit dans
+      # « …\bundle\msi\Jamodio Audio Engine_x.msi » ; le test doit tenir ce cas.
       - name: Test de bout en bout
         shell: pwsh
         run: |
-          $new = Get-ChildItem new-msi -Filter '*.msi' | Select-Object -First 1
-          $old = Get-ChildItem old-msi -Filter '*.msi' | Select-Object -First 1
+          $new = Get-ChildItem 'new msi' -Filter '*.msi' | Select-Object -First 1
+          $old = Get-ChildItem 'old msi' -Filter '*.msi' | Select-Object -First 1
           ./.github/scripts/msi-e2e-network-throttling.ps1 -Msi $new.FullName -OldMsi $old.FullName
       - name: Journaux msiexec
         if: always()
