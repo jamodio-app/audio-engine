@@ -38,6 +38,14 @@ const ATTACK_S: f32 = 0.0005; // 0.5 ms
 const DURATION_S: f32 = 0.120; // 120 ms (queue inaudible ensuite)
 const DURATION_FRAMES: u64 = (DURATION_S as f64 * SR) as u64;
 
+/// Niveau de référence du clic : −12 dB (30/09/2026). Les tables `params` sont
+/// des amplitudes RELATIVES (temps fort 0,90) ; appliquées telles quelles, le
+/// temps fort crêtait à ≈ −0,9 dBFS avec le fader à 0 dB et couvrait la musique.
+/// Le niveau se règle ICI, à la source : le fader du navigateur reste à 0 dB
+/// par défaut (sur son repère) et crête alors vers −13 dBFS. Appliqué une fois
+/// à la création du grain → aucun calcul ajouté par échantillon.
+pub const CLICK_LEVEL: f32 = 0.251_188_64; // 10^(−12/20)
+
 // ─── Backing (B4) ─────────────────────────────────────────────────────────
 /// Gain proportionnel du servo varispeed du backing (erreur en frames → écart de
 /// vitesse). Réglé pour que l'erreur juste sous le seuil de snap sature la borne.
@@ -816,7 +824,7 @@ impl ReferenceSource {
                 self.voices.push(Voice {
                     start_frame: onset.round() as u64,
                     freq,
-                    amp,
+                    amp: amp * CLICK_LEVEL,
                     sound,
                 });
                 self.metro.last_onset_key = Some(key);
@@ -925,6 +933,21 @@ mod tests {
         let (fm, am) = MetroSound::Click.params(Role::Main);
         assert!(aa > am, "accent plus fort que temps normal");
         assert!(fa > fm, "accent plus aigu");
+    }
+
+    #[test]
+    fn click_level_peaks_around_minus_13_dbfs_at_unity_fader() {
+        // Temps fort (le plus fort), fader à 0 dB, pan centre : crête du grain
+        // ≈ 0,90 × 10^(−12/20) ≈ 0,226 (−12,9 dBFS) — jamais près de la pleine échelle.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        let mut out = block(4800); // 100 ms : couvre l'attaque et le pic du grain
+        r.advance_and_generate(&mut out, 0.0);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak_db = 20.0 * peak.log10();
+        assert!(peak > 0.0, "le clic sonne");
+        assert!(peak <= 0.90 * CLICK_LEVEL + 1e-4, "crête {peak} au-delà du niveau de référence");
+        assert!((-15.0..=-12.0).contains(&peak_db), "crête {peak_db:.1} dBFS hors de la cible ≈ −13");
     }
 
     #[test]
