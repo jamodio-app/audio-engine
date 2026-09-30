@@ -3835,9 +3835,9 @@ async fn handle_message(
         BrowserMessage::ReferenceClockPing { ping_id, client_send_ms } => {
             // Réponse IMMÉDIATE : l'ancre échantillon↔mural + l'horloge agent.
             // `outMs` = latence de sortie CONNUE (buffer CPAL mesuré) ; c'est ce
-            // que Chrome ne sait pas sur WASAPI. Le browser gate déjà l'Option B
-            // sur `audioHost ∈ {asio, coreaudio}` → sur WASAPI il ignore ce pong
-            // (fallback Option A). Cf. B0 §3.4.
+            // que Chrome ne sait pas sur WASAPI. Le browser n'utilise la référence
+            // que sur `audioHost ∈ {asio, coreaudio}` ; ailleurs le métronome est
+            // refusé et le dit (plus de clic navigateur). Cf. B0 §3.4.
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
