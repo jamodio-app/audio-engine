@@ -1,4 +1,4 @@
-//! Freinage réseau de Windows (`NetworkThrottlingIndex`) — Lot W3 de
+//! Freinage réseau de Windows (`NetworkThrottlingIndex`) — Lots W3 et W3-bis de
 //! `PLAN-FREINAGE-RESEAU-WINDOWS-2026-09.md` (dépôt du site).
 //!
 //! # Pourquoi
@@ -23,15 +23,20 @@
 //!
 //! # Ce que fait ce module
 //!
-//! - [`installer_step`] : mode `--network-throttling install|uninstall`, lancé
-//!   par l'installeur en compte système (`wix/network-throttling.wxs`).
-//!   L'installation mémorise la valeur d'origine du poste (une seule fois : une
-//!   mise à jour ne l'écrase jamais), puis désactive le freinage. La
-//!   désinstallation remet l'origine — sauf si la valeur a changé depuis (un
-//!   réglage fait par le musicien ou son informaticien n'est jamais écrasé).
+//! L'INSTALLATION est faite par l'installeur Windows lui-même
+//! (`wix/network-throttling.wxs`, W3-bis) : il désactive le freinage et mémorise
+//! la valeur d'origine du poste, sans lancer aucun programme. W3 confiait ce
+//! travail à ce module, lancé par l'installeur : chez un testeur (30/09), il n'a
+//! jamais exécuté son code — cause non établie, échec ignoré sans bruit.
+//!
+//! - [`installer_step`] : mode `--network-throttling uninstall`, lancé par
+//!   l'installeur en compte système à la vraie désinstallation : remet
+//!   l'origine — sauf si la valeur a changé depuis (un réglage fait par le
+//!   musicien ou son informaticien n'est jamais écrasé).
 //! - [`log_state`] : l'état au journal, au lancement et à chaque capture, avec
-//!   l'issue de la dernière étape d'installation. Rien n'est montré au
-//!   musicien : nous corrigeons, il n'a rien à faire.
+//!   la trace de l'installation — et l'anomalie « installé, mais réglage jamais
+//!   posé » dite en toutes lettres. Rien n'est montré au musicien : nous
+//!   corrigeons, il n'a rien à faire.
 //!
 //! Rien ici ne touche au chemin du son. macOS n'est pas concerné.
 
@@ -59,9 +64,25 @@ impl Reading {
     }
 
     /// Relit la forme mémorisée. Un texte illisible n'est JAMAIS interprété :
-    /// l'appelant refuse d'agir.
+    /// l'appelant refuse d'agir. Deux écritures possibles :
+    /// - par l'installeur (W3-bis) : `msi:absent`, ou `msi:` suivi de la valeur
+    ///   telle qu'il la lit — `#10`, et `#-1` ou `#4294967295` pour ffffffff ;
+    /// - par ce module (W3, versions 0.6.6-12 à 0.6.6-14) : `absent` ou `10`.
     pub fn from_memory(s: &str) -> Option<Reading> {
-        match s.trim() {
+        let s = s.trim();
+        if let Some(msi) = s.strip_prefix("msi:") {
+            if msi == "absent" {
+                return Some(Reading::Absent);
+            }
+            // DWORD lu par l'installeur : signé ou non selon la version de Windows.
+            let n: i64 = msi.strip_prefix('#')?.parse().ok()?;
+            return match n {
+                0..=0xFFFF_FFFF => Some(Reading::Value(n as u32)),
+                -0x8000_0000..=-1 => Some(Reading::Value(n as i32 as u32)),
+                _ => None,
+            };
+        }
+        match s {
             "absent" => Some(Reading::Absent),
             other => other.parse().ok().map(Reading::Value),
         }
@@ -74,24 +95,6 @@ impl Reading {
             Reading::Value(v) => format!("ACTIF (valeur {v})"),
             Reading::Absent => "ACTIF (valeur absente = défaut de Windows)".into(),
         }
-    }
-}
-
-/// Ce que l'installation doit faire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InstallPlan {
-    /// Valeur d'origine à mémoriser ; `None` = une origine l'est déjà (mise à
-    /// jour, réinstallation) et ne doit pas être écrasée.
-    pub remember: Option<Reading>,
-    /// Écrire `ffffffff` (faux si c'est déjà la valeur).
-    pub disable: bool,
-}
-
-/// Décision d'installation, sans effet de bord.
-pub fn install_plan(current: Reading, remembered: Option<Reading>) -> InstallPlan {
-    InstallPlan {
-        remember: if remembered.is_none() { Some(current) } else { None },
-        disable: current != Reading::Value(DISABLED),
     }
 }
 
@@ -133,10 +136,23 @@ pub fn written_since_boot(last_write: u64, now: u64, uptime_ms: u64) -> bool {
     last_write > boot
 }
 
-/// Point d'entrée du mode `--network-throttling <étape>` : code de sortie du
-/// processus (0 = fait, 1 = échec, 2 = étape inconnue). L'issue est aussi
-/// écrite dans notre clé, et [`log_state`] la reporte au journal au lancement
-/// suivant : un échec d'installation n'est jamais muet.
+/// Ce que le journal dit de l'installation : la trace laissée par
+/// l'installeur, ou l'anomalie d'une installation sans trace.
+/// `managed` = le marqueur `NetworkThrottlingManaged`, écrit par tout
+/// installeur qui gère ce réglage (depuis la 0.6.6-12).
+pub fn installer_text(managed: bool, step: Option<&str>) -> String {
+    match (managed, step) {
+        (_, Some(step)) => step.to_string(),
+        (true, None) => "ANOMALIE : installé par l'installeur Jamodio, mais aucune trace \
+                          de l'étape du freinage — réglage jamais posé par l'installation"
+            .into(),
+        (false, None) => "aucune installation connue de ce réglage".into(),
+    }
+}
+
+/// Point d'entrée du mode `--network-throttling uninstall` : code de sortie du
+/// processus (0 = fait, 1 = échec, 2 = étape inconnue). Un échec est écrit dans
+/// notre clé (lu par [`log_state`] si l'Audio Engine est réinstallé).
 pub fn installer_step(step: Option<&str>) -> i32 {
     #[cfg(target_os = "windows")]
     {
@@ -160,7 +176,7 @@ pub fn log_state(when: &'static str) {
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use super::{install_plan, uninstall_plan, written_since_boot, Reading, Restore, DISABLED};
+    use super::{installer_text, uninstall_plan, written_since_boot, Reading, Restore, DISABLED};
     use std::io;
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
     use winreg::{RegKey, HKEY};
@@ -168,6 +184,7 @@ mod windows {
     const VALUE: &str = "NetworkThrottlingIndex";
     const ORIGIN: &str = "NetworkThrottlingIndexOrigin";
     const LAST_STEP: &str = "NetworkThrottlingLastStep";
+    const MARKER: &str = "NetworkThrottlingManaged";
 
     /// Où lire et écrire. Les tests visent une clé de TEST, jamais celle du poste.
     pub struct Keys {
@@ -235,9 +252,23 @@ mod windows {
 
         fn write_step(&self, text: &str) {
             // Au mieux : si même notre clé est inaccessible, le journal dira
-            // « aucune étape d'installation connue » et l'état réel.
+            // l'état réel et l'absence de trace.
             if let Ok(k) = self.memory_key() {
                 let _ = k.set_value(LAST_STEP, &text.to_string());
+            }
+        }
+
+        /// Le marqueur posé par l'installeur (DWORD 1), absent = `false`.
+        fn managed(&self) -> io::Result<bool> {
+            let key = match self.root().open_subkey_with_flags(&self.memory, KEY_READ) {
+                Ok(k) => k,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            match key.get_value::<u32, _>(MARKER) {
+                Ok(v) => Ok(v == 1),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
             }
         }
 
@@ -247,23 +278,6 @@ mod windows {
             let ft = key.query_info()?.last_write_time;
             Ok((u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime))
         }
-    }
-
-    fn install(keys: &Keys) -> io::Result<String> {
-        let current = keys.read_current()?;
-        let plan = install_plan(current, keys.read_origin()?);
-        if let Some(origin) = plan.remember {
-            keys.memory_key()?.set_value(ORIGIN, &origin.to_memory())?;
-        }
-        if plan.disable {
-            keys.profile_key()?.set_value(VALUE, &DISABLED)?;
-        }
-        let origin = keys.read_origin()?.map(Reading::describe).unwrap_or_else(|| "?".into());
-        Ok(if plan.disable {
-            format!("install : freinage désactivé, effectif au prochain redémarrage (origine : {origin})")
-        } else {
-            format!("install : déjà désactivé, rien écrit (origine : {origin})")
-        })
     }
 
     fn uninstall(keys: &Keys) -> io::Result<String> {
@@ -296,20 +310,13 @@ mod windows {
     }
 
     pub fn installer_step(keys: &Keys, step: Option<&str>) -> i32 {
-        let outcome = match step {
-            Some("install") => install(keys),
-            Some("uninstall") => uninstall(keys),
-            _ => return 2,
-        };
-        match outcome {
-            Ok(text) => {
-                if step == Some("install") {
-                    keys.write_step(&text);
-                }
-                0
-            }
+        if step != Some("uninstall") {
+            return 2;
+        }
+        match uninstall(keys) {
+            Ok(_) => 0,
             Err(e) => {
-                keys.write_step(&format!("{} : ÉCHEC — {e}", step.unwrap_or("?")));
+                keys.write_step(&format!("uninstall : ÉCHEC — {e}"));
                 1
             }
         }
@@ -330,10 +337,9 @@ mod windows {
     }
 
     pub fn log_state(keys: &Keys, when: &'static str) {
-        let installer = match keys.read_memory_text(LAST_STEP) {
-            Ok(Some(s)) => s,
-            Ok(None) => "aucune étape d'installation connue".into(),
-            Err(e) => format!("illisible ({e})"),
+        let installer = match (keys.managed(), keys.read_memory_text(LAST_STEP)) {
+            (Ok(managed), Ok(step)) => installer_text(managed, step.as_deref()),
+            (Err(e), _) | (_, Err(e)) => format!("illisible ({e})"),
         };
         let origin = match keys.read_origin() {
             Ok(Some(r)) => r.to_memory(),
@@ -406,61 +412,88 @@ mod windows {
             }
         }
 
-        fn cycle(tag: &str, start: Reading) -> TestKeys {
+        /// L'état que laisse l'installeur (W3-bis) : marqueur, origine notée à sa
+        /// façon, freinage désactivé.
+        fn installed(tag: &str, origin: &str) -> TestKeys {
             let t = TestKeys::new(tag);
-            t.set(start);
-            assert_eq!(installer_step(&t.0, Some("install")), 0);
-            assert_eq!(t.0.read_current().unwrap(), Reading::Value(DISABLED));
-            assert_eq!(t.0.read_origin().unwrap(), Some(start));
+            t.set(Reading::Value(DISABLED));
+            let k = t.0.memory_key().unwrap();
+            k.set_value(MARKER, &1u32).unwrap();
+            k.set_value(ORIGIN, &origin.to_string()).unwrap();
+            k.set_value(LAST_STEP, &"install (installeur) : …".to_string()).unwrap();
             t
         }
 
-        #[test]
-        fn installer_puis_desinstaller_remet_l_origine() {
-            let t = cycle("origine10", Reading::Value(10));
-            assert!(t.0.read_memory_text(LAST_STEP).unwrap().unwrap().contains("désactivé"));
+        fn uninstall_ok(t: &TestKeys) {
             assert_eq!(installer_step(&t.0, Some("uninstall")), 0);
-            assert_eq!(t.0.read_current().unwrap(), Reading::Value(10));
             assert_eq!(t.0.read_origin().unwrap(), None, "mémoire effacée");
+            assert_eq!(t.0.read_memory_text(LAST_STEP).unwrap(), None, "trace effacée");
+        }
+
+        #[test]
+        fn l_origine_notee_par_l_installeur_est_remise() {
+            let t = installed("origine10", "msi:#10");
+            uninstall_ok(&t);
+            assert_eq!(t.0.read_current().unwrap(), Reading::Value(10));
+        }
+
+        #[test]
+        fn une_origine_notee_par_la_version_precedente_est_remise() {
+            // 0.6.6-12 à 0.6.6-14 : l'origine était écrite par ce module.
+            let t = installed("ancienne", "10");
+            uninstall_ok(&t);
+            assert_eq!(t.0.read_current().unwrap(), Reading::Value(10));
         }
 
         #[test]
         fn une_valeur_absente_redevient_absente() {
-            let t = cycle("absente", Reading::Absent);
-            assert_eq!(installer_step(&t.0, Some("uninstall")), 0);
+            let t = installed("absente", "msi:absent");
+            uninstall_ok(&t);
             assert_eq!(t.0.read_current().unwrap(), Reading::Absent);
         }
 
         #[test]
-        fn une_mise_a_jour_n_ecrase_pas_l_origine() {
-            let t = cycle("maj", Reading::Value(10));
-            assert_eq!(installer_step(&t.0, Some("install")), 0);
-            assert_eq!(t.0.read_origin().unwrap(), Some(Reading::Value(10)));
+        fn une_origine_deja_desactivee_reste_desactivee() {
+            for (tag, origin) in [("deja-signe", "msi:#-1"), ("deja-non-signe", "msi:#4294967295")] {
+                let t = installed(tag, origin);
+                uninstall_ok(&t);
+                assert_eq!(t.0.read_current().unwrap(), Reading::Value(DISABLED), "{origin}");
+            }
         }
 
         #[test]
         fn un_changement_fait_depuis_n_est_jamais_ecrase() {
-            let t = cycle("change", Reading::Value(10));
+            let t = installed("change", "msi:#10");
             t.set(Reading::Value(20));
-            assert_eq!(installer_step(&t.0, Some("uninstall")), 0);
+            uninstall_ok(&t);
             assert_eq!(t.0.read_current().unwrap(), Reading::Value(20));
         }
 
         #[test]
-        fn une_origine_deja_desactivee_reste_desactivee() {
-            let t = cycle("deja", Reading::Value(DISABLED));
-            assert!(t.0.read_memory_text(LAST_STEP).unwrap().unwrap().contains("déjà désactivé"));
-            assert_eq!(installer_step(&t.0, Some("uninstall")), 0);
+        fn une_origine_illisible_ne_touche_a_rien_et_le_dit() {
+            let t = installed("illisible", "msi:dix");
+            assert_eq!(installer_step(&t.0, Some("uninstall")), 1);
             assert_eq!(t.0.read_current().unwrap(), Reading::Value(DISABLED));
+            assert!(t.0.read_memory_text(LAST_STEP).unwrap().unwrap().contains("ÉCHEC"));
         }
 
         #[test]
         fn une_etape_inconnue_ne_touche_a_rien() {
-            let t = TestKeys::new("inconnue");
-            t.set(Reading::Value(10));
+            let t = installed("inconnue", "msi:#10");
+            // L'installation n'est plus une étape de ce module (W3-bis).
+            assert_eq!(installer_step(&t.0, Some("install")), 2);
             assert_eq!(installer_step(&t.0, Some("bidule")), 2);
             assert_eq!(installer_step(&t.0, None), 2);
-            assert_eq!(t.0.read_current().unwrap(), Reading::Value(10));
+            assert_eq!(t.0.read_current().unwrap(), Reading::Value(DISABLED));
+            assert_eq!(t.0.read_origin().unwrap(), Some(Reading::Value(10)));
+        }
+
+        #[test]
+        fn le_marqueur_se_lit() {
+            let t = TestKeys::new("marqueur");
+            assert!(!t.0.managed().unwrap());
+            t.0.memory_key().unwrap().set_value(MARKER, &1u32).unwrap();
+            assert!(t.0.managed().unwrap());
         }
 
         /// Lecture seule de la VRAIE clé du poste (CI Windows) : jamais d'erreur,
@@ -476,28 +509,6 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn l_installation_memorise_une_seule_fois_et_desactive() {
-        assert_eq!(
-            install_plan(Reading::Value(10), None),
-            InstallPlan { remember: Some(Reading::Value(10)), disable: true }
-        );
-        assert_eq!(
-            install_plan(Reading::Absent, None),
-            InstallPlan { remember: Some(Reading::Absent), disable: true }
-        );
-        // Mise à jour : l'origine mémorisée à la première installation reste.
-        assert_eq!(
-            install_plan(Reading::Value(DISABLED), Some(Reading::Value(10))),
-            InstallPlan { remember: None, disable: false }
-        );
-        // Déjà désactivé avant nous : on le note comme origine, on n'écrit rien.
-        assert_eq!(
-            install_plan(Reading::Value(DISABLED), None),
-            InstallPlan { remember: Some(Reading::Value(DISABLED)), disable: false }
-        );
-    }
 
     #[test]
     fn la_desinstallation_ne_remet_que_ce_qui_est_encore_a_nous() {
@@ -517,6 +528,25 @@ mod tests {
         }
         assert_eq!(Reading::from_memory("dix"), None);
         assert_eq!(Reading::from_memory(""), None);
+    }
+
+    /// Ce que l'installeur écrit (W3-bis) : `msi:` + la valeur telle qu'il la lit.
+    #[test]
+    fn la_memoire_ecrite_par_l_installeur_se_relit() {
+        assert_eq!(Reading::from_memory("msi:#10"), Some(Reading::Value(10)));
+        assert_eq!(Reading::from_memory("msi:#-1"), Some(Reading::Value(DISABLED)));
+        assert_eq!(Reading::from_memory("msi:#4294967295"), Some(Reading::Value(DISABLED)));
+        assert_eq!(Reading::from_memory("msi:absent"), Some(Reading::Absent));
+        for bad in ["msi:", "msi:10", "msi:#", "msi:#dix", "msi:#4294967296", "msi:#-2147483649", "msi:#x0a"] {
+            assert_eq!(Reading::from_memory(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn le_journal_dit_l_installation_sans_trace() {
+        assert_eq!(installer_text(true, Some("install (installeur) : …")), "install (installeur) : …");
+        assert!(installer_text(true, None).starts_with("ANOMALIE"));
+        assert_eq!(installer_text(false, None), "aucune installation connue de ce réglage");
     }
 
     #[test]

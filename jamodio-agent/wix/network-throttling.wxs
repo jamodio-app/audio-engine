@@ -1,39 +1,61 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Freinage réseau de Windows (NetworkThrottlingIndex) — Lot W3 de
+  Freinage réseau de Windows (NetworkThrottlingIndex) — Lots W3 et W3-bis de
   PLAN-FREINAGE-RESEAU-WINDOWS-2026-09 (dépôt du site).
 
-  Toute la logique vit dans l'Audio Engine (`src/net_throttling.rs`, testée) :
-  l'installeur ne fait que l'appeler, en compte système, après la copie des
-  fichiers (`install`) et, à la vraie désinstallation seulement, avant leur
-  suppression (`uninstall`). Pendant une mise à jour, l'ancien produit est
-  retiré avec UPGRADINGPRODUCTCODE : la valeur d'origine n'est PAS remise.
+  C'est l'INSTALLEUR WINDOWS LUI-MÊME qui écrit le réglage et la valeur
+  d'origine du poste — aucun programme n'est lancé à l'installation. W3 faisait
+  écrire notre programme, lancé par l'installeur : chez un testeur (30/09),
+  ce programme n'a jamais exécuté son code (cause non établie ; échec ignoré sans
+  bruit), alors que le marqueur ci-dessous, écrit par l'installeur, était là.
+
+  - Le réglage : `NetworkThrottlingIndex = ffffffff`, composant PERMANENT.
+  - L'origine : mémorisée dans notre clé, composant PERMANENT, avec la valeur
+    déjà mémorisée s'il y en a une (une mise à jour ou une réparation la
+    réécrit à l'identique), sinon la valeur lue avant l'installation. Préfixe
+    `msi:` : une valeur de registre qui commence par `#` serait lue par
+    l'installeur comme un nombre.
+    Permanents : une mise à jour retire l'ancienne version AVANT d'installer la
+    nouvelle (MajorUpgrade afterInstallInitialize) ; sans cela, l'origine
+    serait effacée puis relue… désactivée.
+  - Seule la remise de l'origine, à la vraie désinstallation, passe encore par
+    notre programme (option « network-throttling uninstall », `src/net_throttling.rs`),
+    jamais pendant une mise à jour. S'il échoue, le freinage reste désactivé.
 
   Le réglage n'agit qu'après un redémarrage (mesuré le 29/09) : Windows le
   propose seulement si la valeur lue avant l'installation n'était pas déjà
-  ffffffff — donc une seule fois. Une mise à jour lancée par l'Audio Engine
-  passe `/passive /promptrestart` : la question est posée, jamais imposée.
-
-  Un échec de l'étape n'empêche pas l'installation (l'Audio Engine fonctionne
-  sans) ; il est écrit dans le registre et reporté au journal au lancement.
+  ffffffff. Une mise à jour lancée par l'Audio Engine passe
+  `/passive /promptrestart` : la question est posée, jamais imposée.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
-    <Property Id="JMO_NTI_BEFORE">
+    <!-- Valeur avant l'installation, telle que l'installeur la lit : « #10 »,
+         « #-1 » (ffffffff), vide si absente. -->
+    <Property Id="JMO_NTI_BEFORE" Secure="yes">
       <RegistrySearch Id="JmoNtiBefore" Root="HKLM"
                       Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
                       Name="NetworkThrottlingIndex" Type="raw" Win64="yes" />
     </Property>
+    <!-- Origine déjà mémorisée (par une version précédente), le cas échéant. -->
+    <Property Id="JMO_NTI_ORIGIN_SAVED" Secure="yes">
+      <RegistrySearch Id="JmoNtiOriginSaved" Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
+                      Name="NetworkThrottlingIndexOrigin" Type="raw" Win64="yes" />
+    </Property>
+    <Property Id="JMO_NTI_ORIGIN" Secure="yes" />
 
-    <CustomAction Id="JmoNetThrottlingInstall" FileKey="Path"
-                  ExeCommand="--network-throttling install"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- L'origine à écrire, sans aucun programme : trois cas exclusifs. -->
+    <SetProperty Action="JmoNtiOriginKeep" Id="JMO_NTI_ORIGIN" Value="[JMO_NTI_ORIGIN_SAVED]"
+                 After="AppSearch" Sequence="both">JMO_NTI_ORIGIN_SAVED</SetProperty>
+    <SetProperty Action="JmoNtiOriginValue" Id="JMO_NTI_ORIGIN" Value="msi:[JMO_NTI_BEFORE]"
+                 After="AppSearch" Sequence="both">NOT JMO_NTI_ORIGIN_SAVED AND JMO_NTI_BEFORE</SetProperty>
+    <SetProperty Action="JmoNtiOriginAbsent" Id="JMO_NTI_ORIGIN" Value="msi:absent"
+                 After="AppSearch" Sequence="both">NOT JMO_NTI_ORIGIN_SAVED AND NOT JMO_NTI_BEFORE</SetProperty>
+
     <CustomAction Id="JmoNetThrottlingUninstall" FileKey="Path"
                   ExeCommand="--network-throttling uninstall"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="JmoNetThrottlingInstall" After="InstallFiles">NOT REMOVE="ALL"</Custom>
       <Custom Action="JmoNetThrottlingUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
       <!-- Valeur DWORD lue en « #nombre » ; ffffffff peut s'écrire signée ou non. -->
       <ScheduleReboot After="InstallFinalize"><![CDATA[NOT REMOVE="ALL" AND JMO_NTI_BEFORE <> "#-1" AND JMO_NTI_BEFORE <> "#4294967295"]]></ScheduleReboot>
@@ -42,9 +64,21 @@
     <!-- Référencé par `componentGroupRefs` (tauri.conf.json) : c'est ce qui fait
          entrer ce fragment dans le MSI. -->
     <ComponentGroup Id="JmoNetThrottling">
+      <!-- Marqueur + trace de l'étape : retirés à la désinstallation. -->
       <Component Id="JmoNetThrottlingMarker" Directory="INSTALLDIR" Guid="*" Win64="yes">
         <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
                        Name="NetworkThrottlingManaged" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
+                       Name="NetworkThrottlingLastStep" Type="string"
+                       Value="install (installeur) : freinage désactivé, effectif au prochain redémarrage ; origine mémorisée : [JMO_NTI_ORIGIN]" />
+      </Component>
+      <Component Id="JmoNetThrottlingOrigin" Directory="INSTALLDIR" Guid="*" Win64="yes" Permanent="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
+                       Name="NetworkThrottlingIndexOrigin" Type="string" Value="[JMO_NTI_ORIGIN]" KeyPath="yes" />
+      </Component>
+      <Component Id="JmoNetThrottlingDisable" Directory="INSTALLDIR" Guid="*" Win64="yes" Permanent="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+                       Name="NetworkThrottlingIndex" Type="integer" Value="-1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

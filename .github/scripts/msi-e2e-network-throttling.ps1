@@ -40,6 +40,14 @@ function Set-Nti([string] $v) {
 function Get-Memory($name) {
   (Get-ItemProperty -Path $Memory -Name $name -ErrorAction SilentlyContinue).$name
 }
+# Pose un état « laissé par une version précédente » (cas 7 et 8).
+function Set-Memory([string] $name, $value, [string] $type = 'String') {
+  New-Item -Path $Memory -Force | Out-Null
+  New-ItemProperty -Path $Memory -Name $name -PropertyType $type -Value $value -Force | Out-Null
+}
+function Clear-Memory {
+  Remove-Item -Path $Memory -Recurse -Force -ErrorAction SilentlyContinue
+}
 function Assert($cond, $what) {
   if (-not $cond) { throw "ÉCHEC : $what" }
   Write-Host "  ok — $what"
@@ -78,19 +86,21 @@ Invoke-Msi @('/i', $OldMsi) @(0, $Reboot) 'old.log' | Out-Null
 Assert ((Get-Nti) -eq '10') 'la version publiée ne touche pas au réglage'
 $code = Invoke-Msi @('/i', $Msi) @(0, $Reboot) 'upgrade.log'
 Assert ((Get-Nti) -eq $Off) 'freinage désactivé après la mise à jour'
-Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq '10') 'origine 10 mémorisée'
-Assert ((Get-Memory NetworkThrottlingLastStep) -like 'install :*') "étape notée : $(Get-Memory NetworkThrottlingLastStep)"
+Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq 'msi:#10') "origine 10 mémorisée par l'installeur : $(Get-Memory NetworkThrottlingIndexOrigin)"
+Assert ((Get-Memory NetworkThrottlingLastStep) -like 'install (installeur)*') "étape notée : $(Get-Memory NetworkThrottlingLastStep)"
 Assert ($code -eq $Reboot) 'redémarrage proposé (le réglage vient de changer)'
 
-Write-Host '▸ 2. Réinstallation (même chemin qu''une mise à jour suivante) : origine intacte, pas de redémarrage'
+Write-Host '▸ 2. Réinstallation / réparation (réécrit tout le registre) : origine intacte, pas de redémarrage'
 $code = Invoke-Msi @('/fvomus', $Msi) @(0, $Reboot) 'reinstall.log'
-Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq '10') 'origine toujours 10'
+Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq 'msi:#10') "origine toujours 10 : $(Get-Memory NetworkThrottlingIndexOrigin)"
 Assert ($code -eq 0) 'aucun redémarrage demandé (déjà désactivé)'
 
 Write-Host '▸ 3. Désinstallation : origine remise, rien de nous ne reste'
 Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'uninstall.log' | Out-Null
 Assert ((Get-Nti) -eq '10') 'valeur 10 remise'
 Assert ($null -eq (Get-Memory NetworkThrottlingIndexOrigin)) 'origine effacée'
+Assert ($null -eq (Get-Memory NetworkThrottlingManaged)) 'marqueur retiré'
+Assert ($null -eq (Get-Memory NetworkThrottlingLastStep)) 'trace retirée'
 
 Write-Host '▸ 4. Valeur absente à l''origine'
 Set-Nti 'absent'
@@ -114,5 +124,28 @@ Set-Nti 20
 Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'changed-uninstall.log' | Out-Null
 Assert ((Get-Nti) -eq '20') 'la valeur 20 posée depuis est gardée'
 
+Write-Host '▸ 7. Le cas du 30/09 : installé par une version précédente, réglage jamais posé (marqueur sans origine)'
+Clear-Memory
 Set-Nti 10
-Write-Host '✔ Installeur : freinage réseau géré comme prévu dans les 6 cas.'
+Set-Memory NetworkThrottlingManaged 1 'DWord'
+$code = Invoke-Msi @('/i', $Msi) @(0, $Reboot) 'marker-install.log'
+Assert ((Get-Nti) -eq $Off) 'freinage désactivé'
+Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq 'msi:#10') 'origine 10 mémorisée'
+Assert ($code -eq $Reboot) 'redémarrage proposé'
+Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'marker-uninstall.log' | Out-Null
+Assert ((Get-Nti) -eq '10') 'valeur 10 remise'
+
+Write-Host '▸ 8. Origine déjà notée par une version précédente (0.6.6-12 à -14, forme « 10 ») : jamais remplacée'
+Clear-Memory
+Set-Nti '0xffffffff'
+Set-Memory NetworkThrottlingManaged 1 'DWord'
+Set-Memory NetworkThrottlingIndexOrigin '10'
+$code = Invoke-Msi @('/i', $Msi) @(0, $Reboot) 'legacy-install.log'
+Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq '10') "origine « 10 » conservée, pas remplacée par ffffffff : $(Get-Memory NetworkThrottlingIndexOrigin)"
+Assert ($code -eq 0) 'aucun redémarrage demandé (déjà désactivé)'
+Invoke-Msi @('/x', $Msi) @(0, $Reboot) 'legacy-uninstall.log' | Out-Null
+Assert ((Get-Nti) -eq '10') 'valeur 10 remise'
+
+Clear-Memory
+Set-Nti 10
+Write-Host '✔ Installeur : freinage réseau géré comme prévu dans les 8 cas.'
