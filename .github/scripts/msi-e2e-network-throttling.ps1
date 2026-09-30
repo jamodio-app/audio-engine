@@ -87,12 +87,13 @@ Assert ((Get-Nti) -eq '10') 'la version publiée ne touche pas au réglage'
 $code = Invoke-Msi @('/i', $Msi) @(0, $Reboot) 'upgrade.log'
 Assert ((Get-Nti) -eq $Off) 'freinage désactivé après la mise à jour'
 Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq 'msi:#10') "origine 10 mémorisée par l'installeur : $(Get-Memory NetworkThrottlingIndexOrigin)"
-Assert ((Get-Memory NetworkThrottlingLastStep) -like 'install (installeur)*') "étape notée : $(Get-Memory NetworkThrottlingLastStep)"
+Assert ((Get-Memory NetworkThrottlingLastStep) -like 'install (installeur) : freinage désactivé, effectif au prochain redémarrage*') "étape notée : $(Get-Memory NetworkThrottlingLastStep)"
 Assert ($code -eq $Reboot) 'redémarrage proposé (le réglage vient de changer)'
 
 Write-Host '▸ 2. Réinstallation / réparation (réécrit tout le registre) : origine intacte, pas de redémarrage'
 $code = Invoke-Msi @('/fvomus', $Msi) @(0, $Reboot) 'reinstall.log'
 Assert ((Get-Memory NetworkThrottlingIndexOrigin) -eq 'msi:#10') "origine toujours 10 : $(Get-Memory NetworkThrottlingIndexOrigin)"
+Assert ((Get-Memory NetworkThrottlingLastStep) -like '*déjà désactivé avant cette installation*') "trace exacte (rien ne change) : $(Get-Memory NetworkThrottlingLastStep)"
 Assert ($code -eq 0) 'aucun redémarrage demandé (déjà désactivé)'
 
 Write-Host '▸ 3. Désinstallation : origine remise, rien de nous ne reste'

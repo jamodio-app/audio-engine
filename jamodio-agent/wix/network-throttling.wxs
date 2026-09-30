@@ -42,6 +42,7 @@
                       Name="NetworkThrottlingIndexOrigin" Type="raw" Win64="yes" />
     </Property>
     <Property Id="JMO_NTI_ORIGIN" Secure="yes" />
+    <Property Id="JMO_NTI_STEP" Secure="yes" />
 
     <!-- L'origine à écrire, sans aucun programme : trois cas exclusifs. -->
     <SetProperty Action="JmoNtiOriginKeep" Id="JMO_NTI_ORIGIN" Value="[JMO_NTI_ORIGIN_SAVED]"
@@ -50,6 +51,15 @@
                  After="AppSearch" Sequence="both">NOT JMO_NTI_ORIGIN_SAVED AND JMO_NTI_BEFORE</SetProperty>
     <SetProperty Action="JmoNtiOriginAbsent" Id="JMO_NTI_ORIGIN" Value="msi:absent"
                  After="AppSearch" Sequence="both">NOT JMO_NTI_ORIGIN_SAVED AND NOT JMO_NTI_BEFORE</SetProperty>
+
+    <!-- Ce que l'installation a fait, pour la trace : dit exactement, jamais
+         « effectif au prochain redémarrage » quand rien ne change. -->
+    <SetProperty Action="JmoNtiStepAlready" Id="JMO_NTI_STEP"
+                 Value="freinage déjà désactivé avant cette installation, rien ne change"
+                 After="AppSearch" Sequence="both"><![CDATA[JMO_NTI_BEFORE = "#-1" OR JMO_NTI_BEFORE = "#4294967295"]]></SetProperty>
+    <SetProperty Action="JmoNtiStepDisabled" Id="JMO_NTI_STEP"
+                 Value="freinage désactivé, effectif au prochain redémarrage"
+                 After="AppSearch" Sequence="both"><![CDATA[JMO_NTI_BEFORE <> "#-1" AND JMO_NTI_BEFORE <> "#4294967295"]]></SetProperty>
 
     <CustomAction Id="JmoNetThrottlingUninstall" FileKey="Path"
                   ExeCommand="--network-throttling uninstall"
@@ -70,7 +80,7 @@
                        Name="NetworkThrottlingManaged" Type="integer" Value="1" KeyPath="yes" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
                        Name="NetworkThrottlingLastStep" Type="string"
-                       Value="install (installeur) : freinage désactivé, effectif au prochain redémarrage ; origine mémorisée : [JMO_NTI_ORIGIN]" />
+                       Value="install (installeur) : [JMO_NTI_STEP] ; origine mémorisée : [JMO_NTI_ORIGIN]" />
       </Component>
       <Component Id="JmoNetThrottlingOrigin" Directory="INSTALLDIR" Guid="*" Win64="yes" Permanent="yes">
         <RegistryValue Root="HKLM" Key="SOFTWARE\Jamodio\AudioEngine"
