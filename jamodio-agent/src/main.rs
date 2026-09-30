@@ -352,10 +352,10 @@ fn main() {
         plugin_scan::worker::run();
     }
 
-    // Étape d'installeur (Lot W3 du freinage réseau de Windows) : lancé par le
-    // MSI en compte système, AVANT tout le reste — ni journal fichier (il
-    // atterrirait dans le profil système), ni Tauri, ni port 9876. L'issue est
-    // écrite dans le registre et reportée au journal au lancement suivant.
+    // Étape de DÉSINSTALLATION du freinage réseau de Windows (Lots W3, W3-bis) :
+    // lancée par le MSI en compte système, AVANT tout le reste — ni journal
+    // fichier (il atterrirait dans le profil système), ni Tauri, ni port 9876.
+    // L'installation, elle, est écrite par l'installeur lui-même (W3-bis).
     // Cf. `net_throttling` et `wix/network-throttling.wxs`.
     {
         let args: Vec<String> = std::env::args().collect();

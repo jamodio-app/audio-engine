@@ -104,43 +104,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
 
-      # Windows : libopus via vcpkg (audiopus_sys). SRTP = pure Rust
-      # (webrtc-srtp), donc plus besoin d'OpenSSL/libsrtp côté système depuis
-      # v0.3.0 — voir [target.'cfg(windows)'.dependencies] dans
-      # jamodio-audio-core/Cargo.toml.
-      #
-      # Triplet `x64-windows-static-md` = lib statique + MSVCRT dynamique
-      # (compatible Tauri).
-      - name: Install libopus (Windows via vcpkg)
+      # Windows : libopus (vcpkg), SDK ASIO + LLVM — étapes partagées avec
+      # msi-e2e.yml, cf. .github/actions/windows-build-deps (commentaires là-bas).
+      - name: Dépendances de build Windows (libopus, SDK ASIO, LLVM)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg install opus:x64-windows-static-md
-          "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      # ASIO SDK Steinberg : nécessaire pour la feature `asio` de cpal côté
-      # Windows (low-latency 3-5 ms vs WASAPI shared 10-30 ms). cpal-asio-sys
-      # utilise bindgen, qui requiert LLVM/clang.
-      #
-      # ASIO SDK est gratuit (Steinberg Inc., licence ASIO SDK 2.3.3) — URL
-      # stable depuis 2019. Si Steinberg change l'URL, fallback : bundler le
-      # ZIP dans le repo (autorisé pour usage privé / dev).
-      - name: Install ASIO SDK + LLVM (Windows, cpal asio feature)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install llvm -y --no-progress
-          Invoke-WebRequest -Uri "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip" -OutFile asiosdk.zip
-          # Supply-chain : on PIN le SHA256 du SDK ASIO. Sans ça, un téléchargement
-          # compromis (MITM, compromission du miroir Steinberg) serait compilé dans
-          # le binaire signé distribué aux beta-testeurs. Build interrompu si mismatch.
-          $expected = "bc425d9b98701af74b43639798566c48bc005af7328a2251cff722c1885076b2"
-          $actual = (Get-FileHash asiosdk.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $expected) { Write-Error "ASIO SDK checksum mismatch: $actual (attendu $expected)"; exit 1 }
-          Expand-Archive asiosdk.zip -DestinationPath C:\
-          "CPAL_ASIO_DIR=C:\asiosdk_2.3.3_2019-06-14" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+        uses: ./.github/actions/windows-build-deps
 
       # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH
       # relatif vers deps/opus-arm64/ (workaround local pour le dev sur Mac M*
