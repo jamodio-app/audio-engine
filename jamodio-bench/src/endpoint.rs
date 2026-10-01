@@ -7,7 +7,7 @@ use crate::profile::PeerProfile;
 use crate::relay::{RelayClient, Transport};
 use crate::remote::{Command, RemoteClient};
 use crate::report::{self, RelayWindow};
-use crate::server::{Downlink, Kind, Payloads, SenderLoop, SenderWindow, Uplink, UplinkWindow};
+use crate::server::{Downlink, Kind, Senders, SenderWindow, Uplink, UplinkWindow, PER_STREAM_LOCAL};
 use jamodio_audio_core::net::srtp::SrtpParameters;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -39,7 +39,7 @@ pub enum Endpoint {
 pub struct Local {
     /// Adresse du banc sur cette machine.
     ip: String,
-    sender: SenderLoop,
+    senders: Senders,
     relay: Option<RelayClient>,
     /// Mode relais : nature de chaque transport, pour lire ce qu'il mesure.
     roles: HashMap<SocketAddr, Transport>,
@@ -70,7 +70,7 @@ impl Endpoint {
         };
         Ok(Self::Local(Box::new(Local {
             ip,
-            sender: SenderLoop::start(Payloads::encode(220.0)?, Payloads::encode(330.0)?),
+            senders: Senders::new(PER_STREAM_LOCAL)?,
             relay,
             roles: HashMap::new(),
             ups: HashMap::new(),
@@ -164,7 +164,7 @@ impl Endpoint {
             Self::Local(l) => {
                 let link = l.downs.get(&id).ok_or(format!("flux {id} inconnu"))?.clone();
                 link.set_agent_keys(keys)?;
-                l.sender.add(link, profile, seed, offset_us);
+                l.senders.add(id, link, profile, seed, offset_us);
                 Ok(())
             }
             Self::Remote(r) => {
@@ -179,6 +179,7 @@ impl Endpoint {
         match self {
             Self::Local(l) => {
                 l.downs.remove(&id).ok_or(format!("flux {id} inconnu"))?.retire();
+                l.senders.retire(id);
                 Ok(())
             }
             Self::Remote(r) => r.client.call(&Command::Retire { id }).await.map(|_| ()),
@@ -189,7 +190,7 @@ impl Endpoint {
     pub async fn windows(&mut self) -> Result<Windows, String> {
         match self {
             Self::Local(l) => {
-                let Local { relay, roles, ups, sender, .. } = &mut **l;
+                let Local { relay, roles, ups, senders, .. } = &mut **l;
                 let relay = match relay.as_mut() {
                     Some(r) => {
                         let st = r.stats().await?;
@@ -203,7 +204,7 @@ impl Endpoint {
                 };
                 let take = |voice: bool| ups.values().find(|(_, v)| *v == voice).map(|(u, _)| u.take_window());
                 Ok(Windows {
-                    sender: sender.take_window(),
+                    sender: senders.take_window(),
                     up_instrument: take(false).unwrap_or_default(),
                     up_voice: take(true),
                     relay,
@@ -227,7 +228,7 @@ impl Endpoint {
     /// Priorité obtenue par le fil d'envoi (là où il tourne).
     pub fn priority(&self) -> String {
         match self {
-            Self::Local(l) => crate::run::priority_label(&l.sender),
+            Self::Local(l) => format!("{} — {}", l.senders.priority(), if PER_STREAM_LOCAL { "un fil d'envoi par musicien" } else { "un seul fil d'envoi (Windows : l'émetteur distant est recommandé)" }),
             Self::Remote(r) => format!("{} (émetteur distant {})", r.priority, r.host),
         }
     }

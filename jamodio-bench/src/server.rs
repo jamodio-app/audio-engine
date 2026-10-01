@@ -340,6 +340,75 @@ fn send_loop(
     }
 }
 
+/// Les fils d'envoi d'une campagne : un par flux, ou un seul pour tous.
+///
+/// Un seul fil lie les musiciens entre eux : la salve qu'un lien relâche d'un
+/// coup retarde les paquets des AUTRES le temps de l'envoyer (jusqu'à 2,6 ms,
+/// NUC du 01/10/2026), alors que leurs réseaux sont indépendants. Un fil par
+/// flux les délie. Sous Windows, chaque fil tient sa fin d'attente en tournant
+/// (`SPIN_MARGIN`) : un fil par flux chargerait la machine mesurée — d'où un
+/// seul fil en mode local Windows (sur PC, l'émetteur distant est le mode
+/// recommandé), et un par flux partout ailleurs.
+pub struct Senders {
+    payloads: (Payloads, Payloads),
+    shared: Option<SenderLoop>,
+    own: std::collections::HashMap<u32, SenderLoop>,
+    /// Mesures des fils arrêtés (retraits) depuis le dernier relevé.
+    retired: SenderWindow,
+}
+
+/// Un fil par flux sur la machine mesurée (mode local) : partout sauf Windows.
+pub const PER_STREAM_LOCAL: bool = !cfg!(windows);
+
+impl Senders {
+    pub fn new(per_stream: bool) -> Result<Self, String> {
+        let payloads = (Payloads::encode(220.0)?, Payloads::encode(330.0)?);
+        let shared = (!per_stream).then(|| SenderLoop::start(payloads.0.clone(), payloads.1.clone()));
+        Ok(Self { payloads, shared, own: std::collections::HashMap::new(), retired: SenderWindow::default() })
+    }
+
+    /// Le flux `id` part selon `profile`.
+    pub fn add(&mut self, id: u32, link: Arc<Downlink>, profile: &PeerProfile, seed: u64, offset_us: u64) {
+        match self.shared.as_mut() {
+            Some(s) => s.add(link, profile, seed, offset_us),
+            None => {
+                let mut s = SenderLoop::start(self.payloads.0.clone(), self.payloads.1.clone());
+                s.add(link, profile, seed, offset_us);
+                self.own.insert(id, s);
+            }
+        }
+    }
+
+    /// Le flux `id` est retiré (`Downlink::retire` fait par l'appelant) : son
+    /// fil s'arrête, ses dernières mesures sont gardées.
+    pub fn retire(&mut self, id: u32) {
+        if let Some(s) = self.own.remove(&id) {
+            self.retired.absorb(s.take_window());
+        }
+    }
+
+    pub fn take_window(&mut self) -> SenderWindow {
+        let mut w = std::mem::take(&mut self.retired);
+        for s in self.shared.iter().chain(self.own.values()) {
+            w.absorb(s.take_window());
+        }
+        w
+    }
+
+    /// Nombre de fils d'envoi en marche.
+    pub fn threads(&self) -> usize {
+        usize::from(self.shared.is_some()) + self.own.len()
+    }
+
+    /// Priorité obtenue (tous les fils sont promus de la même façon).
+    pub fn priority(&self) -> String {
+        match self.shared.iter().chain(self.own.values()).next() {
+            Some(s) => crate::run::priority_label(s),
+            None => "aucun flux en cours".into(),
+        }
+    }
+}
+
 /// Marge de fin d'attente tenue ACTIVEMENT (Windows seulement).
 ///
 /// Le réveil d'un `sleep` Windows déborde, même en MMCSS : 0,4 ms médian et

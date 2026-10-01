@@ -31,7 +31,7 @@
 //! machine mesurée, un fil par musicien la chargerait.)
 
 use crate::profile::PeerProfile;
-use crate::server::{Downlink, Kind, Payloads, SenderLoop, SenderWindow, Uplink, UplinkWindow};
+use crate::server::{Downlink, Kind, Senders, SenderWindow, Uplink, UplinkWindow};
 use jamodio_audio_core::net::srtp::SrtpParameters;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -115,12 +115,8 @@ pub fn serve(listen: IpAddr, port: u16) -> Result<(), String> {
 /// Ce que l'émetteur tient pour une campagne.
 struct Session {
     listen: String,
-    /// Trames pré-encodées, communes à tous les fils d'envoi.
-    payloads: (Payloads, Payloads),
     /// Un fil d'envoi par flux démarré.
-    senders: HashMap<u32, SenderLoop>,
-    /// Mesures des fils arrêtés (retraits) depuis le dernier relevé.
-    retired_window: SenderWindow,
+    senders: Senders,
     downs: HashMap<u32, Arc<Downlink>>,
     ups: HashMap<u32, (Arc<Uplink>, bool)>,
     stop: Arc<AtomicBool>,
@@ -132,9 +128,7 @@ impl Session {
     fn new(listen: IpAddr) -> Result<Self, String> {
         Ok(Self {
             listen: listen.to_string(),
-            payloads: (Payloads::encode(220.0)?, Payloads::encode(330.0)?),
-            senders: HashMap::new(),
-            retired_window: SenderWindow::default(),
+            senders: Senders::new(true)?,
             downs: HashMap::new(),
             ups: HashMap::new(),
             stop: Arc::new(AtomicBool::new(false)),
@@ -177,28 +171,19 @@ impl Session {
                 profile.validate()?;
                 let link = self.downs.get(&id).ok_or(format!("flux {id} inconnu"))?.clone();
                 link.set_agent_keys(&keys)?;
-                let mut sender = SenderLoop::start(self.payloads.0.clone(), self.payloads.1.clone());
-                sender.add(link, &profile, seed, offset_us);
-                self.senders.insert(id, sender);
+                self.senders.add(id, link, &profile, seed, offset_us);
                 Reply::default()
             }
             Command::Retire { id } => {
                 self.downs.remove(&id).ok_or(format!("flux {id} inconnu"))?.retire();
-                if let Some(sender) = self.senders.remove(&id) {
-                    self.retired_window.absorb(sender.take_window());
-                }
+                self.senders.retire(id);
                 Reply::default()
             }
             Command::Stats => {
                 let take = |voice: bool| self.ups.values().find(|(_, v)| *v == voice).map(|(u, _)| u.take_window());
-                let mut window = std::mem::take(&mut self.retired_window);
-                for s in self.senders.values() {
-                    window.absorb(s.take_window());
-                }
-                // Tous les fils sont promus de la même façon : le premier suffit.
-                let priority = self.senders.values().next().map(crate::run::priority_label);
+                let priority = Some(self.senders.priority());
                 Reply {
-                    sender: Some(window),
+                    sender: Some(self.senders.take_window()),
                     up_instrument: take(false),
                     up_voice: take(true),
                     priority,
@@ -215,7 +200,7 @@ impl Drop for Session {
         for l in self.listeners.drain(..) {
             let _ = l.join();
         }
-        // Chaque `SenderLoop` s'arrête à son tour (son propre `Drop`).
+        // Chaque fil d'envoi s'arrête à son tour (`Drop` de `SenderLoop`).
     }
 }
 
@@ -326,10 +311,10 @@ mod tests {
             s.handle(Command::StartDown { id, keys, profile, seed: m, offset_us: 0 }).unwrap();
             ids.push((id, rx));
         }
-        assert_eq!(s.senders.len(), 2, "un fil par flux");
+        assert_eq!(s.senders.threads(), 2, "un fil par flux");
         std::thread::sleep(Duration::from_millis(400));
         s.handle(Command::Retire { id: ids[0].0 }).unwrap();
-        assert_eq!(s.senders.len(), 1, "le fil du musicien parti est arrêté");
+        assert_eq!(s.senders.threads(), 1, "le fil du musicien parti est arrêté");
         let sent = s.handle(Command::Stats).unwrap().sender.unwrap().sent;
         // ~160 trames par flux en 400 ms : celles du flux retiré sont comptées.
         assert!(sent > 200, "{sent}");
