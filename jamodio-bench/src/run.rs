@@ -6,7 +6,8 @@
 //! interrompue garde ce qu'elle a mesuré, sans se faire passer pour complète.
 
 use crate::driver::{AgentLink, CaptureParams, StreamParams, VoiceParams};
-use crate::report::{self, MachineRow, PeerRow, StepSummary};
+use crate::profile::PeerProfile;
+use crate::report::{self, Event, EventKind, MachineRow, PeerRow, StepSummary, StreamInfo};
 use crate::scenario::Scenario;
 use crate::relay::{RelayClient, Transport};
 use crate::server::{Downlink, Kind, Payloads, SenderLoop, Uplink};
@@ -151,12 +152,21 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
 
     let t0 = Instant::now();
-    let mut names: HashMap<String, (String, bool)> = HashMap::new();
+    let mut streams: HashMap<String, StreamInfo> = HashMap::new();
+    // Transports de chaque flux, pour couper ceux d'un musicien qui part.
+    let mut links: HashMap<String, Arc<Downlink>> = HashMap::new();
     let mut producers: Vec<String> = Vec::new();
     let mut peer_rows: Vec<PeerRow> = Vec::new();
     let mut machine_rows: Vec<MachineRow> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
+    // Instant d'arrivée de chaque musicien (s de campagne) : ses changements de
+    // lien et ses absences se comptent depuis là.
+    let mut arrivals: HashMap<u32, f64> = HashMap::new();
+    // Départs et retours à venir : (instant en s de campagne, musicien, départ ?).
+    let mut pending: Vec<(f64, u32, bool)> = Vec::new();
     let mut warned_no_holes = false;
+    let ctx = StreamCtx { scenario: &scenario, ip, agent_ip: &agent_ip };
 
     // La campagne dans un bloc : une erreur du banc (`?`) en sort sans sauter
     // la sortie propre qui suit — flux retirés, plugin rendu, capture arrêtée.
@@ -166,49 +176,87 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
             // Musiciens à ajouter pour atteindre ce palier (tous au premier).
             let first_new = if musicians == scenario.from_musicians { 2 } else { musicians };
             for m in first_new..=musicians {
-                let profile = scenario.peer(m).clone();
-                let mut kinds = vec![Kind::Instrument];
-                if profile.voice.is_some() {
-                    kinds.push(Kind::Voice);
+                let arrival = t0.elapsed().as_secs_f64();
+                arrivals.insert(m, arrival);
+                let profile = scenario.peer(m);
+                for a in &profile.absences {
+                    pending.push((arrival + a.at_s, m, true));
+                    pending.push((arrival + a.at_s + a.for_s, m, false));
+                    events.push(Event { t_s: arrival + a.at_s, musician: m, kind: EventKind::Absence { for_s: a.for_s } });
                 }
-                for kind in kinds {
-                    let voice = kind == Kind::Voice;
-                    let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
-                    let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
-                    let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
-                    let port = agent_port(&mut relay, &mut relay_roles, role, ip, link.port()).await?;
-                    let keys = agent
-                        .add_stream(&StreamParams {
-                            producer_id: &pid,
-                            peer_id: &format!("bench-{m}"),
-                            server_ip: &agent_ip,
-                            server_port: port,
-                            voice,
-                            server_keys: &link.server_keys,
-                        })
-                        .await?;
-                    link.set_agent_keys(&keys)?;
-                    sender.add(link, &profile, scenario.seed.wrapping_add(u64::from(m)));
-                    names.insert(pid.clone(), (format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }), voice));
+                let mut from = profile.name.clone();
+                for c in &profile.changes {
+                    events.push(Event {
+                        t_s: arrival + c.at_s,
+                        musician: m,
+                        kind: EventKind::Change { from: std::mem::replace(&mut from, c.link.name.clone()), to: c.link.name.clone() },
+                    });
+                }
+                let pids = ctx.add_musician(&mut agent, &mut sender, &mut relay, &mut relay_roles, m, 0, 0).await?;
+                for (pid, info, link) in pids {
+                    streams.insert(pid.clone(), info);
+                    links.insert(pid.clone(), link);
                     producers.push(pid);
                 }
             }
+            pending.sort_by(|a, b| a.0.total_cmp(&b.0));
             let start_s = t0.elapsed().as_secs_f64();
             steps.push(Step { musicians, start_s, end_s: start_s });
             println!("── {musicians} musiciens ({} flux reçus)", producers.len());
 
             let step_end = Instant::now() + Duration::from_secs(scenario.step_secs);
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.tick().await;
+            let mut next_sample = Instant::now() + Duration::from_secs(1);
             while Instant::now() < step_end {
-                tick.tick().await;
+                // Départs et retours à leur heure, entre deux relevés.
+                let next_event = pending.first().map(|(t, _, _)| t0 + Duration::from_secs_f64(*t));
+                let wake = next_event.map_or(next_sample, |e| e.min(next_sample));
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+                while pending.first().is_some_and(|(t, _, _)| t0 + Duration::from_secs_f64(*t) <= Instant::now()) {
+                    let (t, m, leaving) = pending.remove(0);
+                    let mine: Vec<String> = streams.iter().filter(|(_, i)| i.musician == m).map(|(p, _)| p.clone()).collect();
+                    if leaving {
+                        for pid in &mine {
+                            agent.remove_stream(pid)?;
+                            if let Some(link) = links.remove(pid) {
+                                link.retire();
+                            }
+                            streams.remove(pid);
+                            producers.retain(|p| p != pid);
+                        }
+                        println!("   m{m} part ({:.0} s)", t);
+                    } else {
+                        // Un retour = un nouveau flux (nouvel identifiant, numérotation
+                        // à zéro), placé dans la frise du musicien à l'heure prévue.
+                        let returns = events
+                            .iter()
+                            .filter(|e| e.musician == m && e.t_s < t && matches!(e.kind, EventKind::Absence { .. }))
+                            .count() as u64;
+                        let offset_us = ((t - arrivals[&m]) * 1e6).round() as u64;
+                        let pids = ctx.add_musician(&mut agent, &mut sender, &mut relay, &mut relay_roles, m, returns, offset_us).await?;
+                        for (pid, info, link) in pids {
+                            streams.insert(pid.clone(), info);
+                            links.insert(pid.clone(), link);
+                            producers.push(pid);
+                        }
+                        println!("   m{m} revient ({:.0} s)", t);
+                    }
+                }
+                if Instant::now() < next_sample {
+                    continue;
+                }
+                next_sample += Duration::from_secs(1);
                 let t = t0.elapsed().as_secs_f64();
+                // Lien en vigueur pour chaque flux cette seconde-là.
+                for info in streams.values_mut() {
+                    let since = t - arrivals.get(&info.musician).copied().unwrap_or(0.0);
+                    info.link = scenario.peer(info.musician).link_name_at(since).to_string();
+                }
                 let mut last_perf: Option<Value> = None;
                 while let Ok(p) = agent.perf.try_recv() {
                     last_perf = Some(p);
                 }
                 if let Some(p) = &last_perf {
-                    let rows = report::peer_rows(p, t, musicians, &names);
+                    let rows = report::peer_rows(p, t, musicians, &streams);
                     if !warned_no_holes && rows.iter().any(|r| r.get("holesArrival").is_nan()) {
                         // Le numéro de version ne suffit pas à le savoir (la 0.6.6-2
                         // est plus récente que la -1 sans en avoir les mesures).
@@ -281,12 +329,22 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
 
     // Résumé : seuls les paliers mesurés au-delà de leur installation.
-    let summaries: Vec<StepSummary> = steps
+    let measured: Vec<(u32, f64, f64)> = steps
         .iter()
         .filter(|s| s.end_s - s.start_s > scenario.warmup_secs as f64)
-        .map(|s| report::summarize(&peer_rows, &machine_rows, s.musicians, s.start_s + scenario.warmup_secs as f64, s.end_s))
+        .map(|s| (s.musicians, s.start_s + scenario.warmup_secs as f64, s.end_s))
         .collect();
-    let criteria = report::criteria(&summaries, scenario.is_regular(), scenario.send_voice_channel.is_some());
+    let summaries: Vec<StepSummary> = measured
+        .iter()
+        .map(|&(n, from, to)| report::summarize(&peer_rows, &machine_rows, n, from, to))
+        .collect();
+    let musician_table = measured
+        .last()
+        .map_or_else(Vec::new, |&(n, from, to)| report::musician_summaries(&peer_rows, n, from, to));
+    let event_table = report::event_summaries(&peer_rows, &events, &measured);
+    let drift = scenario.is_drift_only().then(|| report::drift_check(&peer_rows, &measured));
+    let mut criteria = report::criteria(&summaries, scenario.is_regular(), scenario.send_voice_channel.is_some());
+    criteria.extend(report::network_criteria(&summaries, !scenario.is_regular(), &event_table, drift.as_ref()));
     let status = match &end {
         End::Complete => "complète".to_string(),
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
@@ -324,10 +382,12 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 if scenario.is_regular() {
                     "flux réguliers".to_string()
                 } else {
-                    format!("gigue/pertes simulées ; profils : {}", profile_list(&scenario))
+                    format!("réseau simulé (cf. « Réseau simulé ») ; profils : {}", profile_list(&scenario))
                 }
             ),
         ),
+        ("Réseau simulé".to_string(), network_line(&scenario)),
+        ("Origine des liens".to_string(), origin_line(&scenario)),
         ("Plugin inséré".to_string(), plugin_line),
         ("Talkback envoyé".to_string(), scenario.send_voice_channel.map_or("non".into(), |c| format!("canal {}", c + 1))),
         ("Fichiers".to_string(), "peers.csv (flux, 1 ligne/s), machine.csv (machine et faux serveur), scenario.json".into()),
@@ -340,7 +400,7 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     write(out_dir, "machine.csv", &report::machine_csv(&machine_rows))?;
     write(out_dir, "scenario.json", &serde_json::to_string_pretty(&scenario).map_err(|e| e.to_string())?)?;
     drop(sender);
-    let summary = report::markdown(&header, &summaries, &criteria);
+    let summary = report::markdown(&header, &summaries, &musician_table, &event_table, &criteria);
     let path = out_dir.join("resume.md");
     write(out_dir, "resume.md", &summary)?;
     println!("\n{summary}");
@@ -411,6 +471,109 @@ fn pick_plugin(items: &[Value], name: &str) -> Result<Value, String> {
     }
 }
 
+/// Ce qu'il faut pour ajouter les flux d'un musicien.
+struct StreamCtx<'a> {
+    scenario: &'a Scenario,
+    /// Adresse du banc, et celle que l'agent doit joindre (relais ou banc).
+    ip: &'a str,
+    agent_ip: &'a str,
+}
+
+impl StreamCtx<'_> {
+    /// Ajoute les flux du musicien `m` (instrument, et voix s'il parle) :
+    /// transport, `add-stream`, clés, calendrier. `rejoin` : 0 à l'arrivée, k au
+    /// k-ième retour (identifiant neuf, comme un vrai musicien qui revient) ;
+    /// `offset_us` : sa place dans la frise du musicien.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_musician(
+        &self,
+        agent: &mut AgentLink,
+        sender: &mut SenderLoop,
+        relay: &mut Option<RelayClient>,
+        relay_roles: &mut HashMap<std::net::SocketAddr, Transport>,
+        m: u32,
+        rejoin: u64,
+        offset_us: u64,
+    ) -> Result<Vec<(String, StreamInfo, Arc<Downlink>)>, String> {
+        let profile: &PeerProfile = self.scenario.peer(m);
+        let seed = self.scenario.seed.wrapping_add(u64::from(m));
+        let mut kinds = vec![Kind::Instrument];
+        if profile.voice.is_some() {
+            kinds.push(Kind::Voice);
+        }
+        let mut out = Vec::new();
+        for kind in kinds {
+            let voice = kind == Kind::Voice;
+            let suffix = if rejoin == 0 { String::new() } else { format!("-r{rejoin}") };
+            let pid = format!("bench-m{m}{}{suffix}", if voice { "-voix" } else { "" });
+            let link = Downlink::bind(self.ip, pid.clone(), kind, seed.wrapping_add(rejoin))?;
+            let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
+            let port = agent_port(relay, relay_roles, role, self.ip, link.port()).await?;
+            let keys = agent
+                .add_stream(&StreamParams {
+                    producer_id: &pid,
+                    peer_id: &format!("bench-{m}{suffix}"),
+                    server_ip: self.agent_ip,
+                    server_port: port,
+                    voice,
+                    server_keys: &link.server_keys,
+                })
+                .await?;
+            link.set_agent_keys(&keys)?;
+            sender.add(link.clone(), profile, seed, offset_us);
+            let info = StreamInfo {
+                name: format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }),
+                voice,
+                musician: m,
+                link: profile.link_name_at(offset_us as f64 / 1e6).to_string(),
+                sim_ppm: profile.drift_ppm,
+            };
+            out.push((pid, info, link));
+        }
+        Ok(out)
+    }
+}
+
+/// Le réseau de chaque musicien simulé, en une ligne : « m2 ethernet −80 ppm ;
+/// m3 fibre +60 ppm, → wifi-charge à 300 s ; m5 absent 20 s à 330 s… ».
+fn network_line(s: &Scenario) -> String {
+    if s.is_regular() {
+        return "aucun (flux parfaitement réguliers)".into();
+    }
+    (2..=s.to_musicians)
+        .map(|m| {
+            let p = s.peer(m);
+            let mut line = format!("m{m} {}", p.name);
+            if p.drift_ppm != 0.0 {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(" {:+.0} ppm", p.drift_ppm));
+            }
+            for c in &p.changes {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(", → {} à {:.0} s", c.link.name, c.at_s));
+            }
+            for a in &p.absences {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(", absent {:.0} s à {:.0} s", a.for_s, a.at_s));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+/// D'où viennent les liens utilisés : un lien inventé ne passe pas pour une
+/// mesure.
+fn origin_line(s: &Scenario) -> String {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for p in &s.peers {
+        for (_, l) in p.timeline() {
+            let origin = l.origin.clone().unwrap_or_else(|| "non précisée".into());
+            if !seen.iter().any(|(n, _)| *n == l.name) {
+                seen.push((l.name.clone(), origin));
+            }
+        }
+    }
+    seen.iter().map(|(n, o)| format!("{n} : {o}")).collect::<Vec<_>>().join(" ; ")
+}
+
 fn profile_list(s: &Scenario) -> String {
     s.peers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
 }
@@ -479,7 +642,7 @@ pub fn selftest(streams: u32, secs: u64) -> Result<bool, String> {
         punch[0] = 0x80;
         punch[1] = crate::server::PAYLOAD_TYPE;
         rx.send_to(&punch, ("127.0.0.1", link.port())).map_err(|e| e.to_string())?;
-        sender.add(link, &PeerProfile::preset("regular").expect("préréglage"), u64::from(i));
+        sender.add(link, &PeerProfile::preset("regular").expect("préréglage"), u64::from(i), 0);
         let (stop, gaps) = (stop.clone(), gaps.clone());
         receivers.push(std::thread::spawn(move || {
             let _ = crate::rt::promote_current_thread();

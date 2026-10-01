@@ -7,6 +7,7 @@
 //! scénario est un fichier JSON qu'une future interface pourra produire.
 
 pub mod driver;
+pub mod library;
 pub mod profile;
 pub mod relay;
 pub mod report;

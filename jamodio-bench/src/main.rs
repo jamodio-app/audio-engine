@@ -6,6 +6,8 @@
 //! session-bench run --profile ethernet --to 6 --step-secs 120
 //! session-bench run --profiles regular,wifi --peer-voice bursts --send-voice 1
 //! session-bench run --scenario mon-test.json
+//! session-bench run --named 9-reseaux-mixtes   # scénario de la bibliothèque
+//! session-bench scenarios                   # la bibliothèque
 //! session-bench scenario > mon-test.json    # scénario par défaut, à modifier
 //! session-bench selftest 8 30               # précision du banc seul, avant une campagne
 //! ```
@@ -14,7 +16,7 @@
 //! le studio ouvert dans le navigateur sera déconnecté pendant le banc.
 
 use jamodio_bench::driver::AgentLink;
-use jamodio_bench::profile::{PeerProfile, Speech};
+use jamodio_bench::profile::{Link, PeerProfile, Speech};
 use jamodio_bench::scenario::Scenario;
 use std::path::PathBuf;
 
@@ -24,16 +26,19 @@ session-bench — banc « N musiciens » contre l'Audio Engine installé
   session-bench devices
   session-bench plugins                        (plugins connus de l'Audio Engine)
   session-bench relay [--listen IP] [--port N] (SECONDE machine : relais du mode réseau)
-  session-bench scenario                       (écrit le scénario par défaut en JSON)
+  session-bench scenarios                      (la bibliothèque de scénarios nommés)
+  session-bench scenario [NOM]                 (écrit le scénario par défaut, ou NOM, en JSON)
   session-bench selftest [FLUX] [SECONDES]     (précision du banc seul, sans Audio Engine ; défaut 8 flux, 30 s)
   session-bench run [options]
 
 Options de run :
+  --named NOM             part d'un scénario de la bibliothèque (cf. scenarios)
   --scenario FICHIER      part d'un scénario JSON (les options suivantes le modifient)
   --from N / --to N       premier / dernier palier, toi compris (défaut 2 → 9)
   --step-secs S           durée d'un palier (défaut 300)
   --warmup-secs S         installation exclue de l'analyse (défaut 30)
-  --profile P             même profil pour tous : regular | ethernet | wifi
+  --profile P             même profil pour tous : regular | ethernet | wifi | fibre |
+                          adsl | wifi-charge | 4g (les quatre derniers : à calibrer)
   --profiles P1,P2,…      profils attribués dans l'ordre d'arrivée, en boucle
   --loss PCT              pertes simulées (%), pour tous les profils
   --peer-voice V          talkback des musiciens simulés : none | bursts | always
@@ -61,13 +66,19 @@ async fn main() {
         Some("devices") => devices(&Scenario::default().agent_url).await,
         Some("plugins") => plugins(&Scenario::default().agent_url).await,
         Some("relay") => relay(&args[1..]),
-        Some("scenario") => match serde_json::to_string_pretty(&Scenario::default()) {
-            Ok(j) => {
-                println!("{j}");
-                Ok(())
+        Some("scenarios") => {
+            for (name, what) in jamodio_bench::library::NAMED {
+                println!("  {name:<24} {what}");
             }
-            Err(e) => Err(e.to_string()),
-        },
+            Ok(())
+        }
+        Some("scenario") => {
+            let scenario = match args.get(1) {
+                Some(name) => named(name),
+                None => Ok(Scenario::default()),
+            };
+            scenario.and_then(|s| serde_json::to_string_pretty(&s).map_err(|e| e.to_string())).map(|j| println!("{j}"))
+        }
         Some("run") => run(&args[1..]).await,
         Some("selftest") => {
             let streams = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(8);
@@ -168,16 +179,28 @@ async fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Le scénario nommé de la bibliothèque, ou une erreur qui les cite tous.
+fn named(name: &str) -> Result<Scenario, String> {
+    jamodio_bench::library::named(name).ok_or_else(|| {
+        let names: Vec<&str> = jamodio_bench::library::NAMED.iter().map(|(n, _)| *n).collect();
+        format!("scénario « {name} » inconnu. Connus : {}", names.join(", "))
+    })
+}
+
 /// Lit les options de `run` (sans dépendance : une vingtaine d'options suffit).
 fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathBuf>), String> {
     // Le scénario de départ d'abord : les autres options le modifient.
-    let mut scenario = match args.iter().position(|a| a == "--scenario") {
-        Some(i) => {
+    let file = args.iter().position(|a| a == "--scenario");
+    let library = args.iter().position(|a| a == "--named");
+    let mut scenario = match (file, library) {
+        (Some(_), Some(_)) => return Err("--scenario ou --named, pas les deux".into()),
+        (Some(i), None) => {
             let path = args.get(i + 1).ok_or("--scenario attend un fichier")?;
             let text = std::fs::read_to_string(path).map_err(|e| format!("{path} : {e}"))?;
             serde_json::from_str(&text).map_err(|e| format!("{path} : {e}"))?
         }
-        None => Scenario::default(),
+        (None, Some(i)) => named(args.get(i + 1).ok_or("--named attend un nom (cf. scenarios)")?)?,
+        (None, None) => Scenario::default(),
     };
     let (mut out, mut save) = (None, None);
     let mut it = args.iter();
@@ -185,7 +208,7 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
         let mut val = || it.next().cloned().ok_or(format!("{opt} attend une valeur"));
         let num = |v: String| v.parse::<u64>().map_err(|_| format!("{opt} : nombre attendu, reçu {v}"));
         match opt.as_str() {
-            "--scenario" => {
+            "--scenario" | "--named" => {
                 val()?;
             }
             "--from" => scenario.from_musicians = num(val()?)? as u32,
@@ -197,7 +220,9 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
                 let v = val()?;
                 scenario.peers = v
                     .split(',')
-                    .map(|n| PeerProfile::preset(n.trim()).ok_or(format!("profil inconnu : {n} (regular | ethernet | wifi)")))
+                    .map(|n| {
+                        PeerProfile::preset(n.trim()).ok_or(format!("profil inconnu : {n} ({})", Link::PRESETS.join(" | ")))
+                    })
                     .collect::<Result<_, _>>()?;
             }
             "--loss" => {
@@ -263,6 +288,17 @@ mod tests {
         s.validate().unwrap();
     }
 
+    /// Un scénario de la bibliothèque se lance par son nom, et les options le
+    /// modifient comme un fichier.
+    #[test]
+    fn un_scenario_nomme_se_lance_et_se_modifie() {
+        let (s, _, _) = parse_run(&args("--named 9-reseaux-mixtes --seed 7")).unwrap();
+        assert_eq!((s.name.as_str(), s.seed, s.to_musicians), ("9-reseaux-mixtes", 7, 9));
+        assert_eq!(s.peer(9).name, "4g");
+        let (s, _, _) = parse_run(&args("--profile wifi-charge")).unwrap();
+        assert_eq!(s.peer(2).name, "wifi-charge");
+    }
+
     #[test]
     fn no_mmcss_se_pose_sans_valeur() {
         let (s, _, _) = parse_run(&args("--no-mmcss --to 3")).unwrap();
@@ -273,7 +309,9 @@ mod tests {
     #[test]
     fn une_option_fausse_est_refusee_avec_son_nom() {
         assert!(parse_run(&args("--to")).unwrap_err().contains("--to"));
-        assert!(parse_run(&args("--profile fibre")).unwrap_err().contains("fibre"));
+        assert!(parse_run(&args("--profile fibree")).unwrap_err().contains("wifi-charge"));
+        assert!(parse_run(&args("--named inconnu")).unwrap_err().contains("9-reseaux-mixtes"));
+        assert!(parse_run(&args("--named regulier-9 --scenario x.json")).unwrap_err().contains("pas les deux"));
         assert!(parse_run(&args("--send-voice 0")).is_err());
         assert!(parse_run(&args("--bidule")).unwrap_err().contains("--bidule"));
     }

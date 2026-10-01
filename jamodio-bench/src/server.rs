@@ -84,6 +84,8 @@ pub struct Downlink {
     ssrc: u32,
     seq_base: u16,
     ts_base: u32,
+    /// Flux retiré (le musicien est parti) : la boucle d'envoi l'abandonne.
+    retired: AtomicBool,
 }
 
 impl Downlink {
@@ -103,7 +105,19 @@ impl Downlink {
             ssrc: rng.next_u64() as u32,
             seq_base: rng.next_u64() as u16,
             ts_base: rng.next_u64() as u32,
+            retired: AtomicBool::new(false),
         }))
+    }
+
+    /// Le musicien part : plus aucun paquet de ce flux. Sans cela, la boucle
+    /// enverrait vers un port que l'agent a fermé (erreurs d'envoi comptées,
+    /// calcul perdu) jusqu'à la fin de la campagne.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Relaxed);
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
     }
 
     pub fn port(&self) -> u16 {
@@ -124,7 +138,7 @@ impl Downlink {
     /// Écoute le perçage de l'agent (comedia) jusqu'à `stop`.
     fn listen_punch(self: Arc<Self>, stop: Arc<AtomicBool>) {
         let mut buf = [0u8; 2048];
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !self.is_retired() {
             if let Ok((len, from)) = self.socket.recv_from(&mut buf) {
                 // Un paquet RTP (pas un rapport RTCP) : c'est le perçage.
                 if len >= 12 && buf[1] & 0x7f == PAYLOAD_TYPE {
@@ -201,11 +215,13 @@ impl SenderLoop {
     }
 
     /// Ajoute un flux : il part dès que l'agent a percé ET rendu ses clés.
-    pub fn add(&mut self, link: Arc<Downlink>, profile: &PeerProfile, seed: u64) {
-        let schedule: Box<dyn Iterator<Item = Frame> + Send> = match (link.kind, profile.voice) {
-            (Kind::Instrument, _) => Box::new(InstrumentSchedule::new(profile, seed)),
-            (Kind::Voice, Some(speech)) => Box::new(VoiceSchedule::new(profile, speech, seed)),
-            (Kind::Voice, None) => Box::new(VoiceSchedule::new(profile, Speech::Always, seed)),
+    /// `offset_us` : place du flux dans la frise du musicien (0 à son arrivée,
+    /// la durée écoulée pour le flux recréé au retour d'une absence).
+    pub fn add(&mut self, link: Arc<Downlink>, profile: &PeerProfile, seed: u64, offset_us: u64) {
+        let speech = profile.voice.unwrap_or(Speech::Always);
+        let schedule: Box<dyn Iterator<Item = Frame> + Send> = match link.kind {
+            Kind::Instrument => Box::new(InstrumentSchedule::resumed(profile, seed, offset_us)),
+            Kind::Voice => Box::new(VoiceSchedule::resumed(profile, speech, seed, offset_us)),
         };
         let l = link.clone();
         let stop = self.stop.clone();
@@ -250,6 +266,7 @@ fn send_loop(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        active.retain(|a| !a.link.is_retired());
         let now = Instant::now();
         let mut soonest: Option<Instant> = None;
         for a in active.iter_mut() {
@@ -440,7 +457,7 @@ mod tests {
         link.set_agent_keys(&agent_keys).unwrap();
 
         let mut sender = SenderLoop::start(Payloads::encode(220.0).unwrap(), Payloads::encode(440.0).unwrap());
-        sender.add(link.clone(), &PeerProfile::preset("regular").unwrap(), 1);
+        sender.add(link.clone(), &PeerProfile::preset("regular").unwrap(), 1, 0);
         let sfu: SocketAddr = format!("127.0.0.1:{}", link.port()).parse().unwrap();
         receiver.punch(sfu).unwrap();
 
@@ -474,6 +491,181 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(450), "cadence tenue, pas de rafale");
         let w = sender.take_window();
         assert!(w.sent >= 200 && w.errors == 0, "{w:?}");
+    }
+
+    /// Ce que le récepteur de l'agent a lu d'un flux du faux serveur : numéro de
+    /// trame (déduit de la séquence), horodatage RTP, instant de lecture.
+    struct Received {
+        index: u64,
+        timestamp: u32,
+        at: Instant,
+    }
+
+    /// Envoie `profile` par le faux serveur au RÉCEPTEUR DE L'AGENT (même code :
+    /// perçage, SRTP, lecture non bloquante) jusqu'à `count` paquets ou `max`.
+    /// Fil promu comme ceux du banc : la date de lecture est la mesure.
+    fn through_agent_receiver(profile: &PeerProfile, seed: u64, count: usize, max: Duration) -> (Vec<Received>, Arc<Downlink>) {
+        let _ = crate::rt::promote_current_thread();
+        let link = Downlink::bind("127.0.0.1", "p1".into(), Kind::Instrument, seed).unwrap();
+        let agent_keys = SrtpParameters::generate_aead_aes_256_gcm();
+        let receiver = RtpReceiver::new(Arc::new(SrtpContext::new(&agent_keys, &link.server_keys).unwrap())).unwrap();
+        link.set_agent_keys(&agent_keys).unwrap();
+        let mut sender = SenderLoop::start(Payloads::encode(220.0).unwrap(), Payloads::encode(440.0).unwrap());
+        sender.add(link.clone(), profile, seed, 0);
+        receiver.punch(format!("127.0.0.1:{}", link.port()).parse().unwrap()).unwrap();
+        let mut buf = Vec::with_capacity(2048);
+        let mut got = Vec::with_capacity(count.min(200_000));
+        let t = Instant::now();
+        while got.len() < count && t.elapsed() < max {
+            match receiver.read(&mut buf) {
+                Ok(_) => {
+                    let at = Instant::now();
+                    let (h, _) = rtp::parse_header(&buf).unwrap();
+                    got.push(Received { index: u64::from(h.sequence.wrapping_sub(link.seq_base)), timestamp: h.timestamp, at });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_micros(200)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        (got, link)
+    }
+
+    /// Un flux retiré (musicien parti) n'envoie plus rien.
+    #[test]
+    fn un_flux_retire_n_envoie_plus_rien() {
+        let link = Downlink::bind("127.0.0.1", "p1".into(), Kind::Instrument, 2).unwrap();
+        link.set_agent_keys(&SrtpParameters::generate_aead_aes_256_gcm()).unwrap();
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut punch = [0u8; 12];
+        punch[0] = 0x80;
+        punch[1] = PAYLOAD_TYPE;
+        rx.send_to(&punch, ("127.0.0.1", link.port())).unwrap();
+        let mut sender = SenderLoop::start(Payloads::encode(220.0).unwrap(), Payloads::encode(440.0).unwrap());
+        sender.add(link.clone(), &PeerProfile::preset("regular").unwrap(), 2, 0);
+        let mut buf = [0u8; 2048];
+        let t = Instant::now();
+        let mut before = 0;
+        while before < 40 && t.elapsed() < Duration::from_secs(5) {
+            before += usize::from(rx.recv_from(&mut buf).is_ok());
+        }
+        assert_eq!(before, 40, "le flux part");
+        link.retire();
+        std::thread::sleep(Duration::from_millis(30));
+        while rx.recv_from(&mut buf).is_ok() {} // ce qui était en route
+        let quiet = Instant::now();
+        let mut after = 0;
+        while quiet.elapsed() < Duration::from_millis(200) {
+            after += usize::from(rx.recv_from(&mut buf).is_ok());
+        }
+        assert_eq!(after, 0, "plus rien après le retrait");
+    }
+
+    /// La dérive lue par l'ESTIMATEUR DE L'AGENT (`sync::drift`), calcul pur :
+    /// les instants du calendrier tiennent lieu d'arrivées. +50 ppm est lu +50.
+    #[test]
+    fn la_derive_simulee_est_celle_que_lit_l_estimateur_de_l_agent() {
+        use jamodio_audio_core::sync::drift::DriftEstimator;
+        for ppm in [50.0, -50.0, 100.0] {
+            let p = PeerProfile { drift_ppm: ppm, ..PeerProfile::preset("regular").unwrap() };
+            let mut est = DriftEstimator::new("banc");
+            let t0 = Instant::now();
+            for f in InstrumentSchedule::new(&p, 1).take_while(|f| f.send_at_us <= 60_000_000) {
+                est.observe((f.index as u32).wrapping_mul(FRAME_SAMPLES), t0 + Duration::from_micros(f.send_at_us));
+            }
+            assert!((est.drift_ppm() - ppm).abs() < 0.1, "{ppm} ppm lus {}", est.drift_ppm());
+        }
+    }
+
+    /// Échange réel, court (CI) : une forte dérive traverse tout le chemin
+    /// (cadence, horodatage, SRTP, réception) et l'estimateur de l'agent la lit.
+    /// La précision n'est pas l'objet ici (machine de CI) : cf. le test long.
+    #[test]
+    fn la_derive_traverse_le_recepteur_de_l_agent() {
+        drift_through_agent(1_000.0, Duration::from_secs(10), 250.0);
+    }
+
+    /// Échange réel, long (5 min) : +50 ppm lus à ±2 ppm par l'estimateur de
+    /// l'agent — la précision que l'agent annonce après quelques minutes
+    /// (`sync/drift.rs`). Ce test prouve le banc ET la mesure de l'agent.
+    /// `cargo test -p jamodio-bench --release -- --ignored derive_lue --nocapture`
+    #[test]
+    #[ignore = "5 minutes : à lancer à la main sur une machine calme"]
+    fn derive_lue_a_2_ppm_par_le_recepteur_de_l_agent() {
+        drift_through_agent(50.0, Duration::from_secs(300), 2.0);
+    }
+
+    fn drift_through_agent(ppm: f64, secs: Duration, tolerance_ppm: f64) {
+        use jamodio_audio_core::sync::drift::DriftEstimator;
+        let p = PeerProfile { drift_ppm: ppm, ..PeerProfile::preset("regular").unwrap() };
+        let (got, _) = through_agent_receiver(&p, 1, usize::MAX, secs);
+        let mut est = DriftEstimator::new("banc");
+        for r in &got {
+            est.observe(r.timestamp, r.at);
+        }
+        let read = est.drift_ppm();
+        println!("dérive simulée {ppm} ppm, lue {read:.2} ppm ({} paquets)", got.len());
+        assert!((read - ppm).abs() <= tolerance_ppm, "simulée {ppm}, lue {read:.2}");
+    }
+
+    /// Échange réel : un paquet désordonné par le banc arrive APRÈS le suivant et
+    /// le suivi de séquence de l'agent (`net::seq`) le classe « en retard » (non
+    /// joué). Le banc ne fait pas que le dire : l'agent le voit.
+    #[test]
+    fn le_desordre_du_banc_est_vu_en_retard_par_l_agent() {
+        use crate::profile::Reorder;
+        use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
+        let p = PeerProfile { reorder: Some(Reorder { pct: 5.0, max_depth: 2 }), ..PeerProfile::preset("regular").unwrap() };
+        let (got, _) = through_agent_receiver(&p, 4, 2_000, Duration::from_secs(10));
+        assert!(got.len() >= 1_980, "{} paquets", got.len());
+        // L'ordre reçu est celui du calendrier (la boucle locale ne perd presque
+        // rien : on tolère un manque, jamais une inversion inventée).
+        let planned: Vec<u64> = InstrumentSchedule::new(&p, 4).take(2_100).map(|f| f.index).collect();
+        let mut it = planned.iter();
+        assert!(got.iter().all(|r| it.any(|&i| i == r.index)), "ordre reçu = ordre envoyé");
+        let mut seq = SeqTracker::new();
+        let mut highest = 0;
+        let mut overtaken = 0;
+        let mut late = 0;
+        for r in &got {
+            if r.index < highest {
+                overtaken += 1;
+            }
+            highest = highest.max(r.index);
+            if seq.on_packet(r.index as u16) == Arrival::Late {
+                late += 1;
+            }
+        }
+        assert!(overtaken > 60, "~5 % de 2 000 : {overtaken}");
+        assert_eq!(late, overtaken, "chaque paquet dépassé est « en retard » pour l'agent");
+        assert_eq!(seq.counters().late, late);
+    }
+
+    /// Échange réel : les pertes en rafales du banc sont exactement les paquets
+    /// que le suivi de séquence de l'agent compte perdus.
+    #[test]
+    fn les_rafales_du_banc_sont_les_pertes_que_compte_l_agent() {
+        use crate::profile::BurstLoss;
+        use jamodio_audio_core::net::seq::SeqTracker;
+        let p = PeerProfile {
+            burst_loss: Some(BurstLoss { rate_pct: 2.0, mean_packets: 4.0 }),
+            ..PeerProfile::preset("regular").unwrap()
+        };
+        let (got, _) = through_agent_receiver(&p, 6, 3_000, Duration::from_secs(15));
+        let last = got.last().unwrap().index;
+        let sent: std::collections::HashSet<u64> =
+            InstrumentSchedule::new(&p, 6).take_while(|f| f.index <= last).map(|f| f.index).collect();
+        let first = got[0].index;
+        let planned_lost = (first..=last).filter(|i| !sent.contains(i)).count() as u64;
+        let mut seq = SeqTracker::new();
+        for r in &got {
+            seq.on_packet(r.index as u16);
+        }
+        let lost = seq.counters().lost();
+        assert!(planned_lost > 20, "{planned_lost}");
+        // La boucle locale peut perdre un paquet de plus sur une machine chargée
+        // (vu le 28/09/2026) ; jamais moins que ce que le banc a retiré.
+        assert!(lost >= planned_lost && lost <= planned_lost + 3, "agent {lost}, banc {planned_lost}");
     }
 
     /// Ce que l'EXPÉDITEUR de l'agent envoie est reçu, déchiffré et mesuré.
