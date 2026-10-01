@@ -13,6 +13,13 @@ grandit. Plan et critères : `internal-docs/plans/PLAN-BANC-N-MUSICIENS-2026-09.
 2. **Fermer le studio dans le navigateur** : l'Audio Engine n'a qu'un
    propriétaire, le banc prend sa place.
 3. La carte son branchée, comme pour jouer.
+4. **Fermer les programmes de fond qui prennent la main sur la machine** :
+   prise en main à distance (TeamViewer…), application Claude, navigateur. Le
+   01/10/2026 sur le NUC, avec TeamViewer et Claude ouverts (même inactifs), le
+   banc envoyait jusqu'à 1,8 ms en retard (7 secondes sur 30) ; fermés,
+   « SUFFISANTE ». Lequel des deux suffisait à dégrader : non établi.
+5. Lancer `selftest` : « SUFFISANTE » avant toute campagne, sinon chercher ce
+   qui tourne encore.
 
 ## Lancer
 
