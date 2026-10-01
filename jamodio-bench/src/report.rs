@@ -514,6 +514,18 @@ pub struct Criterion {
     pub detail: String,
 }
 
+const NOT_MEASURED: &str = "aucun palier mesuré (campagne arrêtée avant la fin de l'installation)";
+
+/// Trous de cause locale (réception, décodage, consommation) sur la campagne.
+/// `+ 0.0` : une somme vide vaut −0, qui s'écrirait « -0 ».
+fn local_holes(steps: &[StepSummary]) -> f64 {
+    steps
+        .iter()
+        .map(|s| (s.holes_per_min[1] + s.holes_per_min[2] + s.holes_per_min[3]) * s.seconds / 60.0)
+        .sum::<f64>()
+        + 0.0
+}
+
 /// Les quatre critères validés le 28/09/2026.
 ///
 /// - `regular` : flux simulés sans gigue ni perte (critère 1 : sans gigue
@@ -525,21 +537,23 @@ pub fn criteria(steps: &[StepSummary], regular: bool, voice_sent: bool) -> Vec<C
     // 1. Zéro trou de cause locale (réception, décodage, consommation). La
     // réception n'est mesurée qu'à partir de l'agent 0.6.6-6 : avant, elle
     // reste inconnue (NaN) et le critère ne juge pas.
-    let local: f64 = steps
-        .iter()
-        .map(|s| (s.holes_per_min[1] + s.holes_per_min[2] + s.holes_per_min[3]) * s.seconds / 60.0)
-        .sum();
+    // Aucun palier mesuré (campagne arrêtée pendant l'installation) : aucun
+    // critère ne peut se dire tenu — une absence de mesure n'est pas un succès.
+    let measured = !steps.is_empty();
+    let local = local_holes(steps);
     out.push(Criterion {
         id: 1,
         text: "zéro trou de cause locale (réception, décodage, consommation), flux réguliers",
-        verdict: if !regular || !local.is_finite() {
+        verdict: if !measured || !regular || !local.is_finite() {
             Verdict::NotApplicable
         } else if local == 0.0 {
             Verdict::Holds
         } else {
             Verdict::Fails
         },
-        detail: if !regular {
+        detail: if !measured {
+            NOT_MEASURED.into()
+        } else if !regular {
             "scénario avec gigue ou pertes simulées : critère réservé aux flux réguliers".into()
         } else if !local.is_finite() {
             "l'Audio Engine ne mesure pas toutes les causes locales (réception : 0.6.6-6 et plus)".into()
@@ -594,8 +608,12 @@ pub fn criteria(steps: &[StepSummary], regular: bool, voice_sent: bool) -> Vec<C
     out.push(Criterion {
         id: 4,
         text: "sortie audio sans retard (callbacks manquants < 1 % chaque seconde)",
-        verdict: if late == 0 { Verdict::Holds } else { Verdict::Fails },
-        detail: format!("{late} seconde(s) en retard"),
+        verdict: match (measured, late) {
+            (false, _) => Verdict::NotApplicable,
+            (true, 0) => Verdict::Holds,
+            (true, _) => Verdict::Fails,
+        },
+        detail: if measured { format!("{late} seconde(s) en retard") } else { NOT_MEASURED.into() },
     });
     out
 }
@@ -816,26 +834,26 @@ pub fn network_criteria(steps: &[StepSummary], network: bool, events: &[EventSum
     // 5. Le réseau ne fait pas tomber la machine : aucun trou de cause locale.
     // « Réception » comprise (décision du 01/10/2026) : elle est locale par
     // définition, comme dans le critère 1.
-    let local: f64 = steps
-        .iter()
-        .map(|s| (s.holes_per_min[1] + s.holes_per_min[2] + s.holes_per_min[3]) * s.seconds / 60.0)
-        .sum();
+    let local = local_holes(steps);
     out.push(Criterion {
         id: 5,
         text: "le réseau ne fait pas tomber la machine : aucun trou de cause locale (réception, décodage, consommation) sous réseau simulé",
-        verdict: if !network || !local.is_finite() {
+        verdict: if steps.is_empty() || !network || !local.is_finite() {
             Verdict::NotApplicable
         } else if local == 0.0 {
             Verdict::Holds
         } else {
             Verdict::Fails
         },
-        detail: if !network {
+        detail: if steps.is_empty() {
+            NOT_MEASURED.into()
+        } else if !network {
             "aucun réseau simulé : cf. critère 1".into()
         } else if !local.is_finite() {
             "l'Audio Engine ne mesure pas toutes les causes locales (réception : 0.6.6-6 et plus)".into()
         } else {
-            let network_holes: f64 = steps.iter().map(|s| (s.holes_per_min[0] + s.holes_per_min[4]) * s.seconds / 60.0).sum();
+            // `+ 0.0` : une somme vide vaut −0, qui s'écrirait « -0 ».
+            let network_holes: f64 = steps.iter().map(|s| (s.holes_per_min[0] + s.holes_per_min[4]) * s.seconds / 60.0).sum::<f64>() + 0.0;
             format!("{local:.0} trou(s) de cause locale ; trous dus au réseau (arrivée + séquence), comptés : {network_holes:.0}")
         },
     });
@@ -1130,6 +1148,18 @@ mod tests {
         assert_eq!(ko[1].verdict, Verdict::Fails);
         assert!(ko[1].detail.contains("+6.0 ms à 9"), "{}", ko[1].detail);
         assert_eq!(ko[1].verdict.label(), "NON TENU");
+    }
+
+    /// Campagne arrêtée avant tout palier mesuré : aucun critère n'est « tenu »
+    /// (vu le 01/10/2026 : un studio rouvert avait repris l'Audio Engine au
+    /// bout d'une seconde, et le résumé affichait « TENU »).
+    #[test]
+    fn sans_palier_mesure_aucun_critere_n_est_tenu() {
+        let mut all = criteria(&[], true, false);
+        all.extend(network_criteria(&[], true, &[], None));
+        assert!(all.iter().all(|c| c.verdict == Verdict::NotApplicable), "{all:?}");
+        assert!(all[0].detail.contains("aucun palier mesuré"));
+        assert!(!markdown(&[], &[], &[], &[], &all).contains("-0"));
     }
 
     /// Un seul palier : le critère 2 n'a rien à comparer.
