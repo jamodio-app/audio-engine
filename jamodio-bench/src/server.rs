@@ -36,6 +36,7 @@ pub enum Kind {
 /// Encoder à la volée coûterait au banc 400 encodages par seconde et par flux —
 /// sur le même PC en mode local, ce serait le banc qui chargerait la machine.
 /// Le DÉCODAGE, lui, reste entier côté agent : c'est lui qu'on mesure.
+#[derive(Clone)]
 pub struct Payloads {
     frames: Vec<Vec<u8>>,
 }
@@ -184,6 +185,15 @@ pub struct SenderWindow {
     pub late_us: Vec<u32>,
     pub sent: u64,
     pub errors: u64,
+}
+
+impl SenderWindow {
+    /// Ajoute les mesures d'un autre fil d'envoi sur la même fenêtre.
+    pub fn absorb(&mut self, other: SenderWindow) {
+        self.late_us.extend(other.late_us);
+        self.sent += other.sent;
+        self.errors += other.errors;
+    }
 }
 
 /// La boucle d'envoi de TOUS les flux de descente, sur un fil.

@@ -75,6 +75,8 @@ la boucle, dans les deux sens.
 ```
 
 - La précision du banc affichée est celle de l'émetteur (mesurée là-bas).
+- Un fil d'envoi par musicien : la salve qu'un lien relâche ne retarde pas
+  les autres (avec un seul fil, jusqu'à 2,6 ms, NUC du 01/10/2026).
 - Les flux partent avec l'horloge de l'émetteur : la dérive que lit l'Audio
   Engine contient l'écart entre les deux horloges (quelques ppm, le même pour
   tous les flux). Le résumé l'estime et le retire avant de comparer.

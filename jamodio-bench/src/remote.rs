@@ -21,6 +21,14 @@
 //! Le pilote parle à l'émetteur par un canal de commande TCP (une ligne JSON par
 //! commande et par réponse), comme au relais. Les clés SRTP y passent : clés de
 //! test, tirées au hasard à chaque campagne, sur le réseau local.
+//!
+//! **Un fil d'envoi par musicien.** Avec un seul fil pour tous, la salve qu'un
+//! lien relâche d'un coup (pic, gigue à queue lourde) retardait les paquets des
+//! AUTRES musiciens le temps de l'envoyer — jusqu'à 2,6 ms, NUC du 01/10/2026,
+//! dès le passage d'un seul musicien en Wi-Fi chargé. En vrai, leurs réseaux
+//! sont indépendants : le banc ne doit pas les lier. L'émetteur est une machine
+//! dédiée, il a les cœurs pour. (Le mode local garde un seul fil : sur la
+//! machine mesurée, un fil par musicien la chargerait.)
 
 use crate::profile::PeerProfile;
 use crate::server::{Downlink, Kind, Payloads, SenderLoop, SenderWindow, Uplink, UplinkWindow};
@@ -107,7 +115,12 @@ pub fn serve(listen: IpAddr, port: u16) -> Result<(), String> {
 /// Ce que l'émetteur tient pour une campagne.
 struct Session {
     listen: String,
-    sender: SenderLoop,
+    /// Trames pré-encodées, communes à tous les fils d'envoi.
+    payloads: (Payloads, Payloads),
+    /// Un fil d'envoi par flux démarré.
+    senders: HashMap<u32, SenderLoop>,
+    /// Mesures des fils arrêtés (retraits) depuis le dernier relevé.
+    retired_window: SenderWindow,
     downs: HashMap<u32, Arc<Downlink>>,
     ups: HashMap<u32, (Arc<Uplink>, bool)>,
     stop: Arc<AtomicBool>,
@@ -119,7 +132,9 @@ impl Session {
     fn new(listen: IpAddr) -> Result<Self, String> {
         Ok(Self {
             listen: listen.to_string(),
-            sender: SenderLoop::start(Payloads::encode(220.0)?, Payloads::encode(330.0)?),
+            payloads: (Payloads::encode(220.0)?, Payloads::encode(330.0)?),
+            senders: HashMap::new(),
+            retired_window: SenderWindow::default(),
             downs: HashMap::new(),
             ups: HashMap::new(),
             stop: Arc::new(AtomicBool::new(false)),
@@ -162,20 +177,31 @@ impl Session {
                 profile.validate()?;
                 let link = self.downs.get(&id).ok_or(format!("flux {id} inconnu"))?.clone();
                 link.set_agent_keys(&keys)?;
-                self.sender.add(link, &profile, seed, offset_us);
+                let mut sender = SenderLoop::start(self.payloads.0.clone(), self.payloads.1.clone());
+                sender.add(link, &profile, seed, offset_us);
+                self.senders.insert(id, sender);
                 Reply::default()
             }
             Command::Retire { id } => {
                 self.downs.remove(&id).ok_or(format!("flux {id} inconnu"))?.retire();
+                if let Some(sender) = self.senders.remove(&id) {
+                    self.retired_window.absorb(sender.take_window());
+                }
                 Reply::default()
             }
             Command::Stats => {
                 let take = |voice: bool| self.ups.values().find(|(_, v)| *v == voice).map(|(u, _)| u.take_window());
+                let mut window = std::mem::take(&mut self.retired_window);
+                for s in self.senders.values() {
+                    window.absorb(s.take_window());
+                }
+                // Tous les fils sont promus de la même façon : le premier suffit.
+                let priority = self.senders.values().next().map(crate::run::priority_label);
                 Reply {
-                    sender: Some(self.sender.take_window()),
+                    sender: Some(window),
                     up_instrument: take(false),
                     up_voice: take(true),
-                    priority: Some(crate::run::priority_label(&self.sender)),
+                    priority,
                     ..Reply::default()
                 }
             }
@@ -189,7 +215,7 @@ impl Drop for Session {
         for l in self.listeners.drain(..) {
             let _ = l.join();
         }
-        // `SenderLoop` s'arrête à son tour (son propre `Drop`).
+        // Chaque `SenderLoop` s'arrête à son tour (son propre `Drop`).
     }
 }
 
@@ -277,6 +303,37 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Un fil d'envoi par musicien : deux flux, deux fils ; un retrait arrête le
+    /// sien, et les mesures des deux sont rendues ensemble (rien de perdu au
+    /// retrait).
+    #[test]
+    fn chaque_musicien_a_son_propre_fil_d_envoi() {
+        let mut s = Session::new("127.0.0.1".parse().unwrap()).unwrap();
+        let mut ids = Vec::new();
+        for m in 2..=3u64 {
+            let r = s.handle(Command::OpenDown { producer_id: format!("bench-m{m}"), voice: false, seed: m }).unwrap();
+            let (id, port) = (r.id.unwrap(), r.port.unwrap());
+            // Le perçage de l'agent : un en-tête RTP suffit pour apprendre l'adresse.
+            let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut punch = [0u8; 12];
+            punch[0] = 0x80;
+            punch[1] = crate::server::PAYLOAD_TYPE;
+            rx.send_to(&punch, ("127.0.0.1", port)).unwrap();
+            let profile = Box::new(PeerProfile::preset("regular").unwrap());
+            let keys = SrtpParameters::generate_aead_aes_256_gcm();
+            s.handle(Command::StartDown { id, keys, profile, seed: m, offset_us: 0 }).unwrap();
+            ids.push((id, rx));
+        }
+        assert_eq!(s.senders.len(), 2, "un fil par flux");
+        std::thread::sleep(Duration::from_millis(400));
+        s.handle(Command::Retire { id: ids[0].0 }).unwrap();
+        assert_eq!(s.senders.len(), 1, "le fil du musicien parti est arrêté");
+        let sent = s.handle(Command::Stats).unwrap().sender.unwrap().sent;
+        // ~160 trames par flux en 400 ms : celles du flux retiré sont comptées.
+        assert!(sent > 200, "{sent}");
+        assert!(s.handle(Command::Stats).unwrap().priority.is_some());
     }
 
     #[test]
