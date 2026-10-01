@@ -23,6 +23,19 @@ use std::path::PathBuf;
 const USAGE: &str = "\
 session-bench — banc « N musiciens » contre l'Audio Engine installé
 
+Campagne de version (lancée depuis le dépôt de l'Audio Engine) :
+  session-bench configurer                     (une fois par machine : carte son, émetteur distant, nom)
+  session-bench conseil [DEPUIS] [JUSQUA] [--publique]
+                                               (faut-il une campagne ? DEPUIS = version de référence)
+  session-bench version [rapide|complete|bruit] (la campagne ; verdict ouvert à la fin)
+  session-bench reference [DOSSIER]            (la dernière campagne devient la référence de la machine)
+  session-bench importer --type importee|bruit --machine NOM --note TEXTE DOSSIER…
+                                               (range des campagnes lancées à la main)
+  session-bench reanalyser DOSSIER             (refait metrics.json depuis les CSV)
+  session-bench archiver DOSSIER --resumes DIR [--bruts DIR]
+
+Scénarios et réglages fins :
+
   session-bench devices
   session-bench plugins                        (plugins connus de l'Audio Engine)
   session-bench relay [--listen IP] [--port N] (SECONDE machine : relais du mode réseau)
@@ -86,6 +99,18 @@ async fn main() {
             scenario.and_then(|s| serde_json::to_string_pretty(&s).map_err(|e| e.to_string())).map(|j| println!("{j}"))
         }
         Some("run") => run(&args[1..]).await,
+        Some("configurer") => jamodio_bench::tools::configure(&results()).await,
+        Some("version") => version(&args[1..]).await,
+        Some("reference") => jamodio_bench::tools::set_reference(&results(), args.get(1).map(String::as_str)),
+        Some("conseil") => advice(&args[1..]),
+        Some("importer") => import(&args[1..]),
+        Some("reanalyser") => match args.get(1) {
+            Some(d) => jamodio_bench::campaign::reanalyze(std::path::Path::new(d)).map(|m| {
+                println!("metrics.json réécrit ({} flux, {} palier(s)).", m.streams.len(), m.steps.len())
+            }),
+            None => Err("reanalyser DOSSIER".into()),
+        },
+        Some("archiver") => archive(&args[1..]),
         Some("selftest") => {
             let streams = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(8);
             let secs = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(30);
@@ -105,6 +130,84 @@ async fn main() {
         eprintln!("\nERREUR : {e}");
         std::process::exit(1);
     }
+}
+
+/// Dossier des résultats : `bench-results/` là où le banc est lancé.
+fn results() -> PathBuf {
+    PathBuf::from("bench-results")
+}
+
+async fn version(args: &[String]) -> Result<(), String> {
+    use jamodio_bench::campaign::CampaignKind;
+    let kind = match args.first().map(String::as_str) {
+        None | Some("rapide") => CampaignKind::Rapide,
+        Some("complete") | Some("complète") => CampaignKind::Complete,
+        Some("bruit") => CampaignKind::Bruit,
+        Some(other) => return Err(format!("version : rapide | complete | bruit, reçu « {other} »")),
+    };
+    jamodio_bench::campaign::version(&results(), kind).await.map(|_| ())
+}
+
+fn advice(args: &[String]) -> Result<(), String> {
+    use jamodio_bench::campaign::{CampaignInfo, MachineConfig, References};
+    let public = args.iter().any(|a| a == "--publique");
+    let mut revs = args.iter().filter(|a| !a.starts_with("--"));
+    let from = match revs.next() {
+        Some(r) => r.clone(),
+        None => {
+            // La version de référence de cette machine : son tag « v… ».
+            let base = results();
+            let machine = MachineConfig::load(&base)?.machine;
+            let rel = References::load(&base)?
+                .current(&machine)
+                .map(str::to_string)
+                .ok_or(format!("{machine} n'a pas de référence : préciser DEPUIS (ex. v0.6.6-15)"))?;
+            format!("v{}", CampaignInfo::load(&base.join(rel))?.audio_engine)
+        }
+    };
+    let to = revs.next().cloned().unwrap_or_else(|| "HEAD".into());
+    let files = jamodio_bench::advice::changed_files(&from, &to)?;
+    print!("{}", jamodio_bench::advice::render(&from, &to, &files, public));
+    Ok(())
+}
+
+fn import(args: &[String]) -> Result<(), String> {
+    use jamodio_bench::campaign::CampaignKind;
+    let (mut kind, mut machine, mut note, mut dirs) = (None, None, String::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--type" => {
+                kind = Some(match it.next().map(String::as_str) {
+                    Some("importee") => CampaignKind::Importee,
+                    Some("bruit") => CampaignKind::Bruit,
+                    other => return Err(format!("--type importee | bruit, reçu {other:?}")),
+                })
+            }
+            "--machine" => machine = it.next().cloned(),
+            "--note" => note = it.next().cloned().unwrap_or_default(),
+            d => dirs.push(PathBuf::from(d)),
+        }
+    }
+    let machine = machine.ok_or("--machine NOM (celui de session-bench configurer)")?;
+    let dir = jamodio_bench::campaign::import(&results(), kind.ok_or("--type importee | bruit")?, &machine, &note, &dirs)?;
+    println!("Campagne rangée : {}", dir.display());
+    Ok(())
+}
+
+fn archive(args: &[String]) -> Result<(), String> {
+    let mut it = args.iter();
+    let dir = it.next().ok_or("archiver DOSSIER --resumes DIR [--bruts DIR]")?.clone();
+    let (mut summaries, mut raw) = (None, None);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--resumes" => summaries = it.next().map(PathBuf::from),
+            "--bruts" => raw = it.next().map(PathBuf::from),
+            other => return Err(format!("option inconnue : {other}")),
+        }
+    }
+    let summaries = summaries.ok_or("--resumes DIR")?;
+    jamodio_bench::tools::archive(&results(), &dir, &summaries, raw.as_deref())
 }
 
 async fn devices(url: &str) -> Result<(), String> {

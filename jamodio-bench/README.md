@@ -59,6 +59,41 @@ Dans `bench-results/<scénario>-<date>/` :
 
 Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
 
+## Campagne de version (lot R5) — ce que Ben lance
+
+Depuis le dépôt de l'Audio Engine, sur la machine mesurée, l'Audio Engine de
+la version à juger installé, studio fermé :
+
+```text
+cargo run --release -p jamodio-bench -- configurer        (une fois : carte son, émetteur distant, nom)
+cargo run --release -p jamodio-bench -- conseil           (faut-il une campagne ? aucune / rapide / complète)
+cargo run --release -p jamodio-bench -- version           (rapide, ~30 min) — ou : version complete (~1 h 30)
+cargo run --release -p jamodio-bench -- reference         (quand la version est validée : elle devient la référence)
+```
+
+- **`conseil`** compare le code de la version de référence de la machine (tag
+  `v…`) à la version en cours : chemin audio, installeur, dépendances → une
+  campagne ; interface, textes, CI, tests, numéro de version seul → aucune.
+  Version publique (`--publique`) → complète. Dans le doute (fichier non
+  rangé), on mesure. La décision reste à Ben.
+- **`version`** enchaîne les scénarios (rapide : `regulier-9`, `pics-seuls`,
+  `un-wifi-charge-parmi-8`, `9-reseaux-mixtes`), compare chaque flux à la
+  référence de la machine et ouvre le verdict : « ✔ AUCUNE RÉGRESSION »,
+  « ✖ RÉGRESSION » (flux, écart, tolérance), « ○ NON CONCLUANT » (pourquoi :
+  pas de référence, scénario modifié, autres périphériques, banc imprécis,
+  campagne interrompue). Une campagne s'arrête au premier scénario incomplet.
+- **Tolérances** : `version bruit` lance la série rapide 3 fois (entrelacée) ;
+  la tolérance d'un flux vaut 2 × le plus grand écart vu entre passages,
+  jamais sous 1 ms (cible) ni 0,5 trou/min. Sans mesure du bruit : planchers.
+- **Rangement** (`bench-results/`) : `campagnes/<machine>/<date>-<version>-<type>/`
+  (campagne.json, verdict.md/html, un dossier par scénario avec ses CSV et
+  `metrics.json`), `index.csv`, `references.json` (historique jamais effacé),
+  `tolerances/<machine>.json`, `machine.json`.
+- **`importer`** range des dossiers lancés à la main (`run`) ; **`reanalyser`**
+  refait `metrics.json` depuis les CSV : un échantillon archivé garde sa
+  valeur quand l'analyse évolue. **`archiver`** copie les résumés (quelques Ko)
+  vers le dépôt du site (privé) et la campagne entière vers un partage.
+
 ## Émetteur distant (lot R1-bis) — le mode recommandé sur PC
 
 Le banc doit être plus précis que ce qu'il mesure. Sur la machine mesurée, sa
