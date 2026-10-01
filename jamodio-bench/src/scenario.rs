@@ -62,6 +62,12 @@ pub struct Scenario {
     /// vrai réseau et la carte réseau de la machine mesurée. `None` = local.
     #[serde(default)]
     pub relay: Option<String>,
+    /// Émetteur distant `IP:PORT` (`session-bench remote` sur une SECONDE
+    /// machine, lot R1-bis) : les flux simulés y sont fabriqués et envoyés, et
+    /// ce que l'agent envoie y est reçu. La précision du banc ne dépend plus de
+    /// la machine mesurée. `None` = flux fabriqués ici.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     /// Windows : les fils du banc prennent la priorité de fil la plus haute
     /// (`THREAD_PRIORITY_TIME_CRITICAL`) au lieu de MMCSS « Pro Audio ». Pendant
     /// de l'interrupteur `no-mmcss` de l'Audio Engine (Lot W1,
@@ -89,6 +95,7 @@ impl Default for Scenario {
             server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),
             relay: None,
+            remote: None,
             no_mmcss: false,
         }
     }
@@ -124,6 +131,17 @@ impl Scenario {
         if let Some(r) = &self.relay {
             r.parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("relay « {r} » : {e} (attendu IP:PORT)"))?;
+        }
+        if let Some(r) = &self.remote {
+            if self.relay.is_some() {
+                return Err("relais ou émetteur distant, pas les deux (l'émetteur distant fait déjà passer les flux par le réseau)".into());
+            }
+            let addr = r
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("remote « {r} » : {e} (attendu IP:PORT)"))?;
+            if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                return Err(format!("remote {addr} : l'Audio Engine refuse le bouclage — l'adresse réseau de la seconde machine"));
+            }
         }
         if self.peers.is_empty() {
             return Err("au moins un profil de musicien".into());
@@ -262,6 +280,9 @@ mod tests {
             Scenario { server_ip: "127.0.0.1".into(), ..Scenario::default() },
             Scenario { server_ip: "pas-une-ip".into(), ..Scenario::default() },
             Scenario { relay: Some("10.0.0.2".into()), ..Scenario::default() },
+            Scenario { remote: Some("10.0.0.2".into()), ..Scenario::default() },
+            Scenario { remote: Some("127.0.0.1:51901".into()), ..Scenario::default() },
+            Scenario { remote: Some("10.0.0.2:51901".into()), relay: Some("10.0.0.3:51900".into()), ..Scenario::default() },
             Scenario {
                 peers: vec![PeerProfile { loss_pct: 150.0, ..PeerProfile::preset("regular").unwrap() }],
                 ..Scenario::default()

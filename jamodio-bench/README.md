@@ -59,6 +59,31 @@ Dans `bench-results/<scénario>-<date>/` :
 
 Joindre aussi le **journal de l'Audio Engine** (lignes `TROU`, `perfstats`).
 
+## Émetteur distant (lot R1-bis) — le mode recommandé sur PC
+
+Le banc doit être plus précis que ce qu'il mesure. Sur la machine mesurée, sa
+précision dépend de ce qui y tourne (NUC, 01/10/2026 : jusqu'à 2 ms de retard,
+17 à 186 secondes sur 330, ancien banc compris). Avec l'émetteur distant, une
+SECONDE machine fabrique et envoie les flux simulés et reçoit ce que l'Audio
+Engine envoie ; la machine mesurée ne fait plus que piloter l'Audio Engine et
+ne traite que les paquets d'un vrai musicien. Le vrai câble réseau est dans
+la boucle, dans les deux sens.
+
+```text
+(seconde machine, en Ethernet)  session-bench remote
+(machine mesurée)               cargo run --release -p jamodio-bench -- run --named regulier-9 --remote IP-DE-LA-SECONDE:51901 --input "…" --output "…"
+```
+
+- La précision du banc affichée est celle de l'émetteur (mesurée là-bas).
+- Les flux partent avec l'horloge de l'émetteur : la dérive que lit l'Audio
+  Engine contient l'écart entre les deux horloges (quelques ppm, le même pour
+  tous les flux). Le résumé l'estime et le retire avant de comparer.
+- Un trou « arrivée » vient du trajet émetteur → machine mesurée ; une coupure
+  de l'instrument envoyé, du trajet inverse.
+- Le binaire macOS est autonome (bibliothèques système seulement) : il se
+  copie sur un Mac sans rien y installer. Autoriser `session-bench` dans le
+  pare-feu des deux machines.
+
 ## Réseaux réalistes (lot R1, `PLAN-BANC-REALISTE-2026-10.md`)
 
 Chaque musicien simulé a SON lien et SON horloge. Dans un scénario JSON, à

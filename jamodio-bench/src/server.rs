@@ -14,6 +14,7 @@ use crate::profile::{Frame, InstrumentSchedule, PeerProfile, Speech, VoiceSchedu
 use jamodio_audio_core::codec::encoder::{MusicEncoder, MAX_PACKET_SIZE};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::srtp::{SrtpContext, SrtpParameters};
+use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -175,8 +176,9 @@ struct Active {
     t0: Option<Instant>,
 }
 
-/// Mesures du faux serveur sur une fenêtre, vidées chaque seconde.
-#[derive(Debug, Default, Clone)]
+/// Mesures du faux serveur sur une fenêtre, vidées chaque seconde (transmises
+/// telles quelles par l'émetteur distant).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SenderWindow {
     /// Retard d'envoi sur l'heure prévue (µs), un par paquet.
     pub late_us: Vec<u32>,
@@ -345,7 +347,7 @@ fn wait_precisely(until: Instant) {
 }
 
 /// Mesures d'un flux MONTANT (ce que l'agent envoie) sur une fenêtre.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct UplinkWindow {
     pub packets: u64,
     /// Plus grand écart entre deux paquets reçus (µs).

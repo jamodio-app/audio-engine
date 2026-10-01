@@ -799,7 +799,17 @@ pub struct DriftCheck {
 /// Fenêtre de comparaison du critère 7 : 5 min au début, 5 min à la fin.
 pub const DRIFT_EDGE_S: f64 = 300.0;
 
-pub fn drift_check(peers: &[PeerRow], steps: &[(u32, f64, f64)]) -> DriftCheck {
+/// Écart d'horloge entre l'émetteur distant et la machine mesurée (ppm) :
+/// commun à tous les flux, il s'ajoute à la dérive que l'agent estime. Médiane
+/// de (lue − simulée) sur les musiciens : robuste à un flux mal mesuré, juste
+/// que les dérives simulées soient nulles ou symétriques. `NaN` sans mesure.
+pub fn clock_offset_ppm(musicians: &[MusicianSummary]) -> f64 {
+    percentile(musicians.iter().map(|m| m.read_ppm - m.sim_ppm).collect(), 0.5)
+}
+
+/// `clock_offset_ppm` : écart d'horloge à retirer avant de comparer la dérive
+/// lue à la simulée (0 quand les flux partent de la machine mesurée).
+pub fn drift_check(peers: &[PeerRow], steps: &[(u32, f64, f64)], clock_offset_ppm: f64) -> DriftCheck {
     let mut c = DriftCheck { seconds: 0.0, holes: 0.0, worst_shift: None, worst_read_error_ppm: f64::NAN, drift_drops: 0.0 };
     for &(musicians, start, end) in steps.iter().filter(|(_, s, e)| e - s >= 2.0 * DRIFT_EDGE_S) {
         c.seconds += end - start;
@@ -814,7 +824,8 @@ pub fn drift_check(peers: &[PeerRow], steps: &[(u32, f64, f64)]) -> DriftCheck {
                 c.worst_shift = Some((stream.to_string(), shift));
             }
             if let Some(last) = rows.iter().rev().find(|r| r.get("driftPpm").is_finite()) {
-                let err = (last.get("driftPpm") - last.sim_ppm).abs();
+                let offset = if clock_offset_ppm.is_finite() { clock_offset_ppm } else { 0.0 };
+                let err = (last.get("driftPpm") - offset - last.sim_ppm).abs();
                 c.worst_read_error_ppm = if c.worst_read_error_ppm.is_finite() { c.worst_read_error_ppm.max(err) } else { err };
             }
         }
@@ -1270,7 +1281,7 @@ mod tests {
         let steps = [(9, 30.0, 1830.0)];
         let mut ok = stream(2, 1830, |_| 5.0, &[], -100.0, -99.2);
         ok.extend(stream(3, 1830, |t| if t > 1500.0 { 6.0 } else { 5.0 }, &[], 100.0, 101.0));
-        let d = drift_check(&ok, &steps);
+        let d = drift_check(&ok, &steps, 0.0);
         assert_eq!((d.holes, d.seconds), (0.0, 1800.0));
         assert!((d.worst_read_error_ppm - 1.0).abs() < 1e-9);
         let c = &network_criteria(&[], true, &[], Some(&d))[2];
@@ -1278,15 +1289,32 @@ mod tests {
         assert!(c.detail.contains("+1.0 ms (m3)"), "{}", c.detail);
 
         let holed = stream(2, 1830, |_| 5.0, &[900.0], -100.0, -100.0);
-        assert_eq!(network_criteria(&[], true, &[], Some(&drift_check(&holed, &steps)))[2].verdict, Verdict::Fails);
+        assert_eq!(network_criteria(&[], true, &[], Some(&drift_check(&holed, &steps, 0.0)))[2].verdict, Verdict::Fails);
         let drifting = stream(2, 1830, |t| 5.0 + t / 600.0, &[], -100.0, -100.0);
-        assert_eq!(network_criteria(&[], true, &[], Some(&drift_check(&drifting, &steps)))[2].verdict, Verdict::Fails);
+        assert_eq!(network_criteria(&[], true, &[], Some(&drift_check(&drifting, &steps, 0.0)))[2].verdict, Verdict::Fails);
 
-        let short = drift_check(&ok, &[(9, 30.0, 400.0)]);
+        let short = drift_check(&ok, &[(9, 30.0, 400.0)], 0.0);
         let c = &network_criteria(&[], true, &[], Some(&short))[2];
         assert_eq!(c.verdict, Verdict::NotApplicable);
         assert!(c.detail.contains("10 min"), "{}", c.detail);
         assert_eq!(network_criteria(&[], true, &[], None)[2].verdict, Verdict::NotApplicable);
+    }
+
+    /// Émetteur distant : un écart d'horloge commun (+7 ppm) s'ajoute à chaque
+    /// dérive lue ; il est estimé puis retiré avant de comparer.
+    #[test]
+    fn l_ecart_d_horloge_commun_est_estime_puis_retire() {
+        let steps = [(9, 30.0, 1830.0)];
+        let mut peers = stream(2, 1830, |_| 5.0, &[], -100.0, -93.0);
+        peers.extend(stream(3, 1830, |_| 5.0, &[], 100.0, 107.5));
+        peers.extend(stream(4, 1830, |_| 5.0, &[], 0.0, 7.0));
+        let table = musician_summaries(&peers, 9, 30.0, 1830.0);
+        let offset = clock_offset_ppm(&table);
+        assert!((offset - 7.0).abs() < 1e-9, "{offset}");
+        let d = drift_check(&peers, &steps, offset);
+        assert!((d.worst_read_error_ppm - 0.5).abs() < 1e-9, "{}", d.worst_read_error_ppm);
+        assert!((drift_check(&peers, &steps, 0.0).worst_read_error_ppm - 7.5).abs() < 1e-9);
+        assert!(clock_offset_ppm(&[]).is_nan());
     }
 
     /// Critère 5 : sous réseau simulé, seules les causes locales le font tomber ;

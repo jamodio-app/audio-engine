@@ -26,6 +26,8 @@ session-bench — banc « N musiciens » contre l'Audio Engine installé
   session-bench devices
   session-bench plugins                        (plugins connus de l'Audio Engine)
   session-bench relay [--listen IP] [--port N] (SECONDE machine : relais du mode réseau)
+  session-bench remote [--listen IP] [--port N] (SECONDE machine : émetteur distant —
+                                               y fabrique les flux simulés, cf. --remote)
   session-bench scenarios                      (la bibliothèque de scénarios nommés)
   session-bench scenario [NOM]                 (écrit le scénario par défaut, ou NOM, en JSON)
   session-bench selftest [FLUX] [SECONDES]     (précision du banc seul, sans Audio Engine ; défaut 8 flux, 30 s)
@@ -52,6 +54,9 @@ Options de run :
   --agent URL             WebSocket de l'Audio Engine (défaut ws://127.0.0.1:9876)
   --relay IP:PORT         mode réseau : les flux passent par le relais lancé sur
                           une seconde machine (session-bench relay)
+  --remote IP:PORT        émetteur distant : les flux simulés sont fabriqués et
+                          envoyés par une seconde machine (session-bench remote) —
+                          la précision du banc ne dépend plus de cette machine
   --out DOSSIER           où écrire les résultats (défaut bench-results/<date>)
   --save-scenario FICHIER écrit le scénario final avant de lancer
   --no-mmcss              Windows : fils du banc en priorité TIME_CRITICAL, sans MMCSS
@@ -66,6 +71,7 @@ async fn main() {
         Some("devices") => devices(&Scenario::default().agent_url).await,
         Some("plugins") => plugins(&Scenario::default().agent_url).await,
         Some("relay") => relay(&args[1..]),
+        Some("remote") => remote(&args[1..]),
         Some("scenarios") => {
             for (name, what) in jamodio_bench::library::NAMED {
                 println!("  {name:<24} {what}");
@@ -131,11 +137,17 @@ async fn plugins(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// La seconde machine du mode réseau : relaie les flux entre le banc et
-/// l'agent de la machine mesurée.
-fn relay(args: &[String]) -> Result<(), String> {
+/// L'émetteur distant : fabrique et envoie les flux simulés depuis une seconde
+/// machine, reçoit ce que l'agent envoie (lot R1-bis).
+fn remote(args: &[String]) -> Result<(), String> {
+    let (listen, port) = listen_options(args, jamodio_bench::remote::DEFAULT_PORT)?;
+    jamodio_bench::remote::serve(listen, port)
+}
+
+/// `--listen IP` (défaut : l'adresse réseau de cette machine) et `--port N`.
+fn listen_options(args: &[String], default_port: u16) -> Result<(std::net::IpAddr, u16), String> {
     let mut listen = None;
-    let mut port = jamodio_bench::relay::DEFAULT_PORT;
+    let mut port = default_port;
     let mut it = args.iter();
     while let Some(opt) = it.next() {
         let v = it.next().ok_or(format!("{opt} attend une valeur"))?;
@@ -149,6 +161,13 @@ fn relay(args: &[String]) -> Result<(), String> {
         Some(ip) => ip,
         None => jamodio_bench::scenario::primary_local_ip()?,
     };
+    Ok((listen, port))
+}
+
+/// La seconde machine du mode réseau : relaie les flux entre le banc et
+/// l'agent de la machine mesurée.
+fn relay(args: &[String]) -> Result<(), String> {
+    let (listen, port) = listen_options(args, jamodio_bench::relay::DEFAULT_PORT)?;
     jamodio_bench::relay::serve(listen, port)
 }
 
@@ -246,6 +265,7 @@ fn parse_run(args: &[String]) -> Result<(Scenario, Option<PathBuf>, Option<PathB
             "--output" => scenario.output_device = Some(val()?),
             "--agent" => scenario.agent_url = val()?,
             "--relay" => scenario.relay = Some(val()?),
+            "--remote" => scenario.remote = Some(val()?),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--save-scenario" => save = Some(PathBuf::from(val()?)),
             "--no-mmcss" => scenario.no_mmcss = true,
@@ -297,6 +317,17 @@ mod tests {
         assert_eq!(s.peer(9).name, "4g");
         let (s, _, _) = parse_run(&args("--profile wifi-charge")).unwrap();
         assert_eq!(s.peer(2).name, "wifi-charge");
+    }
+
+    #[test]
+    fn l_emetteur_distant_se_choisit_et_exclut_le_relais() {
+        let (s, _, _) = parse_run(&args("--named regulier-9 --remote 192.168.1.20:51901")).unwrap();
+        assert_eq!(s.remote.as_deref(), Some("192.168.1.20:51901"));
+        s.validate().unwrap();
+        let (s, _, _) = parse_run(&args("--remote 192.168.1.20:51901 --relay 192.168.1.20:51900")).unwrap();
+        assert!(s.validate().unwrap_err().contains("pas les deux"));
+        assert!(listen_options(&args("--port 1 --listen pas-une-ip"), 2).unwrap_err().contains("--listen"));
+        assert_eq!(listen_options(&args("--listen 10.0.0.2 --port 4000"), 2).unwrap(), ("10.0.0.2".parse().unwrap(), 4000));
     }
 
     #[test]
