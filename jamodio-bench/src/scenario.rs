@@ -200,6 +200,31 @@ impl Scenario {
                 .all(|p| p.link().is_regular() && p.changes.is_empty() && p.absences.is_empty())
     }
 
+    /// Empreinte de ce qui décide des paquets envoyés et de la charge : liens,
+    /// graine, paliers, talkback, plugin. Les réglages propres à la machine
+    /// (périphériques, adresses, mode réseau) en sont exclus : deux machines
+    /// lançant le même scénario ont la même empreinte. Une empreinte qui change
+    /// (préréglage recalibré en R2…) interdit de comparer à une référence
+    /// d'avant : on ne compare pas des pommes et des poires.
+    pub fn fingerprint(&self) -> String {
+        let mut s = self.clone();
+        s.input_device = None;
+        s.output_device = None;
+        s.channel_index = None;
+        s.agent_url = String::new();
+        s.server_ip = String::new();
+        s.relay = None;
+        s.remote = None;
+        s.no_mmcss = false;
+        let json = serde_json::to_string(&s).expect("un scénario se sérialise");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in json.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        format!("{h:016x}")
+    }
+
     /// Durée totale de la campagne.
     pub fn total_secs(&self) -> u64 {
         u64::from(self.to_musicians - self.from_musicians + 1) * self.step_secs
@@ -315,6 +340,22 @@ mod tests {
         };
         let s = Scenario { from_musicians: 9, peers: vec![change], ..Scenario::default() };
         assert!(s.validate().unwrap_err().contains("changement de lien"));
+    }
+
+    #[test]
+    fn l_empreinte_ignore_la_machine_mais_pas_le_reseau_simule() {
+        let base = crate::library::named("9-reseaux-mixtes").unwrap();
+        let ailleurs = Scenario {
+            input_device: Some("1:UMC ASIO Driver".into()),
+            remote: Some("192.168.1.49:51901".into()),
+            ..base.clone()
+        };
+        assert_eq!(base.fingerprint(), ailleurs.fingerprint(), "même scénario, autre machine");
+        let mut recalibre = base.clone();
+        recalibre.peers[1].loss_pct = 0.03;
+        assert_ne!(base.fingerprint(), recalibre.fingerprint(), "un lien recalibré change l'empreinte");
+        assert_ne!(base.fingerprint(), Scenario { seed: 2, ..base.clone() }.fingerprint());
+        assert_eq!(base.fingerprint().len(), 16);
     }
 
     #[test]

@@ -175,6 +175,21 @@ struct Active {
     next: Option<Frame>,
     /// Origine du calendrier : posée quand le flux devient prêt.
     t0: Option<Instant>,
+    /// Fin de l'envoi du paquet précédent de CE flux (cf. [`lateness`]).
+    free_at: Option<Instant>,
+}
+
+/// Retard d'envoi imputable au BANC : depuis que le paquet pouvait partir,
+/// c'est-à-dire à son heure ET une fois le paquet précédent de son propre flux
+/// parti. Attendre derrière sa propre salve (pic relâché d'un coup, gigue à
+/// queue lourde) est le comportement d'un vrai lien, simulé exprès : ce n'est
+/// pas une erreur du banc. Attendre derrière la salve d'un AUTRE musicien en
+/// est une (leurs réseaux sont indépendants) : elle reste comptée. Avant
+/// (01/10/2026), le retard se mesurait depuis l'heure seule, et le verdict
+/// tombait à « insuffisant » dès qu'un lien relâchait des salves.
+pub fn lateness(start: Instant, due: Instant, free_at: Option<Instant>) -> Duration {
+    let could_leave = free_at.map_or(due, |f| f.max(due));
+    start.saturating_duration_since(could_leave)
 }
 
 /// Mesures du faux serveur sur une fenêtre, vidées chaque seconde (transmises
@@ -273,7 +288,7 @@ fn send_loop(
     while !stop.load(Ordering::Relaxed) {
         loop {
             match add_rx.try_recv() {
-                Ok((link, schedule)) => active.push(Active { link, schedule, next: None, t0: None }),
+                Ok((link, schedule)) => active.push(Active { link, schedule, next: None, t0: None, free_at: None }),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -298,12 +313,14 @@ fn send_loop(
                     Kind::Instrument => instrument.get(f.index),
                     Kind::Voice => voice.get(f.index),
                 };
+                let start = Instant::now();
+                let late = lateness(start, due, a.free_at).as_micros().min(u32::MAX as u128) as u32;
                 let ok = a
                     .link
                     .packet(f, payload)
                     .and_then(|p| a.link.socket.send_to(&p, addr).map_err(|e| e.to_string()))
                     .is_ok();
-                let late = now.saturating_duration_since(due).as_micros().min(u32::MAX as u128) as u32;
+                a.free_at = Some(Instant::now());
                 let mut w = window.lock().unwrap();
                 if ok {
                     w.sent += 1;
@@ -540,6 +557,24 @@ mod tests {
             }
         }
         (got, link)
+    }
+
+    /// Le retard imputable au banc part de l'heure du paquet, ou de la fin du
+    /// paquet précédent de son flux s'il partait encore : la file d'un lien
+    /// n'est pas comptée, l'attente derrière un autre flux l'est.
+    #[test]
+    fn le_retard_du_banc_ne_compte_pas_la_file_du_lien_lui_meme() {
+        let t = Instant::now();
+        let ms = |v: u64| Duration::from_millis(v);
+        // À l'heure, flux libre : aucun retard.
+        assert_eq!(lateness(t + ms(5), t + ms(5), None), Duration::ZERO);
+        // Parti 2 ms après son heure, flux libre depuis longtemps : 2 ms (banc).
+        assert_eq!(lateness(t + ms(7), t + ms(5), Some(t)), ms(2));
+        // Dû à 5 ms mais derrière sa propre salve jusqu'à 9 ms, parti à 9 ms :
+        // la file du lien, pas le banc.
+        assert_eq!(lateness(t + ms(9), t + ms(5), Some(t + ms(9))), Duration::ZERO);
+        // Derrière sa salve jusqu'à 9 ms, parti à 10 ms : 1 ms imputable au banc.
+        assert_eq!(lateness(t + ms(10), t + ms(5), Some(t + ms(9))), ms(1));
     }
 
     /// Un flux retiré (musicien parti) n'envoie plus rien.

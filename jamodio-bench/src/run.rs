@@ -8,7 +8,7 @@
 use crate::driver::{AgentLink, CaptureParams, StreamParams, VoiceParams};
 use crate::endpoint::Endpoint;
 use crate::profile::PeerProfile;
-use crate::report::{self, Event, EventKind, MachineRow, PeerRow, StepSummary, StreamInfo};
+use crate::report::{self, Event, EventKind, MachineRow, PeerRow, StreamInfo};
 use crate::scenario::Scenario;
 use crate::server::{Downlink, Kind, Payloads, SenderLoop};
 use serde_json::Value;
@@ -165,16 +165,8 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                 for a in &profile.absences {
                     pending.push((arrival + a.at_s, m, true));
                     pending.push((arrival + a.at_s + a.for_s, m, false));
-                    events.push(Event { t_s: arrival + a.at_s, musician: m, kind: EventKind::Absence { for_s: a.for_s } });
                 }
-                let mut from = profile.name.clone();
-                for c in &profile.changes {
-                    events.push(Event {
-                        t_s: arrival + c.at_s,
-                        musician: m,
-                        kind: EventKind::Change { from: std::mem::replace(&mut from, c.link.name.clone()), to: c.link.name.clone() },
-                    });
-                }
+                events.extend(crate::analysis::musician_events(profile, m, arrival));
                 let pids = ctx.add_musician(&mut agent, &mut endpoint, m, 0, 0).await?;
                 for (pid, info, id) in pids {
                     streams.insert(pid.clone(), info);
@@ -295,31 +287,17 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     };
     endpoint.shutdown();
 
-    // Résumé : seuls les paliers mesurés au-delà de leur installation.
-    let measured: Vec<(u32, f64, f64)> = steps
-        .iter()
-        .filter(|s| s.end_s - s.start_s > scenario.warmup_secs as f64)
-        .map(|s| (s.musicians, s.start_s + scenario.warmup_secs as f64, s.end_s))
-        .collect();
-    let summaries: Vec<StepSummary> = measured
-        .iter()
-        .map(|&(n, from, to)| report::summarize(&peer_rows, &machine_rows, n, from, to))
-        .collect();
-    let musician_table = measured
-        .last()
-        .map_or_else(Vec::new, |&(n, from, to)| report::musician_summaries(&peer_rows, n, from, to));
-    let event_table = report::event_summaries(&peer_rows, &events, &measured);
-    let clock_offset = if scenario.remote.is_some() { report::clock_offset_ppm(&musician_table) } else { 0.0 };
-    let drift = scenario.is_drift_only().then(|| report::drift_check(&peer_rows, &measured, clock_offset));
-    let mut criteria = report::criteria(&summaries, scenario.is_regular(), scenario.send_voice_channel.is_some());
-    criteria.extend(report::network_criteria(&summaries, !scenario.is_regular(), &event_table, drift.as_ref()));
+    // Résumé : la même analyse que celle d'un échantillon relu plus tard.
+    let raw_steps: Vec<(u32, f64, f64)> = steps.iter().map(|s| (s.musicians, s.start_s, s.end_s)).collect();
+    let analysis = crate::analysis::analyze(&scenario, &peer_rows, &machine_rows, &raw_steps, &events);
+    let clock_offset = analysis.clock_offset_ppm;
     let status = match &end {
         End::Complete => "complète".to_string(),
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
         End::AgentError(e) => format!("ARRÊTÉE PAR L'AUDIO ENGINE : {e}"),
         End::BenchError(e) => format!("ARRÊTÉE PAR UNE ERREUR DU BANC : {e}"),
     };
-    let (precision, _) = report::precision(&machine_rows.iter().map(|r| r.sender_late_max_ms).collect::<Vec<_>>());
+    let precision = analysis.precision_text.clone();
     let relay_precision = match (&scenario.relay, &scenario.remote) {
         (Some(addr), _) => {
             let (p, _) = report::precision(&machine_rows.iter().map(|r| r.relay_delay_max_ms).collect::<Vec<_>>());
@@ -378,7 +356,9 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     write(out_dir, "peers.csv", &report::peers_csv(&peer_rows))?;
     write(out_dir, "machine.csv", &report::machine_csv(&machine_rows))?;
     write(out_dir, "scenario.json", &serde_json::to_string_pretty(&scenario).map_err(|e| e.to_string())?)?;
-    let summary = report::markdown(&header, &summaries, &musician_table, &event_table, &criteria);
+    let metrics = crate::analysis::Metrics::from_analysis(&scenario, &analysis, matches!(end, End::Complete));
+    write(out_dir, "metrics.json", &serde_json::to_string_pretty(&metrics).map_err(|e| e.to_string())?)?;
+    let summary = report::markdown(&header, &analysis.summaries, &analysis.musicians, &analysis.events, &analysis.criteria);
     let path = out_dir.join("resume.md");
     write(out_dir, "resume.md", &summary)?;
     println!("\n{summary}");

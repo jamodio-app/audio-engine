@@ -477,11 +477,14 @@ pub fn summarize(peers: &[PeerRow], machine: &[MachineRow], musicians: u32, from
 }
 
 /// État d'un critère.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
+    #[serde(rename = "tenu")]
     Holds,
+    #[serde(rename = "non-tenu")]
     Fails,
     /// Le scénario ne permet pas d'en juger (dit pourquoi dans le détail).
+    #[serde(rename = "sans-objet")]
     NotApplicable,
 }
 

@@ -6,6 +6,7 @@
 //! seconde et un résumé qui dit si les critères tiennent. Pensé pour durer : un
 //! scénario est un fichier JSON qu'une future interface pourra produire.
 
+pub mod analysis;
 pub mod driver;
 pub mod endpoint;
 pub mod library;
