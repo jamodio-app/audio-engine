@@ -961,6 +961,17 @@ impl AudioMixer {
         }
     }
 
+    /// Chantier P1 (02/10/2026) — rend la montée de cible d'un trou dû à une
+    /// perte avérée (cf. `JitterBuffer::refund_hole_growth`). Appelé par le fil
+    /// de réception : même verrou court par flux que `observe_jitter`, jamais
+    /// tenu en même temps que la map.
+    pub fn refund_hole_growth(&self, producer_id: &str, growth: super::ring_buffer::HoleGrowth) {
+        let cell = self.streams.read().get(producer_id).cloned();
+        if let Some(cell) = cell {
+            cell.jitter.lock().refund_hole_growth(growth);
+        }
+    }
+
     /// P1 (01/07) — repart propre après un rétablissement audio (reset ASIO).
     /// Vide les jitter buffers du périmé accumulé pendant le gel de sortie et les
     /// re-prime à la cible de démarrage. Appelé par la pipeline juste après une
