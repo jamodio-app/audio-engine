@@ -20,8 +20,31 @@ pub const NAMED: [(&str, &str); 8] = [
     ("9-reseaux-mixtes", "3 Ethernet, 2 fibre, 1 ADSL, 1 Wi-Fi chargé, 1 4G, dérives de −80 à +80 ppm (critère 5, 10 min)"),
 ];
 
+/// Scénarios d'exploration : hors des campagnes de version (ils ne changent ni
+/// la série rapide ni la complète, ni leurs références), lancés pour une
+/// question précise.
+pub const EXPLORATION: [(&str, &str); 6] = [
+    ("rafales-de-1", "P1 : 8 flux sans gigue, 0,5 % perdus par rafales d'EXACTEMENT 1 paquet (5 min 30)"),
+    ("rafales-de-2", "P1 : idem, rafales de 2 paquets"),
+    ("rafales-de-3", "P1 : idem, rafales de 3 paquets (le masquage tient 3 trames)"),
+    ("rafales-de-4", "P1 : idem, rafales de 4 paquets"),
+    ("rafales-de-5", "P1 : idem, rafales de 5 paquets"),
+    ("rafales-de-6", "P1 : idem, rafales de 6 paquets"),
+];
+
 /// Le scénario nommé, ou `None` s'il n'existe pas.
 pub fn named(name: &str) -> Option<Scenario> {
+    // P1 — même taux de perte, rafales de longueur fixe : le seuil où une perte
+    // se paie en latence se voit net.
+    if let Some(len) = name.strip_prefix("rafales-de-").and_then(|l| l.parse::<u32>().ok()).filter(|l| (1..=6).contains(l)) {
+        let p = PeerProfile {
+            name: format!("rafales-fixes-{len}"),
+            origin: Some("chantier P1 : seuil du masquage (3 trames)".into()),
+            burst_loss: Some(crate::profile::BurstLoss { rate_pct: 0.5, mean_packets: f64::from(len), fixed: true }),
+            ..PeerProfile::preset("regular").expect("préréglage")
+        };
+        return Some(Scenario { name: name.into(), from_musicians: 9, to_musicians: 9, step_secs: 330, peers: vec![p], ..Scenario::default() });
+    }
     let wifi_charge = Link::preset("wifi-charge").expect("préréglage");
     let regular = || PeerProfile::preset("regular").expect("préréglage");
     // Un seul effet du Wi-Fi chargé, sur des flux sans gigue.
@@ -90,6 +113,36 @@ mod tests {
             assert_eq!((s.from_musicians, s.to_musicians), (9, 9), "{name} : 9 musiciens d'emblée");
         }
         assert!(named("inconnu").is_none());
+    }
+
+    /// Les références posées le 02/10/2026 comparent par EMPREINTE de scénario :
+    /// si une évolution du banc changeait ces empreintes, toutes les références
+    /// deviendraient incomparables. Relevées sur les campagnes de référence.
+    #[test]
+    fn les_empreintes_des_scenarios_de_version_ne_bougent_pas() {
+        for (name, fp) in [
+            ("regulier-9", "5bdeb62940e6254d"),
+            ("derive-100ppm", "2f0f0f6b6dbe5782"),
+            ("pics-seuls", "a003428e91583b82"),
+            ("desordre-seul", "5f964d827fa9e5b7"),
+            ("rafales-seules", "796dc42aac1ecb1b"),
+            ("evenements", "e98aa50fcd3a8ff3"),
+            ("un-wifi-charge-parmi-8", "770cae24764aff5b"),
+            ("9-reseaux-mixtes", "acb2ec4e76276195"),
+        ] {
+            assert_eq!(named(name).unwrap().fingerprint(), fp, "{name}");
+        }
+    }
+
+    #[test]
+    fn les_scenarios_d_exploration_existent_et_ne_touchent_pas_la_serie_complete() {
+        for (name, _) in EXPLORATION {
+            let s = named(name).unwrap_or_else(|| panic!("{name}"));
+            s.validate().unwrap();
+            assert!(!NAMED.iter().any(|(n, _)| *n == name), "{name} hors des campagnes de version");
+        }
+        assert!(named("rafales-de-7").is_none() && named("rafales-de-0").is_none());
+        assert_eq!(named("rafales-de-4").unwrap().peer(2).burst_loss.unwrap().mean_packets, 4.0);
     }
 
     #[test]

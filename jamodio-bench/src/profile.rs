@@ -133,9 +133,31 @@ fn pareto_tail_factor(shape: f64) -> f64 {
 pub struct BurstLoss {
     pub rate_pct: f64,
     pub mean_packets: f64,
+    /// Chaque rafale fait EXACTEMENT `mean_packets` paquets (au lieu d'une
+    /// longueur tirée au hasard autour de cette moyenne). Sert à situer un
+    /// seuil — chantier P1 : l'Audio Engine masque au plus 3 trames d'affilée
+    /// (`mixer/conceal.rs`), une rafale de 4 devient-elle un trou ?
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fixed: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl BurstLoss {
+    /// Longueur d'une rafale fixe (en paquets).
+    fn fixed_len(&self) -> u32 {
+        self.mean_packets.round() as u32
+    }
+
+    /// Rafale fixe : probabilité, par paquet transmis, d'en commencer une, pour
+    /// perdre `rate_pct` % au total (L perdus pour 1/q + L paquets en moyenne).
+    fn fixed_start(&self) -> f64 {
+        let rate = self.rate_pct / 100.0;
+        rate / (f64::from(self.fixed_len()) * (1.0 - rate))
+    }
+
     /// Probabilités par paquet : (bon → mauvais, mauvais → bon).
     fn transitions(&self) -> (f64, f64) {
         let rate = self.rate_pct / 100.0;
@@ -234,20 +256,20 @@ impl Link {
             },
             "adsl" => Self {
                 loss_pct: 0.05,
-                burst_loss: Some(BurstLoss { rate_pct: 0.2, mean_packets: 3.0 }),
+                burst_loss: Some(BurstLoss { rate_pct: 0.2, mean_packets: 3.0, fixed: false }),
                 spikes: Some(Spikes { every_mean_s: 60.0, hold_ms: 40.0 }),
                 ..Self::plain(name, UNCALIBRATED, pareto(6.0, 60.0))
             },
             "wifi-charge" => Self {
                 loss_pct: 0.1,
-                burst_loss: Some(BurstLoss { rate_pct: 0.5, mean_packets: 4.0 }),
+                burst_loss: Some(BurstLoss { rate_pct: 0.5, mean_packets: 4.0, fixed: false }),
                 spikes: Some(Spikes { every_mean_s: 8.0, hold_ms: 60.0 }),
                 reorder: Some(Reorder { pct: 0.2, max_depth: 2 }),
                 ..Self::plain(name, UNCALIBRATED, pareto(20.0, 120.0))
             },
             "4g" => Self {
                 loss_pct: 0.1,
-                burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 6.0 }),
+                burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 6.0, fixed: false }),
                 spikes: Some(Spikes { every_mean_s: 15.0, hold_ms: 100.0 }),
                 reorder: Some(Reorder { pct: 0.5, max_depth: 3 }),
                 ..Self::plain(name, UNCALIBRATED, pareto(25.0, 200.0))
@@ -286,6 +308,9 @@ impl Link {
             }
             if b.transitions().0 > 1.0 {
                 return Err(format!("{who} : taux de rafales impossible avec des rafales aussi courtes"));
+            }
+            if b.fixed && (b.mean_packets.fract() != 0.0 || b.fixed_start() > 1.0) {
+                return Err(format!("{who} : rafale fixe = un nombre entier de paquets, compatible avec le taux"));
             }
         }
         if let Some(s) = self.spikes {
@@ -570,6 +595,12 @@ pub struct InstrumentSchedule {
     rng: Rng,
     burst_rng: Rng,
     burst_bad: bool,
+    /// Rafale fixe en cours : paquets encore à perdre.
+    burst_left: u32,
+    /// Une rafale fixe vient de finir : le paquet suivant passe, sans tirage
+    /// — sinon deux rafales de L se colleraient en une de 2L et brouilleraient
+    /// le seuil cherché.
+    burst_just_ended: bool,
     spikes: SpikeTrain,
     reorder_rng: Rng,
     next_index: u64,
@@ -596,6 +627,8 @@ impl InstrumentSchedule {
             rng: Rng::new(seed),
             burst_rng: Rng::new(seed ^ SEED_BURST),
             burst_bad: false,
+            burst_left: 0,
+            burst_just_ended: false,
             spikes: SpikeTrain::new(seed),
             reorder_rng: Rng::new(seed ^ SEED_REORDER),
             next_index: 0,
@@ -621,6 +654,22 @@ impl InstrumentSchedule {
         let lost = self.rng.unit() < (link.loss_pct / 100.0).clamp(0.0, 1.0);
         let delay = link.jitter.sample_us(&mut self.rng);
         let burst_lost = match link.burst_loss {
+            // Longueur fixe : un tirage par paquet transmis, aucun pendant la rafale.
+            Some(b) if b.fixed => {
+                if self.burst_left > 0 {
+                    self.burst_left -= 1;
+                    self.burst_just_ended = self.burst_left == 0;
+                    true
+                } else if std::mem::take(&mut self.burst_just_ended) {
+                    false
+                } else if self.burst_rng.unit() < b.fixed_start() {
+                    self.burst_left = b.fixed_len() - 1;
+                    self.burst_just_ended = self.burst_left == 0;
+                    true
+                } else {
+                    false
+                }
+            }
             Some(b) => {
                 let (enter_bad, leave_bad) = b.transitions();
                 let u = self.burst_rng.unit();
@@ -629,6 +678,8 @@ impl InstrumentSchedule {
             }
             None => {
                 self.burst_bad = false;
+                self.burst_left = 0;
+                self.burst_just_ended = false;
                 false
             }
         };
@@ -856,7 +907,7 @@ mod tests {
     /// Rafales : taux global et longueur moyenne tenus (±10 %).
     #[test]
     fn les_pertes_en_rafales_ont_le_taux_et_la_longueur_annonces() {
-        let p = PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 5.0 }), ..regular() };
+        let p = PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 5.0, fixed: false }), ..regular() };
         let frames: Vec<_> = InstrumentSchedule::new(&p, 21).take(400_000).collect();
         let span = frames.last().unwrap().index + 1;
         let lost = span - frames.len() as u64;
@@ -897,6 +948,27 @@ mod tests {
             highest = highest.max(f.index);
         }
         assert!(kept > 19_000 && kept < 20_000, "{kept}");
+    }
+
+    /// Rafales fixes : chaque rafale fait exactement L paquets, au taux annoncé.
+    #[test]
+    fn une_rafale_fixe_fait_exactement_sa_longueur() {
+        for len in 1..=6u64 {
+            let p = PeerProfile {
+                burst_loss: Some(BurstLoss { rate_pct: 0.5, mean_packets: len as f64, fixed: true }),
+                ..regular()
+            };
+            p.validate().unwrap();
+            let frames: Vec<_> = InstrumentSchedule::new(&p, 31).take(400_000).collect();
+            // Deux rafales ne se collent jamais : après une rafale, un paquet passe.
+            let gaps: Vec<u64> = frames.windows(2).map(|w| w[1].index - w[0].index - 1).filter(|&g| g > 0).collect();
+            assert!(gaps.iter().all(|&g| g == len), "L={len} : {:?}", &gaps[..gaps.len().min(10)]);
+            let span = frames.last().unwrap().index + 1;
+            let rate = (span - frames.len() as u64) as f64 / span as f64;
+            assert!((rate - 0.005).abs() < 0.0005, "L={len} : taux {rate}");
+        }
+        let bad = PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 0.5, mean_packets: 2.5, fixed: true }), ..regular() };
+        assert!(bad.validate().is_err(), "longueur fixe non entière");
     }
 
     /// Désordre : la part annoncée (±10 %), chaque trame déplacée part après 1 à
@@ -1068,8 +1140,8 @@ mod tests {
             PeerProfile { drift_ppm: 1_500.0, ..r() },
             PeerProfile { jitter: Jitter::Pareto { tail_ms: 10.0, shape: 0.5, max_ms: 50.0 }, ..r() },
             PeerProfile { jitter: Jitter::Pareto { tail_ms: 10.0, shape: 2.0, max_ms: 5.0 }, ..r() },
-            PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 60.0, mean_packets: 3.0 }), ..r() },
-            PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 0.5 }), ..r() },
+            PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 60.0, mean_packets: 3.0, fixed: false }), ..r() },
+            PeerProfile { burst_loss: Some(BurstLoss { rate_pct: 1.0, mean_packets: 0.5, fixed: false }), ..r() },
             PeerProfile { spikes: Some(Spikes { every_mean_s: 1.0, hold_ms: 1_500.0 }), ..r() },
             PeerProfile { reorder: Some(Reorder { pct: 1.0, max_depth: 0 }), ..r() },
             PeerProfile { reorder: Some(Reorder { pct: 1.0, max_depth: 200 }), ..r() },
