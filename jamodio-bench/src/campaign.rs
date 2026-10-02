@@ -241,6 +241,32 @@ pub async fn version(base: &Path, kind: CampaignKind) -> Result<PathBuf, String>
 
 /// Verdict, pages et index d'une campagne écrite dans `dir`.
 pub fn finish(base: &Path, dir: &Path, info: &CampaignInfo) -> Result<PathBuf, String> {
+    let outcome = write_verdict(base, dir, info)?;
+    append_index(base, info, outcome, dir)?;
+    Ok(dir.join("verdict.html"))
+}
+
+/// `session-bench verdict [DOSSIER]` : recalcule le verdict d'une campagne
+/// (la dernière de cette machine par défaut) avec la référence et les
+/// tolérances ACTUELLES — après une nouvelle référence, une mesure du bruit,
+/// ou un renommage. L'index n'est pas touché.
+pub fn recompute_verdict(base: &Path, dir: Option<&str>) -> Result<PathBuf, String> {
+    let rel = match dir {
+        Some(d) => d.trim_end_matches(['/', '\\']).replace('\\', "/"),
+        None => {
+            let machine = MachineConfig::load(base)?.machine;
+            latest_campaign(base, &machine).ok_or(format!("aucune campagne pour {machine} dans index.csv"))?
+        }
+    };
+    let dir = base.join(&rel);
+    let info = CampaignInfo::load(&dir)?;
+    write_verdict(base, &dir, &info)?;
+    Ok(dir.join("verdict.html"))
+}
+
+/// Écrit verdict.md et verdict.html (et les tolérances pour une campagne de
+/// bruit) ; rend le verdict.
+fn write_verdict(base: &Path, dir: &Path, info: &CampaignInfo) -> Result<Outcome, String> {
     let (md, html, outcome) = if info.kind == CampaignKind::Bruit {
         let tol = noise_tolerances(dir, info)?;
         let path = Tolerances::path(base, &info.machine);
@@ -261,9 +287,8 @@ pub fn finish(base: &Path, dir: &Path, info: &CampaignInfo) -> Result<PathBuf, S
     };
     write(dir, "verdict.md", &md)?;
     write(dir, "verdict.html", &html)?;
-    append_index(base, info, outcome, dir)?;
     println!("\n{md}");
-    Ok(dir.join("verdict.html"))
+    Ok(outcome)
 }
 
 // ─── Comparaison et tolérances ───────────────────────────────────────────────
@@ -858,16 +883,11 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Version du banc : le commit du dépôt d'où il est lancé, s'il y en a un.
+/// Version du banc : le commit d'où ce binaire a été compilé (`build.rs`),
+/// « +modifié » s'il y avait des changements non commités. Un binaire copié
+/// sur une autre machine garde la sienne.
 pub fn bench_commit() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "inconnue (lancé hors du dépôt)".into())
+    env!("BENCH_COMMIT").to_string()
 }
 
 /// (« 20261001-1840 » pour un nom de dossier, « 2026-10-01T18:40:12Z »), en UTC.

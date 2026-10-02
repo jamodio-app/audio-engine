@@ -60,7 +60,17 @@ pub async fn configure(base: &Path) -> Result<(), String> {
         Some(remote)
     };
     let plugin = ask("Plugin à insérer pendant les campagnes (nom exact ; Entrée = aucun) :")?;
-    let default_name = crate::run::machine_name();
+    // Un nom déjà connu ici (campagnes, tolérances) plutôt que le nom réseau :
+    // sinon la campagne ne retrouve ni ses tolérances ni sa référence (NUC,
+    // 02/10/2026 : « benpc » proposé, « NUC » attendu).
+    let known = known_machines(base);
+    if !known.is_empty() {
+        println!("Machines déjà connues ici : {}", known.join(", "));
+    }
+    let default_name = match known.as_slice() {
+        [one] => one.clone(),
+        _ => crate::run::machine_name(),
+    };
     let machine = ask(&format!("Nom de cette machine dans les résultats [{default_name}] :"))?;
     let cfg = MachineConfig {
         machine: if machine.is_empty() { default_name } else { machine },
@@ -76,6 +86,27 @@ pub async fn configure(base: &Path) -> Result<(), String> {
     cfg.save(base)?;
     println!("Enregistré dans {} :\n{}", MachineConfig::path(base).display(), serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?);
     Ok(())
+}
+
+/// Noms de machine déjà présents dans `bench-results` (campagnes, tolérances).
+pub fn known_machines(base: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(base.join("campagnes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .chain(
+            std::fs::read_dir(base.join("tolerances"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok()?.strip_suffix(".json").map(str::to_string)),
+        )
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// `session-bench reference [DOSSIER]` : la campagne (la dernière de cette
@@ -160,6 +191,19 @@ mod tests {
 
     /// L'archive garde les résumés (pas les CSV), une ligne d'index par
     /// campagne même archivée deux fois, et la campagne entière côté bruts.
+    #[test]
+    fn les_machines_connues_viennent_des_campagnes_et_des_tolerances() {
+        let base = std::env::temp_dir().join(format!("banc-noms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("campagnes/NUC")).unwrap();
+        std::fs::create_dir_all(base.join("tolerances")).unwrap();
+        std::fs::write(base.join("tolerances/NUC.json"), "{}").unwrap();
+        std::fs::write(base.join("tolerances/MacBook.json"), "{}").unwrap();
+        assert_eq!(known_machines(&base), vec!["MacBook".to_string(), "NUC".to_string()]);
+        assert!(known_machines(&base.join("absent")).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn l_archive_garde_les_resumes_et_indexe_sans_doublon() {
         let root = std::env::temp_dir().join(format!("banc-archive-{}", std::process::id()));

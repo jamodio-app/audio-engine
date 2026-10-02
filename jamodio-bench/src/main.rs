@@ -29,6 +29,7 @@ Campagne de version (lancée depuis le dépôt de l'Audio Engine) :
                                                (faut-il une campagne ? DEPUIS = version de référence)
   session-bench version [rapide|complete|bruit] (la campagne ; verdict ouvert à la fin)
   session-bench reference [DOSSIER]            (la dernière campagne devient la référence de la machine)
+  session-bench verdict [DOSSIER]              (recalcule le verdict avec la référence et les tolérances actuelles)
   session-bench importer --type importee|bruit --machine NOM --note TEXTE DOSSIER…
                                                (range des campagnes lancées à la main)
   session-bench reanalyser DOSSIER             (refait metrics.json depuis les CSV)
@@ -102,6 +103,9 @@ async fn main() {
         Some("configurer") => jamodio_bench::tools::configure(&results()).await,
         Some("version") => version(&args[1..]).await,
         Some("reference") => jamodio_bench::tools::set_reference(&results(), args.get(1).map(String::as_str)),
+        Some("verdict") => jamodio_bench::campaign::recompute_verdict(&results(), args.get(1).map(String::as_str)).map(|p| {
+            jamodio_bench::campaign::open_page(&p);
+        }),
         Some("conseil") => advice(&args[1..]),
         Some("importer") => import(&args[1..]),
         Some("reanalyser") => match args.get(1) {

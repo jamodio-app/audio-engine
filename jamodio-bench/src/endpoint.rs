@@ -83,8 +83,16 @@ impl Endpoint {
 
     pub async fn remote(addr: &str) -> Result<Self, String> {
         let mut client = RemoteClient::connect(addr).await?;
-        let host = client.call(&Command::Hello).await?.host.unwrap_or_else(|| "?".into());
+        let hello = client.call(&Command::Hello).await?;
+        let bench = hello.bench.unwrap_or_else(|| "ancien banc, sans version".into());
+        let host = format!("{} (banc {bench})", hello.host.unwrap_or_else(|| "?".into()));
         println!("Émetteur distant {host} ({addr}) : les flux simulés partent de là-bas.");
+        if bench != crate::campaign::bench_commit() {
+            println!(
+                "⚠ L'émetteur n'a pas le même banc que cette machine ({bench} ≠ {}) : le mettre à jour (session-bench copié depuis le même commit).",
+                crate::campaign::bench_commit()
+            );
+        }
         Ok(Self::Remote(Box::new(Remote { client, host, priority: "inconnue".into() })))
     }
 

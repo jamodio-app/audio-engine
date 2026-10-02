@@ -72,6 +72,11 @@ pub struct Reply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Version du banc de l'émetteur (commit compilé) : un émetteur resté sur
+    /// un ancien binaire se voit dans l'en-tête du résumé (01/10/2026 : la
+    /// précision « insuffisante » venait d'un émetteur non mis à jour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +149,11 @@ impl Session {
 
     fn handle(&mut self, cmd: Command) -> Result<Reply, String> {
         Ok(match cmd {
-            Command::Hello => Reply { host: Some(crate::run::machine_name()), ..Reply::default() },
+            Command::Hello => Reply {
+                host: Some(crate::run::machine_name()),
+                bench: Some(crate::campaign::bench_commit()),
+                ..Reply::default()
+            },
             Command::OpenUp { voice } => {
                 let up = Uplink::bind(&self.listen)?;
                 let id = self.id();
@@ -346,8 +355,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn le_recepteur_de_l_agent_recoit_les_flux_de_l_emetteur_distant() {
         let mut remote = RemoteClient::connect(&spawn_remote().to_string()).await.unwrap();
-        let host = remote.call(&Command::Hello).await.unwrap().host.unwrap();
-        assert!(!host.is_empty());
+        let hello = remote.call(&Command::Hello).await.unwrap();
+        assert!(!hello.host.unwrap().is_empty());
+        assert_eq!(hello.bench.as_deref(), Some(crate::campaign::bench_commit().as_str()));
         let (id, port, server_keys) = remote
             .open(&Command::OpenDown { producer_id: "bench-m2".into(), voice: false, seed: 2 })
             .await
