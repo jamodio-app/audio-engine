@@ -2602,7 +2602,10 @@ async fn audio_liveness_supervisor(
         // remonte l'erreur au browser (« règle en 48 kHz »). Drainé hors des
         // branches de reset pour couvrir tous les chemins (reset coopératif,
         // flatline, réveil de veille) d'un seul point. Locks brefs, hors thread audio.
-        if let Some(actual_sr) = { pipeline.lock().await.take_rate_drift_stop() } {
+        // Le verrou est relâché à la fin de cette instruction, AVANT la branche
+        // (qui reprend `pipeline.lock()` : le garder serait un interblocage).
+        let rate_drift_stop = pipeline.lock().await.take_rate_drift_stop();
+        if let Some(actual_sr) = rate_drift_stop {
             tracing::warn!(
                 target: "jamodio::ws",
                 actual_sr,
