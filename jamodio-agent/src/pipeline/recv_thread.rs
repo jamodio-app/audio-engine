@@ -178,7 +178,12 @@ pub(super) struct Rx<'a> {
     pub stack_delay: &'a Mutex<Histogram>,
     /// Bloc de sortie (ms), relu une fois par réveil.
     pub output_block_ms: f64,
+    /// Chantier P2 — paquets lus pendant ce réveil.
+    pub packets: u32,
 }
+
+/// Chantier P2 — au-delà, un réveil du fil de réception est découpé au journal.
+const LONG_WAKE: std::time::Duration = std::time::Duration::from_millis(2);
 
 fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxMeasures) {
     // Bande temps réel (macOS, contrainte de temps légère), MMCSS « Pro Audio »
@@ -227,7 +232,9 @@ fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxM
             m.wake_late.lock().observe(late.as_secs_f32() * 1000.0);
         }
         let output_block_ms = core.output_block_ms();
-        let mut rx = Rx { core: &mut core, buf: &mut buf, stack_delay: &m.stack_delay, output_block_ms };
+        // Chantier P2 — de quoi découper un réveil long (cf. fin de boucle).
+        let (log_before, holes_before) = core.hole_reporting();
+        let mut rx = Rx { core: &mut core, buf: &mut buf, stack_delay: &m.stack_delay, output_block_ms, packets: 0 };
 
         // 1. Les sockets prêtes, lues à tour de rôle jusqu'à être vides (attente
         //    « sur front »). En pause après des erreurs : la reprise relira (3).
@@ -239,6 +246,7 @@ fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxM
             }
         }
         read_ready(&mut ready, &mut streams, &mut rx);
+        let read_done = Instant::now();
 
         // 2. Les commandes.
         loop {
@@ -277,6 +285,7 @@ fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxM
 
         // 3. Les échéances réseau : reprises après erreur, perçages, silences.
         let now = Instant::now();
+        let commands_done = now;
         ready.clear();
         for (t, st) in streams.iter_mut() {
             if st.retry_at.is_some_and(|r| r <= now) {
@@ -298,6 +307,7 @@ fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxM
         }
 
         // 4. Le masquage, après avoir relu les sockets des flux qu'il va juger.
+        let network_done = Instant::now();
         conceal_pass(&mut ready, &mut streams, &mut rx, Instant::now);
 
         // Lot 1-D4 — le travail de ce réveil, face au contrat de calcul du fil.
@@ -305,6 +315,28 @@ fn recv_loop(mut poll: Poll, cmd_rx: Receiver<RecvCmd>, mut core: RxCore, m: RxM
         m.wake_work.lock().observe(work.as_secs_f32() * 1000.0);
         if work > AUDIO_RECV_COMPUTATION {
             m.wake_over_budget.fetch_add(1, Ordering::Relaxed);
+        }
+        // Chantier P2 (02/10/2026) — un réveil long se découpe : à quoi le fil
+        // a-t-il passé ce temps, pendant que les paquets des autres flux
+        // attendaient ? (01/10 : 9,5 ms de travail au moment de 6 trous
+        // « réception » simultanés.) Journal seulement pour ces réveils-là,
+        // rares (~70 secondes sur une journée de banc) : rien sur le chemin courant.
+        if work > LONG_WAKE {
+            let packets = rx.packets;
+            let (log_after, holes_after) = rx.core.hole_reporting();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            tracing::info!(
+                target: "jamodio::recv",
+                work_ms = ms(work),
+                read_ms = ms(read_done.saturating_duration_since(woke)),
+                commands_ms = ms(commands_done.saturating_duration_since(read_done)),
+                network_ms = ms(network_done.saturating_duration_since(commands_done)),
+                conceal_ms = ms(Instant::now().saturating_duration_since(network_done)),
+                hole_log_ms = ms(log_after.saturating_sub(log_before)),
+                packets,
+                holes = holes_after.saturating_sub(holes_before),
+                "réveil long du fil de réception — découpe (P2)"
+            );
         }
     }
 }
@@ -362,6 +394,7 @@ fn read_one(st: &mut Stream, rx: &mut Rx<'_>) -> bool {
         Ok(r) if r.len > 0 => {
             // Horodatage d'arrivée — ICI, avant tout parse (load-bearing).
             let recv_instant = Instant::now();
+            rx.packets += 1;
             // Lot 1-D2 — attente système → lecture (mesure seule).
             if let Some(d) = r.stack_delay {
                 rx.stack_delay.lock().observe(d.as_secs_f32() * 1000.0);
@@ -683,7 +716,7 @@ pub(super) mod tests {
     fn passe(b: &mut BancM0, now: Instant) {
         let mut buf = Vec::with_capacity(2048);
         let stack = Mutex::new(Histogram::new(16));
-        let mut rx = Rx { core: &mut b.core, buf: &mut buf, stack_delay: &stack, output_block_ms: 64.0 * 1000.0 / 48_000.0 };
+        let mut rx = Rx { core: &mut b.core, buf: &mut buf, stack_delay: &stack, output_block_ms: 64.0 * 1000.0 / 48_000.0, packets: 0 };
         conceal_pass(&mut Vec::new(), &mut b.streams, &mut rx, || now);
     }
 
