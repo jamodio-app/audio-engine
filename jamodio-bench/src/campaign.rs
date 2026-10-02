@@ -182,6 +182,21 @@ pub fn read_metrics(dir: &Path) -> Result<Metrics, String> {
 /// Lance la campagne de version `kind` sur cette machine.
 pub async fn version(base: &Path, kind: CampaignKind) -> Result<PathBuf, String> {
     let cfg = MachineConfig::load(base)?;
+    // Une campagne de version se mesure avec UN banc : l'émetteur distant doit
+    // être du même commit que cette machine. Le 02/10/2026, un émetteur copié
+    // mais pas relancé tournait encore l'ancien binaire — précision faussée,
+    // vue seulement après coup. Ici, on refuse de démarrer.
+    if let Some(addr) = &cfg.remote {
+        let mut emitter = crate::remote::RemoteClient::connect(addr).await?;
+        let hello = emitter.call(&crate::remote::Command::Hello).await?;
+        let theirs = hello.bench.unwrap_or_else(|| "ancien banc, sans version".into());
+        if theirs != bench_commit() {
+            return Err(format!(
+                "l'émetteur distant {addr} n'a pas le même banc que cette machine ({theirs} ≠ {}) : y copier le session-bench du même commit, puis l'arrêter (Ctrl-C) et le relancer",
+                bench_commit()
+            ));
+        }
+    }
     // Une première connexion : l'Audio Engine répond, et sa version nomme le dossier.
     let (audio_engine, os) = {
         let agent = AgentLink::connect(&Scenario::default().agent_url).await?;
