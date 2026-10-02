@@ -119,6 +119,10 @@ windows-sys = { version = "0.59", features = [
     # QueryPerformanceCounter (horloge des horodatages logiciels de Winsock).
     "Win32_System_IO",
     "Win32_System_Performance",
+    # Traces de plantage sans noms de fonctions (crash_addresses.rs) : adresses
+    # brutes de la pile + adresse de chargement de l'exécutable.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
