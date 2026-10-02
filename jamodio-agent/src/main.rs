@@ -6,6 +6,7 @@
 
 mod audio;
 mod bench_flags;
+mod crash_addresses;
 mod keep_awake;
 mod logging;
 #[cfg(target_os = "macos")]
@@ -415,11 +416,18 @@ fn main() {
                 .or_else(|| info.payload().downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<payload non-string>".to_string());
             let backtrace = std::backtrace::Backtrace::force_capture();
+            // Les binaires publiés n'ont pas de noms de fonctions : la trace
+            // ci-dessus en est privée. Adresses brutes + adresse de chargement
+            // = de quoi les retrouver avec le fichier de symboles privé de la
+            // version (cf. crash_addresses.rs).
+            let raw = crash_addresses::RawTrace::capture();
             tracing::error!(
                 target: "jamodio::panic",
                 location = %location,
                 message = %message,
                 backtrace = %backtrace,
+                image_base = %raw.as_ref().map(|r| format!("{:#x}", r.image_base)).unwrap_or_default(),
+                frames = %raw.as_ref().map(crash_addresses::RawTrace::frames_hex).unwrap_or_default(),
                 "PANIC Rust — thread en cours d'unwind"
             );
             default_hook(info);

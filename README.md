@@ -15,7 +15,7 @@ Côté UI : fenêtre Tauri minimale + tray icon + WS local `ws://localhost:9876`
 que l'app web ([jamodio.com/app](https://jamodio.com/app)) détecte pour
 basculer automatiquement du mode navigateur (WebRTC) au mode agent (RTP direct).
 
-Repo : [github.com/jamodio-app/audio-engine](https://github.com/jamodio-app/audio-engine)
+Dépôt **privé** — code confidentiel (voir [LICENSE](./LICENSE)).
 
 ---
 
@@ -85,29 +85,28 @@ sélectionné dans l'agent, pas de prompt).
 
 ## Build & release
 
-Ce dépôt est **source-available** (voir [LICENSE](./LICENSE)) : le code est
-visible pour la distribution des binaires et le fonctionnement de l'updater,
-mais n'est pas ouvert à la contribution externe. Les instructions de build
-local et le process de publication des releases sont maintenus en interne par
-Jamodio.
-
 Les releases sont produites automatiquement par GitHub Actions
 ([`release.yml`](.github/workflows/release.yml)) au push d'un tag `vX.Y.Z` :
-compilation macOS (Apple Silicon) + Windows, signature de l'updater Tauri, et
-publication des 2 installeurs sous des noms stables.
+compilation macOS (Apple Silicon) + Windows, signature de l'updater Tauri,
+installeurs sous des noms stables, fichiers de symboles privés (`.dSYM`,
+`.pdb`). La diffusion aux musiciens passe par `npm run agent:publish` (dépôt
+web), qui publie la version sur https://jamodio.com/installer. Procédure
+complète : runbook mainteneur du dépôt web.
 
 ---
 
 ## Intégration côté web
 
 Le site [jamodio.com](https://jamodio.com) propose le téléchargement de l'agent
-via les 2 URLs de release stables (elles pointent toujours sur la dernière
-version publiée) :
+via des URLs stables (toujours la dernière version définitive) :
 
 ```
-/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg
-/releases/latest/download/Jamodio-Audio-Engine-Windows.msi
+https://jamodio.com/installer/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg
+https://jamodio.com/installer/Jamodio-Audio-Engine-Windows.msi
+https://jamodio.com/installer/Jamodio-Audio-Engine-Windows-en.msi
 ```
+
+L'updater lit `https://jamodio.com/installer/latest.json`.
 
 Une fois installé, l'agent est détecté automatiquement par l'app web grâce au
 WebSocket local `ws://localhost:9876`, qui bascule le mode audio du navigateur
