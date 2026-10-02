@@ -6,10 +6,11 @@
 //! interrompue garde ce qu'elle a mesuré, sans se faire passer pour complète.
 
 use crate::driver::{AgentLink, CaptureParams, StreamParams, VoiceParams};
-use crate::report::{self, MachineRow, PeerRow, StepSummary};
+use crate::endpoint::Endpoint;
+use crate::profile::PeerProfile;
+use crate::report::{self, Event, EventKind, MachineRow, PeerRow, StreamInfo};
 use crate::scenario::Scenario;
-use crate::relay::{RelayClient, Transport};
-use crate::server::{Downlink, Kind, Payloads, SenderLoop, Uplink};
+use crate::server::{Downlink, Kind, Payloads, SenderLoop};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,13 +39,8 @@ enum End {
 pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> {
     scenario.validate()?;
 
-    println!("Préparation des trames Opus…");
-    let payloads = (Payloads::encode(220.0)?, Payloads::encode(330.0)?);
     // Avant tout fil du banc : leur promotion en dépend.
     crate::rt::set_without_mmcss(scenario.no_mmcss);
-    let mut sender = SenderLoop::start(payloads.0, payloads.1);
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut listeners = Vec::new();
 
     println!("Connexion à l'Audio Engine ({})…", scenario.agent_url);
     let mut agent = AgentLink::connect(&scenario.agent_url).await?;
@@ -63,60 +59,48 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     agent.select_devices(Some(&input), Some(&output))?;
     println!("Entrée : {input} — sortie : {output}");
 
-    // Capture instrument, envoyée au transport montant du banc.
-    let server_ip = match scenario.server_ip.as_str() {
-        "auto" => crate::scenario::primary_local_ip()?.to_string(),
-        ip => ip.to_string(),
-    };
-    let ip = server_ip.as_str();
-    println!("Faux serveur sur {ip} (cette machine)");
-    // Mode relais : l'agent joint le RELAIS (seconde machine), qui renvoie au
-    // banc ; sinon il joint directement le banc.
-    let mut relay = match scenario.relay.as_deref() {
-        Some(addr) => {
-            let r = RelayClient::connect(addr).await?;
-            println!("Relais {addr} : les flux passent par le réseau.");
-            Some(r)
+    // Où vivent les flux : sur l'émetteur distant (seconde machine), ou sur
+    // cette machine (en direct, ou à travers le relais).
+    let mut endpoint = match scenario.remote.as_deref() {
+        Some(addr) => Endpoint::remote(addr).await?,
+        None => {
+            let ip = match scenario.server_ip.as_str() {
+                "auto" => crate::scenario::primary_local_ip()?.to_string(),
+                ip => ip.to_string(),
+            };
+            println!("Faux serveur sur {ip} (cette machine) — préparation des trames Opus…");
+            Endpoint::local(ip, scenario.relay.as_deref()).await?
         }
-        None => None,
     };
-    let agent_ip = relay.as_ref().map_or(server_ip.clone(), |r| r.ip.to_string());
-    // Mode relais : nature de chaque transport, pour lire ce qu'il mesure.
-    let mut relay_roles: HashMap<std::net::SocketAddr, Transport> = HashMap::new();
-    let up_instrument = Uplink::bind(ip)?;
-    let up_port = agent_port(&mut relay, &mut relay_roles, Transport::UpInstrument, ip, up_instrument.port()).await?;
+    let agent_ip = endpoint.agent_ip();
+
+    // Capture instrument, envoyée au transport montant du banc.
+    let up = endpoint.open_uplink(false).await?;
     let keys = agent
         .start_capture(&CaptureParams {
             ssrc: 0x4A4D_0001,
             server_ip: &agent_ip,
-            server_port: up_port,
+            server_port: up.port,
             input_device: Some(&input),
             channel_index: scenario.channel_index,
-            server_keys: &up_instrument.server_keys,
+            server_keys: &up.keys,
         })
         .await?;
-    up_instrument.set_agent_keys(&keys)?;
-    listeners.push(spawn_listen(up_instrument.clone(), stop.clone()));
+    endpoint.uplink_keys(up.id, &keys).await?;
 
-    let up_voice = match scenario.send_voice_channel {
-        Some(channel) => {
-            let up = Uplink::bind(ip)?;
-            let port = agent_port(&mut relay, &mut relay_roles, Transport::UpVoice, ip, up.port()).await?;
-            let keys = agent
-                .start_voice(&VoiceParams {
-                    ssrc: 0x4A4D_0002,
-                    server_ip: &agent_ip,
-                    server_port: port,
-                    channel_index: channel,
-                    server_keys: &up.server_keys,
-                })
-                .await?;
-            up.set_agent_keys(&keys)?;
-            listeners.push(spawn_listen(up.clone(), stop.clone()));
-            Some(up)
-        }
-        None => None,
-    };
+    if let Some(channel) = scenario.send_voice_channel {
+        let up = endpoint.open_uplink(true).await?;
+        let keys = agent
+            .start_voice(&VoiceParams {
+                ssrc: 0x4A4D_0002,
+                server_ip: &agent_ip,
+                server_port: up.port,
+                channel_index: channel,
+                server_keys: &up.keys,
+            })
+            .await?;
+        endpoint.uplink_keys(up.id, &keys).await?;
+    }
 
     // Plugin inséré : la charge réelle du musicien, dans l'Audio Engine.
     // Chargé en DERNIER avant la campagne : toute erreur de préparation qui
@@ -151,12 +135,21 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
 
     let t0 = Instant::now();
-    let mut names: HashMap<String, (String, bool)> = HashMap::new();
+    let mut streams: HashMap<String, StreamInfo> = HashMap::new();
+    // Transport de chaque flux, pour couper ceux d'un musicien qui part.
+    let mut links: HashMap<String, u32> = HashMap::new();
     let mut producers: Vec<String> = Vec::new();
     let mut peer_rows: Vec<PeerRow> = Vec::new();
     let mut machine_rows: Vec<MachineRow> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
+    // Instant d'arrivée de chaque musicien (s de campagne) : ses changements de
+    // lien et ses absences se comptent depuis là.
+    let mut arrivals: HashMap<u32, f64> = HashMap::new();
+    // Départs et retours à venir : (instant en s de campagne, musicien, départ ?).
+    let mut pending: Vec<(f64, u32, bool)> = Vec::new();
     let mut warned_no_holes = false;
+    let ctx = StreamCtx { scenario: &scenario, agent_ip: &agent_ip };
 
     // La campagne dans un bloc : une erreur du banc (`?`) en sort sans sauter
     // la sortie propre qui suit — flux retirés, plugin rendu, capture arrêtée.
@@ -166,49 +159,79 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
             // Musiciens à ajouter pour atteindre ce palier (tous au premier).
             let first_new = if musicians == scenario.from_musicians { 2 } else { musicians };
             for m in first_new..=musicians {
-                let profile = scenario.peer(m).clone();
-                let mut kinds = vec![Kind::Instrument];
-                if profile.voice.is_some() {
-                    kinds.push(Kind::Voice);
+                let arrival = t0.elapsed().as_secs_f64();
+                arrivals.insert(m, arrival);
+                let profile = scenario.peer(m);
+                for a in &profile.absences {
+                    pending.push((arrival + a.at_s, m, true));
+                    pending.push((arrival + a.at_s + a.for_s, m, false));
                 }
-                for kind in kinds {
-                    let voice = kind == Kind::Voice;
-                    let pid = format!("bench-m{m}{}", if voice { "-voix" } else { "" });
-                    let link = Downlink::bind(ip, pid.clone(), kind, scenario.seed.wrapping_add(u64::from(m)))?;
-                    let role = if voice { Transport::DownVoice } else { Transport::DownInstrument };
-                    let port = agent_port(&mut relay, &mut relay_roles, role, ip, link.port()).await?;
-                    let keys = agent
-                        .add_stream(&StreamParams {
-                            producer_id: &pid,
-                            peer_id: &format!("bench-{m}"),
-                            server_ip: &agent_ip,
-                            server_port: port,
-                            voice,
-                            server_keys: &link.server_keys,
-                        })
-                        .await?;
-                    link.set_agent_keys(&keys)?;
-                    sender.add(link, &profile, scenario.seed.wrapping_add(u64::from(m)));
-                    names.insert(pid.clone(), (format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }), voice));
+                events.extend(crate::analysis::musician_events(profile, m, arrival));
+                let pids = ctx.add_musician(&mut agent, &mut endpoint, m, 0, 0).await?;
+                for (pid, info, id) in pids {
+                    streams.insert(pid.clone(), info);
+                    links.insert(pid.clone(), id);
                     producers.push(pid);
                 }
             }
+            pending.sort_by(|a, b| a.0.total_cmp(&b.0));
             let start_s = t0.elapsed().as_secs_f64();
             steps.push(Step { musicians, start_s, end_s: start_s });
             println!("── {musicians} musiciens ({} flux reçus)", producers.len());
 
             let step_end = Instant::now() + Duration::from_secs(scenario.step_secs);
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.tick().await;
+            let mut next_sample = Instant::now() + Duration::from_secs(1);
             while Instant::now() < step_end {
-                tick.tick().await;
+                // Départs et retours à leur heure, entre deux relevés.
+                let next_event = pending.first().map(|(t, _, _)| t0 + Duration::from_secs_f64(*t));
+                let wake = next_event.map_or(next_sample, |e| e.min(next_sample));
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+                while pending.first().is_some_and(|(t, _, _)| t0 + Duration::from_secs_f64(*t) <= Instant::now()) {
+                    let (t, m, leaving) = pending.remove(0);
+                    let mine: Vec<String> = streams.iter().filter(|(_, i)| i.musician == m).map(|(p, _)| p.clone()).collect();
+                    if leaving {
+                        for pid in &mine {
+                            agent.remove_stream(pid)?;
+                            if let Some(id) = links.remove(pid) {
+                                endpoint.retire(id).await?;
+                            }
+                            streams.remove(pid);
+                            producers.retain(|p| p != pid);
+                        }
+                        println!("   m{m} part ({:.0} s)", t);
+                    } else {
+                        // Un retour = un nouveau flux (nouvel identifiant, numérotation
+                        // à zéro), placé dans la frise du musicien à l'heure prévue.
+                        let returns = events
+                            .iter()
+                            .filter(|e| e.musician == m && e.t_s < t && matches!(e.kind, EventKind::Absence { .. }))
+                            .count() as u64;
+                        let offset_us = ((t - arrivals[&m]) * 1e6).round() as u64;
+                        let pids = ctx.add_musician(&mut agent, &mut endpoint, m, returns, offset_us).await?;
+                        for (pid, info, id) in pids {
+                            streams.insert(pid.clone(), info);
+                            links.insert(pid.clone(), id);
+                            producers.push(pid);
+                        }
+                        println!("   m{m} revient ({:.0} s)", t);
+                    }
+                }
+                if Instant::now() < next_sample {
+                    continue;
+                }
+                next_sample += Duration::from_secs(1);
                 let t = t0.elapsed().as_secs_f64();
+                // Lien en vigueur pour chaque flux cette seconde-là.
+                for info in streams.values_mut() {
+                    let since = t - arrivals.get(&info.musician).copied().unwrap_or(0.0);
+                    info.link = scenario.peer(info.musician).link_name_at(since).to_string();
+                }
                 let mut last_perf: Option<Value> = None;
                 while let Ok(p) = agent.perf.try_recv() {
                     last_perf = Some(p);
                 }
                 if let Some(p) = &last_perf {
-                    let rows = report::peer_rows(p, t, musicians, &names);
+                    let rows = report::peer_rows(p, t, musicians, &streams);
                     if !warned_no_holes && rows.iter().any(|r| r.get("holesArrival").is_nan()) {
                         // Le numéro de version ne suffit pas à le savoir (la 0.6.6-2
                         // est plus récente que la -1 sans en avoir les mesures).
@@ -217,26 +240,8 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
                     }
                     peer_rows.extend(rows);
                 }
-                let relay_window = match relay.as_mut() {
-                    Some(r) => {
-                        let st = r.stats().await?;
-                        Some(report::RelayWindow {
-                            delay_p99_ms: f64::from(st.delay_p99_us) / 1000.0,
-                            delay_max_ms: f64::from(st.delay_max_us) / 1000.0,
-                            arrivals: report::relay_arrivals(&st.ports, &relay_roles),
-                        })
-                    }
-                    None => None,
-                };
-                let row = report::machine_row(
-                    last_perf.as_ref(),
-                    t,
-                    musicians,
-                    &sender.take_window(),
-                    up_instrument.take_window(),
-                    up_voice.as_ref().map(|u| u.take_window()),
-                    relay_window,
-                );
+                let w = endpoint.windows().await?;
+                let row = report::machine_row(last_perf.as_ref(), t, musicians, &w.sender, w.up_instrument, w.up_voice, w.relay);
                 progress(musicians, t - start_s, &row, &peer_rows);
                 machine_rows.push(row);
                 if let Some(last) = steps.last_mut() {
@@ -275,41 +280,47 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
     let _ = agent.stop();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    stop.store(true, Ordering::Relaxed);
-    for l in listeners {
-        let _ = l.join();
-    }
+    let priority = endpoint.priority();
+    let remote_host = match &endpoint {
+        Endpoint::Remote(r) => Some(r.host.clone()),
+        Endpoint::Local(_) => None,
+    };
+    endpoint.shutdown();
 
-    // Résumé : seuls les paliers mesurés au-delà de leur installation.
-    let summaries: Vec<StepSummary> = steps
-        .iter()
-        .filter(|s| s.end_s - s.start_s > scenario.warmup_secs as f64)
-        .map(|s| report::summarize(&peer_rows, &machine_rows, s.musicians, s.start_s + scenario.warmup_secs as f64, s.end_s))
-        .collect();
-    let criteria = report::criteria(&summaries, scenario.is_regular(), scenario.send_voice_channel.is_some());
+    // Résumé : la même analyse que celle d'un échantillon relu plus tard.
+    let raw_steps: Vec<(u32, f64, f64)> = steps.iter().map(|s| (s.musicians, s.start_s, s.end_s)).collect();
+    let analysis = crate::analysis::analyze(&scenario, &peer_rows, &machine_rows, &raw_steps, &events);
+    let clock_offset = analysis.clock_offset_ppm;
     let status = match &end {
         End::Complete => "complète".to_string(),
         End::Interrupted => "INTERROMPUE (Ctrl-C) — paliers partiels".to_string(),
         End::AgentError(e) => format!("ARRÊTÉE PAR L'AUDIO ENGINE : {e}"),
         End::BenchError(e) => format!("ARRÊTÉE PAR UNE ERREUR DU BANC : {e}"),
     };
-    let (precision, _) = report::precision(&machine_rows.iter().map(|r| r.sender_late_max_ms).collect::<Vec<_>>());
-    let priority = match sender.priority.get() {
-        Some(Ok(p)) => p.to_string(),
-        Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
-        None => "inconnue".into(),
-    };
-    let relay_precision = match &scenario.relay {
-        Some(addr) => {
+    let precision = analysis.precision_text.clone();
+    let relay_precision = match (&scenario.relay, &scenario.remote) {
+        (Some(addr), _) => {
             let (p, _) = report::precision(&machine_rows.iter().map(|r| r.relay_delay_max_ms).collect::<Vec<_>>());
             format!("{addr} — {p}")
         }
-        None => "aucun (mode local)".into(),
+        (None, Some(_)) => "aucun (émetteur distant)".into(),
+        (None, None) => "aucun (mode local)".into(),
     };
+
     let header = vec![
         ("Campagne".to_string(), status),
         ("Précision du banc".to_string(), precision),
         ("Relais (réseau)".to_string(), relay_precision),
+        (
+            "Émetteur distant".to_string(),
+            match (&scenario.remote, &remote_host) {
+                (Some(addr), Some(host)) => format!(
+                    "{host} ({addr}) — les flux simulés partent de là-bas ; la précision ci-dessus y est mesurée ; écart d'horloge estimé {}",
+                    if clock_offset.is_finite() { format!("{clock_offset:+.1} ppm (retiré avant de comparer les dérives)") } else { "inconnu".into() }
+                ),
+                _ => "aucun".into(),
+            },
+        ),
         ("Priorité des fils du banc".to_string(), priority),
         ("Freinage réseau Windows (registre)".to_string(), crate::rt::multimedia_profile()),
         ("Scénario".to_string(), scenario.name.clone()),
@@ -320,14 +331,20 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
             "Mode".to_string(),
             format!(
                 "{}, {}",
-                if scenario.relay.is_some() { "réseau (relais)" } else { "local" },
+                match (&scenario.relay, &scenario.remote) {
+                    (Some(_), _) => "réseau (relais)",
+                    (None, Some(_)) => "réseau (émetteur distant)",
+                    (None, None) => "local",
+                },
                 if scenario.is_regular() {
                     "flux réguliers".to_string()
                 } else {
-                    format!("gigue/pertes simulées ; profils : {}", profile_list(&scenario))
+                    format!("réseau simulé (cf. « Réseau simulé ») ; profils : {}", profile_list(&scenario))
                 }
             ),
         ),
+        ("Réseau simulé".to_string(), network_line(&scenario)),
+        ("Origine des liens".to_string(), origin_line(&scenario)),
         ("Plugin inséré".to_string(), plugin_line),
         ("Talkback envoyé".to_string(), scenario.send_voice_channel.map_or("non".into(), |c| format!("canal {}", c + 1))),
         ("Fichiers".to_string(), "peers.csv (flux, 1 ligne/s), machine.csv (machine et faux serveur), scenario.json".into()),
@@ -339,8 +356,9 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     write(out_dir, "peers.csv", &report::peers_csv(&peer_rows))?;
     write(out_dir, "machine.csv", &report::machine_csv(&machine_rows))?;
     write(out_dir, "scenario.json", &serde_json::to_string_pretty(&scenario).map_err(|e| e.to_string())?)?;
-    drop(sender);
-    let summary = report::markdown(&header, &summaries, &criteria);
+    let metrics = crate::analysis::Metrics::from_analysis(&scenario, &analysis, matches!(end, End::Complete));
+    write(out_dir, "metrics.json", &serde_json::to_string_pretty(&metrics).map_err(|e| e.to_string())?)?;
+    let summary = report::markdown(&header, &analysis.summaries, &analysis.musicians, &analysis.events, &analysis.criteria);
     let path = out_dir.join("resume.md");
     write(out_dir, "resume.md", &summary)?;
     println!("\n{summary}");
@@ -351,41 +369,32 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
 }
 
-/// Le port que l'agent doit joindre pour ce transport du banc : celui du relais
-/// en mode réseau, le sien sinon.
-async fn agent_port(
-    relay: &mut Option<RelayClient>,
-    roles: &mut HashMap<std::net::SocketAddr, Transport>,
-    role: Transport,
-    bind_ip: &str,
-    bench_port: u16,
-) -> Result<u16, String> {
-    match relay {
-        Some(r) => {
-            let bench: std::net::SocketAddr = format!("{bind_ip}:{bench_port}").parse().map_err(|e| format!("{e}"))?;
-            roles.insert(bench, role);
-            r.open(bench).await
-        }
-        None => Ok(bench_port),
-    }
-}
-
-fn spawn_listen(up: Arc<Uplink>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || up.listen(stop))
-}
-
-/// Le périphérique demandé, s'il figure EXACTEMENT dans la liste de l'agent
-/// (format strict `idx:nom`), sinon celui par défaut. Aucun défaut, ou un
-/// identifiant inconnu → erreur qui cite les identifiants valides : pas de
-/// choix au hasard, et pas d'aller-retour avec l'agent pour un identifiant faux
-/// (NUC, 28/09 : « 1 » au lieu de « 1:UMC ASIO Driver »).
+/// Le périphérique demandé, au format strict `idx:nom`, sinon celui par
+/// défaut. Même règle que l'agent (`audio/device.rs::locate`) et le studio :
+/// l'index glisse au branchement d'une carte (01/10/2026 : la Focusrite
+/// branchée, le micro interne passe de `0:` à `1:`) — si l'identifiant exact
+/// n'existe plus, on retrouve le périphérique par son nom EXACT et UNIQUE ;
+/// absent → perdu, homonymes → refus. Jamais d'à-peu-près, et le glissement
+/// est dit à l'écran.
 fn pick_device(list: &Value, wanted: Option<&str>, what: &str) -> Result<String, String> {
+    let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
     if let Some(w) = wanted {
-        let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
         if ids.contains(&w) {
             return Ok(w.to_string());
         }
-        return Err(format!("{what} « {w} » inconnue. Identifiants exacts : {}", ids.join(" | ")));
+        let name = w.split_once(':').map(|(_, n)| n).filter(|n| !n.is_empty());
+        let same: Vec<&str> = match name {
+            Some(n) => ids.iter().copied().filter(|id| id.split_once(':').is_some_and(|(_, m)| m == n)).collect(),
+            None => Vec::new(),
+        };
+        return match same.as_slice() {
+            [one] => {
+                println!("{what} « {w} » : index glissé, retrouvée par son nom exact → « {one} »");
+                Ok(one.to_string())
+            }
+            [] => Err(format!("{what} « {w} » introuvable (débranchée ?). Identifiants exacts : {}", ids.join(" | "))),
+            _ => Err(format!("{what} « {w} » : plusieurs périphériques portent ce nom ({}) — préciser l'identifiant", same.join(" | "))),
+        };
     }
     list.as_array()
         .and_then(|l| l.iter().find(|d| d["isDefault"].as_bool() == Some(true)))
@@ -411,12 +420,107 @@ fn pick_plugin(items: &[Value], name: &str) -> Result<Value, String> {
     }
 }
 
+/// Ce qu'il faut pour ajouter les flux d'un musicien.
+struct StreamCtx<'a> {
+    scenario: &'a Scenario,
+    /// Adresse que l'agent doit joindre (banc, relais ou émetteur distant).
+    agent_ip: &'a str,
+}
+
+impl StreamCtx<'_> {
+    /// Ajoute les flux du musicien `m` (instrument, et voix s'il parle) :
+    /// transport, `add-stream`, clés, calendrier. `rejoin` : 0 à l'arrivée, k au
+    /// k-ième retour (identifiant neuf, comme un vrai musicien qui revient) ;
+    /// `offset_us` : sa place dans la frise du musicien. Rend, par flux, son
+    /// identifiant d'agent, ce que le banc en sait et son transport.
+    async fn add_musician(
+        &self,
+        agent: &mut AgentLink,
+        endpoint: &mut Endpoint,
+        m: u32,
+        rejoin: u64,
+        offset_us: u64,
+    ) -> Result<Vec<(String, StreamInfo, u32)>, String> {
+        let profile: &PeerProfile = self.scenario.peer(m);
+        let seed = self.scenario.seed.wrapping_add(u64::from(m));
+        let mut out = Vec::new();
+        for voice in [false, true] {
+            if voice && profile.voice.is_none() {
+                continue;
+            }
+            let suffix = if rejoin == 0 { String::new() } else { format!("-r{rejoin}") };
+            let pid = format!("bench-m{m}{}{suffix}", if voice { "-voix" } else { "" });
+            let down = endpoint.open_downlink(&pid, voice, seed.wrapping_add(rejoin)).await?;
+            let keys = agent
+                .add_stream(&StreamParams {
+                    producer_id: &pid,
+                    peer_id: &format!("bench-{m}{suffix}"),
+                    server_ip: self.agent_ip,
+                    server_port: down.port,
+                    voice,
+                    server_keys: &down.keys,
+                })
+                .await?;
+            endpoint.start_downlink(down.id, &keys, profile, seed, offset_us).await?;
+            let info = StreamInfo {
+                name: format!("m{m}-{}{}", profile.name, if voice { "-voix" } else { "" }),
+                voice,
+                musician: m,
+                link: profile.link_name_at(offset_us as f64 / 1e6).to_string(),
+                sim_ppm: profile.drift_ppm,
+            };
+            out.push((pid, info, down.id));
+        }
+        Ok(out)
+    }
+}
+
+/// Le réseau de chaque musicien simulé, en une ligne : « m2 ethernet −80 ppm ;
+/// m3 fibre +60 ppm, → wifi-charge à 300 s ; m5 absent 20 s à 330 s… ».
+fn network_line(s: &Scenario) -> String {
+    if s.is_regular() {
+        return "aucun (flux parfaitement réguliers)".into();
+    }
+    (2..=s.to_musicians)
+        .map(|m| {
+            let p = s.peer(m);
+            let mut line = format!("m{m} {}", p.name);
+            if p.drift_ppm != 0.0 {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(" {:+.0} ppm", p.drift_ppm));
+            }
+            for c in &p.changes {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(", → {} à {:.0} s", c.link.name, c.at_s));
+            }
+            for a in &p.absences {
+                let _ = std::fmt::Write::write_fmt(&mut line, format_args!(", absent {:.0} s à {:.0} s", a.for_s, a.at_s));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+/// D'où viennent les liens utilisés : un lien inventé ne passe pas pour une
+/// mesure.
+fn origin_line(s: &Scenario) -> String {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for p in &s.peers {
+        for (_, l) in p.timeline() {
+            let origin = l.origin.clone().unwrap_or_else(|| "non précisée".into());
+            if !seen.iter().any(|(n, _)| *n == l.name) {
+                seen.push((l.name.clone(), origin));
+            }
+        }
+    }
+    seen.iter().map(|(n, o)| format!("{n} : {o}")).collect::<Vec<_>>().join(" ; ")
+}
+
 fn profile_list(s: &Scenario) -> String {
     s.peers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 /// Nom de la machine (`hostname` existe sous macOS comme sous Windows).
-fn machine_name() -> String {
+pub fn machine_name() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -456,6 +560,15 @@ fn progress(musicians: u32, t_step: f64, m: &MachineRow, peers: &[PeerRow]) {
     );
 }
 
+/// Priorité obtenue par le fil d'envoi du banc, en toutes lettres.
+pub fn priority_label(sender: &SenderLoop) -> String {
+    match sender.priority.get() {
+        Some(Ok(p)) => p.to_string(),
+        Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
+        None => "inconnue".into(),
+    }
+}
+
 /// Mesure la précision du BANC SEUL, sans Audio Engine : `streams` flux
 /// réguliers envoyés sur la machine à des récepteurs du banc, pendant `secs`
 /// secondes. À lancer avant une campagne : si le banc n'est pas assez précis
@@ -479,7 +592,7 @@ pub fn selftest(streams: u32, secs: u64) -> Result<bool, String> {
         punch[0] = 0x80;
         punch[1] = crate::server::PAYLOAD_TYPE;
         rx.send_to(&punch, ("127.0.0.1", link.port())).map_err(|e| e.to_string())?;
-        sender.add(link, &PeerProfile::preset("regular").expect("préréglage"), u64::from(i));
+        sender.add(link, &PeerProfile::preset("regular").expect("préréglage"), u64::from(i), 0);
         let (stop, gaps) = (stop.clone(), gaps.clone());
         receivers.push(std::thread::spawn(move || {
             let _ = crate::rt::promote_current_thread();
@@ -513,11 +626,7 @@ pub fn selftest(streams: u32, secs: u64) -> Result<bool, String> {
     for r in receivers {
         let _ = r.join();
     }
-    let priority = match sender.priority.get() {
-        Some(Ok(p)) => p.to_string(),
-        Some(Err(e)) => format!("NORMALE — promotion refusée : {e}"),
-        None => "inconnue".into(),
-    };
+    let priority = priority_label(&sender);
     let (verdict, ok) = report::precision(&maxima);
     let worst_gap = gaps.lock().unwrap().iter().copied().fold(0.0, f64::max);
     println!("\nPriorité des fils du banc : {priority}");
@@ -548,7 +657,23 @@ mod tests {
         assert_eq!(pick_device(&l, None, "entrée").unwrap(), "1:UMC ASIO Driver");
         assert_eq!(pick_device(&l, Some("0:ASIO4ALL v2"), "entrée").unwrap(), "0:ASIO4ALL v2");
         let e = pick_device(&l, Some("1"), "entrée").unwrap_err();
-        assert!(e.contains("« 1 » inconnue") && e.contains("1:UMC ASIO Driver"), "{e}");
+        assert!(e.contains("« 1 » introuvable") && e.contains("1:UMC ASIO Driver"), "{e}");
+    }
+
+    /// L'index glisse au branchement d'une carte : retrouvé par son nom exact
+    /// et unique ; absent ou homonyme → refus, jamais d'à-peu-près.
+    #[test]
+    fn un_index_glisse_se_retrouve_par_le_nom_exact_et_unique() {
+        let l = json!([
+            { "id": "0:Scarlett Solo 4th Gen", "isDefault": false },
+            { "id": "1:Microphone MacBook Pro", "isDefault": true },
+            { "id": "2:Teams", "isDefault": false },
+            { "id": "3:Teams", "isDefault": false },
+        ]);
+        assert_eq!(pick_device(&l, Some("0:Microphone MacBook Pro"), "entrée").unwrap(), "1:Microphone MacBook Pro");
+        assert!(pick_device(&l, Some("0:Microphone"), "entrée").unwrap_err().contains("introuvable"), "nom partiel refusé");
+        assert!(pick_device(&l, Some("5:Teams"), "entrée").unwrap_err().contains("plusieurs"));
+        assert!(pick_device(&l, Some("4:UMC"), "entrée").unwrap_err().contains("débranchée"));
     }
 
     #[test]

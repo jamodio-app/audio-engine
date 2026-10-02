@@ -5,7 +5,7 @@
 //! produire ce fichier pour lancer un test précis. Le scénario complet est
 //! recopié en tête des résultats — on sait toujours ce qui a tourné.
 
-use crate::profile::{PeerProfile, Speech};
+use crate::profile::PeerProfile;
 use serde::{Deserialize, Serialize};
 
 /// Borne haute du nombre de musiciens : au-delà, le banc n'a pas été pensé
@@ -62,6 +62,12 @@ pub struct Scenario {
     /// vrai réseau et la carte réseau de la machine mesurée. `None` = local.
     #[serde(default)]
     pub relay: Option<String>,
+    /// Émetteur distant `IP:PORT` (`session-bench remote` sur une SECONDE
+    /// machine, lot R1-bis) : les flux simulés y sont fabriqués et envoyés, et
+    /// ce que l'agent envoie y est reçu. La précision du banc ne dépend plus de
+    /// la machine mesurée. `None` = flux fabriqués ici.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     /// Windows : les fils du banc prennent la priorité de fil la plus haute
     /// (`THREAD_PRIORITY_TIME_CRITICAL`) au lieu de MMCSS « Pro Audio ». Pendant
     /// de l'interrupteur `no-mmcss` de l'Audio Engine (Lot W1,
@@ -89,6 +95,7 @@ impl Default for Scenario {
             server_ip: "auto".into(),
             agent_url: "ws://127.0.0.1:9876".into(),
             relay: None,
+            remote: None,
             no_mmcss: false,
         }
     }
@@ -125,22 +132,40 @@ impl Scenario {
             r.parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("relay « {r} » : {e} (attendu IP:PORT)"))?;
         }
+        if let Some(r) = &self.remote {
+            if self.relay.is_some() {
+                return Err("relais ou émetteur distant, pas les deux (l'émetteur distant fait déjà passer les flux par le réseau)".into());
+            }
+            let addr = r
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("remote « {r} » : {e} (attendu IP:PORT)"))?;
+            if addr.ip().is_loopback() || addr.ip().is_unspecified() {
+                return Err(format!("remote {addr} : l'Audio Engine refuse le bouclage — l'adresse réseau de la seconde machine"));
+            }
+        }
         if self.peers.is_empty() {
             return Err("au moins un profil de musicien".into());
         }
         for p in &self.peers {
-            if !(0.0..=100.0).contains(&p.loss_pct) {
-                return Err(format!("{} : perte hors de 0-100 %", p.name));
+            p.validate()?;
+        }
+        // Chaque événement doit tomber dans la campagne, pour CHAQUE musicien qui
+        // porte ce profil (les profils se réutilisent en boucle) : un événement
+        // qui ne se produirait jamais serait une promesse silencieusement non tenue.
+        let total = self.total_secs() as f64;
+        for m in 2..=self.to_musicians {
+            let (p, left) = (self.peer(m), total - self.arrival_s(m));
+            if let Some(c) = p.changes.iter().find(|c| c.at_s >= left) {
+                return Err(format!(
+                    "musicien {m} ({}) : changement de lien à {} s après son arrivée, mais il ne reste que {left} s de campagne",
+                    p.name, c.at_s
+                ));
             }
-            if let crate::profile::Jitter::Exponential { mean_ms } = p.jitter {
-                if !(mean_ms > 0.0 && mean_ms <= 100.0) {
-                    return Err(format!("{} : gigue moyenne hors de ]0, 100] ms", p.name));
-                }
-            }
-            if let Some(Speech::Bursts { talk_mean_s, silence_mean_s }) = p.voice {
-                if !(talk_mean_s > 0.0 && silence_mean_s > 0.0) {
-                    return Err(format!("{} : durées de parole/silence > 0", p.name));
-                }
+            if let Some(a) = p.absences.iter().find(|a| a.at_s + a.for_s >= left) {
+                return Err(format!(
+                    "musicien {m} ({}) : absence de {} s à {} s après son arrivée, mais il ne reste que {left} s de campagne (il doit revenir avant la fin)",
+                    p.name, a.for_s, a.at_s
+                ));
             }
         }
         Ok(())
@@ -151,13 +176,53 @@ impl Scenario {
         &self.peers[(musician as usize - 2) % self.peers.len()]
     }
 
-    /// Flux simulés sans gigue ni perte. Les causes réception, décodage et
+    /// Instant d'arrivée du musicien `musician` dans la campagne (s) : tous au
+    /// premier palier, puis un par palier.
+    pub fn arrival_s(&self, musician: u32) -> f64 {
+        (u64::from(musician.saturating_sub(self.from_musicians)) * self.step_secs) as f64
+    }
+
+    /// Flux simulés parfaitement réguliers : ni gigue, ni perte, ni pic, ni
+    /// désordre, ni dérive, ni événement. Les causes réception, décodage et
     /// consommation sont locales par définition, en mode local comme à travers
     /// le relais : le critère 1 peut juger dès que les flux sont réguliers.
     pub fn is_regular(&self) -> bool {
-        self.peers
-            .iter()
-            .all(|p| p.jitter == crate::profile::Jitter::None && p.loss_pct == 0.0)
+        self.peers.iter().all(PeerProfile::is_regular)
+    }
+
+    /// Seule la dérive est simulée (liens réguliers, aucun événement) : tout trou
+    /// vient alors de la dérive ou de la machine (critère 7).
+    pub fn is_drift_only(&self) -> bool {
+        self.peers.iter().any(|p| p.drift_ppm != 0.0)
+            && self
+                .peers
+                .iter()
+                .all(|p| p.link().is_regular() && p.changes.is_empty() && p.absences.is_empty())
+    }
+
+    /// Empreinte de ce qui décide des paquets envoyés et de la charge : liens,
+    /// graine, paliers, talkback, plugin. Les réglages propres à la machine
+    /// (périphériques, adresses, mode réseau) en sont exclus : deux machines
+    /// lançant le même scénario ont la même empreinte. Une empreinte qui change
+    /// (préréglage recalibré en R2…) interdit de comparer à une référence
+    /// d'avant : on ne compare pas des pommes et des poires.
+    pub fn fingerprint(&self) -> String {
+        let mut s = self.clone();
+        s.input_device = None;
+        s.output_device = None;
+        s.channel_index = None;
+        s.agent_url = String::new();
+        s.server_ip = String::new();
+        s.relay = None;
+        s.remote = None;
+        s.no_mmcss = false;
+        let json = serde_json::to_string(&s).expect("un scénario se sérialise");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in json.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        format!("{h:016x}")
     }
 
     /// Durée totale de la campagne.
@@ -184,6 +249,7 @@ pub fn primary_local_ip() -> Result<std::net::IpAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{Absence, Change, Link, Speech};
 
     #[test]
     fn le_scenario_par_defaut_monte_de_2_a_9_et_se_valide() {
@@ -192,6 +258,19 @@ mod tests {
         assert_eq!((s.from_musicians, s.to_musicians), (2, 9));
         assert!(s.is_regular());
         assert_eq!(s.total_secs(), 8 * 300);
+    }
+
+    /// Un scénario écrit avant R1 (sortie de `session-bench scenario` modifiée,
+    /// telle quelle) se relit, et ses musiciens sont ceux d'alors.
+    #[test]
+    fn un_scenario_d_avant_r1_se_relit_tel_quel() {
+        let json = r#"{"name":"montee-2-a-9","from_musicians":2,"to_musicians":9,"step_secs":300,"warmup_secs":30,"peers":[{"name":"ethernet","jitter":{"model":"exponential","mean_ms":0.7},"loss_pct":1.0,"voice":null},{"name":"wifi","jitter":{"model":"exponential","mean_ms":5.5},"loss_pct":0.0,"voice":{"model":"always"}}],"send_voice_channel":1,"input_device":null,"output_device":null,"channel_index":null,"plugin":null,"seed":1,"server_ip":"auto","agent_url":"ws://127.0.0.1:9876","relay":null,"no_mmcss":false}"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        s.validate().unwrap();
+        let eth = s.peer(2);
+        assert_eq!((eth.name.as_str(), eth.loss_pct, eth.drift_ppm), ("ethernet", 1.0, 0.0));
+        assert!(eth.changes.is_empty() && eth.absences.is_empty() && eth.burst_loss.is_none());
+        assert_eq!(s.peer(3).voice, Some(Speech::Always));
     }
 
     #[test]
@@ -226,6 +305,9 @@ mod tests {
             Scenario { server_ip: "127.0.0.1".into(), ..Scenario::default() },
             Scenario { server_ip: "pas-une-ip".into(), ..Scenario::default() },
             Scenario { relay: Some("10.0.0.2".into()), ..Scenario::default() },
+            Scenario { remote: Some("10.0.0.2".into()), ..Scenario::default() },
+            Scenario { remote: Some("127.0.0.1:51901".into()), ..Scenario::default() },
+            Scenario { remote: Some("10.0.0.2:51901".into()), relay: Some("10.0.0.3:51900".into()), ..Scenario::default() },
             Scenario {
                 peers: vec![PeerProfile { loss_pct: 150.0, ..PeerProfile::preset("regular").unwrap() }],
                 ..Scenario::default()
@@ -234,6 +316,56 @@ mod tests {
         for s in bad {
             assert!(s.validate().is_err(), "{s:?}");
         }
+    }
+
+    /// Un événement qui tomberait après la fin de la campagne est refusé, pour
+    /// chaque musicien qui porte le profil (le dernier arrive le plus tard).
+    #[test]
+    fn un_evenement_hors_de_la_campagne_est_refuse() {
+        let late = PeerProfile {
+            absences: vec![Absence { at_s: 280.0, for_s: 30.0 }],
+            ..PeerProfile::preset("regular").unwrap()
+        };
+        // Montée 2 → 3, paliers de 300 s : m2 arrive à 0 s (600 s devant lui,
+        // retour à 310 s : possible), m3 à 300 s (300 s devant lui : il ne
+        // reviendrait qu'après la fin).
+        let s = Scenario { to_musicians: 3, peers: vec![late.clone()], ..Scenario::default() };
+        assert!(s.validate().unwrap_err().contains("musicien 3"));
+        let ok = Scenario { from_musicians: 3, to_musicians: 3, step_secs: 400, peers: vec![late], ..Scenario::default() };
+        ok.validate().unwrap();
+        assert_eq!(ok.arrival_s(3), 0.0);
+        let change = PeerProfile {
+            changes: vec![Change { at_s: 400.0, link: Link::preset("wifi").unwrap() }],
+            ..PeerProfile::preset("regular").unwrap()
+        };
+        let s = Scenario { from_musicians: 9, peers: vec![change], ..Scenario::default() };
+        assert!(s.validate().unwrap_err().contains("changement de lien"));
+    }
+
+    #[test]
+    fn l_empreinte_ignore_la_machine_mais_pas_le_reseau_simule() {
+        let base = crate::library::named("9-reseaux-mixtes").unwrap();
+        let ailleurs = Scenario {
+            input_device: Some("1:UMC ASIO Driver".into()),
+            remote: Some("192.168.1.20:51901".into()),
+            ..base.clone()
+        };
+        assert_eq!(base.fingerprint(), ailleurs.fingerprint(), "même scénario, autre machine");
+        let mut recalibre = base.clone();
+        recalibre.peers[1].loss_pct = 0.03;
+        assert_ne!(base.fingerprint(), recalibre.fingerprint(), "un lien recalibré change l'empreinte");
+        assert_ne!(base.fingerprint(), Scenario { seed: 2, ..base.clone() }.fingerprint());
+        assert_eq!(base.fingerprint().len(), 16);
+    }
+
+    #[test]
+    fn la_derive_seule_et_la_regularite_se_reconnaissent() {
+        let drift = PeerProfile { drift_ppm: 100.0, ..PeerProfile::preset("regular").unwrap() };
+        let s = Scenario { peers: vec![drift.clone(), PeerProfile::preset("regular").unwrap()], ..Scenario::default() };
+        assert!(s.is_drift_only() && !s.is_regular());
+        let s = Scenario { peers: vec![drift, PeerProfile::preset("ethernet").unwrap()], ..Scenario::default() };
+        assert!(!s.is_drift_only());
+        assert!(!Scenario::default().is_drift_only() && Scenario::default().is_regular());
     }
 
     #[test]
