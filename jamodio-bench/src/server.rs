@@ -764,7 +764,7 @@ mod tests {
         use crate::profile::BurstLoss;
         use jamodio_audio_core::net::seq::SeqTracker;
         let p = PeerProfile {
-            burst_loss: Some(BurstLoss { rate_pct: 2.0, mean_packets: 4.0 }),
+            burst_loss: Some(BurstLoss { rate_pct: 2.0, mean_packets: 4.0, fixed: false }),
             ..PeerProfile::preset("regular").unwrap()
         };
         let (got, _) = through_agent_receiver(&p, 6, 3_000, Duration::from_secs(15));
