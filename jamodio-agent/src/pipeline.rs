@@ -5225,6 +5225,10 @@ struct DecodeState {
     /// classé au prochain vrai paquet, seul à savoir quand il est arrivé — avec
     /// l'état du push qui précédait le trou.
     pending_hole: Option<(HoleAtPull, Option<PushMark>)>,
+    /// Chantier P2 — cumul du temps passé à écrire les lignes `TROU`, et nombre
+    /// de trous classés : relevés par le fil à chaque réveil (cf. `recv_loop`).
+    hole_log_time: std::time::Duration,
+    holes_reported: u64,
     /// Lecture (`recv_instant`) du dernier paquet ÉCARTÉ (tardif, doublon,
     /// saut). Seul un écart survenu AVANT un trou peut en être la cause.
     last_discard: Option<std::time::Instant>,
@@ -5282,6 +5286,8 @@ impl DecodeState {
             last_push: None,
             holes: HoleCounts::default(),
             pending_hole: None,
+            hole_log_time: std::time::Duration::ZERO,
+            holes_reported: 0,
             last_discard: None,
             stack_delay_max_ms: f64::NAN,
             deadline_disarmed: 0,
@@ -5408,6 +5414,12 @@ impl RxCore {
     /// Jusqu'à quand dormir pour le prochain examen de masquage.
     fn next_wait(&self, now: std::time::Instant) -> std::time::Duration {
         next_wait(&self.states, now)
+    }
+
+    /// Chantier P2 — (temps d'écriture des lignes `TROU`, trous classés), cumulés
+    /// sur tous les flux : le fil en fait la différence d'un réveil à l'autre.
+    fn hole_reporting(&self) -> (std::time::Duration, u64) {
+        self.states.values().fold((std::time::Duration::ZERO, 0), |(t, n), st| (t + st.hole_log_time, n + st.holes_reported))
     }
 
     /// Une échéance de masquage est armée : le prochain réveil compte (Lot 1-C).
@@ -5668,11 +5680,16 @@ fn report_hole(
     }
     // La voix se tait légitimement dès que personne ne parle : chacun de ses
     // silences finit en « trou ». Comptés, mais pas au même niveau de journal.
+    // Chantier P2 — le temps de cette écriture est mesuré : le journal s'écrit
+    // depuis ce fil, et un réveil de 9,5 ms a été vu au moment de 6 trous (01/10).
+    let logging = std::time::Instant::now();
     if st.kind == StreamKind::Voice {
         hole_line!(debug);
     } else {
         hole_line!(info);
     }
+    st.hole_log_time += logging.elapsed();
+    st.holes_reported += 1;
 }
 
 /// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
