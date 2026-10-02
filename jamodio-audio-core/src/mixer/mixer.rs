@@ -73,7 +73,12 @@ impl AtomicF32 {
     }
     /// Addition atomique (boucle CAS). Un seul écrivain (le thread audio) face à
     /// un lecteur qui remet à zéro → la boucle aboutit au premier tour en régime.
+    ///
+    /// `fetch_update` est renommé `try_update` à partir de Rust 1.99 (même
+    /// opération). On garde l'ancien nom tant que toutes les machines de
+    /// compilation n'ont pas 1.99 : `try_update` n'y existerait pas.
     #[inline]
+    #[allow(deprecated)]
     fn fetch_add_level(&self, v: f32) {
         let _ = self
             .0
