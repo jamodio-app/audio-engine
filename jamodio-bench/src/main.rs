@@ -87,7 +87,12 @@ async fn main() {
         Some("relay") => relay(&args[1..]),
         Some("remote") => remote(&args[1..]),
         Some("scenarios") => {
+            println!("Campagnes de version :");
             for (name, what) in jamodio_bench::library::NAMED {
+                println!("  {name:<24} {what}");
+            }
+            println!("Exploration (hors campagnes de version) :");
+            for (name, what) in jamodio_bench::library::EXPLORATION {
                 println!("  {name:<24} {what}");
             }
             Ok(())
