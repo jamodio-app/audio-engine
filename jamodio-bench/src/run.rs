@@ -369,18 +369,32 @@ pub async fn run(scenario: Scenario, out_dir: &Path) -> Result<PathBuf, String> 
     }
 }
 
-/// Le périphérique demandé, s'il figure EXACTEMENT dans la liste de l'agent
-/// (format strict `idx:nom`), sinon celui par défaut. Aucun défaut, ou un
-/// identifiant inconnu → erreur qui cite les identifiants valides : pas de
-/// choix au hasard, et pas d'aller-retour avec l'agent pour un identifiant faux
-/// (NUC, 28/09 : « 1 » au lieu de « 1:UMC ASIO Driver »).
+/// Le périphérique demandé, au format strict `idx:nom`, sinon celui par
+/// défaut. Même règle que l'agent (`audio/device.rs::locate`) et le studio :
+/// l'index glisse au branchement d'une carte (01/10/2026 : la Focusrite
+/// branchée, le micro interne passe de `0:` à `1:`) — si l'identifiant exact
+/// n'existe plus, on retrouve le périphérique par son nom EXACT et UNIQUE ;
+/// absent → perdu, homonymes → refus. Jamais d'à-peu-près, et le glissement
+/// est dit à l'écran.
 fn pick_device(list: &Value, wanted: Option<&str>, what: &str) -> Result<String, String> {
+    let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
     if let Some(w) = wanted {
-        let ids: Vec<&str> = list.as_array().into_iter().flatten().filter_map(|d| d["id"].as_str()).collect();
         if ids.contains(&w) {
             return Ok(w.to_string());
         }
-        return Err(format!("{what} « {w} » inconnue. Identifiants exacts : {}", ids.join(" | ")));
+        let name = w.split_once(':').map(|(_, n)| n).filter(|n| !n.is_empty());
+        let same: Vec<&str> = match name {
+            Some(n) => ids.iter().copied().filter(|id| id.split_once(':').is_some_and(|(_, m)| m == n)).collect(),
+            None => Vec::new(),
+        };
+        return match same.as_slice() {
+            [one] => {
+                println!("{what} « {w} » : index glissé, retrouvée par son nom exact → « {one} »");
+                Ok(one.to_string())
+            }
+            [] => Err(format!("{what} « {w} » introuvable (débranchée ?). Identifiants exacts : {}", ids.join(" | "))),
+            _ => Err(format!("{what} « {w} » : plusieurs périphériques portent ce nom ({}) — préciser l'identifiant", same.join(" | "))),
+        };
     }
     list.as_array()
         .and_then(|l| l.iter().find(|d| d["isDefault"].as_bool() == Some(true)))
@@ -643,7 +657,23 @@ mod tests {
         assert_eq!(pick_device(&l, None, "entrée").unwrap(), "1:UMC ASIO Driver");
         assert_eq!(pick_device(&l, Some("0:ASIO4ALL v2"), "entrée").unwrap(), "0:ASIO4ALL v2");
         let e = pick_device(&l, Some("1"), "entrée").unwrap_err();
-        assert!(e.contains("« 1 » inconnue") && e.contains("1:UMC ASIO Driver"), "{e}");
+        assert!(e.contains("« 1 » introuvable") && e.contains("1:UMC ASIO Driver"), "{e}");
+    }
+
+    /// L'index glisse au branchement d'une carte : retrouvé par son nom exact
+    /// et unique ; absent ou homonyme → refus, jamais d'à-peu-près.
+    #[test]
+    fn un_index_glisse_se_retrouve_par_le_nom_exact_et_unique() {
+        let l = json!([
+            { "id": "0:Scarlett Solo 4th Gen", "isDefault": false },
+            { "id": "1:Microphone MacBook Pro", "isDefault": true },
+            { "id": "2:Teams", "isDefault": false },
+            { "id": "3:Teams", "isDefault": false },
+        ]);
+        assert_eq!(pick_device(&l, Some("0:Microphone MacBook Pro"), "entrée").unwrap(), "1:Microphone MacBook Pro");
+        assert!(pick_device(&l, Some("0:Microphone"), "entrée").unwrap_err().contains("introuvable"), "nom partiel refusé");
+        assert!(pick_device(&l, Some("5:Teams"), "entrée").unwrap_err().contains("plusieurs"));
+        assert!(pick_device(&l, Some("4:UMC"), "entrée").unwrap_err().contains("débranchée"));
     }
 
     #[test]
