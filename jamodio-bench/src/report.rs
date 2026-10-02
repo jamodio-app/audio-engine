@@ -46,8 +46,6 @@ pub const PEER_FIELDS: &[&str] = &[
     "packetsExpected",
     "packetsDuplicate",
     "packetsJump",
-    // Chantier P1 : trous de perte avérée dont la montée de cible a été rendue.
-    "holesLossRefunded",
 ];
 
 fn field(name: &str) -> usize {

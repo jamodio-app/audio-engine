@@ -1758,7 +1758,6 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         holes_sequence: net.holes.sequence,
                         holes_unclassified: net.holes.unclassified,
                         holes_after_buffer_holds: net.holes.after_buffer_holds,
-                        holes_loss_refunded: net.holes.loss_refunded,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
                         target_reactive_ms: s.target_reactive_ms,

@@ -1466,10 +1466,6 @@ pub struct PeerPerf {
     /// masquage est trop courte.
     #[serde(rename = "holesAfterBufferHolds")]
     pub holes_after_buffer_holds: u64,
-    /// Chantier P1 (02/10/2026) — parmi les trous « arrivée », ceux dus à une
-    /// perte avérée dont la montée de cible a été rendue (cumul).
-    #[serde(rename = "holesLossRefunded")]
-    pub holes_loss_refunded: u64,
     /// ── Lot 0 du chantier tampon : de quoi la cible est faite, et ce que le
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).

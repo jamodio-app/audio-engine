@@ -10,7 +10,7 @@ use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
 use jamodio_audio_core::mixer::conceal::Wait;
 use jamodio_audio_core::mixer::hole::{self, HoleCause, HoleFacts};
 use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
-use jamodio_audio_core::mixer::ring_buffer::{consumed_ms_between, HoleAtPull, HoleGrowth, PushReport};
+use jamodio_audio_core::mixer::ring_buffer::{consumed_ms_between, HoleAtPull, PushReport};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
@@ -5125,35 +5125,7 @@ pub struct HoleCounts {
     /// le réveil suivant est arrivé trop tard. C'est la mesure qui dit si
     /// `conceal::WAKE_SLACK_MS` est trop court.
     pub after_buffer_holds: u64,
-    /// Chantier P1 — parmi les trous « arrivée », ceux dus à une PERTE avérée
-    /// dont la montée de cible a été rendue (cf. [`settle_loss_refunds`]).
-    pub loss_refunded: u64,
 }
-
-/// Chantier P1 (02/10/2026) — un trou « arrivée » dont des paquets manquaient,
-/// en attente de savoir s'ils arriveront (retard) ou jamais (perte).
-#[derive(Debug, Clone, Copy)]
-struct PendingRefund {
-    /// Au-delà, un paquet manquant ne peut plus être reconnu « en retard » par
-    /// le suivi de séquence (`net::seq::MAX_MISORDER` paquets) : s'il n'est pas
-    /// arrivé, il n'arrivera jamais comme tel — la perte est avérée.
-    due: std::time::Instant,
-    /// Paquets « en retard » comptés quand le trou a été classé. Un seul de plus
-    /// d'ici l'échéance (le manquant, ou n'importe quel autre) et on garde la
-    /// montée : dans le doute, la sécurité d'avant.
-    late_at_report: u64,
-    growth: HoleGrowth,
-}
-
-/// Fenêtre au-delà de laquelle un paquet manquant ne peut plus arriver « en
-/// retard » : `MAX_MISORDER` trames de 2,5 ms (250 ms).
-const LOSS_PROOF: std::time::Duration = std::time::Duration::from_micros(
-    jamodio_audio_core::net::seq::MAX_MISORDER as u64 * 2_500,
-);
-
-/// Borne des trous en attente par flux : au-delà, les plus anciens sont
-/// abandonnés — leur montée reste (la sécurité d'avant), jamais l'inverse.
-const MAX_PENDING_REFUNDS: usize = 64;
 
 /// Le vrai paquet qui provoque un push : quand l'agent l'a LU, et quand le
 /// SYSTÈME l'avait reçu (Lot 1-D2 ; `None` sans horodatage).
@@ -5178,9 +5150,6 @@ struct PushMark {
     read_index: usize,
     /// Arrivée du dernier VRAI paquet poussé (une trame de masquage n'en a pas).
     last_received: Option<std::time::Instant>,
-    /// Paquets perdus (au sens du suivi de séquence) à ce push : un trou
-    /// classé ensuite avec PLUS de perdus a vu des paquets manquer (chantier P1).
-    lost: u64,
 }
 
 /// État de décodage par pair — détenu UNIQUEMENT par le fil de réception.
@@ -5256,9 +5225,6 @@ struct DecodeState {
     /// classé au prochain vrai paquet, seul à savoir quand il est arrivé — avec
     /// l'état du push qui précédait le trou.
     pending_hole: Option<(HoleAtPull, Option<PushMark>)>,
-    /// Chantier P1 — trous en attente de savoir si leurs paquets manquants
-    /// arriveront (retard) ou jamais (perte) ; dans l'ordre des échéances.
-    loss_refunds: std::collections::VecDeque<PendingRefund>,
     /// Chantier P2 — cumul du temps passé à écrire les lignes `TROU`, et nombre
     /// de trous classés : relevés par le fil à chaque réveil (cf. `recv_loop`).
     hole_log_time: std::time::Duration,
@@ -5320,7 +5286,6 @@ impl DecodeState {
             last_push: None,
             holes: HoleCounts::default(),
             pending_hole: None,
-            loss_refunds: std::collections::VecDeque::new(),
             hole_log_time: std::time::Duration::ZERO,
             holes_reported: 0,
             last_discard: None,
@@ -5586,14 +5551,12 @@ fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
 /// `HoleAtPull`, tout le reste se fait ici.
 fn note_push(
     st: &mut DecodeState,
-    mixer: &AudioMixer,
     producer_id: &str,
     report: &PushReport,
     now: std::time::Instant,
     arrived: Option<Arrived>,
     output_block_ms: f64,
 ) {
-    settle_loss_refunds(st, mixer, producer_id, now);
     // Un trou en attente (relevé par une trame de masquage) se classe au premier
     // vrai paquet qui suit. S'il en survient un second avant, le premier se
     // classe tel quel : sa cause restera « arrivée » sans détail.
@@ -5619,34 +5582,8 @@ fn note_push(
         fill_after_ms: report.fill_after_ms,
         read_index: report.read_index,
         last_received,
-        lost: st.seq.counters().lost(),
     });
     st.stack_delay_max_ms = f64::NAN;
-}
-
-/// Chantier P1 (02/10/2026) — rend la montée de cible des trous dus à une
-/// PERTE avérée, une fois la fenêtre passée sans qu'aucun paquet n'arrive en
-/// retard. Le tirage de la sortie a monté la cible à l'instant du trou, sans
-/// savoir (c'est la bonne sécurité) ; si les paquets manquants ne sont jamais
-/// venus, un tampon plus grand ne les aurait pas fait revenir. Mesuré au banc
-/// (rafales de pertes de longueur fixe, 2 machines) : 4 à 6 paquets perdus
-/// d'affilée portaient la cible de 5 à 9-19 ms. Sur le fil de réception, par le
-/// verrou court du flux — jamais dans le callback de sortie.
-fn settle_loss_refunds(st: &mut DecodeState, mixer: &AudioMixer, producer_id: &str, now: std::time::Instant) {
-    while st.loss_refunds.front().is_some_and(|r| r.due <= now) {
-        let Some(r) = st.loss_refunds.pop_front() else { break };
-        if st.seq.counters().late == r.late_at_report {
-            mixer.refund_hole_growth(producer_id, r.growth);
-            st.holes.loss_refunded += 1;
-            tracing::debug!(
-                target: "jamodio::recv",
-                producer = &producer_id[..8.min(producer_id.len())],
-                glitch_samples = r.growth.glitch_samples,
-                reactive_samples = r.growth.reactive_samples,
-                "trou de perte avérée — montée de cible rendue (P1)"
-            );
-        }
-    }
 }
 
 /// Lot 1-A — classe un trou rendu par la sortie, le compte et le journalise.
@@ -5675,23 +5612,6 @@ fn report_hole(
         discarded_before_hole: st.last_discard.is_some_and(|d| d >= p.at && d <= h.at),
     });
     let cause = facts.as_ref().map_or(HoleCause::Unclassified, hole::classify);
-    // Chantier P1 — un trou « arrivée » où des paquets manquaient (plus de
-    // perdus qu'au push d'avant) : perte ou retard, la suite le dira (cf.
-    // `settle_loss_refunds`). Toute autre cause (locale) garde sa montée : c'est
-    // précisément le rôle du plancher anti-trou.
-    if cause == HoleCause::Arrival
-        && !h.growth.is_none()
-        && base.is_some_and(|p| st.seq.counters().lost() > p.lost)
-    {
-        if st.loss_refunds.len() >= MAX_PENDING_REFUNDS {
-            st.loss_refunds.pop_front();
-        }
-        st.loss_refunds.push_back(PendingRefund {
-            due: now + LOSS_PROOF,
-            late_at_report: st.seq.counters().late,
-            growth: h.growth,
-        });
-    }
     match cause {
         HoleCause::Arrival => st.holes.arrival += 1,
         HoleCause::Reception => st.holes.reception += 1,
@@ -5869,7 +5789,7 @@ fn conceal_due_streams(
                 // allouer une copie à chaque trame sur ce thread.
                 let report = st.decoder.decode_loss().and_then(|plc| mixer.push_samples(id, plc));
                 if let Some(report) = report {
-                    note_push(st, mixer, id, &report, now, None, output_block_ms);
+                    note_push(st, id, &report, now, None, output_block_ms);
                     // Ce que le tampon tenait À CET INSTANT, et où en était la
                     // lecture : c'est la seule façon de juger après coup si le
                     // vrai paquet serait arrivé à temps (Lot 1-B). Écrasé à
@@ -6038,7 +5958,7 @@ fn decode_one_packet(
                     if let Some(report) = report {
                         // Le trou éventuel a été révélé par CE paquet : c'est son
                         // arrivée qui compte.
-                        note_push(st, mixer, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
+                        note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
                         st.concealed_frames += 1;
                     }
                 }
@@ -6106,7 +6026,7 @@ fn decode_one_packet(
             mixer.push_samples(producer_id, pcm)
         };
         if let Some(report) = report {
-            note_push(st, mixer, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
+            note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
         }
     }
 }
@@ -6735,10 +6655,6 @@ mod recv_thread;
 // Lot B0-bis du banc « N musiciens » : la réception à N flux en temps simulé.
 #[cfg(test)]
 mod scale_tests;
-
-// Chantier P1 : une perte avérée ne doit pas coûter de latence.
-#[cfg(test)]
-mod loss_refund_tests;
 
 #[cfg(test)]
 mod conceal_loop_tests {
@@ -7457,7 +7373,7 @@ mod conceal_loop_tests {
     fn une_sortie_qui_vide_le_tampon_d_un_coup_est_une_cause_de_consommation() {
         let (mixer, mut st) = apres_un_paquet();
         let r = mixer.push_samples("peer-test", &vec![0.0f32; 48 * 10 * 2]).unwrap();
-        note_push(&mut st, &mixer, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
         tirer_jusqu_au_trou(&mixer);
         recevoir(&mut st, &mixer, 1002, Instant::now());
         assert_eq!(st.holes, HoleCounts { consumption: 1, ..HoleCounts::default() });
@@ -7472,7 +7388,7 @@ mod conceal_loop_tests {
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
         m.insert(Arc::from("peer-test"), st);
         let st = m.get_mut("peer-test").unwrap();
-        note_push(st, &mixer, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        note_push(st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
         let now = Instant::now();
         st.next_deadline = Some(now - Duration::from_millis(10));
         conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
@@ -7492,7 +7408,7 @@ mod conceal_loop_tests {
         let dans_la_machine = Instant::now();
         tirer_jusqu_au_trou(&mixer);
         let r = mixer.push_samples("peer-test", &vec![0.0f32; 240]).unwrap();
-        note_push(&mut st, &mixer, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
         assert_eq!(st.holes, HoleCounts::default(), "pas encore classé");
         assert!(st.pending_hole.is_some());
         std::thread::sleep(Duration::from_millis(1));

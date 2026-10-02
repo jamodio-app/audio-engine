@@ -293,31 +293,6 @@ pub struct HoleAtPull {
     pub target_ms: f64,
     /// Position de lecture avant le vidage (cf. [`consumed_ms_between`]).
     pub read_index: usize,
-    /// Ce que CE trou a fait monter (anti-trou, filet réactif, pression) : de
-    /// quoi le rendre si le trou se révèle dû à une perte avérée (chantier P1,
-    /// 02/10/2026 — cf. [`JitterBuffer::refund_hole_growth`]).
-    pub growth: HoleGrowth,
-}
-
-/// Chantier P1 (02/10/2026) — la montée de la cible décidée à un trou.
-///
-/// Le tirage de la sortie fait monter la cible À L'INSTANT du trou, sans savoir
-/// pourquoi le paquet manque : c'est la bonne sécurité tant qu'on ne sait pas.
-/// Le fil de réception l'apprend ensuite : si les paquets manquants n'arrivent
-/// jamais (perte avérée), attendre plus ne les aurait pas fait revenir — la
-/// montée est rendue. Mesuré au banc (rafales de longueur fixe, 2 machines) :
-/// des rafales de pertes de 4 à 6 paquets portaient la cible de 5 à 9-19 ms.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct HoleGrowth {
-    pub glitch_samples: usize,
-    pub reactive_samples: usize,
-    pub pressure: f32,
-}
-
-impl HoleGrowth {
-    pub fn is_none(&self) -> bool {
-        self.glitch_samples == 0 && self.reactive_samples == 0 && self.pressure == 0.0
-    }
 }
 
 /// Ce qu'un `push` laisse savoir au thread de décodage.
@@ -663,15 +638,13 @@ impl JitterBuffer {
             // lecture dit ce qui est sorti depuis le dernier `push`. Uniquement
             // sur un trou (jamais sur un tirage plein) et hors retour casque —
             // une lecture d'horloge et une copie, aucun tampon, aucune attente.
-            let fresh_hole = !self.local_mode && self.pending_hole.is_none();
-            if fresh_hole {
+            if !self.local_mode && self.pending_hole.is_none() {
                 self.pending_hole = Some(HoleAtPull {
                     at: std::time::Instant::now(),
                     available_ms: samples_to_ms_f64(available as u64),
                     needed_ms: samples_to_ms_f64(needed as u64),
                     target_ms: samples_to_ms_f64(self.target_samples as u64),
                     read_index: self.consumer.read_index(),
-                    growth: HoleGrowth::default(),
                 });
             }
             if available > 0 {
@@ -701,24 +674,11 @@ impl JitterBuffer {
             output[available..].fill(0.0);
             self.count_zero_filled((output.len() - available) as u64);
             self.underruns += 1;
-            let (glitch_before, reactive_before, pressure_before) =
-                (self.glitch_floor_samples, self.reactive_extra_samples, self.underrun_pressure);
             self.adapt_up();
             // C1 — un underrun pousse la pression (bornée) : tant qu'elle reste
             // au-dessus du seuil, la récupération du filet est suspendue (buffer tenu).
             self.underrun_pressure =
                 (self.underrun_pressure + UNDERRUN_PRESSURE_STEP).min(UNDERRUN_PRESSURE_MAX);
-            // P1 — la montée de CE trou, pour pouvoir la rendre (trois
-            // soustractions, uniquement sur un accroc : jamais sur le chemin nominal).
-            if fresh_hole {
-                if let Some(h) = self.pending_hole.as_mut() {
-                    h.growth = HoleGrowth {
-                        glitch_samples: self.glitch_floor_samples.saturating_sub(glitch_before),
-                        reactive_samples: self.reactive_extra_samples.saturating_sub(reactive_before),
-                        pressure: (self.underrun_pressure - pressure_before).max(0.0),
-                    };
-                }
-            }
             self.primed = false;
             // Phase C — un trou de playout casse la continuité d'entrée : on
             // ré-amorce le resampler (sinon interpolation sur une frame périmée).
@@ -945,20 +905,6 @@ impl JitterBuffer {
         self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
-    }
-
-    /// Chantier P1 — rend la montée d'un trou dû à une perte AVÉRÉE (les paquets
-    /// manquants ne sont jamais arrivés : un tampon plus grand ne les aurait pas
-    /// fait revenir). Jamais sous zéro : ce qui a déjà redescendu depuis n'est
-    /// pas rendu deux fois. Appelé par le fil de réception, jamais par la sortie.
-    pub fn refund_hole_growth(&mut self, g: HoleGrowth) {
-        if self.local_mode || g.is_none() {
-            return;
-        }
-        self.glitch_floor_samples = self.glitch_floor_samples.saturating_sub(g.glitch_samples);
-        self.reactive_extra_samples = self.reactive_extra_samples.saturating_sub(g.reactive_samples);
-        self.underrun_pressure = (self.underrun_pressure - g.pressure).max(0.0);
-        self.recompute_target();
     }
 
     fn adapt_down(&mut self) {
@@ -1609,37 +1555,6 @@ mod tests {
             jb.push(&feed);
             jb.pull(&mut out);
         }
-    }
-
-    /// P1 — un trou relève CE qu'il a fait monter ; le rendre ramène la cible
-    /// d'avant, jamais en dessous, et rendre deux fois ne descend pas plus bas.
-    #[test]
-    fn la_montee_d_un_trou_est_relevee_puis_rendue_sans_descendre_sous_l_avant() {
-        let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7); // plancher réseau = 5 ms
-        let before = jb.target_ms();
-        let after = network_underrun_once(&mut jb);
-        assert!(after > before, "le trou fait monter la cible : {before} → {after}");
-        let hole = jb.push(&[0.0_f32; 2]).hole.expect("le trou est rendu au push suivant");
-        assert!(hole.growth.glitch_samples > 0 && hole.growth.reactive_samples > 0, "{:?}", hole.growth);
-        assert!(hole.growth.pressure > 0.0);
-        jb.refund_hole_growth(hole.growth);
-        assert_eq!(jb.target_ms(), before, "montée rendue");
-        assert_eq!((jb.glitch_floor_samples, jb.reactive_extra_samples), (0, 0));
-        assert_eq!(jb.underrun_pressure, 0.0);
-        jb.refund_hole_growth(hole.growth);
-        assert_eq!(jb.target_ms(), before, "rendre deux fois ne descend pas plus bas");
-    }
-
-    /// P1 — le retour casque (mode local) garde son propre chemin : rien n'y est rendu.
-    #[test]
-    fn le_mode_local_ne_rend_rien() {
-        let mut jb = JitterBuffer::new();
-        jb.set_local_mode(true);
-        let g = HoleGrowth { glitch_samples: 480, reactive_samples: 480, pressure: 1.0 };
-        let before = (jb.target_samples, jb.reactive_extra_samples);
-        jb.refund_hole_growth(g);
-        assert_eq!((jb.target_samples, jb.reactive_extra_samples), before);
     }
 
     #[test]
