@@ -51,7 +51,7 @@ pub async fn configure(base: &Path) -> Result<(), String> {
     };
     let input_device = choose("Entrée (ta carte son)", &ids("inputs"))?;
     let output_device = choose("Sortie", &ids("outputs"))?;
-    let remote = ask("Émetteur distant IP:PORT (ex. 192.168.1.49:51901 ; Entrée = flux fabriqués sur cette machine) :")?;
+    let remote = ask("Émetteur distant IP:PORT (ex. 192.168.1.20:51901 ; Entrée = flux fabriqués sur cette machine) :")?;
     let remote = if remote.is_empty() {
         None
     } else {
@@ -62,7 +62,7 @@ pub async fn configure(base: &Path) -> Result<(), String> {
     let plugin = ask("Plugin à insérer pendant les campagnes (nom exact ; Entrée = aucun) :")?;
     // Un nom déjà connu ici (campagnes, tolérances) plutôt que le nom réseau :
     // sinon la campagne ne retrouve ni ses tolérances ni sa référence (NUC,
-    // 02/10/2026 : « benpc » proposé, « NUC » attendu).
+    // 02/10/2026 : le nom réseau proposé au lieu du nom déjà utilisé).
     let known = known_machines(base);
     if !known.is_empty() {
         println!("Machines déjà connues ici : {}", known.join(", "));

@@ -347,7 +347,7 @@ mod tests {
         let base = crate::library::named("9-reseaux-mixtes").unwrap();
         let ailleurs = Scenario {
             input_device: Some("1:UMC ASIO Driver".into()),
-            remote: Some("192.168.1.49:51901".into()),
+            remote: Some("192.168.1.20:51901".into()),
             ..base.clone()
         };
         assert_eq!(base.fingerprint(), ailleurs.fingerprint(), "même scénario, autre machine");

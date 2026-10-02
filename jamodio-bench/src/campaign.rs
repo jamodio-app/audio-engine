@@ -1049,7 +1049,7 @@ mod tests {
                 bench_commit: "x".into(),
                 input_device: Some("1:UMC ASIO Driver".into()),
                 output_device: Some("1:UMC ASIO Driver".into()),
-                remote: Some("192.168.1.49:51901".into()),
+                remote: Some("192.168.1.20:51901".into()),
                 plugin: None,
                 scenarios: vec![ScenarioEntry {
                     dir: "9-reseaux-mixtes".into(),
@@ -1117,12 +1117,12 @@ mod tests {
             input_device: "1:UMC ASIO Driver".into(),
             output_device: "1:UMC ASIO Driver".into(),
             channel_index: None,
-            remote: Some("192.168.1.49:51901".into()),
+            remote: Some("192.168.1.20:51901".into()),
             plugin: None,
         };
         let base = crate::library::named("pics-seuls").unwrap();
         let s = cfg.apply(base.clone());
-        assert_eq!(s.remote.as_deref(), Some("192.168.1.49:51901"));
+        assert_eq!(s.remote.as_deref(), Some("192.168.1.20:51901"));
         assert_eq!(s.fingerprint(), base.fingerprint());
         s.validate().unwrap();
         assert!(serde_json::from_str::<MachineConfig>(r#"{"machine":"x","input_device":"a","output_device":"b","remot":"y"}"#).is_err());
