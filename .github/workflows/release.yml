@@ -239,9 +239,25 @@ jobs:
           set -euo pipefail
           REL="target/${{ matrix.target }}/release"
           APP_BIN=$(find "$REL/bundle/macos" -path '*.app/Contents/MacOS/jamodio-agent' | head -1)
-          DWARF="$REL/jamodio-agent.dSYM/Contents/Resources/DWARF/jamodio-agent"
           [ -n "$APP_BIN" ] || { echo "binaire du .app introuvable"; exit 1; }
-          [ -f "$DWARF" ] || { echo ".dSYM introuvable : $DWARF"; exit 1; }
+          # Le .dSYM utile est celui dont l'UUID est CELUI du binaire publié (codesign
+          # ne change pas l'UUID). Cargo le range sous un nom à tirets bas, avec un
+          # fichier DWARF au nom haché (0.6.6-16 : `jamodio-agent.dSYM` introuvable) :
+          # on ne suppose aucun nom, on exige la correspondance.
+          BIN_UUID=$(dwarfdump --uuid "$APP_BIN" | awk 'NR==1{print $2}')
+          DSYM=""; DWARF=""
+          while IFS= read -r d; do
+            for f in "$d"/Contents/Resources/DWARF/*; do
+              [ -f "$f" ] || continue
+              if [ "$(dwarfdump --uuid "$f" | awk 'NR==1{print $2}')" = "$BIN_UUID" ]; then DSYM="$d"; DWARF="$f"; fi
+            done
+          done < <(find "$REL" -maxdepth 2 -name '*.dSYM' -type d)
+          if [ -z "$DSYM" ]; then
+            echo "ÉCHEC : aucun .dSYM d'UUID $BIN_UUID (celui du binaire publié). Trouvés :"
+            find "$REL" -maxdepth 2 -name '*.dSYM' -type d -exec sh -c 'for f in "$1"/Contents/Resources/DWARF/*; do dwarfdump --uuid "$f"; done' _ {} \;
+            exit 1
+          fi
+          echo ".dSYM privé : $DSYM (UUID $BIN_UUID, identique au binaire publié)"
           in_bin=$( (nm "$APP_BIN" 2>/dev/null || true) | grep -c jamodio || true)
           in_dsym=$(nm "$DWARF" | grep -c jamodio || true)
           strings_left=$(strings -a "$APP_BIN" | grep -c 'jamodio_[a-z_]*::' || true)
@@ -250,7 +266,7 @@ jobs:
           [ "$in_bin" -eq 0 ] || { echo "ÉCHEC : le binaire publié expose $in_bin noms de fonctions"; exit 1; }
           [ "$in_dsym" -gt 1000 ] || { echo "ÉCHEC : .dSYM presque vide ($in_dsym noms)"; exit 1; }
           OUT="Jamodio-Audio-Engine-macOS-symbols-$TAG.zip"
-          (cd "$REL" && zip -qr "$GITHUB_WORKSPACE/$OUT" jamodio-agent.dSYM)
+          (cd "$(dirname "$DSYM")" && zip -qr "$GITHUB_WORKSPACE/$OUT" "$(basename "$DSYM")")
           gh release upload "$TAG" "$OUT" --clobber -R "$REPO"
 
       # Mesure (sans échec) de ce que l'exe Windows laisse lisible : base de la
