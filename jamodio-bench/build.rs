@@ -10,7 +10,12 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "inconnu".into());
+    // Le dernier commit qui touche le BANC (ce dossier) : un commit ailleurs
+    // dans le dépôt (Audio Engine, CI) ne change pas la version du banc, et ne
+    // doit pas faire croire qu'un émetteur à jour est périmé.
+    let commit = git(&["log", "-1", "--format=%h", "--", "."])
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "inconnu".into());
     // Des changements non commités dans le banc : le commit seul mentirait.
     let dirty = git(&["status", "--porcelain", "--", "."]).is_some_and(|s| !s.is_empty());
     println!("cargo:rustc-env=BENCH_COMMIT={commit}{}", if dirty { "+modifié" } else { "" });
