@@ -25,7 +25,7 @@
 //! voix bascule en voix brute pour le reste de la session — un repli VISIBLE (l'UI
 //! affiche « VOIX BRUTE »), pas une voix inintelligible.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +64,9 @@ struct Shared {
     /// Échantillons jetés depuis la création — monotone.
     dropped: AtomicU64,
     max_queued: usize,
+    /// File fermée par son [`VoiceTapCloser`] : l'étage voix s'arrête et les
+    /// producteurs cessent de pousser, même si un émetteur survit (cf. le type).
+    closed: AtomicBool,
 }
 
 /// Côté producteur (capture instrument ou micro dédié). Non bloquant, aucune
@@ -90,6 +93,7 @@ pub fn voice_tap(max_ms: u32) -> (VoiceTapSender, VoiceTapReceiver) {
         queued: AtomicUsize::new(0),
         dropped: AtomicU64::new(0),
         max_queued,
+        closed: AtomicBool::new(false),
     });
     (
         VoiceTapSender { tx, shared: shared.clone() },
@@ -103,6 +107,9 @@ impl VoiceTapSender {
     /// grand soit-il : la borne limite le retard, elle ne refuse pas un pilote à
     /// gros blocs.
     pub fn push(&self, block: Vec<f32>) -> Result<Pushed, Disconnected> {
+        if self.shared.closed.load(Acquire) {
+            return Err(Disconnected);
+        }
         let n = block.len();
         // Réservé AVANT l'envoi : le consommateur ne peut ainsi jamais retirer
         // des échantillons pas encore comptés (pas de sous-dépassement).
@@ -128,15 +135,46 @@ impl VoiceTapSender {
 }
 
 impl VoiceTapReceiver {
+    /// Bloc suivant. `Disconnected` quand tous les émetteurs sont partis OU que
+    /// la file a été fermée — au plus `timeout` après la fermeture.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<f32>, RecvTimeoutError> {
+        if self.shared.closed.load(Acquire) {
+            return Err(RecvTimeoutError::Disconnected);
+        }
         let block = self.rx.recv_timeout(timeout)?;
         self.shared.queued.fetch_sub(block.len(), Relaxed);
         Ok(block)
     }
 
+    /// Poignée qui ferme cette file quand on la lâche.
+    pub fn closer(&self) -> VoiceTapCloser {
+        VoiceTapCloser { shared: self.shared.clone() }
+    }
+
     /// Échantillons jetés depuis la création (monotone).
     pub fn dropped_samples_total(&self) -> u64 {
         self.shared.dropped.load(Relaxed)
+    }
+}
+
+/// Ferme la file quand on la lâche : l'étage voix s'arrête (`recv_timeout` rend
+/// `Disconnected`) et les producteurs ne poussent plus.
+///
+/// Pourquoi ne pas attendre que les émetteurs partent : celui d'un micro dédié
+/// vit dans la fonction de rappel du flux CPAL, et sur macOS CPAL ne la libère
+/// pas quand le flux est détruit (même piège que l'AudioUnit, cf.
+/// `voice_capture`). Le micro s'arrêtait, mais son étage voix — isolation de
+/// voix comprise — restait en vie jusqu'à la fermeture de l'Audio Engine, un
+/// par talkback ouvert (constaté le 03/10/2026, 0.6.6-18 : 4 fils
+/// `voice-encode` sans studio).
+#[derive(Debug)]
+pub struct VoiceTapCloser {
+    shared: Arc<Shared>,
+}
+
+impl Drop for VoiceTapCloser {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Release);
     }
 }
 
@@ -240,6 +278,23 @@ mod tests {
             .filter(|_| tx.push(vec![0.0; 256]) == Ok(Pushed::Queued))
             .count();
         assert_eq!(acceptes, 4_800 / 256);
+    }
+
+    /// Un émetteur qui survit (fonction de rappel CPAL jamais libérée) ne
+    /// retient plus l'étage voix : lâcher la poignée de fermeture suffit.
+    #[test]
+    fn lacher_la_poignee_arrete_l_etage_voix_meme_si_un_emetteur_survit() {
+        let (tx, rx) = voice_tap(VOICE_TAP_MAX_MS);
+        let fermeture = rx.closer();
+        assert_eq!(tx.push(vec![0.0; BLOC_48]), Ok(Pushed::Queued));
+        assert!(rx.recv_timeout(Duration::from_millis(10)).is_ok(), "file ouverte : le bloc passe");
+        drop(fermeture);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Disconnected),
+            "file fermée : l'étage voix sort de sa boucle"
+        );
+        assert_eq!(tx.push(vec![0.0; BLOC_48]), Err(Disconnected), "le producteur cesse de pousser");
     }
 
     #[test]
