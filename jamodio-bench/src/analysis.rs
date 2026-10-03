@@ -139,6 +139,10 @@ pub struct StreamMetrics {
     pub causes_per_min: Vec<Option<f64>>,
     pub target_median_ms: Option<f64>,
     pub target_p95_ms: Option<f64>,
+    /// Son inventé à l'échéance, trames/min. Absent des `metrics.json` d'avant le
+    /// 03/10/2026 : `reanalyser` le recalcule depuis `peers.csv`.
+    #[serde(default)]
+    pub invented_per_min: Option<f64>,
     pub late: Option<f64>,
     pub lost: Option<f64>,
 }
@@ -199,6 +203,7 @@ impl Metrics {
                     causes_per_min: m.causes_per_min.iter().map(|&v| known(v)).collect(),
                     target_median_ms: known(m.target_median_ms),
                     target_p95_ms: known(m.target_p95_ms),
+                    invented_per_min: known(m.invented_per_min),
                     late: known(m.late),
                     lost: known(m.lost),
                 })

@@ -636,6 +636,10 @@ pub struct MusicianSummary {
     pub causes_per_min: [f64; 5],
     pub target_median_ms: f64,
     pub target_p95_ms: f64,
+    /// Trames de son INVENTÉ à l'échéance (masquage d'un paquet absent à son
+    /// heure) par minute — ce que l'oreille entend comme « corrigé » (écoute de
+    /// Ben du 03/10/2026 : invisible dans les trous et la cible).
+    pub invented_per_min: f64,
     /// Paquets écartés en retard (désordre compris), perdus, et audio rattrapé
     /// d'un coup (vidage du tampon trop plein), sur la fenêtre.
     pub late: f64,
@@ -672,6 +676,7 @@ pub fn musician_summaries(peers: &[PeerRow], musicians: u32, from_s: f64, to_s: 
                 ],
                 target_median_ms: percentile(targets.clone(), 0.5),
                 target_p95_ms: percentile(targets, 0.95),
+                invented_per_min: per_min("concealedUnderrunFrames"),
                 late: increase(&rows, "packetsLate"),
                 lost: increase(&rows, "packetsLost"),
                 drift_drops: increase(&rows, "driftDrops"),
@@ -998,13 +1003,13 @@ pub fn markdown(
         s.push_str(
             "\n## Par musicien simulé (dernier palier, instruments)\n\n\
 | Flux | Lien | Dérive simulée / lue (ppm) | Trous/min | arrivée | réception | décodage | consommation | séquence \
-| Cible médiane / p95 (ms) | Paquets en retard | Paquets perdus | Audio rattrapé (échantillons) |\n\
-|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+| Cible médiane / p95 (ms) | Son inventé (trames/min) | Paquets en retard | Paquets perdus | Audio rattrapé (échantillons) |\n\
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for m in musicians {
             let _ = writeln!(
                 s,
-                "| {} | {} | {} / {} | {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} |",
+                "| {} | {} | {} / {} | {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} | {} |",
                 m.stream,
                 m.links,
                 cell(m.sim_ppm),
@@ -1017,6 +1022,7 @@ pub fn markdown(
                 cell(m.causes_per_min[4]),
                 cell(m.target_median_ms),
                 cell(m.target_p95_ms),
+                cell(m.invented_per_min),
                 count(m.late),
                 count(m.lost),
                 count(m.drift_drops),
