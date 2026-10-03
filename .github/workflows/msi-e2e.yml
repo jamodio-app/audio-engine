@@ -31,6 +31,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -51,18 +53,24 @@ jobs:
         shell: bash
         run: rm -f .cargo/config.toml
 
-      # Même installeur que la version publiée (même config Tauri, même WiX,
-      # même signature de mise à jour), sans rien publier.
+      # Même version exacte que release.yml (y changer les deux à la fois).
+      - name: CLI Tauri (version exacte)
+        shell: pwsh
+        run: npm install -g @tauri-apps/cli@2.12.1
+
+      # Même installeur que la version publiée (même config Tauri, même WiX),
+      # sans rien publier — et SANS la clé privée de l'updater : ce test n'a
+      # besoin que du MSI, pas de sa signature de mise à jour (un .sig à part).
+      # Avant, chaque push de branche passait la clé à une CLI npm non épinglée
+      # (revue 0.6.6, constat E).
       - name: Construire l'installeur de la branche
         shell: pwsh
         working-directory: jamodio-agent
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: |
-          npm install -g @tauri-apps/cli@v2
-          tauri build --target x86_64-pc-windows-msvc --bundles msi
+          Set-Content -Path e2e.tauri.conf.json -Value '{"bundle":{"createUpdaterArtifacts":false}}'
+          tauri build --target x86_64-pc-windows-msvc --bundles msi --config e2e.tauri.conf.json
           if ($LASTEXITCODE -ne 0) { throw "construction de l'installeur échouée ($LASTEXITCODE)" }
 
       - name: Dernière version publiée (point de départ des musiciens équipés)
