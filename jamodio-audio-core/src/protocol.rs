@@ -1470,12 +1470,15 @@ pub struct PeerPerf {
     /// tampon a vraiment vécu. Mesures seules, aucune décision ne s'y appuie
     /// encore ; le web ne les affiche pas (contrat `CONTRAT-DONNEES-LIEN`).
     ///
-    /// Les trois parts de `bufferTargetMs` : plancher tiré de la gigue, plancher
-    /// de glitch persistant, filet réactif. Leur somme bornée = la cible.
+    /// Les parts de `bufferTargetMs` : plancher tiré de la gigue, plancher de
+    /// glitch persistant, marge apprise des paquets remplacés à l'échéance
+    /// (0.6.6-20), filet réactif. Leur somme bornée = la cible.
     #[serde(rename = "targetJitterMs")]
     pub target_jitter_ms: f64,
     #[serde(rename = "targetGlitchMs")]
     pub target_glitch_ms: f64,
+    #[serde(rename = "targetLateMs", default)]
+    pub target_late_ms: f64,
     #[serde(rename = "targetReactiveMs")]
     pub target_reactive_ms: f64,
     /// Remplissage RÉEL relevé aux dernières arrivées (~1,3 s) : minimum et

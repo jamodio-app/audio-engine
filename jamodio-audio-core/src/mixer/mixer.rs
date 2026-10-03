@@ -413,6 +413,8 @@ pub struct StreamPerfSnapshot {
     pub target_ms: usize,
     pub target_jitter_ms: f64,
     pub target_glitch_ms: f64,
+    /// 0.6.6-20 — part due aux paquets remplacés à l'échéance (ms).
+    pub target_late_ms: f64,
     pub target_reactive_ms: f64,
     /// Remplissage minimal et médian observés aux dernières arrivées ; `None`
     /// tant qu'aucun paquet n'est arrivé pour ce flux.
@@ -954,10 +956,11 @@ impl AudioMixer {
     /// n'existe pas (peer parti) ou s'il est en override manuel. Appelé par la
     /// recv task à cadence réduite. Clone l'Arc sous le RwLock lecture puis
     /// relâche avant de verrouiller la cellule (jamais les deux à la fois).
-    pub fn observe_jitter(&self, producer_id: &str, jitter_tail_ms: f64) {
+    /// `now` fait aussi redescendre la marge apprise des paquets remplacés.
+    pub fn observe_jitter(&self, producer_id: &str, jitter_tail_ms: f64, now: std::time::Instant) {
         let cell = self.streams.read().get(producer_id).cloned();
         if let Some(cell) = cell {
-            cell.jitter.lock().observe_jitter(jitter_tail_ms);
+            cell.jitter.lock().observe_jitter(jitter_tail_ms, now);
         }
     }
 
@@ -995,11 +998,13 @@ impl AudioMixer {
         })
     }
 
-    /// 0.6.6-20 — le paquet de ce flux qu'un masquage a remplacé vient d'arriver :
-    /// la marge du tampon était trop courte (cf. `JitterBuffer::note_late_arrival`).
-    /// Même verrou court que `push_samples` ; flux inconnu = rien à faire.
+    /// 0.6.6-20 — le paquet de ce flux qu'un masquage à l'échéance a remplacé
+    /// vient d'arriver : la marge du tampon était trop courte (cf.
+    /// `JitterBuffer::note_late_arrival`). Comme `observe_jitter` : l'Arc est
+    /// cloné sous le RwLock lecture, relâché AVANT de verrouiller la cellule.
     pub fn note_late_arrival(&self, producer_id: &str, now: std::time::Instant) {
-        if let Some(cell) = self.streams.read().get(producer_id).cloned() {
+        let cell = self.streams.read().get(producer_id).cloned();
+        if let Some(cell) = cell {
             cell.jitter.lock().note_late_arrival(now);
         }
     }
@@ -1377,6 +1382,7 @@ impl AudioMixer {
                         target_ms: jitter.target_ms(),
                         target_jitter_ms,
                         target_glitch_ms,
+                        target_late_ms: jitter.late_floor_ms(),
                         target_reactive_ms,
                         fill_min_ms: None,
                         fill_p50_ms: None,

@@ -33,8 +33,12 @@ pub enum Arrival {
     Start,
     /// Dans l'ordre : à jouer. `missing` paquets manquent juste avant lui.
     Next { missing: u16 },
-    /// Arrivé après que sa place a été dépassée : à ne PAS jouer.
-    Late,
+    /// Arrivé après que sa place a été dépassée : à ne PAS jouer. `replaced` :
+    /// sa place avait été remplie par du son inventé À L'ÉCHÉANCE (le tampon
+    /// allait manquer de son) — une marge plus grande l'aurait sauvé. Faux pour
+    /// un paquet simplement doublé dans le désordre (sa place a été comblée dès
+    /// l'arrivée du suivant, quelle que soit la marge) ou jamais comblée.
+    Late { replaced: bool },
     /// Déjà reçu : à ne pas jouer.
     Duplicate,
     /// Saut trop grand, en attente de confirmation par le paquet suivant : à ne pas
@@ -115,7 +119,7 @@ impl SeqTracker {
                 self.history |= 1;
                 self.counters.received += 1;
                 self.counters.late += 1;
-                return Arrival::Late;
+                return Arrival::Late { replaced: true };
             }
             self.counters.duplicate += 1;
             return Arrival::Duplicate;
@@ -144,13 +148,16 @@ impl SeqTracker {
                 self.counters.duplicate += 1;
                 return Arrival::Duplicate;
             }
-            // Place déjà remplie par une trame inventée : on la libère du masque,
-            // le paquet reste écarté et compté en retard (ci-dessous).
+            // Place remplie par une trame inventée à l'échéance (masque posé par
+            // `on_concealed`), ou dépassée par un paquet arrivé avant lui (désordre,
+            // place comblée à l'arrivée du suivant) : écarté et compté en retard
+            // dans les deux cas, mais seul le premier dit « marge trop courte ».
+            let replaced = self.concealed & bit != 0;
             self.concealed &= !bit;
             self.history |= bit;
             self.counters.received += 1;
             self.counters.late += 1;
-            return Arrival::Late;
+            return Arrival::Late { replaced };
         }
         if self.resync_seq == Some(seq) {
             return self.start(seq);
@@ -249,7 +256,7 @@ mod tests {
             vec![
                 Arrival::Start,
                 Arrival::Next { missing: 1 },
-                Arrival::Late,
+                Arrival::Late { replaced: false },
                 Arrival::Next { missing: 0 },
             ]
         );
@@ -289,7 +296,7 @@ mod tests {
     fn un_retard_deja_rattrape_devient_un_double() {
         let mut t = SeqTracker::new();
         let arrivals = feed(&mut t, &[1, 3, 2, 2]);
-        assert_eq!(arrivals[2], Arrival::Late);
+        assert_eq!(arrivals[2], Arrival::Late { replaced: false });
         assert_eq!(arrivals[3], Arrival::Duplicate);
         assert_eq!(t.counters().late, 1);
     }
@@ -305,7 +312,7 @@ mod tests {
                 Arrival::Next { missing: 0 },
                 Arrival::Next { missing: 0 },
                 Arrival::Next { missing: 1 },
-                Arrival::Late,
+                Arrival::Late { replaced: false },
             ]
         );
         assert_eq!(t.counters().lost(), 0);
@@ -317,7 +324,7 @@ mod tests {
         t.on_packet(0);
         t.on_packet(MAX_MISORDER);
         // Place 1 : `MAX_MISORDER - 1` en arrière, encore reconnue.
-        assert_eq!(t.on_packet(1), Arrival::Late);
+        assert_eq!(t.on_packet(1), Arrival::Late { replaced: false });
     }
 
     #[test]
@@ -351,6 +358,21 @@ mod tests {
         assert_eq!(t.on_packet(30_001), Arrival::Jump);
     }
 
+    /// 0.6.6-20 (revue) : un paquet doublé dans le désordre n'a pas été remplacé
+    /// À L'ÉCHÉANCE — sa place a été comblée dès l'arrivée du suivant ; une marge
+    /// plus grande n'y aurait rien fait. Seul le remplacement à l'échéance le dit.
+    #[test]
+    fn un_paquet_dans_le_desordre_n_est_pas_un_remplacement_a_l_echeance() {
+        let mut t = SeqTracker::new();
+        assert_eq!(t.on_packet(100), Arrival::Start);
+        assert_eq!(t.on_packet(102), Arrival::Next { missing: 1 });
+        assert_eq!(t.on_packet(101), Arrival::Late { replaced: false });
+        // Même chose en arrière, après un remplacement à l'échéance : vrai.
+        t.on_concealed(); // place 103 inventée à l'échéance
+        t.on_packet(104);
+        assert_eq!(t.on_packet(103), Arrival::Late { replaced: true });
+    }
+
     #[test]
     fn un_paquet_masque_puis_arrive_est_ecarte() {
         // Le cœur de 1.2 : on a inventé la trame 1 faute de l'avoir vue à l'heure.
@@ -358,7 +380,7 @@ mod tests {
         let mut t = SeqTracker::new();
         assert_eq!(t.on_packet(0), Arrival::Start);
         t.on_concealed(); // remplit la place du paquet 1
-        assert_eq!(t.on_packet(1), Arrival::Late);
+        assert_eq!(t.on_packet(1), Arrival::Late { replaced: true });
         assert_eq!(t.counters().late, 1);
         // Et la suite reprend normalement, sans faux trou.
         assert_eq!(t.on_packet(2), Arrival::Next { missing: 0 });
@@ -397,7 +419,7 @@ mod tests {
         // Les trois places sont passées : le paquet 14 suit sans trou déduit.
         assert_eq!(t.on_packet(14), Arrival::Next { missing: 0 });
         // Et les retardataires des places inventées sont écartés.
-        assert_eq!(t.on_packet(12), Arrival::Late);
+        assert_eq!(t.on_packet(12), Arrival::Late { replaced: true });
     }
 
     #[test]

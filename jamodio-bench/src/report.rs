@@ -28,6 +28,9 @@ pub const PEER_FIELDS: &[&str] = &[
     "bufferTargetMs",
     "targetJitterMs",
     "targetGlitchMs",
+    // 0.6.6-20 : marge apprise des paquets remplacés à l'échéance (absente avant :
+    // colonne vide, relue comme inconnue).
+    "targetLateMs",
     "targetReactiveMs",
     "fillMinMs",
     "fillP50Ms",

@@ -6043,7 +6043,7 @@ fn decode_one_packet(
     // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
     // (celui horodaté par le fil de réception) pour drift ET gigue. Un paquet en retard
     // y entre : son retard EST de la gigue. Un double ou un saut non confirmé non.
-    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late) {
+    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late { .. }) {
         st.drift.observe(header.timestamp, recv_instant);
         st.jitter.observe(header.timestamp, recv_instant);
     }
@@ -6068,7 +6068,7 @@ fn decode_one_packet(
         // buffer avec la gigue de QUEUE (pire-cas récent, pas la moyenne), une fois
         // l'estimateur fiable (warmup).
         if st.jitter.is_warm() {
-            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms());
+            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms(), recv_instant);
         }
         // Miroir dans la map partagée, lue à 1 Hz par ws_server. Mise à jour EN
         // PLACE : aucune allocation sur ce thread une fois l'entrée créée.
@@ -6135,11 +6135,14 @@ fn decode_one_packet(
                 st.logged_large_jump = true;
             }
         }
-        Arrival::Late => {
+        Arrival::Late { replaced } => {
             st.last_discard = Some(recv_instant);
-            // 0.6.6-20 — la marge de ce flux était trop courte : le tampon l'apprend
-            // (plancher de glitch, au plus un pas par seconde).
-            mixer.note_late_arrival(producer_id, recv_instant);
+            // 0.6.6-20 — remplacé à l'échéance : la marge de ce flux était trop
+            // courte, le tampon l'apprend. Un paquet simplement dans le désordre
+            // (`replaced == false`) n'apprend rien : aucune marge ne l'aurait sauvé.
+            if replaced {
+                mixer.note_late_arrival(producer_id, recv_instant);
+            }
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
@@ -7640,21 +7643,30 @@ mod conceal_loop_tests {
         assert!((st.concealed_premature_margin_ms - 1.0).abs() < 0.05, "{}", st.concealed_premature_margin_ms);
     }
 
-    /// 0.6.6-20 — le paquet qu'un masquage a remplacé arrive : le tampon de ce
-    /// flux apprend que sa marge était trop courte (plancher de glitch +1 ms).
+    /// Part de la cible apprise des paquets remplacés, pour le flux de test.
+    fn marge_apprise(m: &AudioMixer) -> f64 {
+        m.stream_perf_stats().into_iter().find(|p| p.producer_id == "peer-test").map(|p| p.target_late_ms).unwrap()
+    }
+
+    /// 0.6.6-20 — le paquet qu'un masquage à l'échéance a remplacé arrive : le
+    /// tampon de ce flux apprend que sa marge était trop courte (+1 ms).
     #[test]
     fn un_paquet_arrive_apres_son_masquage_releve_la_marge_du_flux() {
-        let glitch = |m: &AudioMixer| {
-            m.stream_perf_stats()
-                .into_iter()
-                .find(|p| p.producer_id == "peer-test")
-                .map(|p| p.target_glitch_ms)
-                .unwrap()
-        };
         let (mixer, mut st) = apres_un_masquage();
-        let avant = glitch(&mixer);
+        assert_eq!(marge_apprise(&mixer), 0.0);
         recevoir(&mut st, &mixer, 1001, Instant::now());
-        assert!((glitch(&mixer) - avant - 1.0).abs() < 0.05, "marge +1 ms : {avant} → {}", glitch(&mixer));
+        assert!((marge_apprise(&mixer) - 1.0).abs() < 0.05, "marge +1 ms : {}", marge_apprise(&mixer));
+    }
+
+    /// 0.6.6-20 (revue) — un paquet simplement doublé dans le désordre (sa place
+    /// comblée dès l'arrivée du suivant) n'apprend rien : aucune marge ne l'aurait
+    /// sauvé.
+    #[test]
+    fn un_paquet_dans_le_desordre_ne_releve_pas_la_marge() {
+        let (mixer, mut st) = apres_un_paquet();
+        recevoir(&mut st, &mixer, 1002, Instant::now()); // 1001 sauté → inventé à l'arrivée
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // le retardataire
+        assert_eq!(marge_apprise(&mixer), 0.0);
     }
 
     /// Deux tirages (2,67 ms) ont passé la vraie matière (1 ms) : ils ont joué
