@@ -5,7 +5,7 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
-## [Non publié]
+## [0.6.6] — 2026-10-03
 
 **Moins de trous sur PC, un studio complet, et des mises à jour servies par
 jamodio.com.**
