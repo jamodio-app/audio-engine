@@ -714,8 +714,9 @@ pub struct PipelineState {
     /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
     /// d'un seul côté laissait croire à deux réglages de nature différente.
     capture_channels_label: Option<String>,
-    /// Nom de l'entrée RÉELLEMENT ouverte par la capture en cours (part « nom »
-    /// de l'id résolu à l'ouverture, sur le fil COM). `None` hors capture. Seule
+    /// Nom de l'entrée RÉELLEMENT ouverte par la capture en cours (rendu par
+    /// l'ouverture, sur le fil COM ; remis à jour quand le superviseur rouvre
+    /// les flux). `None` hors capture. Seule
     /// source des libellés d'affichage : les relire ne doit JAMAIS résoudre un
     /// périphérique — `get-stats` (1,5 s) et la fenêtre interne (2 s) les
     /// demandent sans cesse, et une énumération ASIO sous le verrou du pipeline
@@ -2571,11 +2572,11 @@ impl PipelineState {
 
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
         // greffer un producteur voix plus tard (validation canal) sans redémarrer
-        // l'instrument. Fresh capture ⇒ pas de voix active. `native_sr` est
+        // l'instrument. Aucune voix active ici : `prepare_audio_for_session` est
+        // passé par `teardown_session` → `stop_voice`. `native_sr` est
         // invariablement 48 kHz ici (R2 ci-dessus).
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
-        self.voice_active = false;
         // ENTRÉE (input_cut) — le pipeline est UNIQUE et à vie (construit 1× au
         // boot). Sans reset, `input_cut` SURVIT d'une session studio à l'autre :
         // quitter en ENTRÉE OFF laissait l'instrument coupé à la source au join
@@ -2791,7 +2792,7 @@ impl PipelineState {
             (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
             (None, None) => Some("canaux 1-2".to_string()),
         };
-        self.capture_input_name = Some(device_name_of(&resolved_input_id).to_string());
+        self.capture_input_name = Some(in_name.clone());
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -3224,6 +3225,9 @@ impl PipelineState {
             BuiltDuplex::Cpal { input, output } => {
                 self.input_buffer_samples = input.input_buf;
                 self.input_hw = crate::audio::declared_latency::input(&input.name);
+                // Sans entrée choisie, le défaut a pu changer (débranché) : on
+                // nomme ce qui est réellement rouvert.
+                self.capture_input_name = Some(input.name);
                 self.capture_stream = Some(input.stream);
                 // Rien ici : un pilote qui se rouvre ne prouve pas que le son revient
                 // (recette PC 17/09). C'est le superviseur qui déclare l'entrée
@@ -3267,6 +3271,7 @@ impl PipelineState {
                 self.input_hw = a.host.input_hw;
                 self.output_hw = a.host.output_hw;
                 let new_sr = a.native_sr;
+                self.capture_input_name = Some(a.name.clone());
                 self.output_device_name = Some(a.name.clone());
                 self.asio_host = Some(a.host);
                 // Interface rouverte — mais « ouverte » n'est pas « vivante » : c'est
