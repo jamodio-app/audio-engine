@@ -45,8 +45,10 @@ jamodio.com.**
   nettoyage de fin de session sauté). L'entrée affichée est désormais celle
   qui est ouverte ou choisie, sans aucune recherche.
 - **Talkback sur un micro séparé (casque, micro USB) : le micro est relâché en
-  quittant le studio.** Il restait ouvert — et la voix encodée — après la fin
-  de la session ou un changement d'entrée, jusqu'au talkback suivant ou à la
+  quittant le studio, et son traitement de la voix s'arrête.** Le micro restait
+  ouvert — et la voix encodée — après la fin de la session ou un changement
+  d'entrée ; puis, une fois le micro relâché, le traitement de la voix (filtre
+  antibruit compris) restait en mémoire, un par talkback ouvert, jusqu'à la
   fermeture de l'Audio Engine.
 - **Le relevé des mesures n'interrompt plus la réception.** Le calcul des
   statistiques de chaque seconde se faisait en tenant un verrou que la
@@ -85,6 +87,10 @@ jamodio.com.**
   donnent des adresses brutes, lues avec les symboles gardés en privé.
 - Chaîne de publication : la clé qui signe les mises à jour n'est plus
   exposée à des outils téléchargés sans version fixe.
+- Seul **jamodio.com** pilote l'Audio Engine d'un musicien : les pages de
+  prévisualisation (`…vercel.app`) ne sont plus acceptées que sur les machines
+  de test, où un fichier `allow-vercel-previews` est posé à côté des journaux
+  (puis l'Audio Engine relancé).
 
 ### Interne
 

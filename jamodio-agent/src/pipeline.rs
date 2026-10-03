@@ -706,6 +706,11 @@ pub struct PipelineState {
     /// instrument. `None` = talkback pris sur le flux instrument (historique).
     /// Lâcher la poignée arrête le flux et relâche le périphérique.
     voice_capture: Option<crate::audio::voice_capture::VoiceCaptureHandle>,
+    /// Étage voix en cours (fil `voice-encode` + fermeture de sa file). Le lâcher
+    /// ferme la file et ATTEND la fin du fil : il s'arrête à coup sûr, quelle
+    /// que soit la source, et deux générations de talkback ne se chevauchent
+    /// jamais (cf. `VoiceEncodeStage`).
+    voice_encode_stage: Option<VoiceEncodeStage>,
     /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
     /// est prise sur un canal de l'interface instrument.
     voice_device_label: Option<String>,
@@ -850,7 +855,7 @@ pub struct PipelineState {
     /// instrument active : canal de commande du tap voix vers le
     /// `capture_stage`. Le tap extrait un canal mono du buffer multicanal BRUT
     /// (AVANT plugin/monitor) et l'envoie au `voice_encode_stage`. Reset à
-    /// `None` au teardown (le thread voix s'arrête alors en cascade).
+    /// `None` au teardown (le thread voix, lui, s'arrête par `stop_voice`).
     voice_ctrl_tx: Option<Sender<VoiceControl>>,
     /// `true` ⇔ un producteur voix est actif. Idempotence de start/stop voix.
     voice_active: bool,
@@ -1560,6 +1565,7 @@ impl PipelineState {
             capture_stream: None,
             playback_stream: None,
             voice_capture: None,
+            voice_encode_stage: None,
             voice_device_label: None,
             capture_channels_label: None,
             capture_input_name: None,
@@ -2897,6 +2903,8 @@ impl PipelineState {
         let (voice_tx, voice_rx) = crate::audio::voice_tap::voice_tap(
             crate::audio::voice_tap::VOICE_TAP_MAX_MS,
         );
+        // Fermeture de la file : réunie au fil voix dès son lancement (étape 6).
+        let voice_closer = voice_tx.closer();
         let voice_stage = self.perfstats.voice_stage.clone();
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
@@ -2908,13 +2916,16 @@ impl PipelineState {
             .output_device_id
             .as_deref()
             .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
-        // 6. Spawn du thread d'encodage voix (RT). Termine seul au drop de voice_tx.
+        // 6. Spawn du thread d'encodage voix (RT). Termine quand sa file est fermée
+        //    (`VoiceEncodeStage` lâché par `stop_voice`, ou à un échec plus bas).
         //    Il signale sur `ready_tx` quand il est PRÊT À CONSOMMER (encodeur créé,
         //    modèles d'isolation chargés) — cf. étape 7. Canal ONESHOT TOKIO (et
         //    non crossbeam) : l'attente doit être `await`, pas bloquante — on tient
         //    le mutex pipeline et on tourne sur un worker du runtime.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        std::thread::Builder::new()
+        let stage_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_ready = stage_ready.clone();
+        let voice_thread = std::thread::Builder::new()
             .name("voice-encode".into())
             .spawn(move || {
                 voice_encode_stage_loop(
@@ -2931,9 +2942,17 @@ impl PipelineState {
                     voice_stage,
                     output_device_name,
                     ready_tx,
+                    thread_ready,
                 );
             })
             .map_err(|e| format!("spawn voice-encode: {}", e))?;
+        // Lâché à tout échec plus bas (sortie de fonction) : la file se ferme et
+        // le fil s'arrête. Gardé par `stop_voice` sinon.
+        let encode_stage = VoiceEncodeStage {
+            closer: Some(voice_closer),
+            thread: Some(voice_thread),
+            ready: stage_ready,
+        };
         // 7. Attend que le thread voix soit prêt AVANT de greffer le tap. Sans ça,
         //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
         //    mesurés) : la file déborde et le DÉBUT du talkback part en silence
@@ -3010,6 +3029,7 @@ impl PipelineState {
                 "canal du flux instrument".to_string()
             }
         };
+        self.voice_encode_stage = Some(encode_stage);
         self.voice_active = true;
         tracing::info!(
             target: "jamodio::pipeline",
@@ -3081,11 +3101,16 @@ impl PipelineState {
     }
 
     /// Arrête la voix, quelle que soit sa source, et remet son état à zéro :
-    /// - tap sur le flux instrument : retiré du `capture_stage` → son `out_tx`
-    ///   voix est lâché, le thread `voice_encode` termine en cascade ;
+    /// - tap sur le flux instrument : retiré du `capture_stage` (son `out_tx`
+    ///   voix est lâché) ;
     /// - micro dédié : la poignée est lâchée → flux arrêté, périphérique RELÂCHÉ
-    ///   (sinon le casque reste tenu par l'agent), et le thread `voice_encode`
-    ///   termine de même. Le drop ATTEND la fin du fil propriétaire du flux.
+    ///   (sinon le casque reste tenu par l'agent). Le drop ATTEND la fin du fil
+    ///   propriétaire du flux ;
+    /// - dans les deux cas, la file de l'étage voix est FERMÉE et le thread
+    ///   `voice_encode` ATTENDU : il sort sans dépendre de la disparition des
+    ///   émetteurs (celui du micro dédié survit sur macOS), avant toute nouvelle
+    ///   voix — ses remises à zéro (VU, « à l'antenne », isolation) ne peuvent
+    ///   plus tomber sur le talkback suivant.
     ///
     /// Seul point d'arrêt de la voix (`stop_voice_capture`, changement de micro,
     /// `teardown_session`) : `voice_active` dit toujours la vérité.
@@ -3095,6 +3120,7 @@ impl PipelineState {
                 let _ = tx.try_send(VoiceControl::Remove);
             }
         }
+        self.voice_encode_stage = None;
         self.voice_capture = None;
         self.voice_device_label = None;
         self.voice_channel_index = None;
@@ -3674,6 +3700,48 @@ pub enum ChannelSel {
     StereoPair(u8),
 }
 
+/// Étage voix d'un talkback : son fil `voice-encode` et la fermeture de sa file.
+/// Le lâcher ferme la file (le fil est réveillé et sort de sa boucle) puis
+/// ATTEND la fin du fil — au plus le traitement d'un bloc en cours, durée
+/// journalisée. Seule exception : un fil pas encore PRÊT (modèles d'isolation
+/// en chargement, cas « pas prêt après 10 s ») n'est pas attendu — la durée
+/// d'un chargement n'est pas bornée, et l'attente tiendrait le verrou du
+/// pipeline ; il voit la fermeture à l'entrée de sa boucle et s'arrête seul.
+struct VoiceEncodeStage {
+    closer: Option<crate::audio::voice_tap::VoiceTapCloser>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Posé par le fil quand il entre dans sa boucle de consommation.
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Au-delà, l'attente de la fin du fil voix est signalée (elle tient le verrou
+/// du pipeline) : en régime normal, elle ne couvre qu'un bloc en cours.
+const VOICE_STAGE_JOIN_WARN: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl Drop for VoiceEncodeStage {
+    fn drop(&mut self) {
+        drop(self.closer.take());
+        let Some(thread) = self.thread.take() else { return };
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                "fil voice-encode encore en chargement : non attendu, il s'arrêtera à la fin du chargement"
+            );
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let panicked = thread.join().is_err();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if panicked {
+            tracing::error!(target: "jamodio::pipeline", elapsed_ms, "le fil voice-encode s'est terminé en panique");
+        } else if t0.elapsed() > VOICE_STAGE_JOIN_WARN {
+            tracing::warn!(target: "jamodio::pipeline", elapsed_ms, "arrêt du fil voice-encode plus long que prévu");
+        } else {
+            tracing::info!(target: "jamodio::pipeline", elapsed_ms, "fil voice-encode arrêté");
+        }
+    }
+}
+
 /// Talkback (Lot 2, v0.5.7) — commande du tap voix, envoyée par
 /// `start_voice_capture` / `stop_voice_capture` (via `voice_ctrl_tx` conservé
 /// dans `PipelineState`) et poll ée par `capture_stage_loop`. Permet de
@@ -3682,8 +3750,8 @@ enum VoiceControl {
     /// Active le tap : extrait le canal mono `channel_index` du buffer BRUT à
     /// chaque bloc CPAL et le pousse vers le `voice_encode_stage` via `out_tx`.
     Add { channel_index: usize, out_tx: crate::audio::voice_tap::VoiceTapSender },
-    /// Retire le tap : le `out_tx` détenu par `capture_stage` est droppé →
-    /// le thread `voice_encode` termine en cascade.
+    /// Retire le tap : le `out_tx` détenu par `capture_stage` est droppé. Le
+    /// thread `voice_encode`, lui, s'arrête à la fermeture de sa file (`stop_voice`).
     Remove,
 }
 
@@ -4102,8 +4170,8 @@ fn capture_stage_loop(
                 VoiceControl::Add { channel_index, out_tx } => {
                     voice_out = Some((channel_index, out_tx));
                 }
-                // Drop de l'`out_tx` → le thread voice_encode voit Disconnected
-                // et termine en cascade (même mécanique que le shutdown global).
+                // Le tap ne pousse plus ; le thread voice_encode s'arrête à la
+                // fermeture de sa file (`stop_voice`).
                 VoiceControl::Remove => voice_out = None,
             }
         }
@@ -4869,8 +4937,10 @@ fn encode_stage_loop(
 //     LowDelay, comme l'instrument) ;
 //   - construit le paquet RTP et l'envoie (SRTP, non bloquant).
 //
-// Termine dès que `in_rx` est déconnecté : `capture_stage` a droppé son
-// `out_tx` (Remove explicite, ou arrêt de la capture instrument).
+// Termine dès que `in_rx` rend `Disconnected`, c.-à-d. quand sa file est fermée
+// (`VoiceEncodeStage` lâché par `stop_voice`, qui attend ensuite la fin du fil) —
+// le `VoiceTapCloser` garde un émetteur : le départ des producteurs (tap retiré,
+// capture instrument arrêtée) ne suffit pas, c'est voulu (un seul chemin d'arrêt).
 //
 // N'ALIMENTE PAS les histogrammes perfstats instrument : la voix est un flux
 // secondaire, on ne veut pas polluer la mesure de latence du chemin principal.
@@ -4897,6 +4967,7 @@ fn voice_encode_stage_loop(
     // Oneshot TOKIO : l'appelant attend en `await`, il ne doit pas bloquer un
     // worker du runtime pendant le chargement des modèles.
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -4987,8 +5058,10 @@ fn voice_encode_stage_loop(
     let mut window_processed: u64 = 0;
     let mut dropped_seen = in_rx.dropped_samples_total();
 
-    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
+    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture),
+    // et l'arrêt de l'étage peut attendre ce fil (cf. `VoiceEncodeStage`).
     // `send` consomme le Sender — le canal se ferme donc de lui-même ensuite.
+    ready.store(true, std::sync::atomic::Ordering::Release);
     let _ = ready_tx.send(());
 
     loop {
@@ -7737,43 +7810,105 @@ mod voice_teardown_tests {
     use jamodio_audio_core::mixer::mixer::AudioMixer;
     use std::sync::Arc;
 
-    /// Pipeline avec un talkback sur micro dédié ; rend le témoin d'arrêt du flux.
-    fn avec_micro_dedie() -> (PipelineState, crossbeam_channel::Receiver<()>) {
+    /// Talkback sur micro dédié, tel que `start_voice_capture` le laisse.
+    struct Talkback {
+        pl: PipelineState,
+        /// Témoin d'arrêt du flux du micro.
+        micro_arrete: crossbeam_channel::Receiver<()>,
+        /// Ce que lit le fil `voice-encode`.
+        etage_voix: crate::audio::voice_tap::VoiceTapReceiver,
+        /// Émetteur qui SURVIT, comme celui que la fonction de rappel CPAL garde
+        /// sur macOS après la destruction du flux.
+        _emetteur: crate::audio::voice_tap::VoiceTapSender,
+    }
+
+    fn avec_micro_dedie() -> Talkback {
         let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
-        let (handle, arrete) = VoiceCaptureHandle::for_test();
+        let (handle, micro_arrete) = VoiceCaptureHandle::for_test();
+        let (emetteur, etage_voix) =
+            crate::audio::voice_tap::voice_tap(crate::audio::voice_tap::VOICE_TAP_MAX_MS);
+        pl.voice_encode_stage = Some(VoiceEncodeStage {
+            closer: Some(emetteur.closer()),
+            thread: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
         pl.voice_capture = Some(handle);
         pl.voice_device_label = Some("Casque USB".to_string());
         pl.voice_active = true;
-        (pl, arrete)
+        Talkback { pl, micro_arrete, etage_voix, _emetteur: emetteur }
     }
 
-    fn assert_voix_arretee(pl: &PipelineState, arrete: &crossbeam_channel::Receiver<()>) {
-        assert!(arrete.try_recv().is_ok(), "flux du micro arrêté, périphérique relâché");
-        assert!(pl.voice_capture.is_none());
-        assert!(!pl.voice_active);
-        assert_eq!(pl.voice_source_label(), None, "la fenêtre ne nomme plus de micro");
+    fn assert_voix_arretee(t: &Talkback) {
+        assert!(t.micro_arrete.try_recv().is_ok(), "flux du micro arrêté, périphérique relâché");
+        assert_eq!(
+            t.etage_voix.recv_timeout(std::time::Duration::from_millis(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+            "le fil voice-encode sort de sa boucle, même avec un émetteur encore en vie"
+        );
+        assert!(t.pl.voice_capture.is_none());
+        assert!(!t.pl.voice_active);
+        assert_eq!(t.pl.voice_source_label(), None, "la fenêtre ne nomme plus de micro");
     }
 
     #[test]
     fn la_fin_de_session_relache_le_micro_dedie() {
-        let (mut pl, arrete) = avec_micro_dedie();
-        pl.teardown_session(false);
-        assert_voix_arretee(&pl, &arrete);
+        let mut t = avec_micro_dedie();
+        t.pl.teardown_session(false);
+        assert_voix_arretee(&t);
     }
 
     #[test]
     fn le_changement_d_entree_relache_le_micro_dedie() {
-        let (mut pl, arrete) = avec_micro_dedie();
-        pl.teardown_session(true);
-        assert_voix_arretee(&pl, &arrete);
+        let mut t = avec_micro_dedie();
+        t.pl.teardown_session(true);
+        assert_voix_arretee(&t);
+    }
+
+    /// Chemin réel de `start_voice_capture` (talkback pris sur un canal de
+    /// l'instrument) : la file branchée au tap reçoit la voix tant que le
+    /// talkback vit ; `stop_voice_capture` attend la fin du fil `voice-encode`
+    /// (il rend la main) et le tap ne peut plus pousser.
+    #[tokio::test]
+    async fn un_talkback_demarre_vit_puis_son_fil_s_arrete_a_l_arret() {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<VoiceControl>(4);
+        pl.voice_ctrl_tx = Some(ctrl_tx);
+        pl.capture_channels_in = 2;
+        pl.start_voice_capture(
+            1234,
+            "127.0.0.1".to_string(),
+            9,
+            111,
+            0,
+            SrtpParameters::generate_aead_aes_256_gcm(),
+            None,
+        )
+        .await
+        .expect("talkback démarré");
+        assert!(pl.voice_active);
+        let Ok(VoiceControl::Add { out_tx, .. }) = ctrl_rx.try_recv() else {
+            panic!("le tap doit être greffé sur la capture instrument");
+        };
+        assert!(out_tx.push(vec![0.0; 48]).is_ok(), "talkback en vie : la voix passe");
+
+        pl.stop_voice_capture();
+        // Le fil détient ses propres copies de ces indicateurs : il ne les
+        // rend qu'en se terminant. 1 = seul le pipeline les tient encore.
+        assert_eq!(Arc::strong_count(&pl.isolation_active), 1, "fil voice-encode terminé");
+        assert_eq!(Arc::strong_count(&pl.voice_on_air), 1, "fil voice-encode terminé");
+        assert_eq!(
+            out_tx.push(vec![0.0; 48]),
+            Err(crate::audio::voice_tap::Disconnected),
+            "file fermée : le tap ne pousse plus"
+        );
     }
 
     /// Avant le correctif, ce message ne faisait plus rien une fois la session
     /// finie (`voice_active` à faux, micro toujours ouvert).
     #[test]
     fn stop_voice_capture_relache_le_micro_dedie() {
-        let (mut pl, arrete) = avec_micro_dedie();
-        pl.stop_voice_capture();
-        assert_voix_arretee(&pl, &arrete);
+        let mut t = avec_micro_dedie();
+        t.pl.stop_voice_capture();
+        assert_voix_arretee(&t);
     }
 }
