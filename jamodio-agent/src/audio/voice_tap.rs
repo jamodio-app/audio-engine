@@ -70,8 +70,8 @@ struct Shared {
 }
 
 /// Côté producteur (capture instrument ou micro dédié). Non bloquant, aucune
-/// allocation : deux opérations atomiques par bloc, hors du callback d'entrée
-/// instrument (le tap instrument vit dans `capture_stage`).
+/// allocation : une lecture et deux opérations atomiques par bloc, hors du
+/// callback d'entrée instrument (le tap instrument vit dans `capture_stage`).
 #[derive(Debug, Clone)]
 pub struct VoiceTapSender {
     tx: Sender<Vec<f32>>,
@@ -127,6 +127,12 @@ impl VoiceTapSender {
         }
     }
 
+    /// Poignée qui ferme cette file quand on la lâche. Elle garde sa propre copie
+    /// de l'émetteur, qui ne sert qu'à réveiller le récepteur à la fermeture.
+    pub fn closer(&self) -> VoiceTapCloser {
+        VoiceTapCloser { shared: self.shared.clone(), wake: self.tx.clone() }
+    }
+
     fn reject(&self, n: usize) -> Pushed {
         self.shared.queued.fetch_sub(n, Relaxed);
         self.shared.dropped.fetch_add(n as u64, Relaxed);
@@ -143,13 +149,14 @@ impl VoiceTapReceiver {
         }
         let block = self.rx.recv_timeout(timeout)?;
         self.shared.queued.fetch_sub(block.len(), Relaxed);
+        // Réveillé par la fermeture (bloc vide du `VoiceTapCloser`), ou bloc
+        // arrivé juste avant : la file est close, l'étage voix s'arrête.
+        if self.shared.closed.load(Acquire) {
+            return Err(RecvTimeoutError::Disconnected);
+        }
         Ok(block)
     }
 
-    /// Poignée qui ferme cette file quand on la lâche.
-    pub fn closer(&self) -> VoiceTapCloser {
-        VoiceTapCloser { shared: self.shared.clone() }
-    }
 
     /// Échantillons jetés depuis la création (monotone).
     pub fn dropped_samples_total(&self) -> u64 {
@@ -157,24 +164,31 @@ impl VoiceTapReceiver {
     }
 }
 
-/// Ferme la file quand on la lâche : l'étage voix s'arrête (`recv_timeout` rend
-/// `Disconnected`) et les producteurs ne poussent plus.
+/// Ferme la file quand on la lâche : l'étage voix s'arrête AUSSITÔT (le
+/// récepteur en attente est réveillé, puis `recv_timeout` rend `Disconnected`)
+/// et les producteurs ne poussent plus.
 ///
 /// Pourquoi ne pas attendre que les émetteurs partent : celui d'un micro dédié
 /// vit dans la fonction de rappel du flux CPAL, et sur macOS CPAL ne la libère
-/// pas quand le flux est détruit (même piège que l'AudioUnit, cf.
-/// `voice_capture`). Le micro s'arrêtait, mais son étage voix — isolation de
+/// pas quand le flux est détruit : pour un périphérique autre que celui « par
+/// défaut », l'écouteur de déconnexion qu'elle installe garde un `Arc` vers le
+/// flux lui-même (cycle de références, cpal 0.15 macOS) — et nos micros dédiés
+/// viennent tous de la liste des entrées. Le micro s'arrêtait, mais son étage voix — isolation de
 /// voix comprise — restait en vie jusqu'à la fermeture de l'Audio Engine, un
 /// par talkback ouvert (constaté le 03/10/2026, 0.6.6-18 : 4 fils
 /// `voice-encode` sans studio).
 #[derive(Debug)]
 pub struct VoiceTapCloser {
     shared: Arc<Shared>,
+    wake: Sender<Vec<f32>>,
 }
 
 impl Drop for VoiceTapCloser {
     fn drop(&mut self) {
         self.shared.closed.store(true, Release);
+        // Réveille un `recv_timeout` en attente (sans cela : jusqu'à 100 ms).
+        // File pleine = le récepteur n'attend pas : rien à réveiller.
+        let _ = self.wake.try_send(Vec::new());
     }
 }
 
@@ -285,7 +299,7 @@ mod tests {
     #[test]
     fn lacher_la_poignee_arrete_l_etage_voix_meme_si_un_emetteur_survit() {
         let (tx, rx) = voice_tap(VOICE_TAP_MAX_MS);
-        let fermeture = rx.closer();
+        let fermeture = tx.closer();
         assert_eq!(tx.push(vec![0.0; BLOC_48]), Ok(Pushed::Queued));
         assert!(rx.recv_timeout(Duration::from_millis(10)).is_ok(), "file ouverte : le bloc passe");
         drop(fermeture);
