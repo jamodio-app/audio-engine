@@ -714,6 +714,14 @@ pub struct PipelineState {
     /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
     /// d'un seul côté laissait croire à deux réglages de nature différente.
     capture_channels_label: Option<String>,
+    /// Nom de l'entrée RÉELLEMENT ouverte par la capture en cours (part « nom »
+    /// de l'id résolu à l'ouverture, sur le fil COM). `None` hors capture. Seule
+    /// source des libellés d'affichage : les relire ne doit JAMAIS résoudre un
+    /// périphérique — `get-stats` (1,5 s) et la fenêtre interne (2 s) les
+    /// demandent sans cesse, et une énumération ASIO sous le verrou du pipeline
+    /// bloquait les autres messages, voire libérait le pilote en service
+    /// (revue 0.6.6, constat A).
+    capture_input_name: Option<String>,
     /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
     /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
     /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
@@ -1220,6 +1228,12 @@ impl PerfHandles {
     }
 }
 
+/// Part « nom » d'un id de périphérique `{idx}:{name}` — l'id entier s'il n'a
+/// pas cette forme. Pour l'affichage seulement.
+fn device_name_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, name)| name)
+}
+
 /// Lecteurs des histogrammes de [`PerfHandles`] : chaque lecture n'échange
 /// qu'un tampon sous le verrou, le calcul se fait verrou relâché (revue 0.6.6,
 /// constat B — le fil de réception prioritaire attendait le tri).
@@ -1547,6 +1561,7 @@ impl PipelineState {
             voice_capture: None,
             voice_device_label: None,
             capture_channels_label: None,
+            capture_input_name: None,
             voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
@@ -2084,12 +2099,12 @@ impl PipelineState {
         let _ = self.restart_playback();
     }
 
-    /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
-    /// sinon l'id du default système. Utilisé uniquement pour les Stats UI
-    /// (pas un point de résolution de capture — le start_capture fait sa
-    /// propre résolution stricte).
-    pub fn selected_input_id(&self) -> Option<String> {
-        self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
+    /// Entrée à afficher dans `get-stats` : l'interface et le canal captés
+    /// pendant une capture, sinon l'entrée choisie par le studio, sinon rien
+    /// (« — »). Ne résout JAMAIS de périphérique (cf. `capture_input_name`).
+    pub fn stats_device_name(&self) -> Option<String> {
+        self.instrument_source_label()
+            .or_else(|| self.input_device_id.as_deref().map(|id| device_name_of(id).to_string()))
     }
 
     /// 0.5.4-5 — host audio actif = ASIO (Windows) ? Gouverne le keep-warm.
@@ -2148,6 +2163,8 @@ impl PipelineState {
         // notre Sender de commande et on remet l'état voix à zéro.
         self.voice_ctrl_tx = None;
         self.voice_active = false;
+        // Plus de capture : plus d'entrée ouverte à nommer.
+        self.capture_input_name = None;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
         self.mixer.remove_local_stream();
         // Hot-swap d'entrée (session_continues) : la réception des pairs est
@@ -2771,6 +2788,7 @@ impl PipelineState {
             (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
             (None, None) => Some("canaux 1-2".to_string()),
         };
+        self.capture_input_name = Some(device_name_of(&resolved_input_id).to_string());
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -3026,9 +3044,7 @@ impl PipelineState {
         if !matches!(self.state, AgentState::Capturing) {
             return None;
         }
-        let name = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()))?;
+        let name = self.capture_input_name.clone()?;
         Some(match self.capture_channels_label.as_deref() {
             Some(ch) => format!("{name} — {ch}"),
             None => name,
@@ -3050,13 +3066,11 @@ impl PipelineState {
         // croire à une autre source que celle affichée juste au-dessus.
         // Le nom est relu à CHAQUE appel (jamais figé au démarrage du talkback)
         // pour ne pas afficher l'ancienne interface après un changement d'entrée.
-        let iface = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()));
+        let iface = self.capture_input_name.clone();
         Some(match (iface, self.voice_channel_index) {
             (Some(name), Some(ch)) => format!("{} — canal {}", name, u16::from(ch) + 1),
             (Some(name), None) => name,
-            // Pas d'entrée sélectionnée alors qu'une voix est active : état
+            // Pas d'entrée ouverte alors qu'une voix est active : état
             // incohérent, on le dit au lieu d'inventer un nom.
             (None, _) => "source inconnue".to_string(),
         })
@@ -7656,5 +7670,50 @@ mod limite_flux_recus_tests {
         }
         let refus = check_recv_capacity(MAX_RECV_STREAMS).expect_err("au-delà de la limite, refus");
         assert!(refus.contains("too many streams"), "{refus}");
+    }
+}
+
+/// Revue 0.6.6, constat A : l'entrée affichée par `get-stats` se lit dans
+/// l'état, sans jamais résoudre un périphérique.
+#[cfg(test)]
+mod stats_device_name_tests {
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    fn pipeline() -> PipelineState {
+        PipelineState::new(Arc::new(AudioMixer::new()))
+    }
+
+    #[test]
+    fn rien_de_choisi_hors_capture_ne_nomme_rien() {
+        assert_eq!(pipeline().stats_device_name(), None);
+    }
+
+    #[test]
+    fn hors_capture_l_entree_choisie_par_le_studio() {
+        let mut pl = pipeline();
+        pl.input_device_id = Some("3:Focusrite USB ASIO".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("Focusrite USB ASIO"));
+    }
+
+    #[test]
+    fn en_capture_l_entree_ouverte_et_son_canal() {
+        let mut pl = pipeline();
+        // Le studio a choisi une entrée, mais c'est l'entrée OUVERTE qui compte.
+        pl.input_device_id = Some("1:Autre".to_string());
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.capture_channels_label = Some("canal 1".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("UMC204HD — canal 1"));
+    }
+
+    #[test]
+    fn la_fin_de_session_oublie_l_entree_ouverte() {
+        let mut pl = pipeline();
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.teardown_session(false);
+        assert_eq!(pl.capture_input_name, None);
     }
 }

@@ -3679,10 +3679,8 @@ async fn handle_message(
             // suivi du canal capté QUAND une capture tourne — même forme que la
             // ligne Talkback, pour qu'on ne croie pas à deux réglages de nature
             // différente. Hors capture, le nom seul (le canal n'a pas cours).
-            let device_name = pl.instrument_source_label().or_else(|| {
-                pl.selected_input_id()
-                    .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id)))
-            });
+            // Lu dans l'état, JAMAIS résolu : on tient le verrou du pipeline.
+            let device_name = pl.stats_device_name();
 
             // Real latency from CPAL buffer: samples / 48000 * 1000.
             //
