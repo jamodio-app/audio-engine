@@ -5259,6 +5259,12 @@ fn voice_encode_stage_loop(
 // push depuis ce fil) → zéro race, zéro contention mutex ×N.
 // Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
+/// 0.6.6-20 — au-delà, un paquet remplacé à l'échéance n'apprend rien au tampon :
+/// il serait arrivé trop tard pour la marge que la cible peut apprendre (plafond
+/// 15 ms) — c'est un pic, l'affaire du plancher de gigue et du filet réactif.
+/// CONSTANTE DE CALIBRATION.
+const JUST_LATE_MAX: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Le dernier masquage à l'échéance, tel qu'il faut le connaître pour juger
 /// son retardataire.
 #[derive(Debug, Clone, Copy)]
@@ -6143,13 +6149,18 @@ fn decode_one_packet(
         }
         Arrival::Late { replaced } => {
             st.last_discard = Some(recv_instant);
-            // 0.6.6-20 — remplacé à l'échéance : la marge de ce flux était trop
-            // courte, le tampon l'apprend. Un paquet simplement dans le désordre
-            // (`replaced == false`) n'apprend rien : aucune marge ne l'aurait sauvé.
-            // Choix assumé : après un pic qui finit en trou, le trou monte le
-            // plancher de glitch ET le retardataire la marge apprise — deux
-            // signaux, deux redescentes (la seconde, rapide : 1 ms / 10 s).
-            if replaced {
+            // 0.6.6-20 — le tampon apprend des seuls paquets qu'une marge de
+            // quelques ms aurait sauvés : remplacés à l'échéance (`replaced` ; un
+            // paquet simplement dans le désordre n'a rien à dire), place du
+            // DERNIER remplacement, arrivés au plus `JUST_LATE_MAX` après lui.
+            // Après un pic de 60 ms, les retardataires arrivent des dizaines de
+            // ms trop tard : apprendre d'eux montait la cible sans rien sauver
+            // (banc pics-seuls, 03/10 : +3,8 ms, son inventé inchangé).
+            let just_late = replaced
+                && st.last_conceal.as_ref().is_some_and(|lc| {
+                    lc.slot == header.sequence && recv_instant.saturating_duration_since(lc.at) <= JUST_LATE_MAX
+                });
+            if just_late {
                 mixer.note_late_arrival(producer_id, recv_instant);
             }
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
@@ -7665,6 +7676,15 @@ mod conceal_loop_tests {
         assert_eq!(marge_apprise(&mixer), 0.0);
         recevoir(&mut st, &mixer, 1001, Instant::now());
         assert!((marge_apprise(&mixer) - 1.0).abs() < 0.05, "marge +1 ms : {}", marge_apprise(&mixer));
+    }
+
+    /// 0.6.6-20 — un remplacé arrivé bien après son remplacement (fin de pic)
+    /// n'apprend rien : quelques ms de marge ne l'auraient pas sauvé.
+    #[test]
+    fn un_paquet_remplace_arrive_bien_trop_tard_n_apprend_rien() {
+        let (mixer, mut st) = apres_un_masquage();
+        recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(30));
+        assert_eq!(marge_apprise(&mixer), 0.0);
     }
 
     /// 0.6.6-20 (revue) — un paquet simplement doublé dans le désordre (sa place
