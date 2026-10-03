@@ -37,6 +37,15 @@ jamodio.com.**
 
 ### Corrigé
 
+- **Moins de son « inventé » sur les connexions irrégulières (Wi-Fi, 4G).**
+  Quand un morceau de son arrivait juste après son heure, l'Audio Engine le
+  remplaçait par du son reconstitué, sans en tirer de leçon : sur un lien
+  irrégulier, cela pouvait arriver plusieurs dizaines de fois par minute. Le
+  tampon de chaque musicien apprend désormais de ces arrivées tardives et garde
+  juste la marge qu'il faut : quelques millisecondes de plus (jamais plus de 15), sur ce seul
+  musicien, tant que sa connexion a des à-coups, puis il la rend peu à peu. Une
+  connexion sans à-coups ne change pas.
+
 - **Windows (ASIO) : l'Audio Engine ne réinterroge plus tous les pilotes audio
   pendant qu'on le consulte.** Le relevé d'état (toutes les 1,5 à 2 secondes,
   studio ouvert ou non) parcourait la liste des pilotes ASIO tant qu'aucune

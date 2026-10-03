@@ -5259,6 +5259,12 @@ fn voice_encode_stage_loop(
 // push depuis ce fil) → zéro race, zéro contention mutex ×N.
 // Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
+/// 0.6.6-20 — au-delà, un paquet remplacé à l'échéance n'apprend rien au tampon :
+/// il serait arrivé trop tard pour la marge que la cible peut apprendre (plafond
+/// 15 ms) — c'est un pic, l'affaire du plancher de gigue et du filet réactif.
+/// CONSTANTE DE CALIBRATION.
+const JUST_LATE_MAX: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Le dernier masquage à l'échéance, tel qu'il faut le connaître pour juger
 /// son retardataire.
 #[derive(Debug, Clone, Copy)]
@@ -6043,7 +6049,7 @@ fn decode_one_packet(
     // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
     // (celui horodaté par le fil de réception) pour drift ET gigue. Un paquet en retard
     // y entre : son retard EST de la gigue. Un double ou un saut non confirmé non.
-    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late) {
+    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late { .. }) {
         st.drift.observe(header.timestamp, recv_instant);
         st.jitter.observe(header.timestamp, recv_instant);
     }
@@ -6056,6 +6062,12 @@ fn decode_one_packet(
     // ne peut prendre que ce qui reste du même budget (cf. `Arrival::Next`).
     let invented_at_deadline = st.consecutive_concealed;
     if matches!(arrival, Arrival::Start | Arrival::Next { .. }) {
+        // Reprise après un silence (échéance désarmée) : la marge apprise des
+        // paquets remplacés redescend du temps écoulé avant que le tampon se
+        // ré-amorce (0.6.6-20, revue).
+        if st.next_deadline.is_none() {
+            mixer.refresh_late_floor(producer_id, recv_instant);
+        }
         // Le flux a repris sa place : le masquage précédent n'a plus de
         // retardataire à attendre, il n'y a plus rien à juger.
         st.last_conceal = None;
@@ -6068,7 +6080,7 @@ fn decode_one_packet(
         // buffer avec la gigue de QUEUE (pire-cas récent, pas la moyenne), une fois
         // l'estimateur fiable (warmup).
         if st.jitter.is_warm() {
-            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms());
+            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms(), recv_instant);
         }
         // Miroir dans la map partagée, lue à 1 Hz par ws_server. Mise à jour EN
         // PLACE : aucune allocation sur ce thread une fois l'entrée créée.
@@ -6135,8 +6147,22 @@ fn decode_one_packet(
                 st.logged_large_jump = true;
             }
         }
-        Arrival::Late => {
+        Arrival::Late { replaced } => {
             st.last_discard = Some(recv_instant);
+            // 0.6.6-20 — le tampon apprend des seuls paquets qu'une marge de
+            // quelques ms aurait sauvés : remplacés à l'échéance (`replaced` ; un
+            // paquet simplement dans le désordre n'a rien à dire), place du
+            // DERNIER remplacement, arrivés au plus `JUST_LATE_MAX` après lui.
+            // Après un pic de 60 ms, les retardataires arrivent des dizaines de
+            // ms trop tard : apprendre d'eux montait la cible sans rien sauver
+            // (banc pics-seuls, 03/10 : +3,8 ms, son inventé inchangé).
+            let just_late = replaced
+                && st.last_conceal.as_ref().is_some_and(|lc| {
+                    lc.slot == header.sequence && recv_instant.saturating_duration_since(lc.at) <= JUST_LATE_MAX
+                });
+            if just_late {
+                mixer.note_late_arrival(producer_id, recv_instant);
+            }
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
@@ -7635,6 +7661,41 @@ mod conceal_loop_tests {
         recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(5));
         assert_eq!(st.concealed_premature_frames, 1);
         assert!((st.concealed_premature_margin_ms - 1.0).abs() < 0.05, "{}", st.concealed_premature_margin_ms);
+    }
+
+    /// Part de la cible apprise des paquets remplacés, pour le flux de test.
+    fn marge_apprise(m: &AudioMixer) -> f64 {
+        m.stream_perf_stats().into_iter().find(|p| p.producer_id == "peer-test").map(|p| p.target_late_ms).unwrap()
+    }
+
+    /// 0.6.6-20 — le paquet qu'un masquage à l'échéance a remplacé arrive : le
+    /// tampon de ce flux apprend que sa marge était trop courte (+1 ms).
+    #[test]
+    fn un_paquet_arrive_apres_son_masquage_releve_la_marge_du_flux() {
+        let (mixer, mut st) = apres_un_masquage();
+        assert_eq!(marge_apprise(&mixer), 0.0);
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert!((marge_apprise(&mixer) - 1.0).abs() < 0.05, "marge +1 ms : {}", marge_apprise(&mixer));
+    }
+
+    /// 0.6.6-20 — un remplacé arrivé bien après son remplacement (fin de pic)
+    /// n'apprend rien : quelques ms de marge ne l'auraient pas sauvé.
+    #[test]
+    fn un_paquet_remplace_arrive_bien_trop_tard_n_apprend_rien() {
+        let (mixer, mut st) = apres_un_masquage();
+        recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(30));
+        assert_eq!(marge_apprise(&mixer), 0.0);
+    }
+
+    /// 0.6.6-20 (revue) — un paquet simplement doublé dans le désordre (sa place
+    /// comblée dès l'arrivée du suivant) n'apprend rien : aucune marge ne l'aurait
+    /// sauvé.
+    #[test]
+    fn un_paquet_dans_le_desordre_ne_releve_pas_la_marge() {
+        let (mixer, mut st) = apres_un_paquet();
+        recevoir(&mut st, &mixer, 1002, Instant::now()); // 1001 sauté → inventé à l'arrivée
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // le retardataire
+        assert_eq!(marge_apprise(&mixer), 0.0);
     }
 
     /// Deux tirages (2,67 ms) ont passé la vraie matière (1 ms) : ils ont joué

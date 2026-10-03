@@ -4,7 +4,7 @@ use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
 pub struct JitterBuffer {
     producer: ringbuf::HeapProd<f32>,
     consumer: ringbuf::HeapCons<f32>,
-    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, plancher de gigue + plancher de glitch + marge apprise + filet réactif, cap)`.
     /// Valeur dérivée, recalculée par `recompute_target()` à chaque changement de
     /// `floor_samples` ou `reactive_extra_samples`. Lue par `pull` (pre-fill +
     /// seuil de drift-drain).
@@ -113,6 +113,13 @@ pub struct JitterBuffer {
     /// P0 — compteur de pulls calmes consécutifs, pour la décroissance très lente
     /// de `glitch_floor_samples`.
     glitch_calm_pulls: u32,
+    /// 0.6.6-20 — marge apprise des paquets remplacés à l'échéance (ms, avec
+    /// fraction pour la redescente continue) ; cf. `note_late_arrival`.
+    late_floor_ms: f64,
+    /// Instant du dernier pas de cette marge (bridage à un pas par seconde).
+    last_late_step: Option<std::time::Instant>,
+    /// Instant jusqu'où la redescente a été appliquée.
+    late_settled_at: Option<std::time::Instant>,
     /// Lot 1-A (23/09/2026) — ce que le tirage a trouvé au dernier trou, en
     /// attente d'être rendu au thread de décodage par le `push` suivant (cf.
     /// [`HoleAtPull`]). Un seul à la fois : après un trou le tampon se ré-amorce,
@@ -267,6 +274,26 @@ const GLITCH_FLOOR_MAX_MS: usize = 20;
 /// underrun remet le compteur à zéro). CONSTANTE DE CALIBRATION.
 const GLITCH_FLOOR_DECAY_CALM_PULLS: u32 = 500;
 
+// ── 0.6.6-20 — marge apprise des paquets remplacés à l'échéance ─────────────
+// Un paquet arrivé APRÈS que sa place a été remplie par du son inventé à
+// l'échéance dit que la marge de ce flux était trop courte d'un rien. Composante
+// À PART de la cible (pas le plancher de glitch, dont la redescente très lente
+// — ~1 ms/64 s — fixerait l'équilibre à ~1 remplacement par minute et monterait
+// même l'Ethernet ; revue de la 0.6.6-20) : +1 pas par remplacement, au plus un
+// par seconde, et redescente CONTINUE dans le temps (pas en tirages : même
+// rythme sur Mac et PC, quel que soit le bloc). Équilibre ≈ un remplacement
+// toutes les 10 s, soit ~6/min — le niveau de la 0.6.5 que Ben a jugé correct
+// à l'écoute (5,7/min, 03/10/2026). CONSTANTES DE CALIBRATION.
+/// Pas de montée par paquet remplacé.
+const LATE_FLOOR_STEP_MS: f64 = 1.0;
+/// Au plus un pas par intervalle : une salve (pic, des dizaines de paquets
+/// remplacés d'un coup) ne vaut qu'une marche.
+const LATE_FLOOR_STEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Redescente continue (ms de marge par seconde) : 1 ms toutes les 10 s.
+const LATE_FLOOR_DECAY_MS_PER_SEC: f64 = 0.1;
+/// Plafond de cette marge (sous MAX 40 ms ; le plancher de glitch a le sien).
+const LATE_FLOOR_MAX_MS: f64 = 15.0;
+
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
     (ms * (SAMPLE_RATE * CHANNELS) as f64 / 1000.0) as usize
@@ -393,6 +420,9 @@ impl JitterBuffer {
             shrink_accum: 0.0,
             glitch_floor_samples: 0,
             glitch_calm_pulls: 0,
+            late_floor_ms: 0.0,
+            last_late_step: None,
+            late_settled_at: None,
             zero_filled_samples: 0,
             continuous_zero_filled: 0,
             fill_obs: [0; FILL_OBS_LEN],
@@ -430,6 +460,9 @@ impl JitterBuffer {
         self.shrink_accum = 0.0;
         self.glitch_floor_samples = 0;
         self.glitch_calm_pulls = 0;
+        self.late_floor_ms = 0.0;
+        self.last_late_step = None;
+        self.late_settled_at = None;
         self.floor_samples = initial;
         self.target_samples = initial;
         self.last_adapt = std::time::Instant::now();
@@ -779,6 +812,11 @@ impl JitterBuffer {
         self.jitter_auto = false;
         self.floor_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
         self.reactive_extra_samples = 0;
+        // La marge apprise des paquets remplacés ne s'ajoute pas à une cible
+        // choisie (elle ne pourrait plus ni monter ni redescendre).
+        self.late_floor_ms = 0.0;
+        self.last_late_step = None;
+        self.late_settled_at = None;
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
         self.primed = false;
@@ -791,17 +829,22 @@ impl JitterBuffer {
     /// `clamp(MIN, K_TAIL·queue + TAIL_HEADROOM, MAX)` ; le filet réactif s'ajoute
     /// par-dessus (backstop CONSERVÉ). Réseau uniquement — le self-monitor local
     /// (`local_mode`) n'appelle pas ce chemin (cible pilotée par `set_target_ms`).
-    pub fn observe_jitter(&mut self, jitter_tail_ms: f64) {
+    ///
+    /// `now` (0.6.6-20) : instant de l'observation, qui fait aussi redescendre la
+    /// marge apprise des paquets remplacés (appel ~10×/s par le fil de réception).
+    pub fn observe_jitter(&mut self, jitter_tail_ms: f64, now: std::time::Instant) {
         if !self.jitter_auto {
             return;
         }
         let floor_ms = (K_TAIL * jitter_tail_ms + TAIL_HEADROOM_MS)
             .clamp(MIN_TARGET_MS as f64, MAX_TARGET_MS as f64);
         self.floor_samples = ms_f64_to_samples(floor_ms);
+        self.settle_late_floor(now);
         self.recompute_target();
     }
 
-    /// Recalcule la cible effective = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Recalcule la cible effective = `clamp(MIN, plancher de gigue + plancher de
+    /// glitch + marge apprise des paquets remplacés + filet réactif, cap)`.
     /// `cap` = `LOCAL_MAX_TARGET_MS` en mode self-monitor, sinon `MAX_TARGET_MS`.
     fn recompute_target(&mut self) {
         let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
@@ -810,8 +853,9 @@ impl JitterBuffer {
         let cap_s = cap_ms * SAMPLE_RATE * CHANNELS / 1000;
         // P0 — `glitch_floor_samples` = headroom persistant piloté par le glitch
         // (0 en local_mode / glitch-free → identique à avant).
-        self.target_samples = (self.floor_samples + self.glitch_floor_samples + self.reactive_extra_samples)
-            .clamp(min_s, cap_s);
+        let late_s = ms_f64_to_samples(self.late_floor_ms);
+        self.target_samples =
+            (self.floor_samples + self.glitch_floor_samples + late_s + self.reactive_extra_samples).clamp(min_s, cap_s);
     }
 
     pub fn underruns(&self) -> u64 {
@@ -859,8 +903,9 @@ impl JitterBuffer {
     }
 
     /// Lot 0 — de quoi la cible est faite : `(plancher de gigue, plancher de
-    /// glitch, filet réactif)` en ms. Leur somme, bornée, donne `target_ms()` :
-    /// sans cette décomposition, on ne sait pas QUI tient le tampon en l'air.
+    /// glitch, filet réactif)` en ms ; avec [`Self::late_floor_ms`] (0.6.6-20),
+    /// leur somme, bornée, donne `target_ms()` : sans cette décomposition, on ne
+    /// sait pas QUI tient le tampon en l'air.
     pub fn target_parts_ms(&self) -> (f64, f64, f64) {
         (
             samples_to_ms_f64(self.floor_samples as u64),
@@ -879,6 +924,64 @@ impl JitterBuffer {
     /// la dérive d'horloge compensée en continu. `(speed - 1)·1e6` ≈ ppm corrigés.
     pub fn resample_speed(&self) -> f64 {
         self.rs_speed
+    }
+
+    /// 0.6.6-20 — un paquet est arrivé APRÈS que sa place a été remplie par du
+    /// son inventé à l'échéance (`Arrival::Late { replaced: true }`) : la marge de
+    /// ce flux était trop courte d'un rien. Ce n'est pas un trou (la sortie n'a
+    /// pas manqué de son), c'est du son inventé que l'oreille entend.
+    ///
+    /// Pourquoi (03/10/2026, prouvé) : sur un lien irrégulier la 0.6.6 posait la
+    /// cible 2 à 4 ms sous la 0.6.5 et inventait 4 à 5 fois plus de son — à cible
+    /// égale les deux masquaient autant ; rien n'apprenait de ces remplacements.
+    ///
+    /// Au plus un pas par [`LATE_FLOOR_STEP_INTERVAL`] ; inactif sur le retour
+    /// casque et sous une cible choisie à la main (`set_target_ms` : l'utilisateur
+    /// a ce qu'il a choisi). Un paquet perdu ou simplement dans le désordre
+    /// n'arrive jamais ici (cf. `Arrival::Late`).
+    pub fn note_late_arrival(&mut self, now: std::time::Instant) {
+        if self.local_mode || !self.jitter_auto {
+            return;
+        }
+        self.settle_late_floor(now);
+        if self
+            .last_late_step
+            .is_some_and(|t| now.saturating_duration_since(t) < LATE_FLOOR_STEP_INTERVAL)
+        {
+            return;
+        }
+        self.last_late_step = Some(now);
+        self.late_floor_ms = (self.late_floor_ms + LATE_FLOOR_STEP_MS).min(LATE_FLOOR_MAX_MS);
+        self.recompute_target();
+    }
+
+    /// Fait redescendre la marge apprise du temps écoulé depuis la dernière fois
+    /// (rythme [`LATE_FLOOR_DECAY_MS_PER_SEC`]). Côté réception seulement — jamais
+    /// dans le callback audio.
+    fn settle_late_floor(&mut self, now: std::time::Instant) {
+        if let Some(t) = self.late_settled_at {
+            let secs = now.saturating_duration_since(t).as_secs_f64();
+            self.late_floor_ms = (self.late_floor_ms - secs * LATE_FLOOR_DECAY_MS_PER_SEC).max(0.0);
+        }
+        // Un instant plus ancien (non attendu : `recv_instant` est pris à la
+        // lecture, dans l'ordre) ne fait pas reculer la référence.
+        self.late_settled_at = Some(self.late_settled_at.map_or(now, |t| t.max(now)));
+    }
+
+    /// Applique la redescente due au temps écoulé et recalcule la cible — à la
+    /// reprise d'un flux après un silence, pour ne pas se ré-amorcer sur une marge
+    /// périmée (la redescente ne s'applique sinon qu'aux observations ~10×/s).
+    pub fn refresh_late_floor(&mut self, now: std::time::Instant) {
+        if self.local_mode || !self.jitter_auto {
+            return;
+        }
+        self.settle_late_floor(now);
+        self.recompute_target();
+    }
+
+    /// 0.6.6-20 — part de la cible due aux paquets remplacés à l'échéance (ms).
+    pub fn late_floor_ms(&self) -> f64 {
+        self.late_floor_ms
     }
 
     fn adapt_up(&mut self) {
@@ -901,7 +1004,8 @@ impl JitterBuffer {
         }
         // Borne le filet pour que `floor + glitch_floor + extra` ne dépasse jamais
         // le cap : sinon une accumulation sans effet rendrait la redescente lente.
-        let max_extra = cap_s.saturating_sub(self.floor_samples + self.glitch_floor_samples);
+        let max_extra = cap_s
+            .saturating_sub(self.floor_samples + self.glitch_floor_samples + ms_f64_to_samples(self.late_floor_ms));
         self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
@@ -1054,7 +1158,7 @@ mod tests {
     #[test]
     fn target_parts_add_up_to_the_target() {
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(4.0); // plancher = 1,0 × 4 + 3 = 7 ms
+        jb.observe_jitter(4.0, std::time::Instant::now()); // plancher = 1,0 × 4 + 3 = 7 ms
 
         let (jitter_part, glitch_part, reactive_part) = jb.target_parts_ms();
         assert!((jitter_part - 7.0).abs() < 0.05, "plancher de gigue : {jitter_part} ms");
@@ -1345,7 +1449,7 @@ mod tests {
     fn reset_for_recovery_flushes_and_reprimes() {
         let mut jb = JitterBuffer::new();
         // Simule le gel de sortie : cible gonflée + ring rempli de périmé.
-        jb.observe_jitter(30.0); // floor ~33 ms
+        jb.observe_jitter(30.0, std::time::Instant::now()); // floor ~33 ms
         let big = vec![0.2_f32; 40 * SAMPLE_RATE * CHANNELS / 1000]; // ~40 ms
         jb.push(&big);
         // Rétablissement.
@@ -1368,7 +1472,7 @@ mod tests {
     fn observe_jitter_low_gives_low_target() {
         let mut jb = JitterBuffer::new();
         // queue 0,7 ms → floor = 1·0,7 + 3 = 3,7 → clamp MIN = 5 ms.
-        jb.observe_jitter(0.7);
+        jb.observe_jitter(0.7, std::time::Instant::now());
         assert_eq!(jb.target_ms(), 5);
     }
 
@@ -1376,7 +1480,7 @@ mod tests {
     fn observe_jitter_high_gives_proportional_target() {
         let mut jb = JitterBuffer::new();
         // queue 12 ms (rafale) → floor = 1·12 + 3 = 15 ms → couvre la queue.
-        jb.observe_jitter(12.0);
+        jb.observe_jitter(12.0, std::time::Instant::now());
         let t = jb.target_ms();
         assert!((14..=16).contains(&t), "target attendu ~15 ms, obtenu {t}");
     }
@@ -1384,7 +1488,7 @@ mod tests {
     #[test]
     fn observe_jitter_clamps_to_max() {
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(100.0); // énorme → borné à MAX_TARGET_MS.
+        jb.observe_jitter(100.0, std::time::Instant::now()); // énorme → borné à MAX_TARGET_MS.
         assert_eq!(jb.target_ms(), MAX_TARGET_MS);
     }
 
@@ -1392,7 +1496,7 @@ mod tests {
     fn manual_override_disables_jitter_targeting() {
         let mut jb = JitterBuffer::new();
         jb.set_target_ms(20); // slider UI : override manuel.
-        jb.observe_jitter(0.5); // doit être ignoré.
+        jb.observe_jitter(0.5, std::time::Instant::now()); // doit être ignoré.
         assert_eq!(jb.target_ms(), 20);
     }
 
@@ -1402,7 +1506,7 @@ mod tests {
         // le filet réactif remonte la cible à l'underrun (jamais moins sûr que
         // l'historique).
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7); // plancher → 5 ms.
+        jb.observe_jitter(0.7, std::time::Instant::now()); // plancher → 5 ms.
         assert_eq!(jb.target_ms(), 5);
 
         let five_ms = 5 * SAMPLE_RATE * CHANNELS / 1000;
@@ -1490,10 +1594,119 @@ mod tests {
         // Additif : sans underrun, le plancher de glitch reste 0 → cible = plancher
         // tail (comportement STRICTEMENT identique à avant P0).
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7); // plancher tail = 5 ms
+        jb.observe_jitter(0.7, std::time::Instant::now()); // plancher tail = 5 ms
         drive_full_pulls(&mut jb, 240, 3000); // calme, jamais d'underrun
         assert_eq!(jb.glitch_floor_samples, 0, "aucun glitch → plancher inerte");
         assert_eq!(jb.target_ms(), 5, "cible = plancher tail (comportement d'avant)");
+    }
+
+    // ─── 0.6.6-20 — marge apprise des paquets remplacés à l'échéance ─────────
+
+    use std::time::{Duration as D, Instant as I};
+
+    fn au_plancher(t0: I) -> JitterBuffer {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7, t0); // plancher tail = 5 ms
+        jb
+    }
+
+    #[test]
+    fn un_paquet_remplace_monte_la_cible_d_un_pas() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        assert_eq!(jb.target_ms(), 5);
+        jb.note_late_arrival(t0);
+        assert_eq!(jb.target_ms(), 6, "remplacé à l'échéance : +1 ms de marge");
+        assert_eq!(jb.glitch_floor_samples, 0, "composante à part : le plancher de glitch n'y est pour rien");
+    }
+
+    #[test]
+    fn une_salve_de_paquets_remplaces_ne_monte_que_d_un_pas_par_seconde() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        for i in 0..40 {
+            jb.note_late_arrival(t0 + D::from_millis(i * 2));
+        }
+        assert!((jb.late_floor_ms() - 1.0).abs() < 0.01, "un pic ne vaut qu'une marche : {}", jb.late_floor_ms());
+        jb.note_late_arrival(t0 + D::from_millis(1_100));
+        assert!((jb.late_floor_ms() - 1.89).abs() < 0.01, "1 − 0,11 de redescente + 1 : {}", jb.late_floor_ms());
+    }
+
+    /// Redescente dans le TEMPS (0,1 ms/s), pas en tirages : même rythme quel que
+    /// soit le bloc de sortie (Mac 64, PC 128-256).
+    #[test]
+    fn la_marge_apprise_redescend_de_1_ms_toutes_les_10_s() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        jb.note_late_arrival(t0);
+        jb.note_late_arrival(t0 + D::from_secs(2));
+        assert_eq!(jb.target_ms(), 6, "1 + 1 − 0,2 = 1,8 ms → 6 ms entiers");
+        jb.observe_jitter(0.7, t0 + D::from_secs(12));
+        assert!((jb.late_floor_ms() - 0.8).abs() < 0.01, "{}", jb.late_floor_ms());
+        jb.observe_jitter(0.7, t0 + D::from_secs(30));
+        assert_eq!(jb.late_floor_ms(), 0.0, "jamais sous zéro");
+        assert_eq!(jb.target_ms(), 5, "revenu au plancher");
+    }
+
+    /// Un remplacement toutes les 20 s (sous l'équilibre de ~6/min) ne tient
+    /// aucune marge durable : chacun s'efface avant le suivant.
+    #[test]
+    fn des_remplacements_rares_ne_tiennent_pas_de_marge() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        for k in 0..30 {
+            jb.note_late_arrival(t0 + D::from_secs(20 * k));
+        }
+        assert!(jb.late_floor_ms() <= 1.0, "{}", jb.late_floor_ms());
+    }
+
+    /// Revue : une marge apprise AVANT qu'on choisisse une cible ne s'y ajoute pas.
+    #[test]
+    fn une_cible_choisie_apres_une_marge_apprise_est_celle_choisie() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        for k in 0..6 {
+            jb.note_late_arrival(t0 + D::from_secs(k));
+        }
+        assert!(jb.late_floor_ms() > 4.0);
+        jb.set_target_ms(12);
+        assert_eq!(jb.target_ms(), 12);
+        assert_eq!(jb.late_floor_ms(), 0.0);
+    }
+
+    /// Revue : à la reprise d'un flux après un silence, la marge a redescendu du
+    /// temps écoulé AVANT que le tampon se ré-amorce.
+    #[test]
+    fn la_reprise_apres_un_silence_part_d_une_marge_a_jour() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        jb.note_late_arrival(t0);
+        jb.note_late_arrival(t0 + D::from_secs(1));
+        assert_eq!(jb.target_ms(), 6);
+        jb.refresh_late_floor(t0 + D::from_secs(60));
+        assert_eq!(jb.late_floor_ms(), 0.0);
+        assert_eq!(jb.target_ms(), 5);
+    }
+
+    #[test]
+    fn sans_paquet_remplace_un_lien_regulier_reste_au_plancher() {
+        let mut jb = au_plancher(I::now());
+        drive_full_pulls(&mut jb, 240, 3000);
+        assert_eq!(jb.target_ms(), 5, "liens réguliers : cible inchangée");
+    }
+
+    #[test]
+    fn le_retour_casque_et_une_cible_choisie_n_apprennent_rien() {
+        let mut casque = JitterBuffer::new();
+        casque.set_local_mode(true);
+        casque.set_target_ms(3);
+        let avant = casque.target_ms();
+        casque.note_late_arrival(I::now());
+        assert_eq!(casque.target_ms(), avant, "self-monitor jamais touché");
+        let mut choisie = JitterBuffer::new();
+        choisie.set_target_ms(12);
+        choisie.note_late_arrival(I::now());
+        assert_eq!(choisie.target_ms(), 12, "cible choisie à la main : l'utilisateur a ce qu'il a choisi");
     }
 
     #[test]
@@ -1502,7 +1715,7 @@ mod tests {
         // réactif (C1) soit drainé au calme, la cible reste AU-DESSUS du plancher
         // tail — c'est ce qui tue les micro-à-coups locaux (contrairement au pur C1).
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7); // plancher tail = 5 ms
+        jb.observe_jitter(0.7, std::time::Instant::now()); // plancher tail = 5 ms
         for _ in 0..4 {
             network_underrun_once(&mut jb);      // +1 ms glitch_floor + filet réactif
             drive_full_pulls(&mut jb, 240, 2000); // calme : draine le réactif, PAS le glitch_floor
@@ -1563,7 +1776,7 @@ mod tests {
         // CALME (pulls pleins, plus d'underrun) doit ramener la cible au plancher
         // tail-aware — au lieu de rester coincée haut comme avant.
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7); // plancher réseau = 5 ms
+        jb.observe_jitter(0.7, std::time::Instant::now()); // plancher réseau = 5 ms
         let t_after = network_underrun_once(&mut jb);
         assert!(t_after > 5, "le filet doit remonter la cible: {t_after} ms");
 
@@ -1582,7 +1795,7 @@ mod tests {
         // Backstop : un underrun TRÈS récent (pression au-dessus du seuil) NE doit
         // PAS déclencher de récupération prématurée — le filet tient (protection).
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7);
+        jb.observe_jitter(0.7, std::time::Instant::now());
         let t_after = network_underrun_once(&mut jb);
 
         // Un seul pull plein juste après : pression ≈ 0.99 > seuil → cible inchangée.
@@ -1598,7 +1811,7 @@ mod tests {
         // cible. La récupération est graduelle, pilotée par
         // `REACTIVE_RECOVER_SAMPLES_PER_PULL` — contraste avec un reset brutal.
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7);
+        jb.observe_jitter(0.7, std::time::Instant::now());
         let floor_samples = 5 * SAMPLE_RATE * CHANNELS / 1000;
         // Pompe le filet par plusieurs underruns francs.
         for _ in 0..4 {
@@ -1648,7 +1861,7 @@ mod tests {
         // La mémoire d'underrun est bornée : même une longue rafale ne fait pas
         // grimper la pression sans limite (sinon buffer tenu trop longtemps après).
         let mut jb = JitterBuffer::new();
-        jb.observe_jitter(0.7);
+        jb.observe_jitter(0.7, std::time::Instant::now());
         for _ in 0..50 {
             jb.push(&vec![0.1_f32; jb.target_samples + 1]);
             let t = jb.target_samples;

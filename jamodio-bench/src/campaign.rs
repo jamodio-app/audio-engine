@@ -313,11 +313,21 @@ fn write_verdict(base: &Path, dir: &Path, info: &CampaignInfo) -> Result<Outcome
 pub struct Tol {
     pub target_ms: f64,
     pub holes_per_min: f64,
+    /// Son inventé (trames/min). Absent des tolérances d'avant le 03/10/2026 :
+    /// le plancher s'applique.
+    #[serde(default = "invented_floor")]
+    pub invented_per_min: f64,
 }
 
 /// Planchers : la cible est publiée en ms ENTIÈRES par l'agent (±1 ms
-/// d'arrondi) ; un demi-trou par minute sur 5 min ne se distingue pas du hasard.
-pub const TOL_FLOOR: Tol = Tol { target_ms: 1.0, holes_per_min: 0.5 };
+/// d'arrondi) ; un demi-trou par minute sur 5 min ne se distingue pas du hasard ;
+/// 10 trames inventées par minute = 25 ms de son par minute, sous ce qu'un flux
+/// varie d'un passage à l'autre sur un lien irrégulier (-17/-18/-19, 03/10).
+pub const TOL_FLOOR: Tol = Tol { target_ms: 1.0, holes_per_min: 0.5, invented_per_min: 10.0 };
+
+fn invented_floor() -> f64 {
+    TOL_FLOOR.invented_per_min
+}
 
 /// Marge appliquée à l'écart observé entre passages (bruit) : deux fois le pire
 /// écart vu sur trois passages. Choix d'ingénierie, à revoir après quelques
@@ -361,10 +371,15 @@ pub fn tolerances_from_runs(runs: &BTreeMap<String, Vec<Metrics>>, source: &str)
             let spread = |v: Vec<f64>| v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min);
             let target = values(|s| s.target_median_ms);
             let holes = values(|s| s.holes_per_min);
+            let invented = values(|s| s.invented_per_min);
             let tol = |v: Vec<f64>, floor: f64| if v.len() < 2 { floor } else { (NOISE_MARGIN * spread(v)).max(floor) };
             streams.insert(
                 name.clone(),
-                Tol { target_ms: tol(target, TOL_FLOOR.target_ms), holes_per_min: tol(holes, TOL_FLOOR.holes_per_min) },
+                Tol {
+                    target_ms: tol(target, TOL_FLOOR.target_ms),
+                    holes_per_min: tol(holes, TOL_FLOOR.holes_per_min),
+                    invented_per_min: tol(invented, TOL_FLOOR.invented_per_min),
+                },
             );
         }
         scenarios.insert(scenario.clone(), streams);
@@ -448,6 +463,7 @@ pub fn compare_scenario(current: &Metrics, reference: Option<&Metrics>, tol: &dy
     }
     let mut regressions = Vec::new();
     let mut improvements = Vec::new();
+    let mut unmeasured = Vec::new();
     for s in &current.streams {
         let Some(rs) = r.streams.iter().find(|x| x.stream == s.stream) else {
             regressions.push(format!("{} : absent de la référence", s.stream));
@@ -462,18 +478,34 @@ pub fn compare_scenario(current: &Metrics, reference: Option<&Metrics>, tol: &dy
                 improvements.push(format!("{} : {what} {rv:.1} → {c:.1} {unit} ({:+.1})", s.stream, c - rv))
             }
             (None, Some(_)) => regressions.push(format!("{} : {what} non mesuré cette fois", s.stream)),
-            _ => {}
+            // Mesure présente, référence sans elle (référence d'avant la mesure) :
+            // rien n'a été comparé — le dire, jamais conclure « aucune régression ».
+            (Some(_), None) => unmeasured.push(format!("{} : {what} absent de la référence", s.stream)),
+            (Some(_), Some(_)) | (None, None) => {}
         };
         check("cible médiane", "ms", s.target_median_ms, rs.target_median_ms, t.target_ms);
         check("trous", "/min", s.holes_per_min, rs.holes_per_min, t.holes_per_min);
+        check("son inventé", "trames/min", s.invented_per_min, rs.invented_per_min, t.invented_per_min);
     }
     for c in &current.criteria {
         if c.verdict == Verdict::Fails && r.criteria.iter().any(|x| x.id == c.id && x.verdict == Verdict::Holds) {
             regressions.push(format!("critère {} : tenu dans la référence, non tenu cette fois", c.id));
         }
     }
-    let outcome = if regressions.is_empty() { Outcome::NoRegression } else { Outcome::Regression };
+    let outcome = if !regressions.is_empty() {
+        Outcome::Regression
+    } else if !unmeasured.is_empty() {
+        Outcome::Inconclusive
+    } else {
+        Outcome::NoRegression
+    };
     let mut lines: Vec<String> = regressions.into_iter().map(|l| format!("✖ {l}")).collect();
+    if !unmeasured.is_empty() {
+        lines.push(format!(
+            "○ non comparé — {} ; relire la référence : session-bench reanalyser <dossier du scénario>",
+            unmeasured.join(", ")
+        ));
+    }
     lines.extend(improvements.into_iter().map(|l| format!("▲ amélioration — {l}")));
     verdict(outcome, lines)
 }
@@ -544,7 +576,10 @@ pub fn compare_campaign(
         outcome,
         reference: reference.map(|(ri, rp)| (rp.display().to_string(), ri.audio_engine.clone())),
         tolerances: tolerances.map_or_else(
-            || format!("par défaut (bruit non mesuré) : cible ±{} ms, trous ±{}/min", TOL_FLOOR.target_ms, TOL_FLOOR.holes_per_min),
+            || format!(
+                "par défaut (bruit non mesuré) : cible ±{} ms, trous ±{}/min, son inventé ±{} trames/min",
+                TOL_FLOOR.target_ms, TOL_FLOOR.holes_per_min, TOL_FLOOR.invented_per_min
+            ),
             |t| format!("mesurées (bruit : {})", t.source),
         ),
         scenarios,
@@ -784,8 +819,8 @@ fn render_noise(info: &CampaignInfo, t: &Tolerances) -> (String, String) {
     }
     let _ = writeln!(
         md,
-        "\nTolérance d'un flux = {NOISE_MARGIN} × le plus grand écart vu entre passages, jamais sous {} ms (cible) ni {} trou/min.\n",
-        TOL_FLOOR.target_ms, TOL_FLOOR.holes_per_min
+        "\nTolérance d'un flux = {NOISE_MARGIN} × le plus grand écart vu entre passages, jamais sous {} ms (cible), {} trou/min ni {} trames inventées/min.\n",
+        TOL_FLOOR.target_ms, TOL_FLOOR.holes_per_min, TOL_FLOOR.invented_per_min
     );
     let mut body = format!(
         "<header class=\"verdict measured\"><p class=\"badge\">{}</p><h1>Bruit du banc — {}</h1></header><p>{}</p>",
@@ -794,11 +829,11 @@ fn render_noise(info: &CampaignInfo, t: &Tolerances) -> (String, String) {
         esc(&format!("Tolérance d'un flux = {NOISE_MARGIN} × le plus grand écart vu entre {NOISE_RUNS} passages, jamais sous les planchers."))
     );
     for (scenario, streams) in &t.scenarios {
-        let _ = writeln!(md, "## {scenario}\n\n| Flux | Tolérance cible (ms) | Tolérance trous (/min) |\n|---|---|---|");
-        let _ = write!(body, "<h2>{}</h2><table><tr><th>Flux</th><th>Cible (ms)</th><th>Trous (/min)</th></tr>", esc(scenario));
+        let _ = writeln!(md, "## {scenario}\n\n| Flux | Tolérance cible (ms) | Tolérance trous (/min) | Tolérance son inventé (trames/min) |\n|---|---|---|---|");
+        let _ = write!(body, "<h2>{}</h2><table><tr><th>Flux</th><th>Cible (ms)</th><th>Trous (/min)</th><th>Son inventé (trames/min)</th></tr>", esc(scenario));
         for (stream, tol) in streams {
-            let _ = writeln!(md, "| {stream} | {:.1} | {:.1} |", tol.target_ms, tol.holes_per_min);
-            let _ = write!(body, "<tr><td>{}</td><td>{:.1}</td><td>{:.1}</td></tr>", esc(stream), tol.target_ms, tol.holes_per_min);
+            let _ = writeln!(md, "| {stream} | {:.1} | {:.1} | {:.1} |", tol.target_ms, tol.holes_per_min, tol.invented_per_min);
+            let _ = write!(body, "<tr><td>{}</td><td>{:.1}</td><td>{:.1}</td><td>{:.1}</td></tr>", esc(stream), tol.target_ms, tol.holes_per_min, tol.invented_per_min);
         }
         md.push('\n');
         body.push_str("</table>");
@@ -943,6 +978,7 @@ mod tests {
             causes_per_min: vec![Some(holes), Some(0.0), Some(0.0), Some(0.0), Some(0.0)],
             target_median_ms: Some(target),
             target_p95_ms: Some(target),
+            invented_per_min: Some(0.0),
             late: Some(0.0),
             lost: Some(0.0),
         }
@@ -983,7 +1019,7 @@ mod tests {
         assert!(v.lines[0].contains("✖ m2-ethernet : cible médiane 5.0 → 8.0 ms (+3.0, tolérance 1.0)"), "{:?}", v.lines);
         assert!(v.lines.iter().any(|l| l.starts_with("▲ amélioration — m9-4g : trous")), "{:?}", v.lines);
         // Une tolérance mesurée plus large absorbe l'écart.
-        let wide = |_: &str| Tol { target_ms: 4.0, holes_per_min: 50.0 };
+        let wide = |_: &str| Tol { target_ms: 4.0, holes_per_min: 50.0, invented_per_min: 500.0 };
         assert_eq!(compare_scenario(&worse, Some(&r), &wide).outcome, Outcome::NoRegression);
     }
 
@@ -1015,6 +1051,48 @@ mod tests {
         }
     }
 
+    /// Écoute de Ben (03/10/2026) : une version qui garde trous et cible mais
+    /// invente bien plus de son est une RÉGRESSION — le banc la voit désormais.
+    #[test]
+    fn un_flux_qui_invente_plus_de_son_est_une_regression() {
+        let with = |inv: f64| {
+            let mut st = stream("m7-wifi-charge", 9.0, 60.0);
+            st.invented_per_min = Some(inv);
+            metrics(vec![st], Verdict::Holds)
+        };
+        let v = compare_scenario(&with(490.0), Some(&with(115.0)), &|_| TOL_FLOOR);
+        assert_eq!(v.outcome, Outcome::Regression);
+        assert!(v.lines[0].contains("son inventé"), "{:?}", v.lines);
+        let v = compare_scenario(&with(115.0), Some(&with(490.0)), &|_| TOL_FLOOR);
+        assert_eq!(v.outcome, Outcome::NoRegression, "moins de son inventé : amélioration");
+    }
+
+    /// Revue : une référence d'avant la mesure ne permet pas de conclure « aucune
+    /// régression » — le verdict dit que rien n'a été comparé.
+    #[test]
+    fn une_reference_sans_la_mesure_rend_le_verdict_non_concluant() {
+        let mut old = stream("m7-wifi-charge", 9.0, 60.0);
+        old.invented_per_min = None;
+        let v = compare_scenario(
+            &metrics(vec![stream("m7-wifi-charge", 9.0, 60.0)], Verdict::Holds),
+            Some(&metrics(vec![old], Verdict::Holds)),
+            &|_| TOL_FLOOR,
+        );
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert!(v.lines.iter().any(|l| l.contains("absent de la référence")), "{:?}", v.lines);
+    }
+
+    /// Les fichiers d'avant le 03/10/2026 (sans la mesure) se relisent : mesure
+    /// inconnue dans les métriques, plancher dans les tolérances.
+    #[test]
+    fn les_anciens_fichiers_se_relisent_sans_la_mesure() {
+        let old = r#"{"stream":"m2","links":"ethernet","holes_per_min":0.0,"causes_per_min":[],"target_median_ms":5.0,"target_p95_ms":5.0,"late":0.0,"lost":0.0}"#;
+        let st: StreamMetrics = serde_json::from_str(old).unwrap();
+        assert_eq!(st.invented_per_min, None);
+        let tol: Tol = serde_json::from_str(r#"{"target_ms":1.0,"holes_per_min":0.5}"#).unwrap();
+        assert_eq!(tol.invented_per_min, TOL_FLOOR.invented_per_min);
+    }
+
     /// Bruit : la tolérance d'un flux suit l'écart entre passages, jamais sous
     /// les planchers.
     #[test]
@@ -1024,7 +1102,7 @@ mod tests {
         let t = tolerances_from_runs(&runs, "bruit-x");
         let s = &t.scenarios["9-reseaux-mixtes"];
         assert_eq!(s["m2-ethernet"], TOL_FLOOR, "aucun écart : les planchers");
-        assert_eq!(s["m9-4g"], Tol { target_ms: 4.0, holes_per_min: 40.0 });
+        assert_eq!(s["m9-4g"], Tol { target_ms: 4.0, holes_per_min: 40.0, invented_per_min: TOL_FLOOR.invented_per_min });
         assert_eq!(t.get("9-reseaux-mixtes", "m9-4g").unwrap().target_ms, 4.0);
         assert!(t.get("autre", "m9-4g").is_none());
     }

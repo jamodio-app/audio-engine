@@ -748,7 +748,7 @@ mod tests {
                 overtaken += 1;
             }
             highest = highest.max(r.index);
-            if seq.on_packet(r.index as u16) == Arrival::Late {
+            if matches!(seq.on_packet(r.index as u16), Arrival::Late { .. }) {
                 late += 1;
             }
         }
