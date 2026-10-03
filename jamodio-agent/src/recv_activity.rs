@@ -8,7 +8,7 @@
 //! sans paquet supprimaient le flux instrument sans prévenir personne : le musicien
 //! restait muet jusqu'à la fin de la session — recette du 16/09/2026.)
 //!
-//! Écrit par la tâche I/O de réception (tokio, hors thread audio) à chaque paquet,
+//! Écrit par le fil de réception (`pipeline::recv_thread`, hors callback audio) à chaque paquet,
 //! lu à 1 Hz par les perf-stats : un seul `store` atomique, aucun verrou.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +39,7 @@ pub fn recv_error_backoff(consecutive: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Au-delà de ce silence, la tâche I/O le journalise (une fois), puis journalise la
+/// Au-delà de ce silence, le fil de réception le journalise (une fois), puis journalise la
 /// reprise. Information de diagnostic seulement : rien n'est coupé.
 pub const SILENCE_LOG_AFTER_MS: u64 = 3_000;
 

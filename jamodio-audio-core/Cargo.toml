@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-audio-core"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -15,6 +15,9 @@ parking_lot = "0.12"       # Verrous fins du mixer (RwLock map + Mutex par flux)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"            # Setsockopt IP_TOS pour DSCP EF marking
+# Lot 1-D3 — attente de la réception sur un fil DÉDIÉ (kqueue / IOCP), hors du
+# runtime tokio. Déjà dans l'arbre (tokio en dépend), même version.
+mio = { version = "1", features = ["os-poll", "net"] }
 base64 = "0.22"            # Encode/decode des clés SRTP (mediasoup wire format)
 getrandom = "0.2"          # Génération de clés SRTP cryptographiquement sûres
 zeroize = "1"              # Efface les clés SRTP décodées de la mémoire au drop
@@ -67,7 +70,15 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     # La signature de WSAIoctl référence OVERLAPPED (passé nul : ioctl synchrone).
     "Win32_System_IO",
+    # Lot 1-D2 — horodatage noyau de la réception (net/rx_timestamp.rs) : les
+    # horodatages logiciels de Winsock sont des valeurs QueryPerformanceCounter.
+    "Win32_System_Performance",
 ] }
+
+# Lot 1-D2 — horodatage noyau de la réception sous macOS (SO_TIMESTAMP + recvmsg,
+# net/rx_timestamp.rs). Déjà dans l'arbre (socket2, tokio).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hound = "3"                # lecture/écriture WAV pour l'exemple de diagnostic iso_offline

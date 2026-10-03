@@ -1,5 +1,5 @@
 use super::reference::{Figure, MetroSound, OutputAnchor, ReferenceSource};
-use super::ring_buffer::JitterBuffer;
+use super::ring_buffer::{JitterBuffer, PushReport};
 use crate::protocol::StreamKind;
 use crate::record::RecordCmd;
 use crate::sync::clock::mono_now_ms;
@@ -73,7 +73,12 @@ impl AtomicF32 {
     }
     /// Addition atomique (boucle CAS). Un seul écrivain (le thread audio) face à
     /// un lecteur qui remet à zéro → la boucle aboutit au premier tour en régime.
+    ///
+    /// `fetch_update` est renommé `try_update` à partir de Rust 1.99 (même
+    /// opération). On garde l'ancien nom tant que toutes les machines de
+    /// compilation n'ont pas 1.99 : `try_update` n'y existerait pas.
     #[inline]
+    #[allow(deprecated)]
     fn fetch_add_level(&self, v: f32) {
         let _ = self
             .0
@@ -408,6 +413,8 @@ pub struct StreamPerfSnapshot {
     pub target_ms: usize,
     pub target_jitter_ms: f64,
     pub target_glitch_ms: f64,
+    /// 0.6.6-20 — part due aux paquets remplacés à l'échéance (ms).
+    pub target_late_ms: f64,
     pub target_reactive_ms: f64,
     /// Remplissage minimal et médian observés aux dernières arrivées ; `None`
     /// tant qu'aucun paquet n'est arrivé pour ce flux.
@@ -425,6 +432,9 @@ pub struct Playout {
     pub buffered_ms: f64,
     /// `false` pendant le ré-amorçage qui suit un trou : la sortie n'y puise pas.
     pub playing: bool,
+    /// Position de lecture du tampon (cf. `ring_buffer::consumed_ms_between`) :
+    /// deux lectures disent ce que la sortie a RÉELLEMENT consommé entre-temps.
+    pub read_index: usize,
 }
 
 /// Mixes N remote audio streams into a single stereo output.
@@ -946,10 +956,11 @@ impl AudioMixer {
     /// n'existe pas (peer parti) ou s'il est en override manuel. Appelé par la
     /// recv task à cadence réduite. Clone l'Arc sous le RwLock lecture puis
     /// relâche avant de verrouiller la cellule (jamais les deux à la fois).
-    pub fn observe_jitter(&self, producer_id: &str, jitter_tail_ms: f64) {
+    /// `now` fait aussi redescendre la marge apprise des paquets remplacés.
+    pub fn observe_jitter(&self, producer_id: &str, jitter_tail_ms: f64, now: std::time::Instant) {
         let cell = self.streams.read().get(producer_id).cloned();
         if let Some(cell) = cell {
-            cell.jitter.lock().observe_jitter(jitter_tail_ms);
+            cell.jitter.lock().observe_jitter(jitter_tail_ms, now);
         }
     }
 
@@ -980,7 +991,31 @@ impl AudioMixer {
     pub fn playout(&self, producer_id: &str) -> Option<Playout> {
         let cell = self.streams.read().get(producer_id).cloned()?;
         let jb = cell.jitter.lock();
-        Some(Playout { buffered_ms: jb.buffered_ms(), playing: jb.is_playing() })
+        Some(Playout {
+            buffered_ms: jb.buffered_ms(),
+            playing: jb.is_playing(),
+            read_index: jb.read_index(),
+        })
+    }
+
+    /// 0.6.6-20 — un flux reprend après un silence : sa marge apprise redescend
+    /// du temps écoulé avant le ré-amorçage (cf. `JitterBuffer::refresh_late_floor`).
+    pub fn refresh_late_floor(&self, producer_id: &str, now: std::time::Instant) {
+        let cell = self.streams.read().get(producer_id).cloned();
+        if let Some(cell) = cell {
+            cell.jitter.lock().refresh_late_floor(now);
+        }
+    }
+
+    /// 0.6.6-20 — le paquet de ce flux qu'un masquage à l'échéance a remplacé
+    /// vient d'arriver : la marge du tampon était trop courte (cf.
+    /// `JitterBuffer::note_late_arrival`). Comme `observe_jitter` : l'Arc est
+    /// cloné sous le RwLock lecture, relâché AVANT de verrouiller la cellule.
+    pub fn note_late_arrival(&self, producer_id: &str, now: std::time::Instant) {
+        let cell = self.streams.read().get(producer_id).cloned();
+        if let Some(cell) = cell {
+            cell.jitter.lock().note_late_arrival(now);
+        }
     }
 
     /// Push decoded samples into a stream's jitter buffer.
@@ -990,7 +1025,10 @@ impl AudioMixer {
     ///
     /// C2.1 — clone l'Arc du flux cible sous le RwLock lecture, relâche, puis
     /// verrouille SA cellule (verrou court). Ne croise le callback que sur ce flux.
-    pub fn push_samples(&self, producer_id: &str, samples: &[f32]) {
+    ///
+    /// Lot 1-A — rend ce que le tampon dit de cet instant (remplissage, position
+    /// de lecture, trou survenu depuis le push précédent) ; `None` = flux inconnu.
+    pub fn push_samples(&self, producer_id: &str, samples: &[f32]) -> Option<PushReport> {
         let cell = self.streams.read().get(producer_id).cloned();
 
         // REC-3 : tap stem-peer. Pre-fader (avant `vol *` dans mix_into),
@@ -1013,7 +1051,7 @@ impl AudioMixer {
                 producer = &producer_id[..8.min(producer_id.len())],
                 "push_samples on unknown stream"
             );
-            return;
+            return None;
         };
 
         // VU du flux — hors lock (ne lit que `samples`), une seule passe.
@@ -1024,10 +1062,10 @@ impl AudioMixer {
         cell.meter.push_interleaved(samples);
 
         // Verrou COURT de la cellule : push + lecture du compteur d'overflow.
-        let new_drops = {
+        let (report, new_drops) = {
             let mut jitter = cell.jitter.lock();
-            jitter.push(samples);
-            jitter.overflow_drops()
+            let report = jitter.push(samples);
+            (report, jitter.overflow_drops())
         };
 
         // Logging rate-limité (écrivain unique = ce thread décode pour ce flux).
@@ -1045,6 +1083,7 @@ impl AudioMixer {
             }
             cell.last_overflow_drops.store(new_drops, Ordering::Relaxed);
         }
+        Some(report)
     }
 
     /// Mix all streams into the output buffer.
@@ -1352,6 +1391,7 @@ impl AudioMixer {
                         target_ms: jitter.target_ms(),
                         target_jitter_ms,
                         target_glitch_ms,
+                        target_late_ms: jitter.late_floor_ms(),
                         target_reactive_ms,
                         fill_min_ms: None,
                         fill_p50_ms: None,

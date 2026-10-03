@@ -6,12 +6,14 @@
 
 mod audio;
 mod bench_flags;
+mod crash_addresses;
 mod keep_awake;
 mod logging;
 #[cfg(target_os = "macos")]
 mod cf_string;
 mod machine_health;
 mod net_interface;
+mod net_throttling;
 mod pipeline;
 mod plugin_scan;
 mod device_loss;
@@ -351,6 +353,18 @@ fn main() {
         plugin_scan::worker::run();
     }
 
+    // Étape de DÉSINSTALLATION du freinage réseau de Windows (Lots W3, W3-bis) :
+    // lancée par le MSI en compte système, AVANT tout le reste — ni journal
+    // fichier (il atterrirait dans le profil système), ni Tauri, ni port 9876.
+    // L'installation, elle, est écrite par l'installeur lui-même (W3-bis).
+    // Cf. `net_throttling` et `wix/network-throttling.wxs`.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--network-throttling") {
+            std::process::exit(net_throttling::installer_step(args.get(i + 1).map(String::as_str)));
+        }
+    }
+
     // Relance « attendue » (bouton « Redémarrer l'agent » → ws_server::
     // spawn_awaited_relaunch). On a été spawné DÉTACHÉ par l'ancien process
     // pendant qu'il s'éteignait. On attend qu'il soit mort — donc que le verrou
@@ -373,6 +387,9 @@ fn main() {
     // sans cette exemption, la minuterie fine de session serait ignorée et les
     // masquages partiraient jusqu'à 15 ms en retard. Cf. `timer_precision`.
     timer_precision::exempt_process_from_timer_throttling();
+
+    // Freinage réseau de Windows : état au journal (support, validation W4).
+    net_throttling::log_state("lancement");
 
     // Filet de diagnostic crash (0.5.11) : un panic Rust part par DÉFAUT sur
     // stderr — jeté sur une app GUI Windows → invisible dans `agent.log` (donc
@@ -399,11 +416,18 @@ fn main() {
                 .or_else(|| info.payload().downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<payload non-string>".to_string());
             let backtrace = std::backtrace::Backtrace::force_capture();
+            // Les binaires publiés n'ont pas de noms de fonctions : la trace
+            // ci-dessus en est privée. Adresses brutes + adresse de chargement
+            // = de quoi les retrouver avec le fichier de symboles privé de la
+            // version (cf. crash_addresses.rs).
+            let raw = crash_addresses::RawTrace::capture();
             tracing::error!(
                 target: "jamodio::panic",
                 location = %location,
                 message = %message,
                 backtrace = %backtrace,
+                image_base = %raw.as_ref().map(|r| format!("{:#x}", r.image_base)).unwrap_or_default(),
+                frames = %raw.as_ref().map(crash_addresses::RawTrace::frames_hex).unwrap_or_default(),
                 "PANIC Rust — thread en cours d'unwind"
             );
             default_hook(info);

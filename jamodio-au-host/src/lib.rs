@@ -12,8 +12,8 @@
 #![cfg(target_os = "macos")]
 
 use jamodio_audio_core::plugin_host::{
-    latency_exceeds_live_budget, MidiEvent, PluginError, PluginHandle, PluginHost, PluginInfo,
-    PluginRef,
+    latency_exceeds_live_budget, EditorListener, EditorState, MidiEvent, PluginError,
+    PluginHandle, PluginHost, PluginInfo, PluginRef,
 };
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -54,6 +54,8 @@ extern "C" {
     fn au_host_latency_samples(p: *mut c_void, handle_id: u32) -> u32;
     fn au_host_open_editor(p: *mut c_void, handle_id: u32) -> c_int;
     fn au_host_close_editor(p: *mut c_void, handle_id: u32) -> c_int;
+    // 0.6.6-13 — états de la fenêtre d'éditeur (cf. `EditorState`).
+    fn au_host_set_editor_callback(p: *mut c_void, cb: Option<EditorCb>, ctx: *mut c_void);
     // 0.5.9-2 — scan out-of-process (cf. section « Scan out-of-process »).
     fn jmo_au_enumerate(cb: AuEnumCb, ctx: *mut c_void);
     // 0.5.9-4 — masque le process worker de scan (Dock/focus). Cf. suppress_dock.
@@ -80,6 +82,36 @@ extern "C" {
 }
 
 type AuEnumCb = unsafe extern "C" fn(ctx: *mut c_void, au_type: u32, au_subtype: u32, au_manuf: u32);
+type EditorCb = unsafe extern "C" fn(ctx: *mut c_void, handle_id: u32, state: i32);
+
+/// Écouteur des fenêtres d'éditeur, à adresse FIXE pour toute la vie de
+/// l'hôte : c'est ce pointeur que le code natif rappelle. Changer d'écouteur
+/// remplace le contenu, jamais l'adresse (un rappel en vol sur le main thread
+/// ne lit donc jamais une mémoire libérée).
+type EditorSlot = std::sync::Mutex<Option<EditorListener>>;
+
+/// Traduit l'état natif (`JMO_EDITOR_*` dans `au_host.mm`).
+fn editor_state_from_native(state: i32) -> Option<EditorState> {
+    match state {
+        0 => Some(EditorState::Opening),
+        1 => Some(EditorState::Open),
+        2 => Some(EditorState::Closed),
+        3 => Some(EditorState::Failed),
+        _ => None,
+    }
+}
+
+unsafe extern "C" fn editor_thunk(ctx: *mut c_void, handle_id: u32, state: i32) {
+    // SAFETY : `ctx` est le `EditorSlot` boxé de l'`AuHost`, vivant jusqu'à
+    // son `Drop`, qui retire le rappel AVANT de libérer la boîte.
+    let slot = &*(ctx as *const EditorSlot);
+    let Some(state) = editor_state_from_native(state) else { return };
+    // Clone hors verrou : l'écouteur ne s'exécute jamais verrou tenu.
+    let listener = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    if let Some(listener) = listener {
+        listener(PluginHandle(handle_id), state);
+    }
+}
 
 // ---------- Helpers fourcc ----------
 
@@ -108,6 +140,8 @@ fn u32_to_fourcc(v: u32) -> String {
 /// avec `os_unfair_lock`).
 pub struct AuHost {
     ptr: *mut c_void,
+    /// Écouteur des fenêtres d'éditeur (cf. `EditorSlot`).
+    editor_slot: Box<EditorSlot>,
 }
 
 // SAFETY : le code ObjC++ sérialise les accès aux entries via os_unfair_lock,
@@ -119,7 +153,10 @@ impl AuHost {
     pub fn new() -> Self {
         let ptr = unsafe { au_host_create() };
         assert!(!ptr.is_null(), "au_host_create returned null");
-        AuHost { ptr }
+        let editor_slot: Box<EditorSlot> = Box::new(std::sync::Mutex::new(None));
+        let ctx = &*editor_slot as *const EditorSlot as *mut c_void;
+        unsafe { au_host_set_editor_callback(ptr, Some(editor_thunk), ctx) };
+        AuHost { ptr, editor_slot }
     }
 }
 
@@ -132,6 +169,8 @@ impl Default for AuHost {
 impl Drop for AuHost {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // Retire le rappel AVANT que `editor_slot` ne soit libéré.
+            unsafe { au_host_set_editor_callback(self.ptr, None, ptr::null_mut()) };
             unsafe { au_host_destroy(self.ptr) };
             self.ptr = ptr::null_mut();
         }
@@ -419,6 +458,10 @@ impl PluginHost for AuHost {
             Err(PluginError::InvalidHandle)
         }
     }
+
+    fn set_editor_listener(&mut self, listener: EditorListener) {
+        *self.editor_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(listener);
+    }
 }
 
 // MidiEvent réservé pour S2 — pas encore consommé par AuHost.
@@ -579,5 +622,38 @@ mod tests {
             h.process_stereo(handle, &mut left, &mut right, &[]).expect("process");
         }
         h.unload(handle).ok();
+    }
+}
+
+#[cfg(test)]
+mod editor_state_tests {
+    use super::*;
+
+    /// Les valeurs natives (`JMO_EDITOR_*`, au_host.mm) et les états Rust ne
+    /// doivent jamais se désaligner ; une valeur inconnue est ignorée.
+    #[test]
+    fn traduction_des_etats_natifs() {
+        assert_eq!(editor_state_from_native(0), Some(EditorState::Opening));
+        assert_eq!(editor_state_from_native(1), Some(EditorState::Open));
+        assert_eq!(editor_state_from_native(2), Some(EditorState::Closed));
+        assert_eq!(editor_state_from_native(3), Some(EditorState::Failed));
+        assert_eq!(editor_state_from_native(4), None);
+    }
+
+    /// Le rappel natif atteint l'écouteur posé, avec le bon plugin et le bon état.
+    #[test]
+    fn le_rappel_natif_atteint_l_ecouteur() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(u32, EditorState)>>> = Arc::default();
+        let mut host = AuHost::new();
+        let sink = seen.clone();
+        host.set_editor_listener(Arc::new(move |h, st| sink.lock().unwrap().push((h.0, st))));
+        let ctx = &*host.editor_slot as *const EditorSlot as *mut c_void;
+        unsafe {
+            editor_thunk(ctx, 7, 0);
+            editor_thunk(ctx, 7, 1);
+            editor_thunk(ctx, 7, 42);
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![(7, EditorState::Opening), (7, EditorState::Open)]);
     }
 }

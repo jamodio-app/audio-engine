@@ -37,3 +37,6 @@ credentials.*
 /au-host-poc/
 /vst3-host-poc/
 
+
+# Résultats du banc « N musiciens » (session-bench) : locaux, jamais commités.
+bench-results/

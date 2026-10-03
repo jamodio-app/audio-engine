@@ -14,6 +14,7 @@
 //! ```text
 //! # aucune ligne = comportement normal
 //! no-rtcp = 1
+//! no-mmcss = 1
 //! ```
 
 use std::collections::BTreeMap;
@@ -37,6 +38,16 @@ pub struct BenchFlags {
     /// Coupe la tâche RTCP (Sender Reports et lecture des rapports du SFU) pour
     /// comparer, avec le même binaire, une session avec et une sans.
     pub no_rtcp: bool,
+    /// Windows : nos fils audio prennent la priorité de fil la plus haute de
+    /// Windows (`THREAD_PRIORITY_TIME_CRITICAL`) au lieu de MMCSS « Pro Audio ».
+    /// Mesure du Lot W1 (PLAN-FREINAGE-RESEAU-WINDOWS-2026-09) : le freinage
+    /// réseau de Windows disparaît-il quand aucun de nos fils n'est MMCSS ?
+    /// Sans effet hors de Windows (dit au journal).
+    pub no_mmcss: bool,
+    // `recv-thread-normal` (0.6.6-8, expérience A/B du 28/09) est retiré en
+    // 0.6.6-9 : lecture et décodage sont un seul fil, qu'on ne laisse jamais en
+    // priorité normale. Un fichier qui le contient encore le voit signalé
+    // « inconnu — ignoré » au journal.
 }
 
 impl BenchFlags {
@@ -90,6 +101,7 @@ impl BenchFlags {
             let on = value == "1";
             match key.as_str() {
                 "no-rtcp" => flags.no_rtcp = on,
+                "no-mmcss" => flags.no_mmcss = on,
                 other => tracing::warn!(
                     target: "jamodio::bench",
                     flag = other,
@@ -137,6 +149,9 @@ impl BenchFlags {
         if self.no_rtcp {
             active.push("no-rtcp");
         }
+        if self.no_mmcss {
+            active.push("no-mmcss");
+        }
         active
     }
 
@@ -152,6 +167,12 @@ impl BenchFlags {
                 flags = active.join(","),
                 path = %Self::path().display(),
                 "interrupteurs de banc ACTIFS — ce n'est pas le comportement normal"
+            );
+        }
+        if self.no_mmcss && !cfg!(target_os = "windows") {
+            tracing::warn!(
+                target: "jamodio::bench",
+                "interrupteur no-mmcss sans effet hors de Windows"
             );
         }
     }
@@ -211,6 +232,24 @@ mod tests {
     fn un_fichier_propre_ne_signale_rien() {
         let (_, issues) = BenchFlags::entries("# commentaire\n\nno-rtcp = 1\n");
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn no_mmcss_est_lu_et_annonce_seul_ou_avec_un_autre() {
+        let flags = BenchFlags::parse("no-mmcss = 1\n");
+        assert!(flags.no_mmcss);
+        assert!(!flags.no_rtcp);
+        assert_eq!(flags.active(), vec!["no-mmcss"]);
+        let both = BenchFlags::parse("no-rtcp = 1\nno-mmcss = 1\n");
+        assert_eq!(both.active(), vec!["no-rtcp", "no-mmcss"]);
+        assert!(!BenchFlags::parse("no-mmcss = 0").no_mmcss);
+    }
+
+    /// L'interrupteur de l'expérience A/B du 28/09, retiré en 0.6.6-9, n'active
+    /// plus rien.
+    #[test]
+    fn l_ancien_interrupteur_recv_thread_normal_n_active_rien() {
+        assert_eq!(BenchFlags::parse("recv-thread-normal = 1\n"), BenchFlags::default());
     }
 
     /// Une faute de frappe ne doit jamais activer un réglage ni en cacher un.

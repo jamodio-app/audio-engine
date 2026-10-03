@@ -8,8 +8,8 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use base64::Engine;
 use jamodio_audio_core::protocol::{
-    AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf, RecvStreamPerf,
-    RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
+    capability, AgentMessage, AgentState, BrowserMessage, PeerPerf, PipelineLatency, PluginPerf,
+    RecvStreamPerf, RecordStemSpec, RecordedFileWire, SendGainSource, StreamLevel, PROTOCOL_VERSION,
 };
 use std::sync::OnceLock;
 use jamodio_audio_core::record::StemSpec;
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc as tokio_mpsc};
 
 use crate::audio::device;
+use crate::audio::rate_check::{resolve_measured_rate, RateSample, RateVerdict};
 use crate::pipeline::{PipelineState, ProducerNetStats};
 
 /// Timeout sur les locks `pipeline.lock().await` dans les handlers heartbeat.
@@ -27,11 +28,62 @@ use crate::pipeline::{PipelineState, ProducerNetStats};
 /// pic CPU local sans perdre la session.
 const LOCK_TIMEOUT_MS: u64 = 200;
 
-/// Suffixe du scope Vercel de l'équipe Jamodio (previews). Seul ce compte peut
-/// déployer sous ce suffixe → un projet tiers `jamodio-*.vercel.app` d'un autre
-/// scope est rejeté. ⚠️ Doit rester synchro avec le SFU (server/sfu.js
-/// VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
+/// Suffixe du scope Vercel de l'équipe Jamodio (previews). ⚠️ Même règle que le
+/// SFU (server/sfu.js VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
+///
+/// Ce suffixe NE SUFFIT PAS à prouver l'équipe : `.vercel.app` est un suffixe
+/// public, et rien ne garantit qu'un autre compte ne puisse pas obtenir
+/// `jamodio-x-bengo82-9540s-projects.vercel.app` comme adresse de production
+/// d'un projet ainsi nommé (revue 0.6.6, constat I). D'où le fichier
+/// [`PREVIEW_ORIGINS_FILE`] : ces pages ne pilotent l'Audio Engine que sur les
+/// machines de test où il est posé.
 const VERCEL_TEAM_SUFFIX: &str = "-bengo82-9540s-projects.vercel.app";
+
+/// Fichier, dans le dossier des journaux (`logging::log_dir`), qui autorise les
+/// pages de prévisualisation Vercel de l'équipe à piloter l'Audio Engine sur
+/// CETTE machine. Son contenu est ignoré ; sa présence est lue au démarrage du
+/// serveur WS (relancer l'Audio Engine après l'avoir posé) et toujours
+/// journalisée. Absent — le cas de tous les musiciens — : seul jamodio.com.
+const PREVIEW_ORIGINS_FILE: &str = "allow-vercel-previews";
+
+/// Page de prévisualisation Vercel de l'équipe — même forme que le SFU
+/// (`^https://jamodio-[a-z0-9-]+-bengo82-9540s-projects\.vercel\.app$`). Une
+/// forme, pas une preuve : cf. [`VERCEL_TEAM_SUFFIX`].
+fn is_team_preview_origin(origin: &str) -> bool {
+    origin
+        .strip_prefix("https://jamodio-")
+        .and_then(|rest| rest.strip_suffix(VERCEL_TEAM_SUFFIX))
+        .is_some_and(|middle| {
+            !middle.is_empty()
+                && middle.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// Lit, une fois, si cette machine accepte les pages de prévisualisation, et le
+/// dit au journal dans les deux cas.
+fn previews_allowed_on_this_machine() -> bool {
+    previews_allowed_in(&crate::logging::log_dir())
+}
+
+/// [`previews_allowed_on_this_machine`] pour un dossier donné (testable).
+fn previews_allowed_in(log_dir: &std::path::Path) -> bool {
+    let path = log_dir.join(PREVIEW_ORIGINS_FILE);
+    let allowed = path.exists();
+    if allowed {
+        tracing::warn!(
+            target: "jamodio::ws",
+            path = %path.display(),
+            "pages de prévisualisation Vercel ACCEPTÉES sur cette machine (machine de test)"
+        );
+    } else {
+        tracing::info!(
+            target: "jamodio::ws",
+            path = %path.display(),
+            "pages de prévisualisation Vercel refusées : seul jamodio.com pilote l'Audio Engine"
+        );
+    }
+    allowed
+}
 
 /// Cadence d'envoi des niveaux VU (Lot 3). 40 ms = 25 Hz — voir le commentaire
 /// du sender pour le pourquoi. La mesure elle-même ne dépend pas de cette
@@ -40,7 +92,9 @@ const LEVELS_PERIOD: Duration = Duration::from_millis(40);
 
 /// Vérifie l'origin de la requête WS upgrade. On accepte uniquement :
 ///   - https://jamodio.com (prod)
-///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope Jamodio)
+///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope
+///     Jamodio) — SEULEMENT si `previews_allowed` (machine de test, cf.
+///     [`PREVIEW_ORIGINS_FILE`])
 ///   - http://localhost:* / http://127.0.0.1:* (dev local + browser-side dev)
 ///   - tauri://localhost ou http://tauri.localhost (UI WEBVIEW INTERNE
 ///     de l'agent — Tauri 2 sert sa webview sous ces schemes selon l'OS).
@@ -52,7 +106,7 @@ const LEVELS_PERIOD: Duration = Duration::from_millis(40);
 ///
 /// Empêche une page web random sur localhost:1234 de piloter l'agent
 /// silencieusement.
-fn origin_allowed(origin: Option<&str>) -> bool {
+fn origin_allowed(origin: Option<&str>, previews_allowed: bool) -> bool {
     let Some(origin) = origin else {
         // Origin absent : un navigateur envoie TOUJOURS un en-tête Origin ;
         // seul un client non-browser (test CLI) ou un process natif local peut
@@ -64,14 +118,11 @@ fn origin_allowed(origin: Option<&str>) -> bool {
     // Origins de PRODUCTION (build release ET debug).
     if origin == "https://jamodio.com"
         || origin == "https://www.jamodio.com"
-        // Previews Vercel : on épingle le SCOPE de l'équipe Jamodio. Un
-        // `ends_with(".vercel.app")` — ou même `starts_with("https://jamodio")`
-        // — laisserait n'importe qui enregistrer `jamodio-x.vercel.app` (gratuit)
-        // et piloter l'agent en drive-by. Les URLs de preview sont
-        // `jamodio-<hash|git-branch>-<scope>.vercel.app` ; seul VERCEL_TEAM_SUFFIX
-        // (le scope de l'équipe) n'est pas usurpable. ⚠️ Doit rester synchro avec
-        // le SFU (server/sfu.js VERCEL_PREVIEW_RE).
-        || (origin.starts_with("https://jamodio-") && origin.ends_with(VERCEL_TEAM_SUFFIX))
+        // Previews Vercel du scope de l'équipe, sur les machines de test
+        // seulement. Un `ends_with(".vercel.app")` laisserait n'importe qui
+        // piloter l'agent en drive-by ; le suffixe d'équipe lui-même n'est pas
+        // une preuve (cf. VERCEL_TEAM_SUFFIX).
+        || (previews_allowed && is_team_preview_origin(origin))
         || is_internal_client_origin(origin)
         || origin == "file://"
     {
@@ -119,7 +170,15 @@ fn make_hello() -> AgentMessage {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        capabilities: vec![],
+        capabilities: [
+            capability::INSTRUMENT_PLUGIN_STATE,
+            capability::PLUGIN_EDITOR_EVENTS,
+            capability::ADD_STREAM_REQUEST_ID,
+            capability::PLUGIN_QUEUE,
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect(),
     }
 }
 
@@ -347,6 +406,7 @@ fn spawn_awaited_relaunch(exe: &std::path::Path) -> std::io::Result<()> {
 
 /// Start the localhost WebSocket server on port 9876.
 pub async fn start(handle: WsServerHandle) {
+    let previews_allowed = previews_allowed_on_this_machine();
     let app = Router::new().route(
         "/",
         get(move |ws: WebSocketUpgrade, headers: HeaderMap, uri: Uri| {
@@ -356,12 +416,23 @@ pub async fn start(handle: WsServerHandle) {
                 let origin = headers
                     .get("origin")
                     .and_then(|h| h.to_str().ok());
-                if !origin_allowed(origin) {
-                    tracing::warn!(
-                        target: "jamodio::ws",
-                        origin = ?origin,
-                        "WS upgrade rejected — origin not whitelisted"
-                    );
+                if !origin_allowed(origin, previews_allowed) {
+                    if origin.is_some_and(is_team_preview_origin) {
+                        // Refus attendu chez un musicien ; sur une machine de
+                        // test, il dit quoi faire.
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            origin = ?origin,
+                            file = %crate::logging::log_dir().join(PREVIEW_ORIGINS_FILE).display(),
+                            "page de prévisualisation Vercel refusée — machine de test : créer ce fichier puis relancer l'Audio Engine"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            origin = ?origin,
+                            "WS upgrade rejected — origin not whitelisted"
+                        );
+                    }
                     return axum::http::Response::builder()
                         .status(403)
                         .body(axum::body::Body::from("forbidden origin"))
@@ -575,6 +646,188 @@ async fn midi_device_list_reply() -> AgentMessage {
     }
 }
 
+/// Messages du navigateur qui touchent au plugin d'instrument. Ils passent par
+/// la FILE DES PLUGINS de la connexion (cf. `OrderedQueue`), jamais par la
+/// boucle des messages : un chargement natif dure de 0,4 à 5 s (AmpliTube, NUC,
+/// 29/09/2026 : 5,2 s) et, traité en ligne, il retenait tout ce qui suivait —
+/// l'`add-stream` d'un musicien qui arrivait avait expiré côté studio.
+///
+/// Le contournement et l'éditeur y passent aussi : ils visent le plugin chargé,
+/// donc ils doivent venir APRÈS le chargement demandé avant eux (un contournement
+/// traité pendant le chargement serait écrasé par sa remise à zéro).
+///
+/// Le clavier virtuel (`PlayMidiNote`) n'y passe pas : une note n'a de sens que
+/// tout de suite, et elle ne bloque jamais (`try_lock`).
+fn is_plugin_message(msg: &BrowserMessage) -> bool {
+    matches!(
+        msg,
+        BrowserMessage::LoadInstrumentPlugin { .. }
+            | BrowserMessage::UnloadInstrumentPlugin
+            | BrowserMessage::SetInstrumentPluginBypass { .. }
+            | BrowserMessage::OpenInstrumentPluginEditor
+            | BrowserMessage::CloseInstrumentPluginEditor
+    )
+}
+
+/// File de travaux traités UN PAR UN, dans l'ordre d'arrivée, par une tâche à
+/// elle : celui qui dépose n'attend jamais.
+///
+/// Fermeture (`close`) : le travail en cours va au bout — un appel natif ne
+/// s'interrompt pas —, ceux qui n'ont pas commencé sont abandonnés et notés au
+/// journal, puis la tâche se termine d'elle-même. Rien ne survit à la connexion.
+struct OrderedQueue<T> {
+    tx: tokio_mpsc::UnboundedSender<(T, String)>,
+    closed: Arc<AtomicBool>,
+}
+
+impl<T: Send + 'static> OrderedQueue<T> {
+    /// `run` traite un travail ; `kind` le nomme dans le journal.
+    fn spawn<F, Fut>(run: F) -> (Self, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(T) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel::<(T, String)>();
+        let closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = closed.clone();
+        let worker = tokio::spawn(async move {
+            while let Some((item, kind)) = rx.recv().await {
+                if worker_closed.load(Ordering::SeqCst) {
+                    tracing::info!(
+                        target: "jamodio::plugin",
+                        message = %kind,
+                        "demande abandonnée : connexion fermée avant son tour"
+                    );
+                    continue;
+                }
+                run(item).await;
+            }
+        });
+        (Self { tx, closed }, worker)
+    }
+
+    /// Dépose un travail. Après `close`, ou si la tâche n'est plus là, il est
+    /// abandonné (et dit au journal).
+    fn push(&self, item: T, kind: String) {
+        if self.closed.load(Ordering::SeqCst) || self.tx.send((item, kind.clone())).is_err() {
+            tracing::info!(target: "jamodio::plugin", message = %kind, "demande abandonnée : connexion fermée");
+        }
+    }
+
+    fn close(self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // `self.tx` part avec `self` : la tâche vide la file puis s'arrête.
+    }
+}
+
+/// File des plugins d'une connexion : chaque message y est traité par
+/// `handle_message` et ses réponses partent vers le navigateur quand elles sont
+/// prêtes.
+fn spawn_plugin_queue(
+    handle: &WsServerHandle,
+    out_tx: &tokio_mpsc::Sender<AgentMessage>,
+) -> (OrderedQueue<BrowserMessage>, tokio::task::JoinHandle<()>) {
+    let handle = handle.clone();
+    let out_tx = out_tx.clone();
+    OrderedQueue::spawn(move |msg: BrowserMessage| {
+        let handle = handle.clone();
+        let out_tx = out_tx.clone();
+        async move {
+            let responses = handle_message(
+                msg,
+                &handle.pipeline,
+                &handle.mixer,
+                &handle.voice_gain,
+                &handle.send_gain_instrument,
+                &handle.send_gain_voice,
+            )
+            .await;
+            for resp in responses {
+                if out_tx.send(resp).await.is_err() {
+                    break; // connexion fermée entre-temps
+                }
+            }
+        }
+    })
+}
+
+/// Exécute une opération native de plugin (chargement, retrait) hors du runtime
+/// async, en tenant le verrou des opérations plugin JUSQU'AU VRAI RETOUR de
+/// l'appel. Si la tâche qui attend est annulée (connexion fermée), l'appel
+/// natif continue et le verrou reste tenu : aucune autre opération ne peut
+/// démarrer en parallèle sur l'hôte.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn run_plugin_op<T, F>(ops: &'static tokio::sync::Mutex<()>, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = ops.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let _held_until_the_native_call_returns = guard;
+        work()
+    })
+    .await
+    // `spawn_blocking` n'échoue que si le travail panique : c'est une erreur de
+    // l'opération, pas une raison de faire tomber la connexion.
+    .map_err(|e| format!("plugin task failed: {e}"))
+}
+
+/// État du plugin d'instrument pour `InstrumentPluginState`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn plugin_state_message(ctrl: &crate::pipeline::PluginControl) -> AgentMessage {
+    match ctrl.snapshot() {
+        Some((info, bypass)) => AgentMessage::InstrumentPluginState {
+            plugin: Some(jamodio_audio_core::protocol::LoadedPluginWire {
+                name: info.name,
+                plugin_ref: info.plugin_ref,
+                latency_samples: info.latency_samples,
+                has_editor: info.has_editor,
+            }),
+            bypass,
+        },
+        None => AgentMessage::InstrumentPluginState { plugin: None, bypass: false },
+    }
+}
+
+/// Envoie l'état du plugin quand AUCUNE opération plugin n'est en cours : un
+/// chargement lancé par la connexion précédente (studio rechargé pendant le
+/// chargement) est ainsi fini avant qu'on dise ce qui tourne. Ne retient rien :
+/// les messages de la connexion continuent d'être traités pendant l'attente.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn send_plugin_state_when_idle(
+    ops: &'static tokio::sync::Mutex<()>,
+    ctrl: crate::pipeline::PluginControl,
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
+) {
+    let _idle = ops.lock().await;
+    let msg = plugin_state_message(&ctrl);
+    let _ = out_tx.send(msg).await;
+    tracing::info!(target: "jamodio::ws", "état du plugin envoyé au studio");
+}
+
+/// Relaie au studio chaque étape de la fenêtre d'éditeur du plugin.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn forward_editor_events(
+    mut editor_rx: broadcast::Receiver<jamodio_audio_core::plugin_host::EditorState>,
+    out_tx: tokio_mpsc::Sender<AgentMessage>,
+) {
+    loop {
+        match editor_rx.recv().await {
+            Ok(state) => {
+                // Journal à la source (`pipeline::with_editor_events`), pas ici :
+                // chaque connexion relaie, une seule écrit.
+                if out_tx.send(AgentMessage::InstrumentPluginEditor { state }).await.is_err() {
+                    break;
+                }
+            }
+            // Quelques états sautés : le suivant fait foi.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// v0.4.3 — Helper extrait pour traiter un Message WS unique. Retourne
 /// `true` si on doit continuer la receive loop, `false` si on doit la
 /// quitter (envoi sortant cassé). Partagé entre la branche `is_internal`
@@ -583,6 +836,7 @@ async fn handle_one_message(
     msg: Message,
     handle: &WsServerHandle,
     out_tx: &tokio_mpsc::Sender<AgentMessage>,
+    plugin_queue: &OrderedQueue<BrowserMessage>,
 ) -> bool {
     let Message::Text(text) = msg else { return true };
 
@@ -637,6 +891,13 @@ async fn handle_one_message(
         tokio::spawn(async move {
             let _ = out_tx.send(midi_device_list_reply().await).await;
         });
+        return true;
+    }
+
+    // Plugin d'instrument : dans la file des plugins, dans l'ordre, sans que la
+    // boucle l'attende (cf. `is_plugin_message`).
+    if is_plugin_message(&browser_msg) {
+        plugin_queue.push(browser_msg, message_kind(&text));
         return true;
     }
 
@@ -721,11 +982,12 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     // push l'état pour que l'UI affiche directement [● bypass][nom][✕] au
     // lieu de "+ FX" trompeur. Le browser reçoit le même message que pour
     // un load fresh, plus rien à modifier côté handler.
+    // 0.6.6-13 — gardé pour les studios qui ne lisent pas encore
+    // `InstrumentPluginState` (envoyé plus bas, qui dit AUSSI « aucun plugin »).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        let pl = handle.pipeline.lock().await;
-        if let Some((info, bypass)) = pl.get_instrument_plugin_snapshot() {
-            drop(pl);
+        let ctrl = handle.pipeline.lock().await.plugin_control();
+        if let Some((info, bypass)) = ctrl.snapshot() {
             let resync = AgentMessage::InstrumentPluginLoaded {
                 name: info.name,
                 plugin_ref: info.plugin_ref,
@@ -771,6 +1033,22 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
 
     // Channel for outgoing messages (from message handler + periodic tasks)
     let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(64);
+
+    // File des plugins de CETTE connexion (cf. `is_plugin_message`).
+    let (plugin_queue, _plugin_worker) = spawn_plugin_queue(&handle, &out_tx);
+
+    // 0.6.6-13 — état du plugin (chargé OU aucun), dès qu'aucune opération
+    // plugin n'est en cours ; puis chaque étape de la fenêtre d'éditeur.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let (plugin_state_task, editor_task) = {
+        let (ctrl, editor_rx) = {
+            let pl = handle.pipeline.lock().await;
+            (pl.plugin_control(), pl.editor_events.subscribe())
+        };
+        let state_task = tokio::spawn(send_plugin_state_when_idle(plugin_ops_lock(), ctrl, out_tx.clone()));
+        let editor_task = tokio::spawn(forward_editor_events(editor_rx, out_tx.clone()));
+        (state_task, editor_task)
+    };
 
     // Subscribe au broadcast shutdown (auto-update).
     let mut shutdown_rx = handle.shutdown_tx.subscribe();
@@ -1096,6 +1374,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // écoulé) y seraient lus comme UNE seconde. On la lit pour remettre les
         // compteurs à zéro, sans la publier ni la juger — comme les mètres VU.
         let mut first_window = true;
+        // Lecteurs des histogrammes (réserves + tampons de tri), créés au premier
+        // relevé puis réutilisés : aucune allocation par seconde.
+        let mut readers: Option<crate::pipeline::PerfReaders> = None;
         loop {
             interval.tick().await;
             // Même règle que les mètres VU : la lecture est DESTRUCTIVE (swap(0)
@@ -1127,19 +1408,32 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     report_age_ms: report.received_at.elapsed().as_millis() as u64,
                 }
             });
-            // Flush histograms (acquièrent le lock parking_lot une fois chacun)
-            let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
-            let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
-            // v0.4.8 — 3 histogrammes par stage pour discriminer "spike
-            // traitement" vs "spike file en queue ringbuf".
-            let capture_snap = pl.perfstats.capture_latency.lock().flush();
-            let process_snap = pl.perfstats.process_latency.lock().flush();
-            let encode_snap = pl.perfstats.encode_latency.lock().flush();
-            let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
-            // 0.5.3 — rafale d'émission (frames Opus/bloc à encode_stage).
-            let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
-            // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
-            let recv_path_snap = pl.perfstats.recv_path.lock().flush();
+            // Histogrammes : sous chaque verrou, un seul échange de tampon ; le
+            // tri se fait ensuite, sans faire attendre le fil de réception ni le
+            // callback audio qui les alimentent (revue 0.6.6, constat B).
+            // v0.4.8 — capture / process / encode discriminent « pic de
+            // traitement » et « pic de file » ; 0.5.3 — rafale d'émission ;
+            // 0.5.3-2 — chemin de réception (lecture → avant push mixer) ;
+            // Lot 1-D4 — travail du fil de réception par réveil ; Lot 1-C —
+            // retard de son réveil ; Lot 1-D2 — attente système → lecture.
+            let crate::pipeline::PerfWindow {
+                pipeline: pipeline_snap,
+                plugin: plugin_snap,
+                capture: capture_snap,
+                process: process_snap,
+                encode: encode_snap,
+                send_path: send_path_snap,
+                emit_burst: emit_burst_snap,
+                recv_path: recv_path_snap,
+                recv_work: recv_work_snap,
+                decode_wake_late: decode_wake_late_snap,
+                recv_stack: recv_stack_snap,
+            } = readers
+                .get_or_insert_with(|| pl.perfstats.readers())
+                .read(&pl.perfstats);
+            // Réveils du fil de réception hors de son contrat de calcul (macOS)
+            // depuis le dernier relevé.
+            let recv_work_over_budget = pl.perfstats.recv_work_over_budget.swap(0, Ordering::Relaxed);
             // 0.5.3-4 — débit de callbacks CPAL sur la fenêtre 1 s (liveness ASIO).
             // Compteurs cumulés → on logue le delta. 0 en session active = sortie
             // ou entrée muette (cold-start), sinon ≈370/s.
@@ -1158,6 +1452,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
             let capturing_now = matches!(pl.state, AgentState::Capturing);
             // Ce que le musicien ENTEND (sortie casque), pic de la seconde.
             let heard_peak = f32::from_bits(pl.perfstats.heard_peak.swap(0, Ordering::Relaxed));
+            // Talkback : coût de l'isolation de voix et voix perdue devant l'étage
+            // voix sur la fenêtre (cf. `audio::voice_tap`). Zéros hors talkback.
+            let voice_stage = pl.perfstats.voice_stage.drain();
             // Tailles de bloc livrées par l'OS (frames PAR CANAL). `0` = le
             // callback correspondant n'a pas encore tourné : on publie alors
             // `None` plutôt qu'un zéro qu'on lirait comme une mesure.
@@ -1524,8 +1821,16 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                         wait_not_due: net.wait_not_due,
                         wait_repriming: net.wait_repriming,
                         deadline_disarmed: net.deadline_disarmed,
+                        holes_arrival: net.holes.arrival,
+                        holes_reception: net.holes.reception,
+                        holes_decode: net.holes.decode,
+                        holes_consumption: net.holes.consumption,
+                        holes_sequence: net.holes.sequence,
+                        holes_unclassified: net.holes.unclassified,
+                        holes_after_buffer_holds: net.holes.after_buffer_holds,
                         target_jitter_ms: s.target_jitter_ms,
                         target_glitch_ms: s.target_glitch_ms,
+                        target_late_ms: s.target_late_ms,
                         target_reactive_ms: s.target_reactive_ms,
                         fill_min_ms: s.fill_min_ms,
                         fill_p50_ms: s.fill_p50_ms,
@@ -1555,6 +1860,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     buffer_target_ms = p.buffer_target_ms,
                     target_jitter_ms = p.target_jitter_ms,
                     target_glitch_ms = p.target_glitch_ms,
+                    target_late_ms = p.target_late_ms,
                     target_reactive_ms = p.target_reactive_ms,
                     fill_min_ms = p.fill_min_ms,
                     fill_p50_ms = p.fill_p50_ms,
@@ -1610,6 +1916,28 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 recv_path_p50_ms = recv_path_snap.p50_ms,
                 recv_path_p99_ms = recv_path_snap.p99_ms,
                 recv_path_max_ms = recv_path_snap.max_ms,
+                // Lot 1-D4 — travail du fil de réception à chaque réveil (lecture,
+                // déchiffrement, décodage, masquage de tous les flux prêts), et
+                // nombre de réveils au-delà de `AUDIO_RECV_COMPUTATION` (0,3 ms).
+                recv_work_count = recv_work_snap.count,
+                recv_work_p99_ms = recv_work_snap.p99_ms,
+                recv_work_max_ms = recv_work_snap.max_ms,
+                recv_work_over_budget,
+                // Lot 1-C — de combien le fil de réception se réveille APRÈS
+                // l'instant prévu quand une échéance de masquage est armée. La
+                // marge de réveil du masquage (`WAKE_SLACK_MS`) doit le couvrir.
+                decode_wake_late_count = decode_wake_late_snap.count,
+                decode_wake_late_p50_ms = decode_wake_late_snap.p50_ms,
+                decode_wake_late_p99_ms = decode_wake_late_snap.p99_ms,
+                decode_wake_late_max_ms = decode_wake_late_snap.max_ms,
+                // Lot 1-D2 — attente système → lecture des paquets reçus (ms). Un
+                // max qui atteint l'écart d'un trou dit que le paquet était dans la
+                // machine et que la réception l'a lu tard. count = 0 en réception :
+                // le système n'horodate pas (dit une fois par flux au journal).
+                recv_stack_count = recv_stack_snap.count,
+                recv_stack_p50_ms = recv_stack_snap.p50_ms,
+                recv_stack_p99_ms = recv_stack_snap.p99_ms,
+                recv_stack_max_ms = recv_stack_snap.max_ms,
                 // 0.5.3 — rafale d'émission : frames Opus émises par bloc d'entrée.
                 // ≈1 = flux régulier (pas de rafale) ; ≫1 = callback gros (ASIO non
                 // honoré). À 48 k natif : emit_burst_mean ≈ taille_callback / 120.
@@ -1636,6 +1964,11 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                 // lignes se distinguent.
                 output_clip_samples = clip_samples,
                 output_total_samples = total_samples,
+                // Talkback — charge de l'isolation en % d'un cœur (> 100 % =
+                // l'étage voix ne suit pas le temps réel), pire bloc, voix perdue.
+                voice_iso_load_pct = voice_stage.iso_load_pct,
+                voice_iso_max_block_ms = voice_stage.iso_max_block_ms,
+                voice_dropped_ms = voice_stage.dropped_ms,
                 pid = std::process::id(),
                 "perfstats snapshot"
             );
@@ -1921,7 +2254,7 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                             );
                         }
 
-                        if !handle_one_message(msg, &handle, &out_tx).await {
+                        if !handle_one_message(msg, &handle, &out_tx, &plugin_queue).await {
                             break;
                         }
                     }
@@ -1944,6 +2277,14 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
     send_task.abort();
     shutdown_task.abort();
     progress_task.abort();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        plugin_state_task.abort();
+        editor_task.abort();
+    }
+    // Le travail plugin en cours va au bout (appel natif), les suivants sont
+    // abandonnés ; la tâche de la file se termine d'elle-même.
+    plugin_queue.close();
 
     // v0.4.3 — Cleanup pipeline UNIQUEMENT pour les clients externes
     // qui ont été PROMUS (= ont envoyé au moins un BrowserMessage et donc
@@ -2065,15 +2406,26 @@ async fn handle_logs_connection(socket: WebSocket, handle: WsServerHandle) {
 }
 
 /// Chantier A (v0.4.12) — sérialise les opérations plugin LENTES (load/unload
-/// natif AU/VST3, 0,4–4 s). Tenu HORS du lock `PipelineState` et du chemin
+/// natif AU/VST3, 0,4–5 s). Tenu HORS du lock `PipelineState` et du chemin
 /// audio → ne gèle rien. Garantit qu'on n'exécute jamais deux init/teardown
 /// natifs concurrents (course handle ↔ instance) même si le browser spamme.
+/// 0.6.6-13 — tenu jusqu'au vrai retour de l'appel natif (`run_plugin_op`) ;
+/// contournement, éditeur et état envoyé à la connexion l'attendent aussi.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static PLUGIN_OPS_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn plugin_ops_lock() -> &'static tokio::sync::Mutex<()> {
     PLUGIN_OPS_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Bundle plugin (cf. `PluginControl`), obtenu en tenant le verrou pipeline le
+/// temps d'un clonage d'`Arc`. `None` si le pipeline reste pris (surcharge).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+async fn plugin_control(
+    pipeline: &Arc<tokio::sync::Mutex<PipelineState>>,
+) -> Option<crate::pipeline::PluginControl> {
+    Some(lock_pipeline_wait(pipeline).await?.plugin_control())
 }
 
 /// Tente d'acquérir le lock pipeline avec un timeout court. Si dépassé,
@@ -2297,15 +2649,11 @@ async fn audio_liveness_supervisor(
     // + erreur browser. Débounce (N fenêtres consécutives) pour ne JAMAIS tuer une
     // session saine sur un glitch de mesure transitoire. Cas le plus fréquent (44,1
     // avec kAsioResetRequest) reste capté en amont par le chemin reset (rate_drift_stop).
+    // La décision (tolérance, rattachement à un rate standard, exclusion des trous
+    // de livraison) est celle de l'ouverture : `audio::rate_check`, une seule règle.
     const DETECTOR_WINDOW: Duration = Duration::from_secs(2);
-    // Tolérance relative : au-delà = écart franc. Mesure sur 2 s (~1500 callbacks
-    // à 48 k/64) → précision ~0,1 %, donc 6 % est très au-dessus du bruit ET capte
-    // un vrai 44,1 (écart 8,1 %) — le cas « driver qui ment/dérive vers 44,1 ».
-    // Les re-clocks grossiers (11025=77 %, 33438=30 %) sont a fortiori captés.
-    const DETECTOR_TOLERANCE: f64 = 0.06;
-    // Nb de fenêtres consécutives en écart avant hard-stop (anti-faux-positif).
-    const DETECTOR_DEBOUNCE: u32 = 2;
     let mut detector_prev_cap = 0u64;
+    let mut detector_prev_stall_us = 0u64;
     let mut detector_window_start = Instant::now();
     let mut detector_mismatch_streak: u32 = 0;
 
@@ -2326,7 +2674,10 @@ async fn audio_liveness_supervisor(
         // remonte l'erreur au browser (« règle en 48 kHz »). Drainé hors des
         // branches de reset pour couvrir tous les chemins (reset coopératif,
         // flatline, réveil de veille) d'un seul point. Locks brefs, hors thread audio.
-        if let Some(actual_sr) = { pipeline.lock().await.take_rate_drift_stop() } {
+        // Le verrou est relâché à la fin de cette instruction, AVANT la branche
+        // (qui reprend `pipeline.lock()` : le garder serait un interblocage).
+        let rate_drift_stop = pipeline.lock().await.take_rate_drift_stop();
+        if let Some(actual_sr) = rate_drift_stop {
             tracing::warn!(
                 target: "jamodio::ws",
                 actual_sr,
@@ -2372,7 +2723,7 @@ async fn audio_liveness_supervisor(
         }
 
         // Observation atomique (lock bref).
-        let (state_capturing, has_stream, has_output, cap, out, input_device) = {
+        let (state_capturing, has_stream, has_output, cap, out, stall_us, input_device) = {
             let pl = pipeline.lock().await;
             (
                 matches!(pl.state, AgentState::Capturing),
@@ -2380,6 +2731,7 @@ async fn audio_liveness_supervisor(
                 pl.has_playback_stream(),
                 pl.perfstats.capture_callbacks.load(Ordering::Relaxed),
                 pl.perfstats.output_callbacks.load(Ordering::Relaxed),
+                pl.perfstats.callback_health.stall_us_total(),
                 pl.input_device_name(),
             )
         };
@@ -2412,6 +2764,8 @@ async fn audio_liveness_supervisor(
             last_default_out = None; // hors session : oublie la base de suivi OS
             silent_rebuilds = 0;     // rien à reprocher à la prochaine interface
             detector_prev_cap = cap; // re-base le détecteur à l'entrée en session
+            detector_prev_stall_us = stall_us;
+            detector_mismatch_streak = 0; // aucune fenêtre d'une session passée ne compte
             detector_window_start = Instant::now();
             last_disruption = Instant::now(); // hors capture : rien de jugeable
             continue;
@@ -2419,8 +2773,17 @@ async fn audio_liveness_supervisor(
 
         // R4 (décision 48k/ASIO-only) — DÉTECTEUR DE DÉRIVE. Toutes les
         // `DETECTOR_WINDOW`, on déduit le rate réel du driver de son débit de
-        // callbacks et on le confronte au 48 kHz assumé. Écart franc PERSISTANT
-        // (débounce) = re-clock silencieux → HARD-STOP. Sondage hors thread audio.
+        // callbacks et on le confronte au 48 kHz assumé. Livraison PERSISTANTE à
+        // un autre rate standard (débounce) = re-clock silencieux → HARD-STOP.
+        // Sondage hors thread audio.
+        //
+        // Le temps passé dans des TROUS de livraison est exclu de la mesure, comme
+        // à l'ouverture : cas Guillaume H. (UR22C, 26/09/2026, agent 0.6.6-2), le
+        // pilote Yamaha fait en session des trous de ~300 ms (notre callback
+        // < 0,5 ms) ; une fenêtre de 2 s en contenant un « mesurait » 41 644 Hz,
+        // deux fenêtres de suite coupaient la session en accusant une interface
+        // restée à 48 kHz. Le trou est un défaut réel (il s'entend et se trace en
+        // « CALLBACK AUDIO IRRÉGULIER »), pas un changement de fréquence.
         if detector_window_start.elapsed() >= DETECTOR_WINDOW {
             // Fenêtre traversée par une INTERRUPTION (reconstruction, flatline,
             // mode dégradé) → mesure faite sur du silence : on la JETTE et on
@@ -2430,8 +2793,6 @@ async fn audio_liveness_supervisor(
                 detector_window_start.elapsed(),
                 last_disruption.elapsed(),
             );
-            let elapsed = detector_window_start.elapsed().as_secs_f64();
-            let cb_delta = cap.saturating_sub(detector_prev_cap);
             // `input_frames` = frames RÉELLEMENT livrés par callback (publié à
             // chaque callback, cf. `capture::log_first_callback`), donc robuste au
             // cas où le driver ASIO ignore notre `Fixed(N)` et délivre sa propre
@@ -2444,43 +2805,52 @@ async fn audio_liveness_supervisor(
                     pl.perfstats.input_frames.load(Ordering::Relaxed),
                 )
             };
-            // Détecteur inerte tant que la géométrie n'est pas connue (frames = 0
-            // avant le 1er callback) ou que le rate assumé est nul (pas encore de
-            // capture confirmée).
-            let mut hard_stop_sr: Option<u32> = None;
-            if window_clean && assumed_sr > 0 && frames_per_cb > 0 && elapsed > 0.0 && cb_delta > 0 {
-                let cb_per_sec = cb_delta as f64 / elapsed;
-                let measured_sr = cb_per_sec * frames_per_cb as f64;
-                let rel_err = (measured_sr - assumed_sr as f64).abs() / assumed_sr as f64;
-                if rel_err > DETECTOR_TOLERANCE {
-                    detector_mismatch_streak += 1;
-                    tracing::warn!(
-                        target: "jamodio::ws",
-                        assumed_sr,
-                        measured_sr = measured_sr as u32,
-                        frames_per_cb,
-                        cb_per_sec = cb_per_sec as u32,
-                        streak = detector_mismatch_streak,
-                        "dérive de rate détectée (débit de callbacks ≠ 48 kHz assumé)"
-                    );
-                    if detector_mismatch_streak >= DETECTOR_DEBOUNCE {
-                        hard_stop_sr = Some(measured_sr as u32);
-                    }
-                } else {
-                    detector_mismatch_streak = 0; // fenêtre saine → reset du débounce
-                }
-            } else if !window_clean {
-                // Interruption dans la fenêtre : la mesure ne veut rien dire, et le
-                // débounce ne doit RIEN garder d'une fenêtre jetée.
-                detector_mismatch_streak = 0;
+            let sample = RateSample {
+                declared_sr: assumed_sr,
+                frames_per_cb,
+                callbacks: cap.saturating_sub(detector_prev_cap),
+                window_us: detector_window_start.elapsed().as_micros() as u64,
+                stall_us: stall_us.saturating_sub(detector_prev_stall_us),
+            };
+            // Interruption dans la fenêtre : la mesure ne veut rien dire, et le
+            // débounce ne doit RIEN garder d'une fenêtre jetée.
+            let verdict = if window_clean {
+                resolve_measured_rate(&sample)
+            } else {
+                RateVerdict::NotMeasurable
+            };
+            let hard_stop_sr = drift_detector_step(&mut detector_mismatch_streak, verdict);
+            match verdict {
+                RateVerdict::Lies { actual_sr, measured_sr } => tracing::warn!(
+                    target: "jamodio::ws",
+                    assumed_sr,
+                    actual_sr,
+                    measured_sr,
+                    frames_per_cb,
+                    callbacks = sample.callbacks,
+                    stall_ms = sample.stall_us / 1000,
+                    streak = detector_mismatch_streak,
+                    "dérive de rate détectée (le pilote livre un autre rate standard que le 48 kHz assumé)"
+                ),
+                RateVerdict::Inconclusive { measured_sr } => tracing::warn!(
+                    target: "jamodio::ws",
+                    assumed_sr,
+                    measured_sr,
+                    frames_per_cb,
+                    callbacks = sample.callbacks,
+                    stall_ms = sample.stall_us / 1000,
+                    "cadence de callbacks hors de tout rate standard — mesure non concluante, session conservée"
+                ),
+                RateVerdict::Confirmed { .. } | RateVerdict::NotMeasurable => {}
             }
             detector_prev_cap = cap;
+            detector_prev_stall_us = stall_us;
             detector_window_start = Instant::now();
 
-            if let Some(measured) = hard_stop_sr {
+            if let Some(actual_sr) = hard_stop_sr {
                 tracing::warn!(
                     target: "jamodio::ws",
-                    measured_sr = measured,
+                    actual_sr,
                     "dérive de rate CONFIRMÉE — HARD-STOP de la capture (R4)"
                 );
                 { pipeline.lock().await.stop_all(); }
@@ -2489,11 +2859,10 @@ async fn audio_liveness_supervisor(
                         reason: "rate-drift-48khz".into(),
                         request_id: None,
                         requested_device: None,
-                        detail: Some(format!("~{} Hz", measured)),
+                        detail: Some(format!("{} Hz", actual_sr)),
                     })
                     .await;
                 session_active = false;
-                detector_mismatch_streak = 0;
                 continue;
             }
         }
@@ -2891,6 +3260,30 @@ fn drift_window_is_clean(window_elapsed: Duration, since_disruption: Duration) -
     since_disruption >= window_elapsed
 }
 
+/// Nombre de fenêtres CONSÉCUTIVES où le pilote livre un autre rate standard avant
+/// le hard-stop (anti-faux-positif).
+const DRIFT_DEBOUNCE: u32 = 2;
+
+/// Débounce du détecteur de dérive en session : rend le rate réellement livré
+/// quand il faut arrêter la capture, `None` sinon.
+///
+/// Seul un verdict `Lies` (rate STANDARD ≠ assumé) fait avancer le compteur ; tout
+/// autre verdict le remet à zéro. Une mesure non concluante ou inexploitable n'est
+/// pas une preuve : elle ne peut ni couper la session, ni s'ajouter à une preuve
+/// précédente. L'appelant remet le compteur à zéro à l'entrée en session.
+fn drift_detector_step(streak: &mut u32, verdict: RateVerdict) -> Option<u32> {
+    match verdict {
+        RateVerdict::Lies { actual_sr, .. } => {
+            *streak += 1;
+            (*streak >= DRIFT_DEBOUNCE).then_some(actual_sr)
+        }
+        RateVerdict::Confirmed { .. } | RateVerdict::Inconclusive { .. } | RateVerdict::NotMeasurable => {
+            *streak = 0;
+            None
+        }
+    }
+}
+
 /// Lot 0 — journalise ce que le SYSTÈME dit du matériel de la session, pilote ASIO
 /// exclu (cf. `audio::hardware_presence`). Diagnostic seul : rien n'est décidé.
 /// Hors thread audio et hors thread COM-STA réservé à ASIO.
@@ -3271,29 +3664,33 @@ async fn handle_message(
             vec![]
         }
 
-        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, media_tag, .. } => {
+        BrowserMessage::AddStream { producer_id, sfu_ip, sfu_port, payload_type: _, srtp_parameters, media_tag, request_id, .. } => {
             tracing::info!(
                 target: "jamodio::ws",
                 producer = &producer_id[..8.min(producer_id.len())],
                 sfu = format!("{}:{}", sfu_ip, sfu_port),
                 ?media_tag,
+                request_id = request_id.as_deref().unwrap_or("-"),
                 "AddStream"
             );
+            // Erreurs corrélées à la DEMANDE (`requestId`), ou au `producer_id`
+            // pour un studio qui ne l'envoie pas encore.
+            let request_key = request_id.clone().unwrap_or_else(|| producer_id.clone());
             // Setup critique du montage d'un flux entrant (join d'un peer) : on
             // ATTEND le lock, jamais de drop (sinon flux jamais monté → peer muet,
-            // cf. symptôme A "ghost/orphan"). Erreurs corrélées au producer_id
-            // → le browser rejette SEULEMENT cette requête (pas ses voisines).
+            // cf. symptôme A "ghost/orphan"). Erreurs corrélées → le browser
+            // rejette SEULEMENT cette requête (pas ses voisines).
             let Some(mut pl) = lock_pipeline_wait(pipeline).await else {
-                return vec![AgentMessage::error_keyed("agent overloaded", producer_id)];
+                return vec![AgentMessage::error_keyed("agent overloaded", request_key)];
             };
             match pl.add_stream(producer_id.clone(), sfu_ip, sfu_port, srtp_parameters, media_tag).await {
                 Ok((local_port, agent_srtp)) => vec![AgentMessage::LocalPort {
                     producer_id,
-                    request_id: None,
+                    request_id,
                     port: local_port,
                     srtp_parameters: agent_srtp,
                 }],
-                Err(e) => vec![AgentMessage::error_keyed(e, producer_id)],
+                Err(e) => vec![AgentMessage::error_keyed(e, request_key)],
             }
         }
 
@@ -3346,10 +3743,8 @@ async fn handle_message(
             // suivi du canal capté QUAND une capture tourne — même forme que la
             // ligne Talkback, pour qu'on ne croie pas à deux réglages de nature
             // différente. Hors capture, le nom seul (le canal n'a pas cours).
-            let device_name = pl.instrument_source_label().or_else(|| {
-                pl.selected_input_id()
-                    .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()).or(Some(id)))
-            });
+            // Lu dans l'état, JAMAIS résolu : on tient le verrou du pipeline.
+            let device_name = pl.stats_device_name();
 
             // Real latency from CPAL buffer: samples / 48000 * 1000.
             //
@@ -3513,9 +3908,9 @@ async fn handle_message(
         BrowserMessage::ReferenceClockPing { ping_id, client_send_ms } => {
             // Réponse IMMÉDIATE : l'ancre échantillon↔mural + l'horloge agent.
             // `outMs` = latence de sortie CONNUE (buffer CPAL mesuré) ; c'est ce
-            // que Chrome ne sait pas sur WASAPI. Le browser gate déjà l'Option B
-            // sur `audioHost ∈ {asio, coreaudio}` → sur WASAPI il ignore ce pong
-            // (fallback Option A). Cf. B0 §3.4.
+            // que Chrome ne sait pas sur WASAPI. Le browser n'utilise la référence
+            // que sur `audioHost ∈ {asio, coreaudio}` ; ailleurs le métronome est
+            // refusé et le dit (plus de clic navigateur). Cf. B0 §3.4.
             let Some(pl) = try_lock_pipeline(pipeline).await else {
                 return vec![];
             };
@@ -3808,34 +4203,27 @@ async fn handle_message(
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 // Chantier A — on ne tient PAS le lock PipelineState pendant le
-                // load natif (0,4–4 s) : on clone le bundle d'Arcs (cheap) puis
+                // load natif (0,4–5 s) : on clone le bundle d'Arcs (cheap) puis
                 // on relâche immédiatement. Le thread audio passe en dry
                 // (handle=None + try_lock) et perfstats_task n'est pas bloqué.
-                // Setup critique : on ATTEND le lock COURT (juste cloner le
-                // bundle d'Arcs). Le load natif lent (0,4–4 s) se fait ensuite
-                // HORS lock (spawn_blocking) — cf. plus bas.
-                let ctrl = {
-                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
-                        return vec![AgentMessage::InstrumentPluginError {
-                            message: "agent overloaded".into(),
-                        }];
-                    };
-                    pl.plugin_control()
+                // 0.6.6-13 — et ce message vient de la FILE DES PLUGINS : la
+                // boucle des messages ne l'attend plus (cf. `is_plugin_message`).
+                let Some(ctrl) = plugin_control(pipeline).await else {
+                    return vec![AgentMessage::InstrumentPluginError {
+                        message: "agent overloaded".into(),
+                    }];
                 };
-                // Sérialise vs un autre load/unload en cours, puis exécute le
-                // load natif sur le pool blocking (ne bloque pas le runtime
-                // tokio ni les autres handlers/tasks).
-                let _ops = plugin_ops_lock().lock().await;
                 let pref = plugin_ref.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || ctrl.load(&pref)).await;
-                // `spawn_blocking` ne panique que si la task panique : on traite
-                // le JoinError comme une erreur de chargement plutôt que de
-                // propager un panic dans le handler WS.
-                let result = match result {
-                    Ok(inner) => inner,
-                    Err(join_err) => Err(format!("plugin load task failed: {join_err}")),
-                };
+                let started = std::time::Instant::now();
+                let result = run_plugin_op(plugin_ops_lock(), move || ctrl.load(&pref))
+                    .await
+                    .and_then(|inner| inner);
+                tracing::info!(
+                    target: "jamodio::plugin",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    ok = result.is_ok(),
+                    "chargement de plugin traité (hors de la boucle des messages)"
+                );
                 match result {
                     Ok((name, latency_samples, has_editor)) => {
                         vec![AgentMessage::InstrumentPluginLoaded {
@@ -3882,20 +4270,15 @@ async fn handle_message(
         BrowserMessage::UnloadInstrumentPlugin => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                // Chantier A — même principe que le load : clone le bundle,
-                // relâche le lock PipelineState, teardown natif sur le pool
-                // blocking (le thread audio est déjà passé en dry dès que
-                // PluginControl::unload pose handle=None).
-                // Setup critique : on ATTEND le lock COURT (clone du bundle),
-                // le teardown natif lent se fait ensuite HORS lock.
-                let ctrl = {
-                    let Some(pl) = lock_pipeline_wait(pipeline).await else {
-                        return vec![];
-                    };
-                    pl.plugin_control()
+                // Chantier A — même principe que le load : teardown natif hors
+                // du lock PipelineState (le thread audio est déjà passé en dry
+                // dès que PluginControl::unload pose handle=None).
+                let Some(ctrl) = plugin_control(pipeline).await else {
+                    return vec![];
                 };
-                let _ops = plugin_ops_lock().lock().await;
-                let _ = tokio::task::spawn_blocking(move || ctrl.unload()).await;
+                if let Err(e) = run_plugin_op(plugin_ops_lock(), move || ctrl.unload()).await {
+                    tracing::error!(target: "jamodio::plugin", error = %e, "retrait du plugin interrompu");
+                }
                 vec![AgentMessage::InstrumentPluginUnloaded]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3904,13 +4287,17 @@ async fn handle_message(
             }
         }
 
+        // Contournement et éditeur : APRÈS toute opération plugin en cours
+        // (verrou des opérations), jamais pendant — l'hôte est alors occupé par
+        // le chargement natif, et un contournement posé pendant serait écrasé.
         BrowserMessage::SetInstrumentPluginBypass { bypass } => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                pl.set_instrument_plugin_bypass(bypass);
+                let _ops = plugin_ops_lock().lock().await;
+                ctrl.set_bypass(bypass);
                 vec![]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -3923,10 +4310,13 @@ async fn handle_message(
         BrowserMessage::OpenInstrumentPluginEditor => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                if let Err(message) = pl.open_instrument_plugin_editor() {
+                let _ops = plugin_ops_lock().lock().await;
+                // L'hôte ouvre la fenêtre de façon asynchrone et publie son
+                // avancement (`InstrumentPluginEditor`) : l'appel rend tout de suite.
+                if let Err(message) = ctrl.open_editor() {
                     return vec![AgentMessage::InstrumentPluginError { message }];
                 }
                 vec![]
@@ -3940,10 +4330,11 @@ async fn handle_message(
         BrowserMessage::CloseInstrumentPluginEditor => {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                let Some(pl) = try_lock_pipeline(pipeline).await else {
+                let Some(ctrl) = plugin_control(pipeline).await else {
                     return vec![];
                 };
-                let _ = pl.close_instrument_plugin_editor();
+                let _ops = plugin_ops_lock().lock().await;
+                let _ = ctrl.close_editor();
                 vec![]
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -4296,7 +4687,8 @@ mod runaway_tests {
 /// un `Arc` à synchronisation interne, le gain voix un simple atomique.
 #[cfg(test)]
 mod derive_de_rate_tests {
-    use super::drift_window_is_clean;
+    use super::{drift_detector_step, drift_window_is_clean};
+    use crate::audio::rate_check::{resolve_measured_rate, RateSample, RateVerdict};
     use std::time::Duration;
 
     const WINDOW: Duration = Duration::from_secs(2);
@@ -4328,6 +4720,47 @@ mod derive_de_rate_tests {
         }
         // Une fois la fenêtre entièrement postérieure, on juge de nouveau.
         assert!(drift_window_is_clean(WINDOW, Duration::from_millis(2_001)));
+    }
+
+    const MENT: RateVerdict = RateVerdict::Lies { actual_sr: 44_100, measured_sr: 44_090 };
+
+    #[test]
+    fn deux_fenetres_consecutives_a_un_autre_rate_arretent_la_capture() {
+        let mut streak = 0;
+        assert_eq!(drift_detector_step(&mut streak, MENT), None);
+        assert_eq!(drift_detector_step(&mut streak, MENT), Some(44_100));
+    }
+
+    #[test]
+    fn une_mesure_non_probante_rompt_la_serie() {
+        for rompt in [
+            RateVerdict::Confirmed { measured_sr: 48_000 },
+            RateVerdict::Inconclusive { measured_sr: 41_644 },
+            RateVerdict::NotMeasurable,
+        ] {
+            let mut streak = 0;
+            assert_eq!(drift_detector_step(&mut streak, MENT), None);
+            assert_eq!(drift_detector_step(&mut streak, rompt), None, "{rompt:?}");
+            assert_eq!(streak, 0, "{rompt:?} remet la série à zéro");
+            assert_eq!(drift_detector_step(&mut streak, MENT), None, "{rompt:?}");
+        }
+    }
+
+    /// Cas Guillaume H. (26/09/2026, agent 0.6.6-2) : deux fenêtres de suite avec un
+    /// trou de ~300 ms du pilote Yamaha (14:46:10 puis 14:46:12 UTC). Avant : 40 910
+    /// puis 41 644 Hz mesurés, hard-stop, sortie du studio. Attendu : session gardée.
+    #[test]
+    fn trous_du_pilote_en_session_ne_coupent_plus_la_repetition() {
+        let fenetres = [
+            RateSample { declared_sr: 48_000, frames_per_cb: 48, callbacks: 1_704, window_us: 2_000_000, stall_us: 294_245 },
+            RateSample { declared_sr: 48_000, frames_per_cb: 48, callbacks: 1_952, window_us: 2_250_000, stall_us: 297_579 },
+        ];
+        let mut streak = 0;
+        for f in fenetres {
+            let verdict = resolve_measured_rate(&f);
+            assert!(matches!(verdict, RateVerdict::Confirmed { .. }), "{verdict:?}");
+            assert_eq!(drift_detector_step(&mut streak, verdict), None);
+        }
     }
 
     #[test]
@@ -4521,5 +4954,337 @@ mod etat_latche_tests {
         assert!(lire(&send_gain_instrument) >= 0.01, "borné en bas");
         regle(f32::NAN).await;
         assert_eq!(lire(&send_gain_instrument), 1.0, "NaN → neutre");
+    }
+}
+
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod file_des_plugins_tests {
+    //! 0.6.6-13 — un chargement de plugin ne retient plus les autres messages
+    //! (session du 29/09/2026 : 5,2 s de chargement d'AmpliTube, l'`add-stream`
+    //! d'un musicien expirait côté studio).
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::time::Duration;
+
+    /// Les tests qui tiennent le verrou GLOBAL des opérations plugin passent un
+    /// par un (les autres utilisent un verrou à eux).
+    static SERIE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn serveur() -> WsServerHandle {
+        let mixer = Arc::new(AudioMixer::new());
+        let pipeline = PipelineState::new(mixer.clone());
+        let voice_gain = pipeline.voice_gain.clone();
+        let send_gain_instrument = pipeline.send_gain_instrument.clone();
+        let send_gain_voice = pipeline.send_gain_voice.clone();
+        WsServerHandle::new(
+            Arc::new(tokio::sync::Mutex::new(pipeline)),
+            mixer,
+            voice_gain,
+            send_gain_instrument,
+            send_gain_voice,
+        )
+    }
+
+    fn texte(json: &str) -> Message {
+        Message::Text(json.to_string())
+    }
+
+    fn verrou_a_part() -> &'static tokio::sync::Mutex<()> {
+        Box::leak(Box::new(tokio::sync::Mutex::new(())))
+    }
+
+    /// Plugin absent du scan : refusé dès que son tour vient (aucun appel natif).
+    const CHARGER: &str = r#"{"type":"load-instrument-plugin","pluginRef":{"format":"au","auType":"aufx","subtype":"zzzz","manufacturer":"zzzz"}}"#;
+    /// Adresse SFU invalide : réponse immédiate, sans réseau.
+    const RECEVOIR: &str = r#"{"type":"add-stream","producerId":"pair-1","sfuIp":"pas-une-ip","sfuPort":4000,"payloadType":111,"srtpParameters":{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"},"requestId":"essai-1"}"#;
+
+    #[tokio::test]
+    async fn un_chargement_en_cours_ne_retient_pas_l_arrivee_d_un_musicien() {
+        let _serie = SERIE.lock().await;
+        let h = serveur();
+        let (out_tx, mut out_rx) = tokio_mpsc::channel::<AgentMessage>(16);
+        let (file, _tache) = spawn_plugin_queue(&h, &out_tx);
+
+        // Un chargement natif est en cours (verrou des opérations plugin tenu).
+        let natif = plugin_ops_lock().lock().await;
+        // Délai explicite : sans la file, la boucle attendrait le chargement
+        // (ici indéfiniment) — c'est exactement le défaut du 29/09.
+        let boucle = async {
+            assert!(handle_one_message(texte(CHARGER), &h, &out_tx, &file).await);
+            assert!(handle_one_message(texte(RECEVOIR), &h, &out_tx, &file).await);
+        };
+        tokio::time::timeout(Duration::from_millis(100), boucle)
+            .await
+            .expect("la boucle des messages a attendu le chargement en cours");
+        // L'arrivée du musicien a sa réponse tout de suite…
+        match out_rx.try_recv() {
+            Ok(AgentMessage::Error { key, .. }) => assert_eq!(key.as_deref(), Some("essai-1")),
+            autre => panic!("réponse à add-stream attendue, reçu {autre:?}"),
+        }
+        // … le chargement, lui, attend son tour.
+        assert!(out_rx.try_recv().is_err(), "le chargement ne doit pas avoir répondu");
+
+        drop(natif);
+        let reponse = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("le chargement répond une fois l'opération précédente finie")
+            .unwrap();
+        assert!(matches!(reponse, AgentMessage::InstrumentPluginError { .. }), "{reponse:?}");
+    }
+
+    #[tokio::test]
+    async fn la_file_traite_dans_l_ordre_un_travail_a_la_fois() {
+        let journal: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let j = journal.clone();
+        let (file, _tache) = OrderedQueue::spawn(move |(nom, ms): (&'static str, u64)| {
+            let j = j.clone();
+            async move {
+                j.lock().push(format!("début {nom}"));
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                j.lock().push(format!("fin {nom}"));
+            }
+        });
+        file.push(("charger", 150), "charger".into());
+        file.push(("contourner", 0), "contourner".into());
+        file.push(("retirer", 0), "retirer".into());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while journal.lock().len() < 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("les trois travaux passent");
+        assert_eq!(
+            *journal.lock(),
+            ["début charger", "fin charger", "début contourner", "fin contourner", "début retirer", "fin retirer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fermer_pendant_un_chargement_le_laisse_finir_et_abandonne_la_suite() {
+        let journal: Arc<parking_lot::Mutex<Vec<&'static str>>> = Arc::default();
+        let (liberer, attente) = tokio::sync::oneshot::channel::<()>();
+        let attente = Arc::new(tokio::sync::Mutex::new(Some(attente)));
+        let j = journal.clone();
+        let (file, tache) = OrderedQueue::spawn(move |nom: &'static str| {
+            let (j, attente) = (j.clone(), attente.clone());
+            async move {
+                j.lock().push(nom);
+                if nom == "charger" {
+                    if let Some(rx) = attente.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    j.lock().push("charger fini");
+                }
+            }
+        });
+        file.push("charger", "charger".into());
+        file.push("contourner", "contourner".into());
+        while journal.lock().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        file.close();
+        liberer.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tache)
+            .await
+            .expect("la tâche de la file se termine d'elle-même")
+            .unwrap();
+        assert_eq!(*journal.lock(), ["charger", "charger fini"], "le contournement est abandonné");
+    }
+
+    #[tokio::test]
+    async fn le_verrou_reste_tenu_jusqu_au_retour_de_l_appel_natif() {
+        let ops = verrou_a_part();
+        let (liberer, attente) = std::sync::mpsc::channel::<()>();
+        let tache = tokio::spawn(run_plugin_op(ops, move || {
+            let _ = attente.recv(); // appel natif long
+        }));
+        while ops.try_lock().is_ok() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // La connexion se ferme : la tâche qui attendait est annulée…
+        tache.abort();
+        let _ = tache.await;
+        // … mais l'appel natif n'a pas rendu : aucune autre opération ne démarre.
+        assert!(ops.try_lock().is_err(), "verrou relâché alors que l'appel natif tourne encore");
+        liberer.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ops.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("le verrou se libère au retour de l'appel natif");
+    }
+
+    #[tokio::test]
+    async fn l_etat_du_plugin_part_apres_l_operation_en_cours_et_dit_aucun() {
+        let ops = verrou_a_part();
+        let h = serveur();
+        let ctrl = h.pipeline.lock().await.plugin_control();
+        let (tx, mut rx) = tokio_mpsc::channel::<AgentMessage>(4);
+        let natif = ops.lock().await;
+        let _tache = tokio::spawn(send_plugin_state_when_idle(ops, ctrl, tx));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "l'état attend la fin de l'opération en cours");
+        drop(natif);
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+        assert!(
+            matches!(msg, AgentMessage::InstrumentPluginState { plugin: None, bypass: false }),
+            "aucun plugin = dit explicitement : {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_stream_renvoie_l_identifiant_de_la_demande_ou_le_flux() {
+        let h = serveur();
+        let appel = |request_id: Option<&str>| {
+            let h = h.clone();
+            let request_id = request_id.map(str::to_string);
+            async move {
+                handle_message(
+                    BrowserMessage::AddStream {
+                        producer_id: "pair-1".into(),
+                        producer_peer_id: None,
+                        sfu_ip: "pas-une-ip".into(),
+                        sfu_port: 4000,
+                        payload_type: 111,
+                        srtp_parameters: serde_json::from_str(
+                            r#"{"cryptoSuite":"AES_CM_128_HMAC_SHA1_80","keyBase64":"a"}"#,
+                        )
+                        .unwrap(),
+                        media_tag: Default::default(),
+                        request_id,
+                    },
+                    &h.pipeline,
+                    &h.mixer,
+                    &h.voice_gain,
+                    &h.send_gain_instrument,
+                    &h.send_gain_voice,
+                )
+                .await
+            }
+        };
+        let cle = |r: Vec<AgentMessage>| match r.as_slice() {
+            [AgentMessage::Error { key, .. }] => key.clone(),
+            autre => panic!("erreur corrélée attendue : {autre:?}"),
+        };
+        assert_eq!(cle(appel(Some("essai-2")).await).as_deref(), Some("essai-2"));
+        assert_eq!(cle(appel(None).await).as_deref(), Some("pair-1"), "ancien studio : clé = flux");
+    }
+
+    #[tokio::test]
+    async fn les_etats_de_la_fenetre_partent_vers_le_studio() {
+        use jamodio_audio_core::plugin_host::EditorState;
+        let (etats, rx) = broadcast::channel::<EditorState>(4);
+        let (tx, mut out) = tokio_mpsc::channel::<AgentMessage>(4);
+        let _tache = tokio::spawn(forward_editor_events(rx, tx));
+        etats.send(EditorState::Opening).unwrap();
+        etats.send(EditorState::Open).unwrap();
+        for attendu in [EditorState::Opening, EditorState::Open] {
+            let msg = tokio::time::timeout(Duration::from_secs(1), out.recv()).await.unwrap().unwrap();
+            assert!(
+                matches!(msg, AgentMessage::InstrumentPluginEditor { state } if state == attendu),
+                "{msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn le_hello_annonce_ce_que_l_audio_engine_sait_faire() {
+        let AgentMessage::Hello { capabilities, .. } = make_hello() else { panic!("Hello attendu") };
+        for c in [
+            capability::INSTRUMENT_PLUGIN_STATE,
+            capability::PLUGIN_EDITOR_EVENTS,
+            capability::ADD_STREAM_REQUEST_ID,
+            capability::PLUGIN_QUEUE,
+        ] {
+            assert!(capabilities.iter().any(|x| x == c), "capacité absente : {c}");
+        }
+    }
+
+    #[test]
+    fn seuls_les_messages_de_plugin_passent_par_la_file() {
+        let parse = |j: &str| serde_json::from_str::<BrowserMessage>(j).unwrap();
+        for j in [
+            CHARGER,
+            r#"{"type":"unload-instrument-plugin"}"#,
+            r#"{"type":"set-instrument-plugin-bypass","bypass":true}"#,
+            r#"{"type":"open-instrument-plugin-editor"}"#,
+            r#"{"type":"close-instrument-plugin-editor"}"#,
+        ] {
+            assert!(is_plugin_message(&parse(j)), "{j}");
+        }
+        for j in [RECEVOIR, r#"{"type":"play-midi-note","status":144,"data1":60,"data2":100}"#] {
+            assert!(!is_plugin_message(&parse(j)), "{j}");
+        }
+    }
+}
+
+/// Revue 0.6.6, constat I : qui peut piloter l'Audio Engine.
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    const PREVIEW: &str = "https://jamodio-git-main-bengo82-9540s-projects.vercel.app";
+
+    #[test]
+    fn jamodio_com_et_la_fenetre_interne_pilotent_toujours() {
+        for o in ["https://jamodio.com", "https://www.jamodio.com", "tauri://localhost", "http://tauri.localhost"] {
+            assert!(origin_allowed(Some(o), false), "{o}");
+        }
+    }
+
+    #[test]
+    fn une_preview_de_l_equipe_ne_pilote_que_sur_une_machine_de_test() {
+        assert!(!origin_allowed(Some(PREVIEW), false), "machine d'un musicien : refusée");
+        assert!(origin_allowed(Some(PREVIEW), true), "machine de test (fichier posé) : acceptée");
+    }
+
+    #[test]
+    fn une_page_hors_de_l_equipe_ne_pilote_jamais() {
+        for o in [
+            "https://jamodio-x.vercel.app",
+            "https://jamodio-x-autre-scope.vercel.app",
+            "https://evil.com",
+            "https://jamodio.com.evil.com",
+            "tauri://localhost.evil",
+        ] {
+            assert!(!origin_allowed(Some(o), true), "{o}");
+        }
+    }
+
+    #[test]
+    fn la_forme_d_une_preview_est_celle_du_sfu() {
+        assert!(is_team_preview_origin(PREVIEW));
+        assert!(is_team_preview_origin("https://jamodio-a1b2c3d4e-bengo82-9540s-projects.vercel.app"));
+        for o in [
+            "https://jamodio--bengo82-9540s-projects.vercel.app",
+            "https://jamodio-x.y-bengo82-9540s-projects.vercel.app",
+            "https://jamodio-X-bengo82-9540s-projects.vercel.app",
+            "https://jamodio-bengo82-9540s-projects.vercel.app",
+        ] {
+            assert!(!is_team_preview_origin(o), "{o}");
+        }
+    }
+
+    /// Le fichier d'autorisation est lu sous son nom exact, dans le dossier des
+    /// journaux.
+    #[test]
+    fn le_fichier_d_autorisation_decide() {
+        let dir = std::env::temp_dir().join(format!("jamodio-previews-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!previews_allowed_in(&dir), "absent : refusées");
+        std::fs::write(dir.join("allow-vercel-previews"), "").unwrap();
+        assert!(previews_allowed_in(&dir), "posé : acceptées");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sans_origine_refuse_en_version_publiee() {
+        assert_eq!(origin_allowed(None, true), cfg!(debug_assertions));
     }
 }

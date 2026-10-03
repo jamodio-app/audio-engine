@@ -3,20 +3,7 @@
 ## Signaler une vulnérabilité
 
 Si tu découvres une vulnérabilité de sécurité dans Jamodio Audio Engine
-(agent desktop) ou dans n'importe quel composant publié sur ce repo,
-**merci de la signaler en privé** plutôt que via une issue publique.
-
-### Canal préféré — GitHub Private Vulnerability Reporting
-
-Ouvre un rapport via l'onglet **Security** de ce repo :
-👉 <https://github.com/jamodio-app/audio-engine/security/advisories/new>
-
-Ce canal est privé entre toi et les mainteneurs. C'est la méthode
-recommandée par GitHub pour la divulgation responsable.
-
-### Canal email
-
-Si tu préfères l'email :
+(agent desktop), **merci de la signaler en privé** par email :
 **support@jamodio.com**
 
 Inclure si possible :
@@ -45,8 +32,7 @@ Inclure si possible :
 - Manque de hardening sur l'environnement local de l'utilisateur
   (ex. : "l'agent fonctionne si l'user a désactivé Gatekeeper").
 - Rapports automatisés sans PoC (scanners SCA non vérifiés, etc.).
-- Bugs fonctionnels non sécurité-critiques → ouvre une issue publique
-  classique.
+- Bugs fonctionnels non sécurité-critiques → support@jamodio.com.
 
 ## Surface concernée
 
@@ -67,11 +53,11 @@ scope de cette politique. Pour ces composants, le même contact
 
 ## Signature et chaîne d'update
 
-Tous les binaires publiés sur les releases de ce repo sont signés
+Tous les binaires publiés sur https://jamodio.com/installer sont signés
 avec une clé minisign (`tauri-plugin-updater`). La clé publique est
 embarquée dans l'agent (`tauri.conf.json > updater.pubkey`) et la
 clé privée est protégée côté secrets GitHub Actions.
 
 Si tu détectes un binaire ou un `latest.json` dont la signature ne
 matche pas la clé publique, **ne l'installe pas** et signale-le
-immédiatement via le canal Security.
+immédiatement à support@jamodio.com.

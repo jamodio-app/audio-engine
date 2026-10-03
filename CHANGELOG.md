@@ -5,6 +5,117 @@ Format : [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ·
 Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 
+## [0.6.6] — 2026-10-03
+
+**Moins de trous sur PC, un studio complet, et des mises à jour servies par
+jamodio.com.**
+
+### Modifié
+
+- **Windows : l'installeur désactive le « freinage réseau » de Windows.**
+  Windows bride par défaut le réseau des applications qui jouent du son
+  (réglage système `NetworkThrottlingIndex`) ; c'était la cause prouvée de
+  trous dans le son reçu sur PC. L'installeur pose la valeur qui le désactive
+  (`ffffffff`), **mémorise la valeur d'origine et la remet à la
+  désinstallation**, et propose une fois de redémarrer Windows (le réglage ne
+  s'applique qu'après un redémarrage). L'écran d'accueil de l'installation le
+  dit. C'est un réglage de **tout le système**, pas seulement de l'Audio
+  Engine.
+- **Réception des autres musiciens : un fil prioritaire dédié** lit et décode
+  tous les flux reçus, au lieu d'une tâche par musicien. Moins de trous dus à
+  la machine, surtout sur PC.
+- **Un studio BAND complet tient** : jusqu'à 32 flux reçus (instrument et voix
+  de chaque musicien), contre 16.
+- **Plugins : un chargement de plugin ne retient plus l'arrivée d'un
+  musicien**, et la fenêtre du plugin dit où elle en est (ouverture, ouverte,
+  fermée).
+- **Métronome : clic à −12 dB**, réglé à la source.
+- **Mises à jour lues sur jamodio.com** (plus sur GitHub), réponses
+  compressées comprises.
+- **Installeur Windows en français jusqu'au bout** (« Lancer Jamodio Audio
+  Engine »).
+
+### Corrigé
+
+- **Moins de son « inventé » sur les connexions irrégulières (Wi-Fi, 4G).**
+  Quand un morceau de son arrivait juste après son heure, l'Audio Engine le
+  remplaçait par du son reconstitué, sans en tirer de leçon : sur un lien
+  irrégulier, cela pouvait arriver plusieurs dizaines de fois par minute. Le
+  tampon de chaque musicien apprend désormais de ces arrivées tardives et garde
+  juste la marge qu'il faut : quelques millisecondes de plus (jamais plus de 15), sur ce seul
+  musicien, tant que sa connexion a des à-coups, puis il la rend peu à peu. Une
+  connexion sans à-coups ne change pas.
+
+- **Windows (ASIO) : l'Audio Engine ne réinterroge plus tous les pilotes audio
+  pendant qu'on le consulte.** Le relevé d'état (toutes les 1,5 à 2 secondes,
+  studio ouvert ou non) parcourait la liste des pilotes ASIO tant qu'aucune
+  entrée n'était choisie, ou pendant toute une session ouverte sur l'entrée
+  par défaut, en bloquant les autres commandes (« Audio Engine occupé »,
+  nettoyage de fin de session sauté). L'entrée affichée est désormais celle
+  qui est ouverte ou choisie, sans aucune recherche.
+- **Talkback sur un micro séparé (casque, micro USB) : le micro est relâché en
+  quittant le studio, et son traitement de la voix s'arrête.** Le micro restait
+  ouvert — et la voix encodée — après la fin de la session ou un changement
+  d'entrée ; puis, une fois le micro relâché, le traitement de la voix (filtre
+  antibruit compris) restait en mémoire, un par talkback ouvert, jusqu'à la
+  fermeture de l'Audio Engine.
+- **Le relevé des mesures n'interrompt plus la réception.** Le calcul des
+  statistiques de chaque seconde se faisait en tenant un verrou que la
+  réception prend à chaque paquet ; il se fait maintenant à part.
+
+- **Windows (ASIO) : une interface bien réglée en 48 kHz n'est plus refusée
+  à l'entrée en studio.** Certains pilotes (Yamaha Steinberg USB, UR22C)
+  marquent une pause de 70 à 200 ms juste après le démarrage du flux ; le
+  contrôle de fréquence de l'Audio Engine la comptait comme du temps de
+  livraison et concluait à une fréquence qui n'existe pas (« 29 692 Hz »),
+  puis refusait la capture. Le temps de pause est désormais exclu de la
+  mesure, et une cadence qui ne correspond à aucune fréquence standard ne
+  remplace plus jamais celle que déclare le pilote. Un pilote qui livre
+  réellement en 44,1 kHz reste refusé, comme avant.
+- **Windows (ASIO) : la session n'est plus coupée par une pause du pilote.**
+  Le même pilote peut marquer, en cours de jeu, des pauses d'environ 300 ms ;
+  la surveillance de fréquence en session les prenait pour un changement de
+  fréquence et faisait sortir du studio (« l'interface a quitté le 48 kHz »).
+  Elle applique désormais la même règle qu'à l'entrée : la pause est exclue
+  de la mesure, et seule une interface qui livre réellement à une autre
+  fréquence standard arrête la capture. La pause elle-même reste un vrai
+  silence, toujours tracée dans le journal.
+- **Talkback : la voix ne part plus hachée sur une machine qui peine.** La
+  file d'attente devant le filtre antibruit ne tenait que 32 ms avec un petit
+  tampon audio (48 échantillons) : au moindre retard du filtre, des morceaux
+  de voix étaient jetés en continu, et la détection de parole, nourrie d'une
+  voix trouée, ouvrait et fermait le talkback au hasard. La file tient
+  désormais 100 ms de voix quelle que soit la taille du tampon (ce délai ne
+  s'ajoute que pendant un retard, et au talkback seul). Si la machine ne suit
+  toujours pas, le talkback passe en voix brute pour le reste de la session,
+  affiché « VOIX BRUTE » sur la tranche, au lieu d'une voix inintelligible.
+
+### Sécurité
+
+- Binaire macOS publié sans noms de fonctions ; les traces de plantage
+  donnent des adresses brutes, lues avec les symboles gardés en privé.
+- Chaîne de publication : la clé qui signe les mises à jour n'est plus
+  exposée à des outils téléchargés sans version fixe.
+- Seul **jamodio.com** pilote l'Audio Engine d'un musicien : les pages de
+  prévisualisation (`…vercel.app`) ne sont plus acceptées que sur les machines
+  de test, où un fichier `allow-vercel-previews` est posé à côté des journaux
+  (puis l'Audio Engine relancé).
+
+### Interne
+
+- Mesure de chaque trou dans le son reçu et de sa cause (arrivée, réception,
+  décodage, consommation), horodatage de la réception par le système, et
+  découpe des réveils longs du fil de réception, au journal perfstats.
+- Journal : la pause de démarrage d'un pilote est nommée (durée, pilote), et
+  une mesure non concluante est dite telle quelle au lieu d'être présentée
+  comme la fréquence de l'interface.
+- Journal perfstats : charge du filtre antibruit du talkback en % d'un cœur
+  (`voice_iso_load_pct`), pire bloc (`voice_iso_max_block_ms`) et voix perdue
+  (`voice_dropped_ms`). La perte de voix est tracée par l'étage voix, une fois
+  par fenêtre de 2 s, quelle que soit la source (plus aucun journal dans le
+  callback du micro talkback dédié).
+
+
 ## [0.6.5] — 2026-09-22
 
 **Moins de clics, et une session qui tient.**

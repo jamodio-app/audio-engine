@@ -16,16 +16,18 @@
 //! **synthétise le clic à l'échantillon près** dans le flux de sortie.
 //!
 //! Un re-ancrage périodique (`set_grid`) absorbe la lente dérive du quartz de
-//! sortie vs l'horloge serveur (= l'équivalent de la DLL d'Option A).
+//! sortie vs l'horloge serveur (la grille reste pilotée par le navigateur).
 //!
 //! ## Banque de sons & subdivisions (métro Lot 1)
 //!
-//! Synthèse additive DÉTERMINISTE, MIROIR EXACT de `web/app/js/lib/metro-sounds.js`
-//! (timbres) et `metro-config.js` (figures) : le clic est identique que la
-//! référence sorte du navigateur (Option A) ou de l'agent (Option B). Timbres :
-//! `click`/`blip`/`digital`/`cowbell`/`woodblock` ; figures : noire → 1/32,
-//! triolets/sextolets (`Figure::offsets`). Toute évolution d'un timbre/figure
-//! doit rester synchronisée des DEUX côtés.
+//! Synthèse additive DÉTERMINISTE. Depuis le 30/09/2026 (studios 100 % agent),
+//! le clic est synthétisé ICI SEULEMENT : le navigateur ne joue plus aucun
+//! métronome, il choisit le timbre et la figure et les transmet
+//! (`reference-config`). Timbres : `click`/`blip`/`digital`/`cowbell`/
+//! `woodblock` — ids wire listés côté web dans `metro-sounds.js` (METRO_SOUNDS) ;
+//! figures : noire → 1/32, triolets/sextolets (`Figure::offsets`), ids et
+//! offsets partagés avec `metro-config.js` (FIGURES). Un id ajouté ici doit
+//! l'être aussi côté web (sélecteur).
 
 /// Sample rate de sortie de l'agent (Hz). Verrouillé à 48 kHz (cf. `playback.rs`).
 const SR: f64 = 48_000.0;
@@ -35,6 +37,14 @@ const SR: f64 = 48_000.0;
 const ATTACK_S: f32 = 0.0005; // 0.5 ms
 const DURATION_S: f32 = 0.120; // 120 ms (queue inaudible ensuite)
 const DURATION_FRAMES: u64 = (DURATION_S as f64 * SR) as u64;
+
+/// Niveau de référence du clic : −12 dB (30/09/2026). Les tables `params` sont
+/// des amplitudes RELATIVES (temps fort 0,90) ; appliquées telles quelles, le
+/// temps fort crêtait à ≈ −0,9 dBFS avec le fader à 0 dB et couvrait la musique.
+/// Le niveau se règle ICI, à la source : le fader du navigateur reste à 0 dB
+/// par défaut (sur son repère) et crête alors vers −13 dBFS. Appliqué une fois
+/// à la création du grain → aucun calcul ajouté par échantillon.
+pub const CLICK_LEVEL: f32 = 0.251_188_64; // 10^(−12/20)
 
 // ─── Backing (B4) ─────────────────────────────────────────────────────────
 /// Gain proportionnel du servo varispeed du backing (erreur en frames → écart de
@@ -70,18 +80,17 @@ enum Role {
 /// chiffrages supportés (max actuel 7 pulses).
 const MAX_BEATS_PER_BAR: usize = 16;
 
-// Tables de partiels [multiplicateur de fréquence, amplitude] — MIROIR EXACT de
-// `metro-sounds.js` SPECS.partials. Synthèse additive déterministe (aucun bruit
-// aléatoire → parité parfaite navigateur/agent).
+// Tables de partiels [multiplicateur de fréquence, amplitude]. Synthèse additive
+// déterministe (aucun bruit aléatoire).
 const P_CLICK: &[(f32, f32)] = &[(1.0, 1.0), (2.0, 0.5)];
 const P_BLIP: &[(f32, f32)] = &[(1.0, 1.0)];
 const P_DIGITAL: &[(f32, f32)] = &[(1.0, 1.0), (3.0, 0.5), (5.0, 0.3), (7.0, 0.18)];
 const P_COWBELL: &[(f32, f32)] = &[(1.0, 1.0), (1.4815, 0.8), (2.0, 0.3), (2.96, 0.22)];
 const P_WOODBLOCK: &[(f32, f32)] = &[(1.0, 1.0), (2.4, 0.35), (3.8, 0.12)];
 
-/// Timbre du métronome (banque synthétisée). MIROIR de `metro-sounds.js`
-/// METRO_SOUNDS. Extensible : une variante + ses lignes dans `params`/`partials`/
-/// `decay_tau` suffit.
+/// Timbre du métronome (banque synthétisée). Ids wire listés côté web dans
+/// `metro-sounds.js` (METRO_SOUNDS, ordre du sélecteur). Extensible : une
+/// variante + ses lignes dans `params`/`partials`/`decay_tau` (+ l'id côté web).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum MetroSound {
     /// Clic synthétique (2 partiels + décroissance rapide) — le défaut.
@@ -111,8 +120,7 @@ impl MetroSound {
         }
     }
 
-    /// Fréquence (Hz) et amplitude (0..1) du grain selon le rôle. Miroir des
-    /// tables `freq`/`amp` de metro-sounds.js.
+    /// Fréquence (Hz) et amplitude (0..1) du grain selon le rôle.
     fn params(self, role: Role) -> (f32, f32) {
         match self {
             MetroSound::Click => match role {
@@ -148,7 +156,7 @@ impl MetroSound {
         }
     }
 
-    /// Partiels du timbre (miroir metro-sounds.js SPECS.partials).
+    /// Partiels du timbre.
     fn partials(self) -> &'static [(f32, f32)] {
         match self {
             MetroSound::Click => P_CLICK,
@@ -159,7 +167,7 @@ impl MetroSound {
         }
     }
 
-    /// Constante de décroissance de l'enveloppe (s) — miroir SPECS.tau.
+    /// Constante de décroissance de l'enveloppe (s).
     fn decay_tau(self) -> f32 {
         match self {
             MetroSound::Click => 0.030,
@@ -207,8 +215,8 @@ pub struct Figure {
     pub offsets: &'static [f32],
 }
 
-// Tables d'offsets (fractions de PULSE) — MIROIR de `metro-config.js` FIGURES.
-// Toute évolution doit rester synchronisée des deux côtés (browser + agent).
+// Tables d'offsets (fractions de PULSE). Elles vivent ICI seulement ; le web ne
+// porte que les ids (`metro-config.js` FIGURES) — un id ajouté l'est des deux côtés.
 const FIGURE_QUARTER: Figure = Figure { offsets: &[0.0] };
 const FIGURE_EIGHTH: Figure = Figure { offsets: &[0.0, 1.0 / 2.0] };
 const FIGURE_EIGHTH_T: Figure = Figure { offsets: &[0.0, 1.0 / 3.0, 2.0 / 3.0] };
@@ -816,7 +824,7 @@ impl ReferenceSource {
                 self.voices.push(Voice {
                     start_frame: onset.round() as u64,
                     freq,
-                    amp,
+                    amp: amp * CLICK_LEVEL,
                     sound,
                 });
                 self.metro.last_onset_key = Some(key);
@@ -925,6 +933,21 @@ mod tests {
         let (fm, am) = MetroSound::Click.params(Role::Main);
         assert!(aa > am, "accent plus fort que temps normal");
         assert!(fa > fm, "accent plus aigu");
+    }
+
+    #[test]
+    fn click_level_peaks_around_minus_13_dbfs_at_unity_fader() {
+        // Temps fort (le plus fort), fader à 0 dB, pan centre : crête du grain
+        // ≈ 0,90 × 10^(−12/20) ≈ 0,226 (−12,9 dBFS) — jamais près de la pleine échelle.
+        let mut r = ReferenceSource::new();
+        r.set_config(true, 1.0, 0.0, 120.0, 1.0, 4, &[2, 0, 0, 0], 4, MetroSound::Click, Figure::default(), 0.0, 0);
+        let mut out = block(4800); // 100 ms : couvre l'attaque et le pic du grain
+        r.advance_and_generate(&mut out, 0.0);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak_db = 20.0 * peak.log10();
+        assert!(peak > 0.0, "le clic sonne");
+        assert!(peak <= 0.90 * CLICK_LEVEL + 1e-4, "crête {peak} au-delà du niveau de référence");
+        assert!((-15.0..=-12.0).contains(&peak_db), "crête {peak_db:.1} dBFS hors de la cible ≈ −13");
     }
 
     #[test]
@@ -1088,7 +1111,7 @@ mod tests {
 
     #[test]
     fn sounds_have_distinct_partials() {
-        // Garde-fou parité : au moins 4 timbres aux partiels distincts.
+        // Garde-fou : au moins 4 timbres aux partiels distincts.
         let sets: Vec<_> = [
             MetroSound::Click, MetroSound::Blip, MetroSound::Digital,
             MetroSound::Cowbell, MetroSound::Woodblock,

@@ -5,6 +5,8 @@ members = [
   "jamodio-agent",
   "jamodio-au-host",
   "jamodio-vst3-host",
+  # Banc « N musiciens » (outil de test interne, non livré) — cf. son Cargo.toml.
+  "jamodio-bench",
 ]
 # La copie patchée d'`asio-sys` (cf. `[patch.crates-io]` en fin de fichier) vit
 # dans l'arborescence mais n'est PAS un membre : elle n'est ni testée ni lintée

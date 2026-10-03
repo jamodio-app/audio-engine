@@ -7,18 +7,21 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use jamodio_audio_core::codec::decoder::MusicDecoder;
 use jamodio_audio_core::codec::encoder::MusicEncoder;
 use jamodio_audio_core::codec::limiter::{self, PeakLimiter};
+use jamodio_audio_core::mixer::conceal::Wait;
+use jamodio_audio_core::mixer::hole::{self, HoleCause, HoleFacts};
 use jamodio_audio_core::mixer::mixer::{AudioMixer, LevelMeter};
+use jamodio_audio_core::mixer::ring_buffer::{consumed_ms_between, HoleAtPull, PushReport};
 use jamodio_audio_core::net::rtp::{self, RtpHeader};
 use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::net::uplink;
-use jamodio_audio_core::perfstats::Histogram;
+use jamodio_audio_core::perfstats::{Histogram, HistogramReader, HistogramSnapshot};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use jamodio_audio_core::plugin_host::{MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
+use jamodio_audio_core::plugin_host::{EditorState, MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::audio::midi::CapturedMidiEvent;
-use crate::recv_activity::{RecvActivity, SILENCE_LOG_AFTER_MS};
+use crate::recv_activity::RecvActivity;
 use jamodio_audio_core::protocol::{AgentState, StreamKind};
 use jamodio_audio_core::record::{RecordedFile, RecorderHandle, StemSpec};
 use jamodio_audio_core::voice_isolation::{IsolationConfig, VoiceIsolator};
@@ -703,6 +706,11 @@ pub struct PipelineState {
     /// instrument. `None` = talkback pris sur le flux instrument (historique).
     /// Lâcher la poignée arrête le flux et relâche le périphérique.
     voice_capture: Option<crate::audio::voice_capture::VoiceCaptureHandle>,
+    /// Étage voix en cours (fil `voice-encode` + fermeture de sa file). Le lâcher
+    /// ferme la file et ATTEND la fin du fil : il s'arrête à coup sûr, quelle
+    /// que soit la source, et deux générations de talkback ne se chevauchent
+    /// jamais (cf. `VoiceEncodeStage`).
+    voice_encode_stage: Option<VoiceEncodeStage>,
     /// Nom lisible du micro talkback dédié (pour l'affichage). `None` = la voix
     /// est prise sur un canal de l'interface instrument.
     voice_device_label: Option<String>,
@@ -711,6 +719,15 @@ pub struct PipelineState {
     /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
     /// d'un seul côté laissait croire à deux réglages de nature différente.
     capture_channels_label: Option<String>,
+    /// Nom de l'entrée RÉELLEMENT ouverte par la capture en cours (rendu par
+    /// l'ouverture, sur le fil COM ; remis à jour quand le superviseur rouvre
+    /// les flux). `None` hors capture. Seule
+    /// source des libellés d'affichage : les relire ne doit JAMAIS résoudre un
+    /// périphérique — `get-stats` (1,5 s) et la fenêtre interne (2 s) les
+    /// demandent sans cesse, et une énumération ASIO sous le verrou du pipeline
+    /// bloquait les autres messages, voire libérait le pilote en service
+    /// (revue 0.6.6, constat A).
+    capture_input_name: Option<String>,
     /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
     /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
     /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
@@ -757,12 +774,13 @@ pub struct PipelineState {
     /// navigateur (`add-stream` / `remove-stream`) : un flux qui se tait n'est
     /// jamais supprimé ici (cf. `recv_activity`).
     recv_streams: HashMap<String, RecvStream>,
-    /// 0.5.3-2 — thread de décodage RT UNIQUE partagé par tous les pairs.
-    /// Lazy-start au 1er `add_stream`, arrêté au `stop_all` (Shutdown + join).
-    /// `None` = pas de stream reçu en cours.
-    decode_thread: Option<DecodeThread>,
-    /// 0.5.3-2 — compteur de génération des io tasks de réception. Incrémenté à
-    /// chaque `add_stream` ; permet au thread de décodage de distinguer un Remove
+    /// Lot 1-D4 (0.6.6-9) — fil UNIQUE de réception et de décodage (priorité
+    /// audio) : il lit TOUTES les sockets reçues, décode, pousse au mélangeur et
+    /// porte les échéances de masquage. Démarré au 1er `add_stream`, arrêté en
+    /// fin de session. `None` = aucun flux reçu en cours.
+    recv_thread: Option<recv_thread::RecvThread>,
+    /// 0.5.3-2 — compteur de génération des flux reçus. Incrémenté à
+    /// chaque `add_stream` ; permet au fil de réception de distinguer un Remove
     /// d'une ancienne connexion d'un re-add du même `producer_id` (race évitée).
     recv_epoch: u64,
     /// Selected devices : ids stricts au format `"{idx}:{name}"` produits par
@@ -837,7 +855,7 @@ pub struct PipelineState {
     /// instrument active : canal de commande du tap voix vers le
     /// `capture_stage`. Le tap extrait un canal mono du buffer multicanal BRUT
     /// (AVANT plugin/monitor) et l'envoie au `voice_encode_stage`. Reset à
-    /// `None` au teardown (le thread voix s'arrête alors en cascade).
+    /// `None` au teardown (le thread voix, lui, s'arrête par `stop_voice`).
     voice_ctrl_tx: Option<Sender<VoiceControl>>,
     /// `true` ⇔ un producteur voix est actif. Idempotence de start/stop voix.
     voice_active: bool,
@@ -921,6 +939,12 @@ pub struct PipelineState {
     /// après reload de page (le plugin reste actif côté agent).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub instrument_plugin_info: Arc<Mutex<Option<LoadedPluginInfo>>>,
+    /// 0.6.6-13 — états de la fenêtre d'éditeur du plugin (ouverture, ouverte,
+    /// fermée, échec), publiés par l'hôte. Chaque connexion WS s'y abonne et les
+    /// transmet au studio. Aucun lecteur = état perdu sans conséquence (la
+    /// fenêtre, elle, vit sa vie).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub editor_events: tokio::sync::broadcast::Sender<EditorState>,
     /// S2 — source d'entrée actuelle. Audio = CPAL classique. Midi(device_id)
     /// = ouvre un MIDI input via midir, force le signal audio à zéro (le mic
     /// reste ouvert pour la cadence d'horloge 48k/128) et passe les events
@@ -971,9 +995,10 @@ pub struct PipelineState {
     pub perfstats: PerfHandles,
 }
 
-/// Un flux reçu d'un pair : la tâche I/O à arrêter, son type, et son activité.
+/// Un flux reçu d'un pair : sa génération (pour le retirer du fil de
+/// réception), son type, et son activité.
 struct RecvStream {
-    stop: tokio::sync::oneshot::Sender<()>,
+    epoch: u64,
     kind: StreamKind,
     activity: Arc<RecvActivity>,
 }
@@ -988,8 +1013,8 @@ pub struct RecvStreamState {
     pub recv_errors: u64,
 }
 
-/// Métriques de timing réseau mesurées par stream entrant, alimentées par les
-/// le thread de décodage (`decode_rt_loop`) et lues à 1 Hz par le perfstats_task.
+/// Métriques de timing réseau mesurées par stream entrant, alimentées par le
+/// fil de réception (`RxCore`) et lues à 1 Hz par le perfstats_task.
 /// Struct extensible : le chantier jitter buffer adaptatif y ajoutera la cible
 /// mesurée et le ratio de resampling de drift (Phases B/C).
 #[derive(Clone, Copy, Default)]
@@ -1023,6 +1048,8 @@ pub struct ProducerNetStats {
     pub wait_buffer_holds: u64,
     pub wait_repriming: u64,
     pub deadline_disarmed: u64,
+    /// Lot 1-A — trous rendus, comptés par cause (cf. `mixer::hole`).
+    pub holes: HoleCounts,
     /// Lot 0 (chantier tampon) — doublons, sauts de numérotation et paquets
     /// qu'Opus n'a pas su décoder. Mesure seule : rien ne s'y appuie encore.
     pub packets_duplicate: u64,
@@ -1069,12 +1096,29 @@ pub struct PerfHandles {
     /// taille de control panel (≈4 pour 512). Cible après fix : ≈1.
     /// (Unité « ms » du Histogram réutilisée pour un comptage de frames.)
     pub emit_burst: Arc<Mutex<Histogram>>,
-    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de l'arrivée réseau (horodatée
-    /// dans `recv_io_task`) à juste avant `push_samples` (file MPSC + parse +
-    /// décode Opus). Miroir de `send_path_latency`. Doit lire ~0,1-0,5 ms si le
-    /// thread de décodage RT tient ; un p99 qui grimpe = décodage préempté (le
-    /// bug Windows que ce thread RT corrige).
+    /// 0.5.3-2 — latence du chemin de RÉCEPTION : de la lecture du paquet à
+    /// juste avant `push_samples` (parse + décodage Opus). Miroir de
+    /// `send_path_latency`. Depuis le Lot 1-D4 (0.6.6-9), lecture et décodage se
+    /// font sur le même fil, à la suite : il n'y a plus d'attente dans un canal
+    /// entre les deux (c'était 5,5 ms au pire sur Mac, banc du 28/09).
     pub recv_path: Arc<Mutex<Histogram>>,
+    /// Lot 1-D4 (0.6.6-9) — travail du fil de réception à chaque réveil : du
+    /// retour de l'attente à la suivante (lecture, déchiffrement, décodage et
+    /// masquage de tous les flux prêts), en ms. Sur macOS, ce fil a un contrat
+    /// temps réel de `rt_priority::AUDIO_RECV_COMPUTATION` par période ; ce
+    /// qu'il se passe quand un réveil le dépasse n'est pas établi — d'où la
+    /// mesure, et le compte des réveils qui le dépassent (`…_over_budget`,
+    /// cumul remis à zéro au relevé 1 Hz).
+    pub recv_work: Arc<Mutex<Histogram>>,
+    pub recv_work_over_budget: Arc<std::sync::atomic::AtomicU64>,
+    /// Lot 1-C (23/09/2026) — retard du RÉVEIL du fil de réception sur
+    /// l'instant prévu, quand il dort jusqu'à une échéance de masquage (ms).
+    /// C'est l'imprécision que `conceal::WAKE_SLACK_MS` est censé couvrir ;
+    /// jusqu'ici elle n'avait été mesurée que hors de l'agent.
+    pub decode_wake_late: Arc<Mutex<Histogram>>,
+    /// Lot 1-D2 — attente entre la réception d'un paquet par le système et sa
+    /// lecture par le fil de réception (ms), qui la nourrit.
+    pub recv_stack_delay: Arc<Mutex<Histogram>>,
     pub capture_drops: Arc<std::sync::atomic::AtomicU64>,
     /// 0.5.3-4 — LIVENESS du callback CPAL d'ENTRÉE : incrémenté d'1 à chaque
     /// callback de capture (cf. `capture::forward_samples`). Sert au watchdog
@@ -1124,6 +1168,9 @@ pub struct PerfHandles {
     /// donc aucune ligne. Cf. `audio::callback_health`. Aujourd'hui seul l'hôte
     /// ASIO l'alimente ; reste à zéro ailleurs (⇒ fenêtre propre ⇒ silence).
     pub callback_health: Arc<crate::audio::callback_health::CallbackHealth>,
+    /// Coût de l'isolation de voix du talkback et voix perdue devant l'étage voix,
+    /// drainés à 1 Hz dans le journal perfstats. Cf. `audio::voice_tap`.
+    pub voice_stage: Arc<crate::audio::voice_tap::VoiceStageStats>,
 }
 
 impl PerfHandles {
@@ -1131,6 +1178,14 @@ impl PerfHandles {
     /// marge confortable pour le flush 1 Hz côté ws_server (10 % slack).
     fn new() -> Self {
         const HISTOGRAM_CAPACITY: usize = 512;
+        // Mesures de la RÉCEPTION : une observation par paquet (ou par réveil),
+        // soit jusqu'à ~400 × N par seconde. À 512 places, le relevé 1 Hz ne
+        // voyait que les ~0,15 dernière seconde à 9 musiciens — et pouvait
+        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à ~20
+        // flux ; au-delà (limite `MAX_RECV_STREAMS`), le relevé porte sur les
+        // 8 192 dernières mesures de la seconde. Le relevé ne trie plus sous le
+        // verrou (`HistogramReader`) : la taille ne coûte rien au fil de réception.
+        const RECV_HISTOGRAM_CAPACITY: usize = 8192;
         Self {
             heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             plugin_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
@@ -1140,7 +1195,11 @@ impl PerfHandles {
             encode_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             send_path_latency: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
             emit_burst: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
-            recv_path: Arc::new(Mutex::new(Histogram::new(HISTOGRAM_CAPACITY))),
+            recv_path: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_work: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_work_over_budget: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decode_wake_late: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
+            recv_stack_delay: Arc::new(Mutex::new(Histogram::new(RECV_HISTOGRAM_CAPACITY))),
             capture_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capture_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_callbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1152,6 +1211,82 @@ impl PerfHandles {
             output_clip_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
+            voice_stage: Arc::new(crate::audio::voice_tap::VoiceStageStats::default()),
+        }
+    }
+
+    /// Lecteurs des histogrammes, pour l'UNIQUE relevé 1 Hz (tâche perfstats).
+    /// Alloue les réserves et tampons de tri une fois ; à créer au premier relevé.
+    pub fn readers(&self) -> PerfReaders {
+        PerfReaders {
+            pipeline: HistogramReader::for_histogram(&self.pipeline_latency),
+            plugin: HistogramReader::for_histogram(&self.plugin_latency),
+            capture: HistogramReader::for_histogram(&self.capture_latency),
+            process: HistogramReader::for_histogram(&self.process_latency),
+            encode: HistogramReader::for_histogram(&self.encode_latency),
+            send_path: HistogramReader::for_histogram(&self.send_path_latency),
+            emit_burst: HistogramReader::for_histogram(&self.emit_burst),
+            recv_path: HistogramReader::for_histogram(&self.recv_path),
+            recv_work: HistogramReader::for_histogram(&self.recv_work),
+            decode_wake_late: HistogramReader::for_histogram(&self.decode_wake_late),
+            recv_stack: HistogramReader::for_histogram(&self.recv_stack_delay),
+        }
+    }
+}
+
+/// Part « nom » d'un id de périphérique `{idx}:{name}` — l'id entier s'il n'a
+/// pas cette forme. Pour l'affichage seulement.
+fn device_name_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, name)| name)
+}
+
+/// Lecteurs des histogrammes de [`PerfHandles`] : chaque lecture n'échange
+/// qu'un tampon sous le verrou, le calcul se fait verrou relâché (revue 0.6.6,
+/// constat B — le fil de réception prioritaire attendait le tri).
+pub struct PerfReaders {
+    pipeline: HistogramReader,
+    plugin: HistogramReader,
+    capture: HistogramReader,
+    process: HistogramReader,
+    encode: HistogramReader,
+    send_path: HistogramReader,
+    emit_burst: HistogramReader,
+    recv_path: HistogramReader,
+    recv_work: HistogramReader,
+    decode_wake_late: HistogramReader,
+    recv_stack: HistogramReader,
+}
+
+/// Fenêtre écoulée de chaque histogramme (lecture destructive).
+pub struct PerfWindow {
+    pub pipeline: HistogramSnapshot,
+    pub plugin: HistogramSnapshot,
+    pub capture: HistogramSnapshot,
+    pub process: HistogramSnapshot,
+    pub encode: HistogramSnapshot,
+    pub send_path: HistogramSnapshot,
+    pub emit_burst: HistogramSnapshot,
+    pub recv_path: HistogramSnapshot,
+    pub recv_work: HistogramSnapshot,
+    pub decode_wake_late: HistogramSnapshot,
+    pub recv_stack: HistogramSnapshot,
+}
+
+impl PerfReaders {
+    /// Lit et vide la fenêtre de chaque histogramme de `h`.
+    pub fn read(&mut self, h: &PerfHandles) -> PerfWindow {
+        PerfWindow {
+            pipeline: self.pipeline.read(&h.pipeline_latency),
+            plugin: self.plugin.read(&h.plugin_latency),
+            capture: self.capture.read(&h.capture_latency),
+            process: self.process.read(&h.process_latency),
+            encode: self.encode.read(&h.encode_latency),
+            send_path: self.send_path.read(&h.send_path_latency),
+            emit_burst: self.emit_burst.read(&h.emit_burst),
+            recv_path: self.recv_path.read(&h.recv_path),
+            recv_work: self.recv_work.read(&h.recv_work),
+            decode_wake_late: self.decode_wake_late.read(&h.decode_wake_late),
+            recv_stack: self.recv_stack.read(&h.recv_stack_delay),
         }
     }
 }
@@ -1306,11 +1441,11 @@ impl PluginControl {
         *self.instrument_plugin_handle.lock() = Some(handle);
         self.instrument_plugin_bypass
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset le flag overload + flush l'histogramme plugin_latency pour
+        // S5 — reset le flag overload + vide l'histogramme plugin_latency pour
         // ne pas mélanger les mesures de l'ancien plugin avec le nouveau.
         self.plugin_auto_bypass_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.plugin_latency.lock().flush();
+        self.plugin_latency.lock().reset();
         // S1.5 — snapshot complet pour resync au reconnect.
         *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
             plugin_ref: plugin_ref.clone(),
@@ -1326,12 +1461,103 @@ impl PluginControl {
         );
         Ok((name, latency, has_editor))
     }
+
+    /// S1.5 — plugin actuellement chargé (None si aucun) et son contournement,
+    /// pour dire l'état au studio à la connexion.
+    pub fn snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
+        let info = self.instrument_plugin_info.lock().clone()?;
+        let bypass = self
+            .instrument_plugin_bypass
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some((info, bypass))
+    }
+
+    pub fn set_bypass(&self, bypass: bool) {
+        self.instrument_plugin_bypass
+            .store(bypass, std::sync::atomic::Ordering::Relaxed);
+        // S5 — un geste du musicien (« Réactiver » ou A/B) vaut prise de
+        // connaissance d'une surcharge : l'alerte peut à nouveau partir si le
+        // plugin repique. Remis à zéro dans les deux sens (couper à la main
+        // n'appelle pas d'alerte).
+        self.plugin_auto_bypass_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ouvre la fenêtre de l'éditeur (asynchrone côté hôte : l'avancement est
+    /// publié sur `PipelineState::editor_events`).
+    pub fn open_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.plugin_host
+            .lock()
+            .open_editor(handle)
+            .map_err(|e| format!("{e}"))
+    }
+
+    pub fn close_editor(&self) -> Result<(), String> {
+        let handle = self
+            .instrument_plugin_handle
+            .lock()
+            .ok_or_else(|| "no plugin loaded".to_string())?;
+        self.plugin_host
+            .lock()
+            .close_editor(handle)
+            .map_err(|e| format!("{e}"))
+    }
+}
+
+/// Plus grand studio : BAND, 10 musiciens (spec `internal-docs/decisions/
+/// TIERS-AND-LIMITS.md`, `server/plan-limits-sfu.js` côté web).
+pub const LARGEST_STUDIO_MUSICIANS: usize = 10;
+/// Flux reçus par musicien : son instrument ET sa voix (talkback via l'Audio
+/// Engine depuis le Lot C, 0.5.10-4).
+pub const STREAMS_PER_MUSICIAN: usize = 2;
+/// Garde-fou anti-DoS (review pré-BETA, 13/07) sur les flux reçus : contextes
+/// SRTP + sockets UDP. Il était de 16, posé avant que la voix passe par l'Audio
+/// Engine : un studio BAND complet en demande 9 × 2 = 18 → les deux derniers
+/// étaient refusés (constaté dans le code le 29/09/2026, jamais en session).
+/// 32 ≈ le double : la marge des transitions (un musicien qui change
+/// d'interface envoie son nouveau flux avant que l'ancien soit fermé ; un
+/// musicien qui revient avant la fermeture de son ancienne connexion).
+pub const MAX_RECV_STREAMS: usize = 32;
+const _: () = assert!(
+    MAX_RECV_STREAMS >= (LARGEST_STUDIO_MUSICIANS - 1) * STREAMS_PER_MUSICIAN,
+    "un studio complet doit toujours tenir dans la limite de flux reçus"
+);
+
+/// Peut-on recevoir un flux de plus, `current` étant déjà reçus ?
+fn check_recv_capacity(current: usize) -> Result<(), String> {
+    if current >= MAX_RECV_STREAMS {
+        return Err(format!("too many streams (max {})", MAX_RECV_STREAMS));
+    }
+    Ok(())
+}
+
+/// Branche l'hôte de plugins sur le canal des états de fenêtre d'éditeur.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn with_editor_events<H: PluginHost>(
+    mut host: H,
+    events: &tokio::sync::broadcast::Sender<EditorState>,
+) -> H {
+    let events = events.clone();
+    host.set_editor_listener(Arc::new(move |_handle, state| {
+        // Journal ICI, une seule fois : les connexions qui relaient l'état (le
+        // studio, la fenêtre interne de l'Audio Engine) ne le réécrivent pas.
+        tracing::info!(target: "jamodio::plugin", ?state, "fenêtre du plugin");
+        // Sans lecteur (aucun studio connecté), l'état se perd : rien à faire.
+        let _ = events.send(state);
+    }));
+    host
 }
 
 const CHANNELS: usize = 2;
 
 impl PipelineState {
     pub fn new(mixer: Arc<AudioMixer>) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let editor_events = tokio::sync::broadcast::channel::<EditorState>(16).0;
         Self {
             keep_awake: None,
             timer_resolution: None,
@@ -1339,8 +1565,10 @@ impl PipelineState {
             capture_stream: None,
             playback_stream: None,
             voice_capture: None,
+            voice_encode_stage: None,
             voice_device_label: None,
             capture_channels_label: None,
+            capture_input_name: None,
             voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
@@ -1352,7 +1580,7 @@ impl PipelineState {
             encoder_stop: None,
             uplink: None,
             recv_streams: HashMap::new(),
-            decode_thread: None,
+            recv_thread: None,
             recv_epoch: 0,
             input_device_id: None,
             output_device_id: None,
@@ -1383,9 +1611,9 @@ impl PipelineState {
             capture_channels_in: 0,
             capture_native_sr: 0,
             #[cfg(target_os = "macos")]
-            plugin_host: Arc::new(Mutex::new(AuHost::new())),
+            plugin_host: Arc::new(Mutex::new(with_editor_events(AuHost::new(), &editor_events))),
             #[cfg(target_os = "windows")]
-            plugin_host: Arc::new(Mutex::new(Vst3Host::new())),
+            plugin_host: Arc::new(Mutex::new(with_editor_events(Vst3Host::new(), &editor_events))),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_handle: Arc::new(Mutex::new(None)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1396,6 +1624,8 @@ impl PipelineState {
             plugin_scan_cache: Arc::new(Mutex::new(PluginScanCache::Scanning)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             instrument_plugin_info: Arc::new(Mutex::new(None)),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            editor_events,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             input_source: Arc::new(Mutex::new(InputSource::Audio)),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1661,57 +1891,6 @@ impl PipelineState {
     }
 
 
-    /// S1.5 — Snapshot pour resync au reconnect WS. Retourne None si aucun
-    /// plugin actuellement chargé. Le bypass est dans le AtomicBool dédié.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn get_instrument_plugin_snapshot(&self) -> Option<(LoadedPluginInfo, bool)> {
-        let info = self.instrument_plugin_info.lock().clone()?;
-        let bypass = self
-            .instrument_plugin_bypass
-            .load(std::sync::atomic::Ordering::Relaxed);
-        Some((info, bypass))
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn set_instrument_plugin_bypass(&self, bypass: bool) {
-        self.instrument_plugin_bypass
-            .store(bypass, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset flag overload : un toggle manuel (= action user
-        // explicite, via UI "Réactiver" ou bypass A/B) signifie que
-        // l'user a pris connaissance et acte. Le perfstats_task peut
-        // à nouveau émettre un overload si le plugin re-spike après.
-        // On reset DANS LES DEUX SENS (bypass=true et bypass=false) car
-        // un toggle vers true = pas un overload-detection automatique
-        // (= l'user a choisi de muter manuellement, il n'a pas besoin
-        // du toast d'alerte).
-        self.plugin_auto_bypass_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn open_instrument_plugin_editor(&self) -> Result<(), String> {
-        let handle = self
-            .instrument_plugin_handle
-            .lock()
-            .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.plugin_host
-            .lock()
-            .open_editor(handle)
-            .map_err(|e| format!("{e}"))
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn close_instrument_plugin_editor(&self) -> Result<(), String> {
-        let handle = self
-            .instrument_plugin_handle
-            .lock()
-            .ok_or_else(|| "no plugin loaded".to_string())?;
-        self.plugin_host
-            .lock()
-            .close_editor(handle)
-            .map_err(|e| format!("{e}"))
-    }
-
     /// Bascule la tranche instrument en PRIVÉ. On continue de S'ENTENDRE ; les
     /// autres musiciens n'entendent plus rien, et la tranche sort du FICHIER
     /// (partagé — décision Ben) via le mixer.
@@ -1927,12 +2106,12 @@ impl PipelineState {
         let _ = self.restart_playback();
     }
 
-    /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
-    /// sinon l'id du default système. Utilisé uniquement pour les Stats UI
-    /// (pas un point de résolution de capture — le start_capture fait sa
-    /// propre résolution stricte).
-    pub fn selected_input_id(&self) -> Option<String> {
-        self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
+    /// Entrée à afficher dans `get-stats` : l'interface et le canal captés
+    /// pendant une capture, sinon l'entrée choisie par le studio, sinon rien
+    /// (« — »). Ne résout JAMAIS de périphérique (cf. `capture_input_name`).
+    pub fn stats_device_name(&self) -> Option<String> {
+        self.instrument_source_label()
+            .or_else(|| self.input_device_id.as_deref().map(|id| device_name_of(id).to_string()))
     }
 
     /// 0.5.4-5 — host audio actif = ASIO (Windows) ? Gouverne le keep-warm.
@@ -1985,12 +2164,17 @@ impl PipelineState {
         }
         // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
         self.uplink = None;
-        // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
-        // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
-        // le thread `voice_encode` termine en cascade (Disconnected). On lâche
-        // notre Sender de commande et on remet l'état voix à zéro.
+        // Talkback : la voix vit avec la capture. Fin de session OU changement
+        // d'entrée → la voix s'arrête, QUELLE QUE SOIT sa source : tap sur le flux
+        // instrument (il vivait sur le `capture_stage` qu'on vient d'arrêter) ou
+        // micro dédié (flux indépendant, qui sinon restait ouvert et continuait
+        // d'encoder et d'envoyer après la sortie du studio — revue 0.6.6,
+        // constat C). Le studio republie le talkback après un changement
+        // d'entrée (`reestablishAgentTalkbackAfterInputSwap`).
+        self.stop_voice();
         self.voice_ctrl_tx = None;
-        self.voice_active = false;
+        // Plus de capture : plus d'entrée ouverte à nommer.
+        self.capture_input_name = None;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
         self.mixer.remove_local_stream();
         // Hot-swap d'entrée (session_continues) : la réception des pairs est
@@ -2006,7 +2190,7 @@ impl PipelineState {
             self.timer_resolution = None;
             // Vraie fin de session : plus de SFU vers lequel relever le réseau local.
             self.sfu_addr = None;
-            // Coupe les réceptions pair + le thread de décodage RT partagé.
+            // Coupe les réceptions des pairs (le fil s'arrête plus bas).
             let ids: Vec<String> = self.recv_streams.keys().cloned().collect();
             for id in ids {
                 self.remove_stream(&id);
@@ -2014,10 +2198,10 @@ impl PipelineState {
             // Fin de session : les réglages d'écoute des pairs partent avec eux.
             // (Hot-swap d'entrée : on garde la réception, donc aussi ses réglages.)
             self.mixer.clear_stream_settings();
-            if let Some(DecodeThread { tx, pool_rx: _, join }) = self.decode_thread.take() {
-                let _ = tx.send(DecodeMsg::Shutdown);
-                drop(tx);
-                let _ = join.join();
+            // Le fil de réception retire chaque flux restant (socket, état,
+            // mélangeur, statistiques), puis se termine.
+            if let Some(rt) = self.recv_thread.take() {
+                rt.shutdown();
             }
         }
     }
@@ -2394,11 +2578,11 @@ impl PipelineState {
 
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
         // greffer un producteur voix plus tard (validation canal) sans redémarrer
-        // l'instrument. Fresh capture ⇒ pas de voix active. `native_sr` est
+        // l'instrument. Aucune voix active ici : `prepare_audio_for_session` est
+        // passé par `teardown_session` → `stop_voice`. `native_sr` est
         // invariablement 48 kHz ici (R2 ci-dessus).
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
-        self.voice_active = false;
         // ENTRÉE (input_cut) — le pipeline est UNIQUE et à vie (construit 1× au
         // boot). Sans reset, `input_cut` SURVIT d'une session studio à l'autre :
         // quitter en ENTRÉE OFF laissait l'instrument coupé à la source au join
@@ -2491,6 +2675,16 @@ impl PipelineState {
             ChannelSel::Default
         };
 
+        // Interrupteurs de banc (fichier `bench-flags`, à côté des journaux),
+        // lus et journalisés à chaque capture — cf. `bench_flags`. Lus AVANT le
+        // lancement des fils audio : `no-mmcss` décide de leur promotion (Lot W1,
+        // PLAN-FREINAGE-RESEAU-WINDOWS-2026-09).
+        let bench = crate::bench_flags::BenchFlags::load();
+        bench.log();
+        crate::audio::rt_priority::set_bench_without_mmcss(bench.no_mmcss);
+        // Freinage réseau de Windows : l'état EN VIGUEUR pour cette session.
+        crate::net_throttling::log_state("capture");
+
         // 6. Spawn encoder thread (std thread, not tokio — real-time audio)
         //
         // SELF-MONITOR : on enregistre un stream local dans le mixer AVANT de
@@ -2553,13 +2747,11 @@ impl PipelineState {
         // Voie B — rapports RTCP du flux instrument (pertes, gigue et aller-retour
         // UDP vus par le SFU), dans une tâche tokio hors du thread audio.
         // Interrupteur de DIAGNOSTIC du banc (PROTOCOLE-BANC-LATENCE §8) : le
-        // fichier `bench-flags`, à côté des journaux, coupe la tâche pour
-        // comparer avec le même binaire l'envoi du son avec et sans RTCP. Une
-        // variable d'environnement ne convenait pas : relancé depuis le studio,
-        // l'Audio Engine n'en héritait pas, et quatre sessions de banc ont été
-        // perdues sans que rien ne le dise (14/09).
-        let bench = crate::bench_flags::BenchFlags::load();
-        bench.log();
+        // fichier `bench-flags` (lu plus haut) coupe la tâche pour comparer avec
+        // le même binaire l'envoi du son avec et sans RTCP. Une variable
+        // d'environnement ne convenait pas : relancé depuis le studio, l'Audio
+        // Engine n'en héritait pas, et quatre sessions de banc ont été perdues
+        // sans que rien ne le dise (14/09).
         // Lot V — une veille en pleine session est une panne audio (pilote ASIO
         // dégradé au réveil) : on pose une demande de maintien éveillé pour la
         // durée de la session, écran compris sous Windows (son rallumage coûte
@@ -2606,6 +2798,7 @@ impl PipelineState {
             (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
             (None, None) => Some("canaux 1-2".to_string()),
         };
+        self.capture_input_name = Some(in_name.clone());
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -2684,22 +2877,13 @@ impl PipelineState {
         // 3. Idempotence : retire l'ancien tap ET/OU ferme l'ancien flux dédié
         //    (changement de micro). Le drop de la poignée relâche le périphérique
         //    AVANT qu'on en ouvre un autre.
-        if self.voice_active {
-            if let Some(tx) = voice_ctrl_tx.as_ref() {
-                let _ = tx.try_send(VoiceControl::Remove);
-            }
-        }
-        self.voice_capture = None;
-        // À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
-        // active : l'ancienne est démontée et la nouvelle pas encore branchée.
-        // Sans ce passage à false, un échec en cours de route (micro débranché
-        // entre l'affichage de la liste et le clic) laisserait l'agent convaincu
-        // qu'un talkback tourne — la fenêtre afficherait un micro pour un flux
-        // inexistant, et le prochain démarrage prendrait la branche « idempotence »
-        // sur un état fantôme.
-        self.voice_active = false;
-        self.voice_device_label = None;
-        self.voice_channel_index = None;
+        //    À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
+        //    active : l'ancienne est démontée et la nouvelle pas encore branchée.
+        //    Un échec en cours de route (micro débranché entre l'affichage de la
+        //    liste et le clic) ne laisse donc pas l'agent convaincu qu'un
+        //    talkback tourne — ni la fenêtre afficher un micro pour un flux
+        //    inexistant.
+        self.stop_voice();
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2714,9 +2898,14 @@ impl PipelineState {
             .map_err(|e| format!("{}", e))?
             .port();
         let sender = Arc::new(sender);
-        // 5. Canal capture_stage → voice_encode (mono BRUT @ 48 kHz — R2). Même
-        //    marge que les ringbufs instrument (32 blocs).
-        let (voice_tx, voice_rx) = bounded::<Vec<f32>>(STAGE_CHANNEL_CAPACITY);
+        // 5. File capture → voice_encode (mono BRUT @ 48 kHz — R2), bornée en
+        //    DURÉE d'audio et non en blocs (cf. `audio::voice_tap`).
+        let (voice_tx, voice_rx) = crate::audio::voice_tap::voice_tap(
+            crate::audio::voice_tap::VOICE_TAP_MAX_MS,
+        );
+        // Fermeture de la file : réunie au fil voix dès son lancement (étape 6).
+        let voice_closer = voice_tx.closer();
+        let voice_stage = self.perfstats.voice_stage.clone();
         let voice_gain = self.voice_gain.clone();
         let voice_rms = self.voice_rms.clone();
         let voice_send_peak = self.voice_send_peak.clone();
@@ -2727,13 +2916,16 @@ impl PipelineState {
             .output_device_id
             .as_deref()
             .and_then(|id| id.split_once(':').map(|(_, name)| name.to_string()));
-        // 6. Spawn du thread d'encodage voix (RT). Termine seul au drop de voice_tx.
+        // 6. Spawn du thread d'encodage voix (RT). Termine quand sa file est fermée
+        //    (`VoiceEncodeStage` lâché par `stop_voice`, ou à un échec plus bas).
         //    Il signale sur `ready_tx` quand il est PRÊT À CONSOMMER (encodeur créé,
         //    modèles d'isolation chargés) — cf. étape 7. Canal ONESHOT TOKIO (et
         //    non crossbeam) : l'attente doit être `await`, pas bloquante — on tient
         //    le mutex pipeline et on tourne sur un worker du runtime.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        std::thread::Builder::new()
+        let stage_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_ready = stage_ready.clone();
+        let voice_thread = std::thread::Builder::new()
             .name("voice-encode".into())
             .spawn(move || {
                 voice_encode_stage_loop(
@@ -2747,21 +2939,29 @@ impl PipelineState {
                     voice_send_peak,
                     voice_on_air,
                     isolation_active,
+                    voice_stage,
                     output_device_name,
                     ready_tx,
+                    thread_ready,
                 );
             })
             .map_err(|e| format!("spawn voice-encode: {}", e))?;
+        // Lâché à tout échec plus bas (sortie de fonction) : la file se ferme et
+        // le fil s'arrête. Gardé par `stop_voice` sinon.
+        let encode_stage = VoiceEncodeStage {
+            closer: Some(voice_closer),
+            thread: Some(voice_thread),
+            ready: stage_ready,
+        };
         // 7. Attend que le thread voix soit prêt AVANT de greffer le tap. Sans ça,
         //    la capture pousse des blocs pendant le chargement des modèles (~260 ms
-        //    mesurés) : la file de 32 blocs déborde et la PREMIÈRE DEMI-SECONDE de
-        //    talkback part en silence (constaté en logs terrain, « tap voix saturé »).
+        //    mesurés) : la file déborde et le DÉBUT du talkback part en silence
+        //    (constaté en logs terrain, « tap voix saturé »).
         match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
             Ok(Ok(())) => {}
             // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
             // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
             Ok(Err(_)) => {
-                self.voice_active = false;
                 return Err("voice encode thread failed to start".to_string());
             }
             // Machine très lente : on greffe quand même (comportement d'avant), mais
@@ -2829,6 +3029,7 @@ impl PipelineState {
                 "canal du flux instrument".to_string()
             }
         };
+        self.voice_encode_stage = Some(encode_stage);
         self.voice_active = true;
         tracing::info!(
             target: "jamodio::pipeline",
@@ -2857,9 +3058,7 @@ impl PipelineState {
         if !matches!(self.state, AgentState::Capturing) {
             return None;
         }
-        let name = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()))?;
+        let name = self.capture_input_name.clone()?;
         Some(match self.capture_channels_label.as_deref() {
             Some(ch) => format!("{name} — {ch}"),
             None => name,
@@ -2881,35 +3080,51 @@ impl PipelineState {
         // croire à une autre source que celle affichée juste au-dessus.
         // Le nom est relu à CHAQUE appel (jamais figé au démarrage du talkback)
         // pour ne pas afficher l'ancienne interface après un changement d'entrée.
-        let iface = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()));
+        let iface = self.capture_input_name.clone();
         Some(match (iface, self.voice_channel_index) {
             (Some(name), Some(ch)) => format!("{} — canal {}", name, u16::from(ch) + 1),
             (Some(name), None) => name,
-            // Pas d'entrée sélectionnée alors qu'une voix est active : état
+            // Pas d'entrée ouverte alors qu'une voix est active : état
             // incohérent, on le dit au lieu d'inventer un nom.
             (None, _) => "source inconnue".to_string(),
         })
     }
 
-    /// Talkback (Lot 2) — retire le producteur voix. No-op si aucune voix active.
-    /// NE touche PAS à la capture instrument. Le thread `voice_encode` termine en
-    /// cascade quand `capture_stage` drop son `out_tx`.
+    /// Talkback (Lot 2) — retire le producteur voix (message `stop-voice-capture`).
+    /// NE touche PAS à la capture instrument.
     pub fn stop_voice_capture(&mut self) {
-        if !self.voice_active {
-            return;
+        let was_running = self.voice_active || self.voice_capture.is_some();
+        self.stop_voice();
+        if was_running {
+            tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
         }
-        if let Some(tx) = self.voice_ctrl_tx.as_ref() {
-            let _ = tx.try_send(VoiceControl::Remove);
+    }
+
+    /// Arrête la voix, quelle que soit sa source, et remet son état à zéro :
+    /// - tap sur le flux instrument : retiré du `capture_stage` (son `out_tx`
+    ///   voix est lâché) ;
+    /// - micro dédié : la poignée est lâchée → flux arrêté, périphérique RELÂCHÉ
+    ///   (sinon le casque reste tenu par l'agent). Le drop ATTEND la fin du fil
+    ///   propriétaire du flux ;
+    /// - dans les deux cas, la file de l'étage voix est FERMÉE et le thread
+    ///   `voice_encode` ATTENDU : il sort sans dépendre de la disparition des
+    ///   émetteurs (celui du micro dédié survit sur macOS), avant toute nouvelle
+    ///   voix — ses remises à zéro (VU, « à l'antenne », isolation) ne peuvent
+    ///   plus tomber sur le talkback suivant.
+    ///
+    /// Seul point d'arrêt de la voix (`stop_voice_capture`, changement de micro,
+    /// `teardown_session`) : `voice_active` dit toujours la vérité.
+    fn stop_voice(&mut self) {
+        if self.voice_active {
+            if let Some(tx) = self.voice_ctrl_tx.as_ref() {
+                let _ = tx.try_send(VoiceControl::Remove);
+            }
         }
-        // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
-        // périphérique (sinon le casque resterait tenu par l'agent).
+        self.voice_encode_stage = None;
         self.voice_capture = None;
         self.voice_device_label = None;
         self.voice_channel_index = None;
         self.voice_active = false;
-        tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
 
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
@@ -3036,6 +3251,9 @@ impl PipelineState {
             BuiltDuplex::Cpal { input, output } => {
                 self.input_buffer_samples = input.input_buf;
                 self.input_hw = crate::audio::declared_latency::input(&input.name);
+                // Sans entrée choisie, le défaut a pu changer (débranché) : on
+                // nomme ce qui est réellement rouvert.
+                self.capture_input_name = Some(input.name);
                 self.capture_stream = Some(input.stream);
                 // Rien ici : un pilote qui se rouvre ne prouve pas que le son revient
                 // (recette PC 17/09). C'est le superviseur qui déclare l'entrée
@@ -3079,6 +3297,7 @@ impl PipelineState {
                 self.input_hw = a.host.input_hw;
                 self.output_hw = a.host.output_hw;
                 let new_sr = a.native_sr;
+                self.capture_input_name = Some(a.name.clone());
                 self.output_device_name = Some(a.name.clone());
                 self.asio_host = Some(a.host);
                 // Interface rouverte — mais « ouverte » n'est pas « vivante » : c'est
@@ -3300,14 +3519,9 @@ impl PipelineState {
         self.remove_stream(&producer_id);
 
         // Garde-fou anti-DoS (review pré-BETA) : borne le nombre de flux entrants
-        // (contextes SRTP + sockets UDP). Un client légitime en monte ≤ quelques
-        // (nombre de pairs) ; ce cap dur évite l'exhaustion mémoire/fd par un flot
-        // d'AddStream. Le remove ci-dessus garantit qu'un ré-ajout du même
-        // producer ne compte pas double.
-        const MAX_RECV_STREAMS: usize = 16;
-        if self.recv_streams.len() >= MAX_RECV_STREAMS {
-            return Err(format!("too many streams (max {})", MAX_RECV_STREAMS));
-        }
+        // (contextes SRTP + sockets UDP), cf. `MAX_RECV_STREAMS`. Le remove
+        // ci-dessus garantit qu'un ré-ajout du même producer ne compte pas double.
+        check_recv_capacity(self.recv_streams.len())?;
 
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -3318,54 +3532,56 @@ impl PipelineState {
         let srtp_ctx = Arc::new(SrtpContext::new(&agent_srtp, &sfu_srtp)?);
 
         // Create UDP receiver
-        let receiver = RtpReceiver::new(srtp_ctx)
-            .await
-            .map_err(|e| format!("UDP bind: {}", e))?;
+        let receiver = RtpReceiver::new(srtp_ctx).map_err(|e| format!("UDP bind: {}", e))?;
         let local_port = receiver.local_addr().map_err(|e| format!("{}", e))?.port();
 
         // Note : pas de punch synchrone ici. Le punch SRTP serait rejeté par le SFU
         // tant que celui-ci n'a pas reçu nos clés via connect-plain-transport
-        // (qui n'est envoyé par le browser qu'après cette réponse). On punch en boucle
-        // dans recv_io_task jusqu'au 1er paquet reçu (=> comedia activé côté SFU).
+        // (qui n'est envoyé par le browser qu'après cette réponse). Le fil de
+        // réception perce en boucle jusqu'au 1er paquet reçu (=> comedia activé
+        // côté SFU).
 
-        // 0.5.3-2 — lazy-start du thread de décodage RT partagé (au 1er stream).
-        // Le stream mixer N'EST PLUS créé ici : le thread de décodage le crée au
-        // 1er paquet du pair (il est l'unique écrivain du mixer côté pairs → zéro
-        // race add/remove/push).
-        if self.decode_thread.is_none() {
-            self.decode_thread = Some(
-                spawn_decode_thread(
-                    self.mixer.clone(),
-                    self.perfstats.net_stats_by_producer.clone(),
-                    self.perfstats.recv_path.clone(),
-                    self.perfstats.output_frames.clone(),
+        // Lot 1-D4 — démarrage du fil de réception et de décodage au 1er flux.
+        // Le stream mixer N'EST PAS créé ici : le fil le crée au 1er paquet du
+        // pair (il est l'unique écrivain du mixer côté pairs → zéro race
+        // add/remove/push).
+        if self.recv_thread.is_none() {
+            self.recv_thread = Some(
+                recv_thread::RecvThread::spawn(
+                    RxCore::new(
+                        self.mixer.clone(),
+                        self.perfstats.net_stats_by_producer.clone(),
+                        self.perfstats.recv_path.clone(),
+                        self.perfstats.output_frames.clone(),
+                    ),
+                    recv_thread::RxMeasures {
+                        stack_delay: self.perfstats.recv_stack_delay.clone(),
+                        wake_late: self.perfstats.decode_wake_late.clone(),
+                        wake_work: self.perfstats.recv_work.clone(),
+                        wake_over_budget: self.perfstats.recv_work_over_budget.clone(),
+                    },
                 )
-                .map_err(|e| format!("spawn decode thread: {}", e))?,
+                .map_err(|e| format!("spawn recv thread: {}", e))?,
             );
         }
-        let decode = self
-            .decode_thread
-            .as_ref()
-            .expect("decode thread démarré juste au-dessus");
-
-        // Stop signal pour la tâche I/O de ce pair.
-        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let activity = Arc::new(RecvActivity::new(std::time::Instant::now()));
-        self.recv_streams.insert(
-            producer_id.clone(),
-            RecvStream { stop: stop_tx, kind: media_tag, activity: activity.clone() },
-        );
-
-        // Spawn la tâche I/O async (recv UDP + horodatage + punch + silence).
-        // Elle forwarde les paquets bruts au thread de décodage RT via le MPSC.
-        let tx = decode.tx.clone();
-        let pool_rx = decode.pool_rx.clone();
-        let pid: Arc<str> = Arc::from(producer_id.as_str());
         self.recv_epoch = self.recv_epoch.wrapping_add(1);
         let epoch = self.recv_epoch;
-        tokio::spawn(async move {
-            recv_io_task(receiver, sfu_addr, pid, epoch, media_tag, activity, tx, pool_rx, stop_rx).await;
-        });
+        self.recv_streams.insert(
+            producer_id.clone(),
+            RecvStream { epoch, kind: media_tag, activity: activity.clone() },
+        );
+        self.recv_thread
+            .as_ref()
+            .expect("fil de réception démarré juste au-dessus")
+            .send(recv_thread::RecvCmd::Add(recv_thread::NewStream {
+                producer_id: Arc::from(producer_id.as_str()),
+                epoch,
+                kind: media_tag,
+                receiver,
+                sfu_addr,
+                activity,
+            }));
 
         // Start playback if not running. Résolution + ouverture sur le thread
         // COM-STA (cf. com_exec) ; pas de fallback silencieux sur le default si
@@ -3401,11 +3617,16 @@ impl PipelineState {
     }
 
     pub fn remove_stream(&mut self, producer_id: &str) {
-        // On signale juste la tâche I/O ; à sa sortie elle envoie `Remove` au
-        // thread de décodage qui retire l'état + le stream mixer + net_stats,
-        // APRÈS le dernier paquet du pair (ordre garanti → zéro 'unknown stream').
+        // Le fil de réception désinscrit la socket puis retire l'état, le stream
+        // mixer et net_stats, au même endroit : rien ne peut suivre le dernier
+        // paquet du pair (zéro 'unknown stream').
         if let Some(stream) = self.recv_streams.remove(producer_id) {
-            let _ = stream.stop.send(());
+            if let Some(rt) = &self.recv_thread {
+                rt.send(recv_thread::RecvCmd::Remove {
+                    producer_id: Arc::from(producer_id),
+                    epoch: stream.epoch,
+                });
+            }
         }
     }
 
@@ -3479,6 +3700,48 @@ pub enum ChannelSel {
     StereoPair(u8),
 }
 
+/// Étage voix d'un talkback : son fil `voice-encode` et la fermeture de sa file.
+/// Le lâcher ferme la file (le fil est réveillé et sort de sa boucle) puis
+/// ATTEND la fin du fil — au plus le traitement d'un bloc en cours, durée
+/// journalisée. Seule exception : un fil pas encore PRÊT (modèles d'isolation
+/// en chargement, cas « pas prêt après 10 s ») n'est pas attendu — la durée
+/// d'un chargement n'est pas bornée, et l'attente tiendrait le verrou du
+/// pipeline ; il voit la fermeture à l'entrée de sa boucle et s'arrête seul.
+struct VoiceEncodeStage {
+    closer: Option<crate::audio::voice_tap::VoiceTapCloser>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Posé par le fil quand il entre dans sa boucle de consommation.
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Au-delà, l'attente de la fin du fil voix est signalée (elle tient le verrou
+/// du pipeline) : en régime normal, elle ne couvre qu'un bloc en cours.
+const VOICE_STAGE_JOIN_WARN: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl Drop for VoiceEncodeStage {
+    fn drop(&mut self) {
+        drop(self.closer.take());
+        let Some(thread) = self.thread.take() else { return };
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                target: "jamodio::pipeline",
+                "fil voice-encode encore en chargement : non attendu, il s'arrêtera à la fin du chargement"
+            );
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let panicked = thread.join().is_err();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if panicked {
+            tracing::error!(target: "jamodio::pipeline", elapsed_ms, "le fil voice-encode s'est terminé en panique");
+        } else if t0.elapsed() > VOICE_STAGE_JOIN_WARN {
+            tracing::warn!(target: "jamodio::pipeline", elapsed_ms, "arrêt du fil voice-encode plus long que prévu");
+        } else {
+            tracing::info!(target: "jamodio::pipeline", elapsed_ms, "fil voice-encode arrêté");
+        }
+    }
+}
+
 /// Talkback (Lot 2, v0.5.7) — commande du tap voix, envoyée par
 /// `start_voice_capture` / `stop_voice_capture` (via `voice_ctrl_tx` conservé
 /// dans `PipelineState`) et poll ée par `capture_stage_loop`. Permet de
@@ -3486,9 +3749,9 @@ pub enum ChannelSel {
 enum VoiceControl {
     /// Active le tap : extrait le canal mono `channel_index` du buffer BRUT à
     /// chaque bloc CPAL et le pousse vers le `voice_encode_stage` via `out_tx`.
-    Add { channel_index: usize, out_tx: Sender<Vec<f32>> },
-    /// Retire le tap : le `out_tx` détenu par `capture_stage` est droppé →
-    /// le thread `voice_encode` termine en cascade.
+    Add { channel_index: usize, out_tx: crate::audio::voice_tap::VoiceTapSender },
+    /// Retire le tap : le `out_tx` détenu par `capture_stage` est droppé. Le
+    /// thread `voice_encode`, lui, s'arrête à la fermeture de sa file (`stop_voice`).
     Remove,
 }
 
@@ -3879,7 +4142,7 @@ fn capture_stage_loop(
     // tête de boucle : Add greffe l'extraction d'un canal mono du buffer BRUT,
     // Remove la retire. Le tap n'impacte JAMAIS le forward instrument (fait en
     // premier), et un ralentissement du thread voix ne peut pas bloquer ce
-    // stage (try_send + drop sur Full).
+    // stage (file bornée en durée, bloc jeté et compté au-delà).
     voice_ctrl_rx: Receiver<VoiceControl>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
@@ -3893,14 +4156,7 @@ fn capture_stage_loop(
     // Talkback (Lot 2) — tap voix actif : `Some((canal_mono, out_tx))`. Le
     // canal a été validé contre `channels_in` au `start_voice_capture`, mais on
     // re-garde ici (indexation d'un thread RT → jamais de panic).
-    let mut voice_out: Option<(usize, Sender<Vec<f32>>)> = None;
-    // Blocs voix abandonnés faute de place depuis la DERNIÈRE trace (cf. le `Full`
-    // plus bas). Compteur de FENÊTRE, pas « d'affilée » : une saturation
-    // intermittente (drop, ok, drop, ok…) est tout aussi audible qu'une continue,
-    // et c'est elle qui domine en pratique.
-    let mut voice_drops: u32 = 0;
-    // Fenêtre d'échantillonnage de la trace de saturation voix. Voir `Full`.
-    let mut voice_drops_last_warn: Option<std::time::Instant> = None;
+    let mut voice_out: Option<(usize, crate::audio::voice_tap::VoiceTapSender)> = None;
 
     loop {
         if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3914,8 +4170,8 @@ fn capture_stage_loop(
                 VoiceControl::Add { channel_index, out_tx } => {
                     voice_out = Some((channel_index, out_tx));
                 }
-                // Drop de l'`out_tx` → le thread voice_encode voit Disconnected
-                // et termine en cascade (même mécanique que le shutdown global).
+                // Le tap ne pousse plus ; le thread voice_encode s'arrête à la
+                // fermeture de sa file (`stop_voice`).
                 VoiceControl::Remove => voice_out = None,
             }
         }
@@ -3925,52 +4181,16 @@ fn capture_stage_loop(
                 // multicanal BRUT (donc AVANT le plugin/monitor/remap instrument)
                 // et l'envoie au `voice_encode_stage`. Coût STRICTEMENT NUL quand
                 // la voix est inactive (`voice_out = None` → un seul test).
-                // try_send non bloquant : le thread capture instrument n'est
-                // JAMAIS ralenti par un retard du thread voix.
+                // Non bloquant : le thread capture instrument n'est JAMAIS ralenti
+                // par un retard du thread voix. Un bloc jeté (étage voix en retard
+                // de plus de la borne) est COMPTÉ par la file ; c'est l'étage voix
+                // qui le trace, une fois par fenêtre, quelle que soit la source
+                // (tap ici ou micro dédié) — cf. `audio::voice_tap`.
                 if let Some((vch, vtx)) = voice_out.as_ref() {
                     let mono = extract_channel_mono(&samples, channels_in, *vch);
-                    if !mono.is_empty() {
-                        match vtx.try_send(mono) {
-                            Ok(()) => {}
-                            // Thread voix en retard : on DROP ce bloc voix
-                            // (concealé par le PLC récepteur). Jamais de stall —
-                            // mais JAMAIS silencieux non plus : depuis que ce
-                            // thread fait tourner l'isolation de voix (deux
-                            // réseaux), une saturation durable s'entend, donc
-                            // elle se trace.
-                            //
-                            // Échantillonnage par le TEMPS (≤ 1 ligne/s), pas par
-                            // un compteur de drops consécutifs : ce dernier était
-                            // remis à zéro au premier bloc passé, si bien qu'une
-                            // saturation INTERMITTENTE (drop, ok, drop, ok…) ne
-                            // dépassait jamais 1-2 et traçait donc à CHAQUE drop —
-                            // 4352 lignes en 25 min mesurées le 05/09, l'exact
-                            // contraire du but recherché, et de quoi évincer le
-                            // diagnostic utile de l'export support (cap 5 Mo).
-                            // On journalise donc au plus une fois par seconde, en
-                            // rapportant le nombre RÉEL de blocs perdus depuis la
-                            // dernière trace.
-                            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                                voice_drops += 1;
-                                const VOICE_WARN_EVERY: std::time::Duration =
-                                    std::time::Duration::from_secs(1);
-                                let due = voice_drops_last_warn
-                                    .is_none_or(|t| t.elapsed() >= VOICE_WARN_EVERY);
-                                if due {
-                                    tracing::warn!(
-                                        target: "jamodio::pipeline",
-                                        dropped_blocks = voice_drops,
-                                        "tap voix saturé — blocs talkback abandonnés (thread voix en retard)"
-                                    );
-                                    voice_drops = 0;
-                                    voice_drops_last_warn = Some(std::time::Instant::now());
-                                }
-                            }
-                            // Thread voix terminé : on cesse de taper.
-                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                                voice_out = None;
-                            }
-                        }
+                    // Thread voix terminé : on cesse de taper.
+                    if !mono.is_empty() && vtx.push(mono).is_err() {
+                        voice_out = None;
                     }
                 }
                 // Timestamp début pipeline INSTRUMENT : posé APRÈS le tap voix
@@ -4717,14 +4937,16 @@ fn encode_stage_loop(
 //     LowDelay, comme l'instrument) ;
 //   - construit le paquet RTP et l'envoie (SRTP, non bloquant).
 //
-// Termine dès que `in_rx` est déconnecté : `capture_stage` a droppé son
-// `out_tx` (Remove explicite, ou arrêt de la capture instrument).
+// Termine dès que `in_rx` rend `Disconnected`, c.-à-d. quand sa file est fermée
+// (`VoiceEncodeStage` lâché par `stop_voice`, qui attend ensuite la fin du fil) —
+// le `VoiceTapCloser` garde un émetteur : le départ des producteurs (tap retiré,
+// capture instrument arrêtée) ne suffit pas, c'est voulu (un seul chemin d'arrêt).
 //
 // N'ALIMENTE PAS les histogrammes perfstats instrument : la voix est un flux
 // secondaire, on ne veut pas polluer la mesure de latence du chemin principal.
 #[allow(clippy::too_many_arguments)]
 fn voice_encode_stage_loop(
-    in_rx: Receiver<Vec<f32>>,
+    in_rx: crate::audio::voice_tap::VoiceTapReceiver,
     sender: Arc<RtpSender>,
     ssrc: u32,
     payload_type: u8,
@@ -4736,6 +4958,8 @@ fn voice_encode_stage_loop(
     voice_send_peak: Arc<LevelMeter>,
     voice_on_air: Arc<std::sync::atomic::AtomicBool>,
     isolation_active: Arc<std::sync::atomic::AtomicBool>,
+    // Coût de l'isolation et voix perdue, pour le journal perfstats 1 Hz.
+    voice_stage: Arc<crate::audio::voice_tap::VoiceStageStats>,
     output_device_name: Option<String>,
     // Signale à `start_voice_capture` que ce thread est prêt à consommer (encodeur
     // créé, modèles d'isolation chargés) → il ne greffe le tap qu'à ce moment.
@@ -4743,6 +4967,7 @@ fn voice_encode_stage_loop(
     // Oneshot TOKIO : l'appelant attend en `await`, il ne doit pas bloquer un
     // worker du runtime pendant le chargement des modèles.
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let _rt_priority_handle = crate::audio::rt_priority::promote_thread_for_audio(
         output_device_name.as_deref(),
@@ -4826,8 +5051,17 @@ fn voice_encode_stage_loop(
     );
     let mut last_limiter_report = std::time::Instant::now();
 
-    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture).
+    // Saturation de l'étage voix (cf. `audio::voice_tap`) : par fenêtre, voix
+    // traitée vs voix jetée devant l'étage.
+    let mut saturation = crate::audio::voice_tap::SaturationWatch::default();
+    let mut window_start = std::time::Instant::now();
+    let mut window_processed: u64 = 0;
+    let mut dropped_seen = in_rx.dropped_samples_total();
+
+    // Prêt à consommer : l'appelant peut greffer le tap voix (cf. start_voice_capture),
+    // et l'arrêt de l'étage peut attendre ce fil (cf. `VoiceEncodeStage`).
     // `send` consomme le Sender — le canal se ferme donc de lui-même ensuite.
+    ready.store(true, std::sync::atomic::Ordering::Release);
     let _ = ready_tx.send(());
 
     loop {
@@ -4843,6 +5077,7 @@ fn voice_encode_stage_loop(
         if mono48.is_empty() {
             continue;
         }
+        window_processed += mono48.len() as u64;
 
         // Gain d'envoi du bloc : lu UNE fois, pour que le mètre et l'étage
         // d'envoi voient la même valeur.
@@ -4874,7 +5109,10 @@ fn voice_encode_stage_loop(
         //        on désactive l'isolation pour le reste de la session (voix brute)
         //        sans JAMAIS couper le talkback — dégradation visible, pas silencieuse.
         if let Some(iso) = isolator.as_mut() {
-            match iso.process_block(&mut mono48) {
+            let t_iso = std::time::Instant::now();
+            let result = iso.process_block(&mut mono48);
+            voice_stage.record_isolation(t_iso.elapsed(), mono48.len());
+            match result {
                 Ok(state) => {
                     voice_on_air.store(state.voice_active, std::sync::atomic::Ordering::Relaxed)
                 }
@@ -4889,6 +5127,41 @@ fn voice_encode_stage_loop(
                     isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+
+        // 1-ter-bis. Voix perdue devant l'étage (file pleine) : tracée par
+        //        fenêtre et, si elle persiste pendant que l'isolation tourne,
+        //        bascule en voix brute pour le reste de la session. Une voix
+        //        hachée à 20 % est inintelligible — et le gate de parole, nourri
+        //        d'un signal troué, s'ouvre et se ferme au hasard. La voix brute
+        //        est un repli VISIBLE (`isolation_active` → « VOIX BRUTE » dans
+        //        l'UI), jamais une coupure du talkback.
+        if window_start.elapsed() >= crate::audio::voice_tap::SATURATION_WINDOW {
+            let dropped_total = in_rx.dropped_samples_total();
+            let dropped = dropped_total.saturating_sub(dropped_seen);
+            dropped_seen = dropped_total;
+            voice_stage.record_dropped(dropped);
+            if dropped > 0 {
+                tracing::warn!(
+                    target: "jamodio::pipeline",
+                    dropped_ms = dropped * 1000 / 48_000,
+                    window_ms = window_start.elapsed().as_millis() as u64,
+                    isolation = isolator.is_some(),
+                    "tap voix saturé — voix talkback perdue (étage voix en retard)"
+                );
+            }
+            if saturation.observe(window_processed, dropped) && isolator.is_some() {
+                tracing::warn!(
+                    target: "jamodio::voice_isolation",
+                    "isolation de voix saturée (la machine ne suit pas le temps réel) \
+                     — talkback en voix brute pour le reste de la session"
+                );
+                isolator = None;
+                voice_on_air.store(false, std::sync::atomic::Ordering::Relaxed);
+                isolation_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            window_start = std::time::Instant::now();
+            window_processed = 0;
         }
 
         // 1-quater. Gain d'ENVOI puis limiteur de crête (cf. `voice_send_stage`) :
@@ -4955,10 +5228,10 @@ fn voice_encode_stage_loop(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Réception : tâches I/O async (1/pair) + UN thread de décodage RT partagé
+// Réception : UN fil prioritaire qui lit, déchiffre, décode et masque
 // ═══════════════════════════════════════════════════════════════════
 //
-// Pourquoi ce split (0.5.3-2, fix « injouable Windows ») :
+// Pourquoi un fil RT (0.5.3-2, fix « injouable Windows ») :
 // Le décodage Opus alimente le jitter buffer (`push_samples`) ; le callback de
 // SORTIE le draine. Si le décodage tourne en priorité NORMALE (ancien
 // `recv_decode_task` sur le pool tokio), Windows le préempte ~10-15 ms → le
@@ -4967,45 +5240,42 @@ fn voice_encode_stage_loop(
 // self-monitor ne décroche jamais : asymétrie. macOS masque le trou (scheduler
 // clément). La réception audio DOIT tourner sur un thread RT — jamais normal.
 //
-// Design (validé en triple revue senior) :
-//   - `recv_io_task` (async tokio, 1/pair) : recv UDP + horodatage d'arrivée +
-//     comedia punch + idle-timeout fantôme. Forwarde le paquet brut via un MPSC.
-//   - `decode_rt_loop` (UN seul std::thread, RT) : décode pour TOUS les pairs
-//     (HashMap d'état). Promotion « event-driven » (MMCSS Windows / QoS macOS
-//     SEUL, PAS le workgroup → pas de sur-population). Seul écrivain du mixer côté
-//     pairs (add/remove/push tous depuis ce thread) → zéro race, zéro contention
-//     mutex ×N (1 thread partagé, pas thread-par-stream).
+// Pourquoi UN seul fil (Lot 1-D4, 0.6.6-9) :
+//   - jusqu'en 0.6.6-6, la lecture se faisait dans une tâche tokio ordinaire
+//     par pair : paquets lus 6,5 à 11 ms en retard (banc du 28/09/2026) ;
+//   - 0.6.6-7/-8 : fil de lecture prioritaire DÉDIÉ + fil de décodage
+//     prioritaire, reliés par un canal. La lecture était corrigée, mais le
+//     paquet attendait jusqu'à 5,5 ms dans le canal avant d'être décodé (Mac,
+//     `decode_queue_ms`) ; lecture en priorité normale : attente courte mais
+//     lecture lente et réveil du décodage jusqu'à 10 ms en retard (A/B,
+//     deux essais concordants). Déduit : un passage de relais entre deux fils
+//     qui se retiennent l'un l'autre.
+//   - donc `recv_thread` fait TOUT, à la suite : lecture (horodatage), déchif-
+//     frement, décodage, push au mixer, échéances de masquage. Plus de canal,
+//     plus de passage de relais, un réveil de fil de moins par paquet.
+//
+// `RxCore` (ci-dessous) est la partie sans socket : l'état de décodage de tous
+// les pairs (HashMap d'état), seul écrivain du mixer côté pairs (add/remove/
+// push depuis ce fil) → zéro race, zéro contention mutex ×N.
 // Décode-sur-push conservé (jitter buffer en PCM, Phases B/C inchangées).
 
-/// Message d'une `recv_io_task` vers le thread de décodage RT partagé.
-enum DecodeMsg {
-    /// Paquet RTP déchiffré, horodaté à l'arrivée (avant tout parse/file).
-    /// `epoch` = génération de l'io task émettrice (cf. re-add même producer).
-    Packet {
-        producer_id: Arc<str>,
-        epoch: u64,
-        recv_instant: std::time::Instant,
-        buf: Vec<u8>,
-        /// Lot C — nature du flux (constante pour le producteur) : détermine
-        /// l'étage de mix au 1er paquet (`mixer.add_stream(kind)`).
-        kind: StreamKind,
-    },
-    /// Pair terminé (stop ou idle-timeout) : envoyé en DERNIER par l'io task →
-    /// le thread retire l'état + le stream mixer APRÈS le dernier paquet du pair
-    /// (ordre garanti : l'io task est l'unique émetteur de ce producteur).
-    /// `epoch` : on n'honore le Remove que s'il matche la génération courante
-    /// (sinon un Remove d'une ancienne connexion supprimerait un stream re-créé).
-    Remove { producer_id: Arc<str>, epoch: u64 },
-    /// Arrêt complet (stop_all).
-    Shutdown,
-}
+/// 0.6.6-20 — au-delà, un paquet remplacé à l'échéance n'apprend rien au tampon :
+/// il serait arrivé trop tard pour la marge que la cible peut apprendre (plafond
+/// 15 ms) — c'est un pic, l'affaire du plancher de gigue et du filet réactif.
+/// CONSTANTE DE CALIBRATION.
+const JUST_LATE_MAX: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Le dernier masquage à l'échéance, tel qu'il faut le connaître pour juger
 /// son retardataire.
 #[derive(Debug, Clone, Copy)]
 struct LastConceal {
     at: std::time::Instant,
+    /// Vraie matière que le tampon tenait juste avant la trame inventée.
     fill_ms: f64,
+    /// Position de lecture juste après l'avoir poussée : ce que la sortie
+    /// consommera ensuite se lit par écart (Lot 1-B, cf.
+    /// `conceal::premature_margin_ms`).
+    read_index: usize,
     /// Numéro de la place comblée : seul CE paquet peut dire si ce masquage
     /// était de trop. Un autre retardataire (place plus ancienne d'une série
     /// de masquages, ou paquet simplement déréordonné qui n'a jamais été
@@ -5013,10 +5283,56 @@ struct LastConceal {
     slot: u16,
 }
 
-/// État de décodage par pair — détenu UNIQUEMENT par le thread RT.
+/// Lot 1-A — trous rendus par le tampon d'un flux, comptés par cause (cf.
+/// `mixer::hole::HoleCause`). Cumuls, remis à zéro si le flux est recréé.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HoleCounts {
+    pub arrival: u64,
+    /// Lot 1-D2 — le paquet était dans la machine, la réception l'a lu trop tard.
+    pub reception: u64,
+    pub decode: u64,
+    pub consumption: u64,
+    pub sequence: u64,
+    pub unclassified: u64,
+    /// Lot 1-C — parmi tous, ceux survenus alors que le masquage avait jugé,
+    /// DEPUIS le dernier push, que le tampon tiendrait (`Wait::BufferHolds`) :
+    /// le réveil suivant est arrivé trop tard. C'est la mesure qui dit si
+    /// `conceal::WAKE_SLACK_MS` est trop court.
+    pub after_buffer_holds: u64,
+}
+
+/// Le vrai paquet qui provoque un push : quand l'agent l'a LU, et quand le
+/// SYSTÈME l'avait reçu (Lot 1-D2 ; `None` sans horodatage).
+#[derive(Debug, Clone, Copy)]
+struct Arrived {
+    read_at: std::time::Instant,
+    in_system_at: Option<std::time::Instant>,
+}
+
+impl Arrived {
+    fn new(read_at: std::time::Instant, stack_delay: Option<std::time::Duration>) -> Self {
+        Self { read_at, in_system_at: stack_delay.and_then(|d| read_at.checked_sub(d)) }
+    }
+}
+
+/// Lot 1-A — l'état du tampon au dernier `push` de ce flux, point de départ de
+/// l'analyse du trou suivant.
+#[derive(Debug, Clone, Copy)]
+struct PushMark {
+    at: std::time::Instant,
+    fill_after_ms: f64,
+    read_index: usize,
+    /// Arrivée du dernier VRAI paquet poussé (une trame de masquage n'en a pas).
+    last_received: Option<std::time::Instant>,
+}
+
+/// État de décodage par pair — détenu UNIQUEMENT par le fil de réception.
 struct DecodeState {
-    /// Génération de l'io task propriétaire (cf. epoch dans `DecodeMsg`).
+    /// Génération du flux (cf. `PipelineState::recv_epoch`).
     epoch: u64,
+    /// Nature du flux : les trous de la voix (qui se tait légitimement) ne se
+    /// journalisent pas comme ceux de l'instrument.
+    kind: StreamKind,
     decoder: MusicDecoder,
     drift: DriftEstimator,
     jitter: JitterEstimator,
@@ -5072,6 +5388,27 @@ struct DecodeState {
     /// Échéances tombées pendant un ré-amorçage du tampon : rien à inventer, on
     /// désarme jusqu'à l'arrivée suivante (cf. `Wait::Repriming`). Un événement.
     wait_repriming: u64,
+    /// Lot 1-A — dernière raison pour laquelle le masquage a attendu, et quand.
+    /// Journalisée avec chaque trou : un trou survenu pendant `BufferHolds` dit
+    /// que le réveil suivant est arrivé trop tard (Lot 1-C).
+    last_wait: Option<(Wait, std::time::Instant)>,
+    /// Lot 1-A — état au dernier `push`, et trous comptés par cause.
+    last_push: Option<PushMark>,
+    holes: HoleCounts,
+    /// Trou relevé par une trame de MASQUAGE (aucun vrai paquet ne l'accompagne) :
+    /// classé au prochain vrai paquet, seul à savoir quand il est arrivé — avec
+    /// l'état du push qui précédait le trou.
+    pending_hole: Option<(HoleAtPull, Option<PushMark>)>,
+    /// Chantier P2 — cumul du temps passé à écrire les lignes `TROU`, et nombre
+    /// de trous classés : relevés par le fil à chaque réveil (cf. `recv_loop`).
+    hole_log_time: std::time::Duration,
+    holes_reported: u64,
+    /// Lecture (`recv_instant`) du dernier paquet ÉCARTÉ (tardif, doublon,
+    /// saut). Seul un écart survenu AVANT un trou peut en être la cause.
+    last_discard: Option<std::time::Instant>,
+    /// Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
+    /// depuis le dernier push (ms) ; `NaN` si aucun n'était horodaté.
+    stack_delay_max_ms: f64,
     /// Nombre de fois où l'on a DÉSARMÉ l'échéance — plafond de masquage
     /// atteint, ou flux tari. Un événement, pas un tour de boucle.
     deadline_disarmed: u64,
@@ -5086,7 +5423,13 @@ struct DecodeState {
 }
 
 impl DecodeState {
-    fn new(producer_id: &str, epoch: u64) -> Option<Self> {
+    /// Le masquage examine-t-il ce flux à `now` ? Une échéance armée et passée,
+    /// et, si un rendez-vous a été posé pour elle, ce rendez-vous atteint.
+    fn examined_at(&self, now: std::time::Instant) -> bool {
+        self.next_deadline.is_some_and(|d| now >= d) && self.next_check.is_none_or(|c| now >= c)
+    }
+
+    fn new(producer_id: &str, epoch: u64, kind: StreamKind) -> Option<Self> {
         let decoder = match MusicDecoder::new() {
             Ok(d) => d,
             Err(e) => {
@@ -5097,6 +5440,7 @@ impl DecodeState {
         let drift_label = producer_id.chars().take(8).collect::<String>();
         Some(Self {
             epoch,
+            kind,
             decoder,
             drift: DriftEstimator::new(drift_label),
             jitter: JitterEstimator::new(),
@@ -5112,6 +5456,14 @@ impl DecodeState {
             wait_within_grace: 0,
             wait_buffer_holds: 0,
             wait_repriming: 0,
+            last_wait: None,
+            last_push: None,
+            holes: HoleCounts::default(),
+            pending_hole: None,
+            hole_log_time: std::time::Duration::ZERO,
+            holes_reported: 0,
+            last_discard: None,
+            stack_delay_max_ms: f64::NAN,
             deadline_disarmed: 0,
             next_deadline: None,
             next_check: None,
@@ -5126,40 +5478,143 @@ impl DecodeState {
     }
 }
 
-/// Handle du thread de décodage RT partagé, détenu par `PipelineState`.
-struct DecodeThread {
-    /// MPSC vers le thread (paquets + lifecycle). Cloné dans chaque io task.
-    tx: Sender<DecodeMsg>,
-    /// Pool de buffers recyclés. Cloné dans chaque io task (côté réception).
-    pool_rx: Receiver<Vec<u8>>,
-    join: std::thread::JoinHandle<()>,
-}
-
-/// Démarre le thread de décodage RT unique (lazy, au 1er stream). Faillible
-/// (cohérent avec le spawn de l'encoder thread) : une erreur OS de création de
-/// thread est propagée au lieu de paniquer.
-fn spawn_decode_thread(
+/// Lot 1-D4 (0.6.6-9) — la réception de TOUS les pairs, sans socket : état de
+/// décodage, push au mixer, échéances de masquage. Détenue par le fil de
+/// réception (`recv_thread`), qui l'appelle pour chaque paquet lu puis à chaque
+/// réveil — sur le même fil, à la suite, sans canal. Séparée des sockets pour
+/// être testée telle quelle.
+struct RxCore {
+    states: HashMap<Arc<str>, DecodeState>,
     mixer: Arc<AudioMixer>,
     net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+    /// Lecture → push (cf. `PerfHandles::recv_path`).
     recv_path: Arc<Mutex<Histogram>>,
-    // Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
-    // et non la durée d'une trame, qui dit combien le tampon doit contenir pour
-    // survivre au prochain tirage (cf. `conceal_due_streams`).
+    /// Taille du bloc que le callback de SORTIE consomme d'un coup. C'est elle,
+    /// et non la durée d'une trame, qui dit combien le tampon doit contenir pour
+    /// survivre au prochain tirage (cf. `conceal_due_streams`).
     output_frames: Arc<std::sync::atomic::AtomicU32>,
-) -> std::io::Result<DecodeThread> {
-    // Data MPSC : N io tasks → 1 thread. 256 = large (décode ≫ arrivée).
-    let (tx, rx) = bounded::<DecodeMsg>(256);
-    // Pool : buffers MTU réutilisés → zéro alloc/dealloc sur le thread RT.
-    let (pool_tx, pool_rx) = bounded::<Vec<u8>>(128);
-    for _ in 0..128 {
-        let _ = pool_tx.try_send(Vec::with_capacity(2048));
+}
+
+impl RxCore {
+    fn new(
+        mixer: Arc<AudioMixer>,
+        net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
+        recv_path: Arc<Mutex<Histogram>>,
+        output_frames: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Self {
+        Self { states: HashMap::new(), mixer, net_stats_by_producer, recv_path, output_frames }
     }
-    let join = std::thread::Builder::new()
-        .name("audio-decode".into())
-        .spawn(move || {
-            decode_rt_loop(rx, pool_tx, mixer, net_stats_by_producer, recv_path, output_frames)
-        })?;
-    Ok(DecodeThread { tx, pool_rx, join })
+
+    /// Bloc de sortie en ms — relu à chaque réveil : il change si la sortie est
+    /// rouverte.
+    fn output_block_ms(&self) -> f64 {
+        output_block_ms(&self.output_frames)
+    }
+
+    /// Un paquet lu et déchiffré de `producer_id` : (re)création de l'état selon
+    /// la génération, puis décodage et push. `recv_instant` = lecture du paquet
+    /// (JAMAIS un `Instant::now()` pris plus loin : la gigue en serait faussée).
+    #[allow(clippy::too_many_arguments)]
+    fn on_packet(
+        &mut self,
+        producer_id: &Arc<str>,
+        epoch: u64,
+        kind: StreamKind,
+        recv_instant: std::time::Instant,
+        stack_delay: Option<std::time::Duration>,
+        buf: &[u8],
+        output_block_ms: f64,
+    ) {
+        let needs_create = match self.states.get(producer_id) {
+            Some(st) if st.epoch == epoch => false,
+            // Paquet d'une génération PÉRIMÉE alors qu'une plus récente est là :
+            // ignoré. (Impossible tant que le retrait d'un flux passe avant l'ajout
+            // du suivant, ce que garantit l'ordre des commandes du fil — gardé
+            // pour ne jamais dépendre de cet ordre.)
+            Some(st) if st.epoch > epoch => return,
+            // Génération plus RÉCENTE que l'état présent → l'ancienne est
+            // supersédée : on retire son stream avant d'en recréer un.
+            Some(_) => {
+                self.mixer.remove_stream(producer_id);
+                true
+            }
+            None => true,
+        };
+        if needs_create {
+            let Some(st) = DecodeState::new(producer_id, epoch, kind) else { return };
+            self.mixer.add_stream(producer_id, kind);
+            self.states.insert(producer_id.clone(), st);
+        }
+        let st = self.states.get_mut(producer_id).expect("état présent ou créé juste au-dessus");
+        decode_one_packet(
+            st,
+            producer_id,
+            recv_instant,
+            buf,
+            &self.mixer,
+            &self.net_stats_by_producer,
+            &self.recv_path,
+            output_block_ms,
+            stack_delay,
+        );
+    }
+
+    /// Pair retiré, après son dernier paquet (le fil a désinscrit sa socket).
+    /// N'honore le retrait que pour la génération courante : celui d'une
+    /// ancienne connexion (re-add même producer) ne doit PAS supprimer le
+    /// stream re-créé par la nouvelle.
+    fn remove(&mut self, producer_id: &str, epoch: u64) {
+        if self.states.get(producer_id).map(|st| st.epoch) == Some(epoch) {
+            self.states.remove(producer_id);
+            self.mixer.remove_stream(producer_id);
+            // Sans ça, un peer disparu laisserait un ppm fantôme dans la
+            // map → PerfStats continuerait à mentionner ce peer mort.
+            self.net_stats_by_producer.lock().remove(producer_id);
+        }
+    }
+
+    /// Le masquage examinera-t-il ce flux (de cette génération) à `now` ? Le fil
+    /// relit alors sa socket d'abord : un paquet déjà dans la machine ne doit
+    /// jamais être remplacé par une trame inventée (M0).
+    fn conceal_due(&self, producer_id: &str, epoch: u64, now: std::time::Instant) -> bool {
+        self.states.get(producer_id).is_some_and(|st| st.epoch == epoch && st.examined_at(now))
+    }
+
+    /// Décide et agit pour chaque flux dont l'échéance est passée.
+    fn conceal(&mut self, now: std::time::Instant, output_block_ms: f64) {
+        conceal_due_streams(&mut self.states, &self.mixer, output_block_ms, now);
+    }
+
+    /// Jusqu'à quand dormir pour le prochain examen de masquage.
+    fn next_wait(&self, now: std::time::Instant) -> std::time::Duration {
+        next_wait(&self.states, now)
+    }
+
+    /// Chantier P2 — (temps d'écriture des lignes `TROU`, trous classés), cumulés
+    /// sur tous les flux : le fil en fait la différence d'un réveil à l'autre.
+    fn hole_reporting(&self) -> (std::time::Duration, u64) {
+        self.states.values().fold((std::time::Duration::ZERO, 0), |(t, n), st| (t + st.hole_log_time, n + st.holes_reported))
+    }
+
+    /// Une échéance de masquage est armée : le prochain réveil compte (Lot 1-C).
+    fn deadline_armed(&self) -> bool {
+        self.states.values().any(|st| st.next_deadline.is_some())
+    }
+}
+
+impl Drop for RxCore {
+    /// Fin du fil, quel qu'en soit le chemin (arrêt, attente des sockets en
+    /// erreur) : aucun pair ne reste dans le mixer ni dans les perf-stats.
+    /// Sépare les locks (jamais les deux en même temps).
+    fn drop(&mut self) {
+        for id in self.states.keys() {
+            self.mixer.remove_stream(id);
+        }
+        let mut ns = self.net_stats_by_producer.lock();
+        for id in self.states.keys() {
+            ns.remove(&**id);
+        }
+    }
 }
 
 /// Lot 1.4 — durée de la rampe d'arrivée d'un flux (ms). Assez long pour que
@@ -5168,7 +5623,7 @@ fn spawn_decode_thread(
 const JOIN_FADE_MS: usize = 300;
 /// Au-delà de ce retard, le paquet attendu n'est plus « en retard » : le flux
 /// est tari (talkback coupé, pair parti). On désarme l'échéance plutôt que de
-/// tenir le thread de décodage éveillé pour un son qui ne viendra pas ;
+/// tenir le fil de réception éveillé pour un son qui ne viendra pas ;
 /// l'arrivée d'un paquet la réarme. Large devant le plafond de masquage
 /// (7,5 ms) et devant toute excursion réseau plausible.
 const STALE_MS: f64 = 200.0;
@@ -5257,9 +5712,163 @@ fn output_block_ms(output_frames: &Arc<std::sync::atomic::AtomicU32>) -> f64 {
     f64::from(frames) * 1000.0 / 48_000.0
 }
 
+/// Lot 1-A — à appeler après CHAQUE push dans le tampon d'un flux reçu : si la
+/// sortie y a trouvé un trou depuis le push précédent, dit POURQUOI (compteur +
+/// une ligne de journal par trou), puis retient l'état de ce push comme point de
+/// départ du trou suivant.
+///
+/// `now` : instant du push. `arrived` : le vrai paquet qui provoque ce push (le
+/// paquet décodé, ou celui dont l'arrivée révèle une perte) ; `None` pour une
+/// trame inventée à l'échéance, qu'aucun paquet n'accompagne.
+///
+/// Tourne sur le fil de réception : le tirage n'a fait que relever
+/// `HoleAtPull`, tout le reste se fait ici.
+fn note_push(
+    st: &mut DecodeState,
+    producer_id: &str,
+    report: &PushReport,
+    now: std::time::Instant,
+    arrived: Option<Arrived>,
+    output_block_ms: f64,
+) {
+    // Un trou en attente (relevé par une trame de masquage) se classe au premier
+    // vrai paquet qui suit. S'il en survient un second avant, le premier se
+    // classe tel quel : sa cause restera « arrivée » sans détail.
+    if let Some(a) = arrived {
+        if let Some((h, base)) = st.pending_hole.take() {
+            report_hole(st, producer_id, &h, base, Some(a), now, output_block_ms);
+        }
+    }
+    if let Some(h) = report.hole {
+        if arrived.is_none() {
+            if let Some((old, base)) = st.pending_hole.take() {
+                report_hole(st, producer_id, &old, base, None, now, output_block_ms);
+            }
+            st.pending_hole = Some((h, st.last_push));
+        } else {
+            let base = st.last_push;
+            report_hole(st, producer_id, &h, base, arrived, now, output_block_ms);
+        }
+    }
+    let last_received = arrived.map(|a| a.read_at).or(st.last_push.and_then(|p| p.last_received));
+    st.last_push = Some(PushMark {
+        at: now,
+        fill_after_ms: report.fill_after_ms,
+        read_index: report.read_index,
+        last_received,
+    });
+    st.stack_delay_max_ms = f64::NAN;
+}
+
+/// Lot 1-A — classe un trou rendu par la sortie, le compte et le journalise.
+fn report_hole(
+    st: &mut DecodeState,
+    producer_id: &str,
+    h: &HoleAtPull,
+    // Le push qui précédait le trou : point de départ de l'analyse.
+    base: Option<PushMark>,
+    arrived: Option<Arrived>,
+    now: std::time::Instant,
+    output_block_ms: f64,
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    // Pas de push connu avant le trou (flux recréé entre-temps) : les faits
+    // manquent, on le dit.
+    let facts = base.map(|p| HoleFacts {
+        fill_at_last_push_ms: p.fill_after_ms,
+        // Trou relevé AVANT le push de référence : horloges incohérentes, la
+        // classification rendra `Unclassified`.
+        since_last_push_ms: if h.at >= p.at { ms(h.at - p.at) } else { -1.0 },
+        consumed_since_push_ms: consumed_ms_between(p.read_index, h.read_index),
+        output_block_ms,
+        next_received_before_hole: arrived.map(|a| a.read_at <= h.at),
+        next_in_system_before_hole: arrived.and_then(|a| a.in_system_at).map(|t| t <= h.at),
+        discarded_before_hole: st.last_discard.is_some_and(|d| d >= p.at && d <= h.at),
+    });
+    let cause = facts.as_ref().map_or(HoleCause::Unclassified, hole::classify);
+    match cause {
+        HoleCause::Arrival => st.holes.arrival += 1,
+        HoleCause::Reception => st.holes.reception += 1,
+        HoleCause::Decode => st.holes.decode += 1,
+        HoleCause::Consumption => st.holes.consumption += 1,
+        HoleCause::Sequence => st.holes.sequence += 1,
+        HoleCause::Unclassified => st.holes.unclassified += 1,
+    }
+    // Ce que le masquage avait décidé depuis le dernier push (sinon : rien).
+    let wait = st
+        .last_wait
+        .filter(|(_, at)| base.is_some_and(|p| *at >= p.at))
+        .map(|(w, _)| w);
+    if wait == Some(Wait::BufferHolds) {
+        st.holes.after_buffer_holds += 1;
+    }
+
+    let short = &producer_id[..8.min(producer_id.len())];
+    // Faits bruts, à côté de la cause : si le classement se révèle mal posé, la
+    // session reste relisable. `-1` = inconnu.
+    let fill_ms = facts.map_or(-1.0, |f| f.fill_at_last_push_ms);
+    let since_push_ms = facts.map_or(-1.0, |f| f.since_last_push_ms);
+    let consumed_ms = facts.map_or(-1.0, |f| f.consumed_since_push_ms);
+    // Écart entre les deux arrivées qui encadrent le trou.
+    let arrival_gap_ms = match (arrived, base.and_then(|p| p.last_received)) {
+        (Some(a), Some(prev)) => ms(a.read_at.saturating_duration_since(prev)),
+        _ => -1.0,
+    };
+    // Du paquet lu à son push : le retard du décodage. Depuis 0.6.6-9, lecture
+    // et décodage se suivent sur le même fil : plus d'attente dans un canal à
+    // découper (les champs `decode_queue_ms` / `decode_process_ms` de la
+    // 0.6.6-8 sont retirés).
+    let decode_delay_ms = arrived.map_or(-1.0, |a| ms(now.saturating_duration_since(a.read_at)));
+    // Lot 1-D2 — plus longue attente système → lecture parmi les paquets lus
+    // depuis le dernier push : si elle vaut à peu près l'écart d'arrivée, les
+    // paquets étaient dans la machine et la réception les a lus en retard.
+    let stack_delay_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms } else { -1.0 };
+    let wait = match wait {
+        None => "none",
+        Some(Wait::NotDue) => "not_due",
+        Some(Wait::LinkUnknown) => "link_unknown",
+        Some(Wait::WithinGrace) => "within_grace",
+        Some(Wait::BufferHolds) => "buffer_holds",
+        Some(Wait::Repriming) => "repriming",
+    };
+    macro_rules! hole_line {
+        ($lvl:ident) => {
+            tracing::$lvl!(
+                target: "jamodio::recv",
+                producer = short,
+                kind = ?st.kind,
+                cause = cause.as_str(),
+                fill_ms,
+                since_push_ms,
+                consumed_ms,
+                available_ms = h.available_ms,
+                needed_ms = h.needed_ms,
+                target_ms = h.target_ms,
+                arrival_gap_ms,
+                decode_delay_ms,
+                stack_delay_ms,
+                conceal_wait = wait,
+                "TROU"
+            )
+        };
+    }
+    // La voix se tait légitimement dès que personne ne parle : chacun de ses
+    // silences finit en « trou ». Comptés, mais pas au même niveau de journal.
+    // Chantier P2 — le temps de cette écriture est mesuré : le journal s'écrit
+    // depuis ce fil, et un réveil de 9,5 ms a été vu au moment de 6 trous (01/10).
+    let logging = std::time::Instant::now();
+    if st.kind == StreamKind::Voice {
+        hole_line!(debug);
+    } else {
+        hole_line!(info);
+    }
+    st.hole_log_time += logging.elapsed();
+    st.holes_reported += 1;
+}
+
 /// Lot 1.2 — pour chaque flux dont l'échéance est passée, décider et agir.
 ///
-/// Tourne sur le thread de décodage, JAMAIS dans le callback audio : il ne fait
+/// Tourne sur le fil de réception, JAMAIS dans le callback audio : il ne fait
 /// que trouver des échantillons de plus dans son tampon, exactement comme si le
 /// paquet était arrivé.
 fn conceal_due_streams(
@@ -5274,10 +5883,10 @@ fn conceal_due_streams(
         // ce serait compter des tours de boucle (jusqu'à 400/s par flux muet) et
         // non des événements, ce qui écraserait les autres raisons à l'analyse.
         // Ce sont les DÉSARMEMENTS qui sont comptés, là où ils ont lieu.
-        let Some(deadline) = st.next_deadline else { continue };
-        if now < deadline || st.next_check.is_some_and(|c| now < c) {
+        if !st.examined_at(now) {
             continue;
         }
+        let Some(deadline) = st.next_deadline else { continue };
         let late_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0;
         // Flux inconnu du mixer (retiré entre-temps) : 0 ms, donc la décision se
         // fait comme sur un tampon vide — et le push suivant ne trouvera personne.
@@ -5296,6 +5905,7 @@ fn conceal_due_streams(
         };
         match decision {
             Conceal::Wait(why) => {
+                st.last_wait = Some((why, now));
                 match why {
                     Wait::NotDue => st.wait_not_due += 1,
                     Wait::LinkUnknown => st.wait_link_unknown += 1,
@@ -5351,20 +5961,21 @@ fn conceal_due_streams(
                 // décodage suivant (Sprint 3 BUG 7) : on la pousse tout de suite
                 // — `push_samples` la recopie dans le tampon — plutôt que d'en
                 // allouer une copie à chaque trame sur ce thread.
-                let pushed = match st.decoder.decode_loss() {
-                    Some(plc) => {
-                        mixer.push_samples(id, plc);
-                        true
-                    }
-                    None => false,
-                };
-                if pushed {
-                    // Ce que le tampon tenait À CET INSTANT : c'est la seule
-                    // façon de juger après coup si le vrai paquet serait arrivé
-                    // à temps. Écrasé à chaque masquage — on juge le dernier,
-                    // celui qui précède immédiatement l'arrivée.
+                let report = st.decoder.decode_loss().and_then(|plc| mixer.push_samples(id, plc));
+                if let Some(report) = report {
+                    note_push(st, id, &report, now, None, output_block_ms);
+                    // Ce que le tampon tenait À CET INSTANT, et où en était la
+                    // lecture : c'est la seule façon de juger après coup si le
+                    // vrai paquet serait arrivé à temps (Lot 1-B). Écrasé à
+                    // chaque masquage — on juge le dernier, celui qui précède
+                    // immédiatement l'arrivée.
                     st.seq.on_concealed();
-                    st.last_conceal = st.seq.highest().map(|slot| LastConceal { at: now, fill_ms, slot });
+                    st.last_conceal = st.seq.highest().map(|slot| LastConceal {
+                        at: now,
+                        fill_ms: report.fill_before_ms,
+                        read_index: report.read_index,
+                        slot,
+                    });
                     // (`on_concealed` ci-dessus : la place est prise, un
                     // retardataire sera écarté au lieu d'être joué après sa
                     // remplaçante.)
@@ -5396,159 +6007,10 @@ fn conceal_due_streams(
     }
 }
 
-/// Boucle du thread de décodage RT. Promu en tête. Multiplexe tous les pairs.
-fn decode_rt_loop(
-    rx: Receiver<DecodeMsg>,
-    pool_tx: Sender<Vec<u8>>,
-    mixer: Arc<AudioMixer>,
-    net_stats_by_producer: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: Arc<Mutex<Histogram>>,
-    output_frames: Arc<std::sync::atomic::AtomicU32>,
-) {
-    // Promotion « event-driven » : MMCSS « Pro Audio » (Windows) / QoS
-    // USER_INTERACTIVE seul (macOS, PAS le workgroup) / thread-priority (Linux).
-    let _rt = crate::audio::rt_priority::promote_thread_for_audio_recv();
-
-    let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
-
-    loop {
-        // Lot 1.2 — on n'attend plus un paquet indéfiniment : on attend jusqu'au
-        // PROCHAIN EXAMEN UTILE. Sans ça, un paquet en retard ne réveille
-        // personne, le tampon se vide et la sortie joue du silence — le trou sec
-        // que ce chantier supprime.
-        let wait = next_wait(&states, std::time::Instant::now());
-        match rx.recv_timeout(wait) {
-            Ok(msg) => {
-                if handle_decode_msg(msg, &mut states, &pool_tx, &mixer, &net_stats_by_producer, &recv_path).is_break() {
-                    break;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            // Tous les émetteurs partis : plus rien n'arrivera jamais.
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
-        if drain_then_conceal(
-            &rx,
-            &mut states,
-            &pool_tx,
-            &mixer,
-            &net_stats_by_producer,
-            &recv_path,
-            output_block_ms(&output_frames),
-            std::time::Instant::now,
-        )
-        .is_break()
-        {
-            break;
-        }
-    }
-
-    // Shutdown : nettoie les streams mixer + net_stats restants (Remove non
-    // encore traités). Sépare les locks (jamais les deux en même temps).
-    {
-        for id in states.keys() {
-            mixer.remove_stream(id);
-        }
-    }
-    {
-        let mut ns = net_stats_by_producer.lock();
-        for id in states.keys() {
-            ns.remove(&**id);
-        }
-    }
-}
-
-/// Après chaque réveil : traiter TOUT ce qui est déjà arrivé, PUIS décider de
-/// masquer, à l'heure d'après ce vidage (`now` est lu une fois la file vide).
-///
-/// M0 (21/09/2026) — avant, la décision passait avant le message reçu, et sans
-/// regarder le reste de la file : un paquet déjà là — voire déjà dans la main —
-/// était remplacé par une trame inventée, puis écarté comme « en retard ». La
-/// marge maximale mesurée au banc (2,40 ms, soit le seuil de l'époque) était la
-/// signature de ce cas. La file est bornée, le vidage aussi.
-#[allow(clippy::too_many_arguments)]
-fn drain_then_conceal(
-    rx: &Receiver<DecodeMsg>,
-    states: &mut HashMap<Arc<str>, DecodeState>,
-    pool_tx: &Sender<Vec<u8>>,
-    mixer: &Arc<AudioMixer>,
-    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &Arc<Mutex<Histogram>>,
-    output_block_ms: f64,
-    now: impl Fn() -> std::time::Instant,
-) -> std::ops::ControlFlow<()> {
-    while let Ok(msg) = rx.try_recv() {
-        handle_decode_msg(msg, states, pool_tx, mixer, net_stats_by_producer, recv_path)?;
-    }
-    conceal_due_streams(states, mixer, output_block_ms, now());
-    std::ops::ControlFlow::Continue(())
-}
-
-/// Traite UN message du thread de décodage. `Break` = arrêt demandé.
-fn handle_decode_msg(
-    msg: DecodeMsg,
-    states: &mut HashMap<Arc<str>, DecodeState>,
-    pool_tx: &Sender<Vec<u8>>,
-    mixer: &Arc<AudioMixer>,
-    net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-    recv_path: &Arc<Mutex<Histogram>>,
-) -> std::ops::ControlFlow<()> {
-    match msg {
-        DecodeMsg::Shutdown => return std::ops::ControlFlow::Break(()),
-        DecodeMsg::Remove { producer_id, epoch } => {
-            // N'honore le Remove que pour la génération courante : un Remove
-            // d'une ancienne connexion (re-add même producer) ne doit PAS
-            // supprimer le stream re-créé par la nouvelle génération.
-            if states.get(&producer_id).map(|st| st.epoch) == Some(epoch) {
-                states.remove(&producer_id);
-                mixer.remove_stream(&producer_id);
-                // Sans ça, un peer disparu laisserait un ppm fantôme dans la
-                // map → PerfStats continuerait à mentionner ce peer mort.
-                net_stats_by_producer.lock().remove(&*producer_id);
-            }
-        }
-        DecodeMsg::Packet { producer_id, epoch, recv_instant, buf, kind } => {
-            // (Re)création de l'état + du stream mixer selon la génération.
-            let needs_create = match states.get(&producer_id) {
-                Some(st) if st.epoch == epoch => false,
-                // Paquet d'une génération PÉRIMÉE (ancienne connexion qui
-                // traîne après un re-add) → ignoré.
-                Some(st) if st.epoch > epoch => {
-                    let _ = pool_tx.try_send(buf);
-                    return std::ops::ControlFlow::Continue(());
-                }
-                // Génération plus RÉCENTE que l'état présent → l'ancienne est
-                // supersédée : on retire son stream avant d'en recréer un.
-                Some(_) => {
-                    mixer.remove_stream(&producer_id);
-                    true
-                }
-                None => true,
-            };
-            if needs_create {
-                match DecodeState::new(&producer_id, epoch) {
-                    Some(st) => {
-                        mixer.add_stream(&producer_id, kind);
-                        states.insert(producer_id.clone(), st);
-                    }
-                    None => {
-                        let _ = pool_tx.try_send(buf);
-                        return std::ops::ControlFlow::Continue(());
-                    }
-                }
-            }
-            let st = states.get_mut(&producer_id).expect("état présent ou créé juste au-dessus");
-            decode_one_packet(st, &producer_id, recv_instant, &buf, mixer, net_stats_by_producer, recv_path);
-            // Recycle le buffer (capacité conservée) → zéro alloc/dealloc RT.
-            let _ = pool_tx.try_send(buf);
-        }
-    }
-    std::ops::ControlFlow::Continue(())
-}
-
 /// Décode UN paquet pour `st` et le pousse dans le jitter buffer. Tourne sur le
-/// thread RT. `recv_instant` = arrivée réseau horodatée par `recv_io_task`
-/// (JAMAIS un `Instant::now()` ici, sinon le délai de file polluerait la gigue).
+/// fil de réception. `recv_instant` = lecture du paquet, horodatée avant tout
+/// traitement (JAMAIS un `Instant::now()` ici, sinon le délai de traitement
+/// polluerait la gigue).
 #[allow(clippy::too_many_arguments)]
 fn decode_one_packet(
     st: &mut DecodeState,
@@ -5558,9 +6020,17 @@ fn decode_one_packet(
     mixer: &Arc<AudioMixer>,
     net_stats_by_producer: &Arc<Mutex<HashMap<String, ProducerNetStats>>>,
     recv_path: &Arc<Mutex<Histogram>>,
+    output_block_ms: f64,
+    stack_delay: Option<std::time::Duration>,
 ) {
     let short = &producer_id[..8.min(producer_id.len())];
     st.pkt_count += 1;
+    // Lot 1-D2 — la plus longue attente système → lecture depuis le dernier push.
+    if let Some(d) = stack_delay {
+        let d_ms = d.as_secs_f64() * 1000.0;
+        st.stack_delay_max_ms = if st.stack_delay_max_ms.is_finite() { st.stack_delay_max_ms.max(d_ms) } else { d_ms };
+    }
+    let arrived = Arrived::new(recv_instant, stack_delay);
     if st.pkt_count == 1 {
         tracing::info!(target: "jamodio::recv", producer = short, bytes = buf.len(), "first RTP packet received");
     } else if st.pkt_count.is_multiple_of(5000) {
@@ -5577,9 +6047,9 @@ fn decode_one_packet(
     let arrival = st.seq.on_packet(header.sequence);
 
     // Estimateurs de timing réseau (mesure pure). Un unique instant d'arrivée
-    // (celui horodaté dans recv_io_task) pour drift ET gigue. Un paquet en retard
+    // (celui horodaté par le fil de réception) pour drift ET gigue. Un paquet en retard
     // y entre : son retard EST de la gigue. Un double ou un saut non confirmé non.
-    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late) {
+    if matches!(arrival, Arrival::Start | Arrival::Next { .. } | Arrival::Late { .. }) {
         st.drift.observe(header.timestamp, recv_instant);
         st.jitter.observe(header.timestamp, recv_instant);
     }
@@ -5592,6 +6062,12 @@ fn decode_one_packet(
     // ne peut prendre que ce qui reste du même budget (cf. `Arrival::Next`).
     let invented_at_deadline = st.consecutive_concealed;
     if matches!(arrival, Arrival::Start | Arrival::Next { .. }) {
+        // Reprise après un silence (échéance désarmée) : la marge apprise des
+        // paquets remplacés redescend du temps écoulé avant que le tampon se
+        // ré-amorce (0.6.6-20, revue).
+        if st.next_deadline.is_none() {
+            mixer.refresh_late_floor(producer_id, recv_instant);
+        }
         // Le flux a repris sa place : le masquage précédent n'a plus de
         // retardataire à attendre, il n'y a plus rien à juger.
         st.last_conceal = None;
@@ -5604,7 +6080,7 @@ fn decode_one_packet(
         // buffer avec la gigue de QUEUE (pire-cas récent, pas la moyenne), une fois
         // l'estimateur fiable (warmup).
         if st.jitter.is_warm() {
-            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms());
+            mixer.observe_jitter(producer_id, st.jitter.jitter_tail_ms(), recv_instant);
         }
         // Miroir dans la map partagée, lue à 1 Hz par ws_server. Mise à jour EN
         // PLACE : aucune allocation sur ce thread une fois l'entrée créée.
@@ -5627,6 +6103,7 @@ fn decode_one_packet(
             wait_buffer_holds: st.wait_buffer_holds,
             wait_repriming: st.wait_repriming,
             deadline_disarmed: st.deadline_disarmed,
+            holes: st.holes,
             packets_duplicate: counters.duplicate,
             packets_jump: counters.jump,
             decode_errors: st.decoder.errors(),
@@ -5657,8 +6134,11 @@ fn decode_one_packet(
             if (1..=PLC_MAX_GAP).contains(&missing) {
                 for _ in 0..u32::from(missing).min(budget) {
                     // Poussée immédiate, sans copie : cf. le masquage à l'échéance.
-                    if let Some(plc) = st.decoder.decode_loss() {
-                        mixer.push_samples(producer_id, plc);
+                    let report = st.decoder.decode_loss().and_then(|plc| mixer.push_samples(producer_id, plc));
+                    if let Some(report) = report {
+                        // Le trou éventuel a été révélé par CE paquet : c'est son
+                        // arrivée qui compte.
+                        note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
                         st.concealed_frames += 1;
                     }
                 }
@@ -5667,15 +6147,39 @@ fn decode_one_packet(
                 st.logged_large_jump = true;
             }
         }
-        Arrival::Late => {
+        Arrival::Late { replaced } => {
+            st.last_discard = Some(recv_instant);
+            // 0.6.6-20 — le tampon apprend des seuls paquets qu'une marge de
+            // quelques ms aurait sauvés : remplacés à l'échéance (`replaced` ; un
+            // paquet simplement dans le désordre n'a rien à dire), place du
+            // DERNIER remplacement, arrivés au plus `JUST_LATE_MAX` après lui.
+            // Après un pic de 60 ms, les retardataires arrivent des dizaines de
+            // ms trop tard : apprendre d'eux montait la cible sans rien sauver
+            // (banc pics-seuls, 03/10 : +3,8 ms, son inventé inchangé).
+            let just_late = replaced
+                && st.last_conceal.as_ref().is_some_and(|lc| {
+                    lc.slot == header.sequence && recv_instant.saturating_duration_since(lc.at) <= JUST_LATE_MAX
+                });
+            if just_late {
+                mixer.note_late_arrival(producer_id, recv_instant);
+            }
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
+            //
+            // Lot 1-B — on le juge sur ce que la sortie a RÉELLEMENT consommé
+            // depuis le masquage (position de lecture), pas sur le temps écoulé.
+            // Au-delà de `PREMATURE_JUDGE_MAX`, l'écart de position n'est plus
+            // sûr (tour de l'index) : on s'abstient plutôt que de compter faux.
+            const PREMATURE_JUDGE_MAX: std::time::Duration = std::time::Duration::from_millis(400);
             if let Some(lc) = st.last_conceal.filter(|lc| lc.slot == header.sequence) {
                 st.last_conceal = None;
-                let delay_ms = recv_instant.saturating_duration_since(lc.at).as_secs_f64() * 1000.0;
-                if let Some(margin) =
-                    jamodio_audio_core::mixer::conceal::premature_margin_ms(lc.fill_ms, delay_ms)
+                let consumed_ms = mixer
+                    .playout(producer_id)
+                    .filter(|_| recv_instant.saturating_duration_since(lc.at) < PREMATURE_JUDGE_MAX)
+                    .map(|p| consumed_ms_between(lc.read_index, p.read_index));
+                if let Some(margin) = consumed_ms
+                    .and_then(|c| jamodio_audio_core::mixer::conceal::premature_margin_ms(lc.fill_ms, c))
                 {
                     st.concealed_premature_frames += 1;
                     st.concealed_premature_margin_ms += margin;
@@ -5685,8 +6189,12 @@ fn decode_one_packet(
             }
             return;
         }
-        Arrival::Duplicate => return,
+        Arrival::Duplicate => {
+            st.last_discard = Some(recv_instant);
+            return;
+        }
         Arrival::Jump => {
+            st.last_discard = Some(recv_instant);
             if !st.logged_large_jump {
                 tracing::warn!(target: "jamodio::recv", producer = short, got_seq = header.sequence, "seq jump — packet held until the stream restart is confirmed");
                 st.logged_large_jump = true;
@@ -5695,145 +6203,28 @@ fn decode_one_packet(
         }
     }
 
-    // Décode le paquet + push. recv_path = arrivée réseau → juste avant push
-    // (file MPSC + parse + décode) : doit lire ~0,1-0,5 ms si le thread RT tient.
+    // Décode le paquet + push. recv_path = lecture → juste avant push (parse +
+    // décode) : doit lire ~0,1 ms si le fil tient.
     if let Some(pcm) = st.decoder.decode(payload) {
-        let recv_path_ms = recv_instant.elapsed().as_secs_f32() * 1000.0;
-        recv_path.lock().observe(recv_path_ms);
-        if st.fade_in_remaining > 0 {
+        let before_push = std::time::Instant::now();
+        recv_path.lock().observe(before_push.saturating_duration_since(recv_instant).as_secs_f32() * 1000.0);
+        let report = if st.fade_in_remaining > 0 {
             // Lot 1.4 — la rampe s'applique à une copie, dans un tampon de
             // travail gardé par le flux (aucune allocation une fois sa taille
             // atteinte), le temps des ~120 premiers blocs ; ensuite push direct.
             st.fade_scratch.clear();
             st.fade_scratch.extend_from_slice(pcm);
             st.fade_in_remaining = apply_join_fade(&mut st.fade_scratch, st.fade_in_remaining);
-            mixer.push_samples(producer_id, &st.fade_scratch);
+            mixer.push_samples(producer_id, &st.fade_scratch)
         } else {
-            mixer.push_samples(producer_id, pcm);
+            mixer.push_samples(producer_id, pcm)
+        };
+        if let Some(report) = report {
+            note_push(st, producer_id, &report, std::time::Instant::now(), Some(arrived), output_block_ms);
         }
     }
 }
 
-/// Tâche I/O de réception (async tokio, 1 par pair). Recv UDP + horodatage +
-/// comedia punch + activité (silence). Ne décode RIEN : forwarde le paquet brut au
-/// thread de décodage RT. S'arrête UNIQUEMENT sur `remove_stream` (ou arrêt du
-/// thread de décodage) et envoie alors un `Remove` terminal.
-#[allow(clippy::too_many_arguments)]
-async fn recv_io_task(
-    receiver: RtpReceiver,
-    sfu_addr: SocketAddr,
-    producer_id: Arc<str>,
-    epoch: u64,
-    kind: StreamKind,
-    activity: Arc<RecvActivity>,
-    tx: Sender<DecodeMsg>,
-    pool_rx: Receiver<Vec<u8>>,
-    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
-) {
-    let short = &producer_id[..8.min(producer_id.len())];
-
-    // Punch périodique pour comedia : on retry jusqu'au 1er paquet entrant.
-    // 100 ms × 30 = 3 s (marge pour le connect-plain-transport du browser).
-    let mut punch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    punch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut punch_remaining: u32 = 30;
-
-    // Silence : un flux qui se tait n'est JAMAIS terminé ici (cf. `recv_activity`) —
-    // sa fin vient du navigateur (`remove-stream`). On journalise seulement le début
-    // et la fin d'un silence de l'INSTRUMENT (~400 paquets/s en continu, même quand
-    // le musicien ne joue pas) ; la voix se tait légitimement dès que personne ne
-    // parle.
-    let mut silence_check = tokio::time::interval(std::time::Duration::from_secs(1));
-    silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut silence_logged = false;
-    let mut got_first = false;
-    // N13 — erreurs de réception qui S'ENCHAÎNENT (remis à zéro dès qu'un paquet
-    // passe). Une erreur isolée ne dit rien (cf. `recv_error_backoff`).
-    let mut consecutive_recv_errors: u32 = 0;
-
-    // Buffer courant (recyclé via le pool). 2048 ≥ MTU + tag SRTP + en-tête RTP.
-    let mut buf: Vec<u8> = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
-
-    loop {
-        tokio::select! {
-            _ = &mut stop_rx => break,
-            _ = punch_interval.tick(), if punch_remaining > 0 => {
-                let _ = receiver.punch(sfu_addr).await;
-                punch_remaining -= 1;
-            }
-            _ = silence_check.tick(), if matches!(kind, StreamKind::Instrument) => {
-                let silent_ms = activity.silent_ms(std::time::Instant::now());
-                if !silence_logged && got_first && silent_ms >= SILENCE_LOG_AFTER_MS {
-                    tracing::warn!(target: "jamodio::recv", producer = short, silent_ms, "aucun paquet reçu — flux conservé, reprise automatique à leur retour");
-                    silence_logged = true;
-                }
-            }
-            result = receiver.recv(&mut buf) => {
-                match result {
-                    Ok((len, _addr)) if len > 0 => {
-                        // Horodatage d'arrivée — ICI, avant tout parse/file (load-bearing).
-                        let recv_instant = std::time::Instant::now();
-                        if silence_logged {
-                            let silent_ms = activity.silent_ms(recv_instant);
-                            tracing::info!(target: "jamodio::recv", producer = short, silent_ms, "paquets revenus après un silence");
-                            silence_logged = false;
-                        }
-                        activity.mark_packet(recv_instant);
-                        consecutive_recv_errors = 0;
-                        // 1er paquet valide : comedia activé → on stoppe les punches.
-                        if !got_first {
-                            got_first = true;
-                            punch_remaining = 0;
-                        }
-                        // Échange le buffer plein contre un neuf (pool) et envoie
-                        // le plein au thread de décodage.
-                        let fresh = pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(2048));
-                        let full = std::mem::replace(&mut buf, fresh);
-                        if tx
-                            .send(DecodeMsg::Packet {
-                                producer_id: producer_id.clone(),
-                                epoch,
-                                recv_instant,
-                                buf: full,
-                                kind,
-                            })
-                            .is_err()
-                        {
-                            break; // thread de décodage parti (shutdown)
-                        }
-                    }
-                    // len == 0 : RTCP filtré / échec SRTP (déjà loggé) → on réutilise buf.
-                    Ok(_) => {}
-                    Err(e) => {
-                        activity.mark_recv_error();
-                        consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
-                        // Une erreur isolée est journalisée (elle reste un fait) ;
-                        // une rafale ne l'est plus qu'au début, sinon le journal
-                        // devient illisible au moment précis où on le lit.
-                        if consecutive_recv_errors <= 3 {
-                            tracing::warn!(
-                                target: "jamodio::recv",
-                                producer = %producer_id,
-                                error = %e,
-                                consecutive = consecutive_recv_errors,
-                                "erreur de réception UDP"
-                            );
-                        }
-                        let wait = crate::recv_activity::recv_error_backoff(consecutive_recv_errors);
-                        if !wait.is_zero() {
-                            tokio::time::sleep(wait).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Message terminal : le thread retire l'état + le stream mixer + l'entrée
-    // net_stats de ce pair, APRÈS notre dernier paquet (ordre garanti — émetteur
-    // unique) → zéro 'unknown stream', zéro ppm fantôme.
-    let _ = tx.send(DecodeMsg::Remove { producer_id, epoch });
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Chantier A (v0.4.12) — tests PluginControl (load/unload non-bloquant)
@@ -6452,6 +6843,13 @@ mod teardown_tests {
     }
 }
 
+// Lot 1-D3 — fil de réception dédié (priorité audio), toutes sockets par `mio`.
+mod recv_thread;
+
+// Lot B0-bis du banc « N musiciens » : la réception à N flux en temps simulé.
+#[cfg(test)]
+mod scale_tests;
+
 #[cfg(test)]
 mod conceal_loop_tests {
     use super::*;
@@ -6470,7 +6868,7 @@ mod conceal_loop_tests {
     /// Un flux dont la sortie est EN LECTURE, tampon VIDE : le cas où le masquage
     /// a un sens. Un flux neuf, jamais amorcé, n'en a pas — la sortie n'y lit
     /// rien (cf. `Wait::Repriming`).
-    fn flux_en_lecture(mixer: &AudioMixer) {
+    pub(super) fn flux_en_lecture(mixer: &AudioMixer) {
         const BLOC: usize = 64 * 2;
         mixer.add_stream("peer-test", StreamKind::Instrument);
         mixer.push_samples("peer-test", &vec![0.0f32; 48_000 / 10 * 2]); // 100 ms
@@ -6492,8 +6890,8 @@ mod conceal_loop_tests {
         assert!(p.playing && p.buffered_ms == 0.0, "{p:?}");
     }
 
-    fn state(now: Instant) -> DecodeState {
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+    pub(super) fn state(now: Instant) -> DecodeState {
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.seq.on_packet(1000);
         // Chauffe l'estimateur de gigue avec un flux parfaitement régulier
         // (120 paquets de 2,5 ms) : au-delà du warmup, la queue de gigue est
@@ -6511,7 +6909,7 @@ mod conceal_loop_tests {
     /// Le montage inverse : un flux entendu, mais dont on ne connaît pas encore
     /// la régularité.
     fn state_lien_inconnu(now: Instant) -> DecodeState {
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.seq.on_packet(1000);
         st.next_deadline = Some(now + FRAME);
         st
@@ -6603,129 +7001,22 @@ mod conceal_loop_tests {
         assert!(s.next_deadline.is_some(), "l'échéance continue d'avancer");
     }
 
-    /// Un vrai paquet Opus (2,5 ms de silence) numéroté `seq`, tel qu'il sort
-    /// du réseau.
-    fn paquet(seq: u16) -> Vec<u8> {
-        let enc = MusicEncoder::new().expect("encodeur Opus");
-        let pcm = vec![0.0f32; enc.frame_size() * 2];
-        let mut out = vec![0u8; 1500];
-        let n = enc.encode(&pcm, &mut out).expect("encodage");
-        let header = RtpHeader {
-            payload_type: 111,
-            sequence: seq,
-            timestamp: u32::from(seq) * 120,
-            ssrc: 1,
-            marker: false,
-        };
-        rtp::build_packet(&header, &out[..n])
+    fn hist() -> Arc<Mutex<Histogram>> {
+        Arc::new(Mutex::new(Histogram::new(16)))
     }
 
     fn recevoir(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant) {
+        recevoir_horodate(st, mixer, seq, at, None);
+    }
+
+    /// Comme `recevoir`, avec l'attente système → lecture du paquet (Lot 1-D2).
+    fn recevoir_horodate(st: &mut DecodeState, mixer: &Arc<AudioMixer>, seq: u16, at: Instant, stack_delay: Option<Duration>) {
         let stats = Arc::new(Mutex::new(HashMap::new()));
-        let recv_path = Arc::new(Mutex::new(Histogram::new(16)));
-        decode_one_packet(st, "peer-test", at, &paquet(seq), mixer, &stats, &recv_path);
+        decode_one_packet(st, "peer-test", at, &recv_thread::tests::paquet(seq), mixer, &stats, &hist(), BLOC_ASIO_MS, stack_delay);
     }
 
-    // ─── M0 (21/09/2026) : ce qui est arrivé passe avant la décision ──────
-
-    struct Banc {
-        mixer: Arc<AudioMixer>,
-        states: HashMap<Arc<str>, DecodeState>,
-        tx: Sender<DecodeMsg>,
-        rx: Receiver<DecodeMsg>,
-        pool_tx: Sender<Vec<u8>>,
-        _pool_rx: Receiver<Vec<u8>>,
-        stats: Arc<Mutex<HashMap<String, ProducerNetStats>>>,
-        recv_path: Arc<Mutex<Histogram>>,
-    }
-
-    /// Un flux connu, tampon VIDE, échéance dépassée bien au-delà de la grâce :
-    /// sans rien d'autre, on masquerait.
-    fn banc(now: Instant) -> Banc {
-        let mixer = Arc::new(AudioMixer::new());
-        flux_en_lecture(&mixer);
-        let mut st = state(now);
-        st.next_deadline = Some(now - Duration::from_millis(10));
-        let mut states: HashMap<Arc<str>, DecodeState> = HashMap::new();
-        states.insert(Arc::from("peer-test"), st);
-        let (tx, rx) = bounded(64);
-        let (pool_tx, pool_rx) = bounded(64);
-        Banc {
-            mixer,
-            states,
-            tx,
-            rx,
-            pool_tx,
-            _pool_rx: pool_rx,
-            stats: Arc::new(Mutex::new(HashMap::new())),
-            recv_path: Arc::new(Mutex::new(Histogram::new(16))),
-        }
-    }
-
-    fn passe(b: &mut Banc, now: Instant) -> std::ops::ControlFlow<()> {
-        drain_then_conceal(
-            &b.rx, &mut b.states, &b.pool_tx, &b.mixer, &b.stats, &b.recv_path, BLOC_ASIO_MS,
-            || now,
-        )
-    }
-
-    fn envoyer(b: &Banc, seq: u16, recv_instant: Instant) {
-        b.tx.send(DecodeMsg::Packet {
-            producer_id: Arc::from("peer-test"),
-            epoch: 1,
-            recv_instant,
-            buf: paquet(seq),
-            kind: StreamKind::Instrument,
-        })
-        .unwrap();
-    }
-
-    /// LE cas du banc : le paquet attendu est déjà dans la file quand le thread
-    /// se réveille en retard. Avant M0, on inventait une trame, puis on jetait
-    /// le vrai paquet comme « en retard » — un masquage prématuré sur deux
-    /// plateformes, et le son inventé à la place du vrai.
-    #[test]
-    fn un_paquet_deja_dans_la_file_nest_jamais_remplace() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        envoyer(&b, 1001, now - Duration::from_millis(1));
-
-        assert!(passe(&mut b, now).is_continue());
-        let s = b.states.values().next().unwrap();
-        assert_eq!(s.concealed_underrun_frames, 0, "rien d'inventé : le vrai paquet était là");
-        assert_eq!(s.seq.counters().late, 0, "et il n'a pas été écarté");
-        assert!(b.mixer.playout("peer-test").unwrap().buffered_ms > 0.0, "il est dans le tampon");
-    }
-
-    #[test]
-    fn toute_la_file_passe_pas_seulement_le_premier() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        for (i, seq) in (1001..=1004).enumerate() {
-            envoyer(&b, seq, now - Duration::from_micros(4_000 - 1_000 * i as u64));
-        }
-        assert!(passe(&mut b, now).is_continue());
-        let s = b.states.values().next().unwrap();
-        assert_eq!(s.concealed_underrun_frames, 0);
-        assert!(b.rx.is_empty(), "la file est vidée avant la décision");
-    }
-
-    #[test]
-    fn sans_rien_dans_la_file_le_masquage_part_toujours() {
-        // Le contrôle : M0 ne doit pas désarmer le masquage d'un vrai retard.
-        let now = Instant::now();
-        let mut b = banc(now);
-        assert!(passe(&mut b, now).is_continue());
-        assert_eq!(b.states.values().next().unwrap().concealed_underrun_frames, 1);
-    }
-
-    #[test]
-    fn un_arret_dans_la_file_arrete_la_boucle() {
-        let now = Instant::now();
-        let mut b = banc(now);
-        b.tx.send(DecodeMsg::Shutdown).unwrap();
-        assert!(passe(&mut b, now).is_break());
-    }
+    // M0 (21/09/2026, « ce qui est arrivé passe avant la décision ») : testé
+    // avec la vraie socket dans `recv_thread::tests` depuis le Lot 1-D4.
 
     // ─── M2 (21/09/2026) : ne revenir que quand l'attente peut changer ─────
 
@@ -7128,7 +7419,7 @@ mod conceal_loop_tests {
         flux_en_lecture(&mixer);
         let now = Instant::now();
         let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
-        let mut st = DecodeState::new("peer-test", 1).expect("décodeur Opus");
+        let mut st = DecodeState::new("peer-test", 1, StreamKind::Instrument).expect("décodeur Opus");
         st.next_deadline = Some(now - Duration::from_millis(10)); // échéance passée
         m.insert(Arc::from("peer-test"), st);
         conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
@@ -7179,6 +7470,246 @@ mod conceal_loop_tests {
         recevoir(&mut entame, &mixer, 1005, now); // 4 places manquantes
         assert_eq!(entame.concealed_frames, 2);
     }
+
+    // ─── Lot 1-A (23/09/2026) : la cause de chaque trou ──────────────────
+
+    /// Tire des blocs de 64 frames (1,33 ms, nos deux plateformes) jusqu'au
+    /// trou : le tirage qui ne trouve plus un bloc entier le relève.
+    fn tirer_jusqu_au_trou(mixer: &AudioMixer) {
+        let mut bloc = vec![0.0f32; 64 * 2];
+        for _ in 0..1000 {
+            let avant = mixer.playout("peer-test").unwrap();
+            mixer.mix_into(&mut bloc);
+            if !mixer.playout("peer-test").unwrap().playing && avant.playing {
+                return;
+            }
+        }
+        panic!("le tampon n'a jamais manqué");
+    }
+
+    /// Un flux en lecture qui vient de recevoir 1001 : point de départ commun.
+    fn apres_un_paquet() -> (Arc<AudioMixer>, DecodeState) {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        let mut st = state(Instant::now());
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert!(st.last_push.is_some(), "le push est retenu comme point de départ");
+        (mixer, st)
+    }
+
+    /// LE cas qu'on veut voir : le paquet suivant n'est arrivé qu'après le trou.
+    #[test]
+    fn un_paquet_arrive_apres_le_trou_est_compte_comme_arrivee() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
+    }
+
+    /// Arrivé avant le trou, poussé après : le décodage était en retard.
+    #[test]
+    fn un_paquet_arrive_avant_le_trou_mais_pousse_apres_accuse_le_decodage() {
+        let (mixer, mut st) = apres_un_paquet();
+        let arrive = Instant::now();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, arrive);
+        assert_eq!(st.holes, HoleCounts { decode: 1, ..HoleCounts::default() });
+    }
+
+    /// Un paquet arrivé puis écarté (doublon) AVANT le trou.
+    #[test]
+    fn un_paquet_ecarte_avant_le_trou_est_une_cause_de_sequence() {
+        let (mixer, mut st) = apres_un_paquet();
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // doublon : écarté
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { sequence: 1, ..HoleCounts::default() });
+    }
+
+    /// Banc du 28/09/2026 : rien n'arrive, le trou se fait, PUIS les retardataires
+    /// arrivent et sont écartés. L'écart est la conséquence du trou, pas sa cause.
+    #[test]
+    fn un_paquet_ecarte_apres_le_trou_n_en_est_pas_la_cause() {
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // retardataire écarté après le trou
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
+    }
+
+    /// Lot 1-D2 : le paquet était dans la machine 20 ms avant sa lecture, donc
+    /// avant le trou — la réception de l'agent l'a lu trop tard.
+    #[test]
+    fn un_paquet_dans_la_machine_mais_lu_apres_le_trou_accuse_la_reception() {
+        // L'heure d'arrivée dans la machine est prise AVANT le trou : le test ne
+        // dépend d'aucune durée (la CI a déjà fait durer une pause de 5 ms plus
+        // de 20 ms, 28/09/2026).
+        let (mixer, mut st) = apres_un_paquet();
+        let dans_la_machine = Instant::now();
+        tirer_jusqu_au_trou(&mixer);
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
+        assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
+        // Arrivé dans la machine APRÈS le trou : en amont.
+        let (mixer, mut st) = apres_un_paquet();
+        tirer_jusqu_au_trou(&mixer);
+        let dans_la_machine = Instant::now();
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
+        assert_eq!(st.holes, HoleCounts { arrival: 1, ..HoleCounts::default() });
+    }
+
+    /// La sortie vide 10 ms de tampon en un instant (rafale de callbacks) :
+    /// ce n'est pas l'arrivée qui a manqué.
+    #[test]
+    fn une_sortie_qui_vide_le_tampon_d_un_coup_est_une_cause_de_consommation() {
+        let (mixer, mut st) = apres_un_paquet();
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 48 * 10 * 2]).unwrap();
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts { consumption: 1, ..HoleCounts::default() });
+    }
+
+    /// Lot 1-C : le masquage avait jugé que le tampon tiendrait, et il n'a
+    /// pas tenu — compté à part, en plus de la cause.
+    #[test]
+    fn un_trou_apres_un_tampon_juge_suffisant_est_compte_a_part() {
+        let (mixer, st) = apres_un_paquet();
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 48 * 10 * 2]).unwrap();
+        let mut m: HashMap<Arc<str>, DecodeState> = HashMap::new();
+        m.insert(Arc::from("peer-test"), st);
+        let st = m.get_mut("peer-test").unwrap();
+        note_push(st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        let now = Instant::now();
+        st.next_deadline = Some(now - Duration::from_millis(10));
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        let st = m.get_mut("peer-test").unwrap();
+        assert_eq!(st.last_wait.map(|(w, _)| w), Some(Wait::BufferHolds));
+        tirer_jusqu_au_trou(&mixer);
+        recevoir(st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes.after_buffer_holds, 1);
+        assert_eq!(st.holes.consumption, 1);
+    }
+
+    /// Un trou relevé par une trame de MASQUAGE attend le vrai paquet suivant
+    /// pour être classé (banc du 28/09 : deux trous « arrivée » sans aucun fait).
+    #[test]
+    fn un_trou_releve_par_un_masquage_se_classe_au_paquet_suivant() {
+        let (mixer, mut st) = apres_un_paquet();
+        let dans_la_machine = Instant::now();
+        tirer_jusqu_au_trou(&mixer);
+        let r = mixer.push_samples("peer-test", &vec![0.0f32; 240]).unwrap();
+        note_push(&mut st, "peer-test", &r, Instant::now(), None, BLOC_ASIO_MS);
+        assert_eq!(st.holes, HoleCounts::default(), "pas encore classé");
+        assert!(st.pending_hole.is_some());
+        std::thread::sleep(Duration::from_millis(1));
+        let lu = Instant::now();
+        recevoir_horodate(&mut st, &mixer, 1002, lu, Some(lu - dans_la_machine));
+        assert_eq!(st.holes, HoleCounts { reception: 1, ..HoleCounts::default() });
+        assert!(st.pending_hole.is_none());
+    }
+
+    /// Le chemin de réception se mesure de la LECTURE du paquet (`recv_instant`)
+    /// au push : un paquet lu il y a 3 ms compte au moins 3 ms.
+    #[test]
+    fn le_chemin_de_reception_se_mesure_de_la_lecture_au_push() {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        let mut st = state(Instant::now());
+        let h = hist();
+        let lu = Instant::now() - Duration::from_millis(3);
+        let stats = Arc::new(Mutex::new(HashMap::new()));
+        decode_one_packet(&mut st, "peer-test", lu, &recv_thread::tests::paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None);
+        let path = HistogramReader::for_histogram(&h).read(&h);
+        assert_eq!(path.count, 1);
+        assert!(path.max_ms >= 3.0, "lecture → push {} ms", path.max_ms);
+    }
+
+    /// Un tirage plein ne produit rien à analyser.
+    #[test]
+    fn sans_trou_rien_n_est_compte() {
+        let (mixer, mut st) = apres_un_paquet();
+        mixer.mix_into(&mut vec![0.0f32; 64 * 2]);
+        recevoir(&mut st, &mixer, 1002, Instant::now());
+        assert_eq!(st.holes, HoleCounts::default());
+    }
+
+    // ─── Lot 1-B (23/09/2026) : un masquage prématuré se juge en consommation ──
+
+    /// Un masquage sur 1 ms de vraie matière, retenu pour être jugé.
+    fn apres_un_masquage() -> (Arc<AudioMixer>, DecodeState) {
+        let mixer = Arc::new(AudioMixer::new());
+        flux_en_lecture(&mixer);
+        mixer.push_samples("peer-test", &vec![0.0f32; 48 * 2]); // 1 ms
+        let now = Instant::now();
+        let mut m = states(now - Duration::from_millis(10));
+        conceal_due_streams(&mut m, &mixer, BLOC_ASIO_MS, now);
+        let st = m.remove("peer-test").unwrap();
+        let lc = st.last_conceal.expect("masquage retenu");
+        assert!((lc.fill_ms - 1.0).abs() < 0.05, "vraie matière retenue : {} ms", lc.fill_ms);
+        (mixer, st)
+    }
+
+    /// La sortie n'a rien tiré avant l'arrivée du vrai paquet : il aurait été
+    /// joué à temps. Le temps écoulé n'y est pour rien.
+    #[test]
+    fn un_paquet_arrive_avant_que_la_sortie_entame_l_invention_est_premature() {
+        let (mixer, mut st) = apres_un_masquage();
+        recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(5));
+        assert_eq!(st.concealed_premature_frames, 1);
+        assert!((st.concealed_premature_margin_ms - 1.0).abs() < 0.05, "{}", st.concealed_premature_margin_ms);
+    }
+
+    /// Part de la cible apprise des paquets remplacés, pour le flux de test.
+    fn marge_apprise(m: &AudioMixer) -> f64 {
+        m.stream_perf_stats().into_iter().find(|p| p.producer_id == "peer-test").map(|p| p.target_late_ms).unwrap()
+    }
+
+    /// 0.6.6-20 — le paquet qu'un masquage à l'échéance a remplacé arrive : le
+    /// tampon de ce flux apprend que sa marge était trop courte (+1 ms).
+    #[test]
+    fn un_paquet_arrive_apres_son_masquage_releve_la_marge_du_flux() {
+        let (mixer, mut st) = apres_un_masquage();
+        assert_eq!(marge_apprise(&mixer), 0.0);
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert!((marge_apprise(&mixer) - 1.0).abs() < 0.05, "marge +1 ms : {}", marge_apprise(&mixer));
+    }
+
+    /// 0.6.6-20 — un remplacé arrivé bien après son remplacement (fin de pic)
+    /// n'apprend rien : quelques ms de marge ne l'auraient pas sauvé.
+    #[test]
+    fn un_paquet_remplace_arrive_bien_trop_tard_n_apprend_rien() {
+        let (mixer, mut st) = apres_un_masquage();
+        recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(30));
+        assert_eq!(marge_apprise(&mixer), 0.0);
+    }
+
+    /// 0.6.6-20 (revue) — un paquet simplement doublé dans le désordre (sa place
+    /// comblée dès l'arrivée du suivant) n'apprend rien : aucune marge ne l'aurait
+    /// sauvé.
+    #[test]
+    fn un_paquet_dans_le_desordre_ne_releve_pas_la_marge() {
+        let (mixer, mut st) = apres_un_paquet();
+        recevoir(&mut st, &mixer, 1002, Instant::now()); // 1001 sauté → inventé à l'arrivée
+        recevoir(&mut st, &mixer, 1001, Instant::now()); // le retardataire
+        assert_eq!(marge_apprise(&mixer), 0.0);
+    }
+
+    /// Deux tirages (2,67 ms) ont passé la vraie matière (1 ms) : ils ont joué
+    /// l'invention, qui a donc évité un trou.
+    #[test]
+    fn une_sortie_qui_a_joue_l_invention_prouve_un_masquage_utile() {
+        let (mixer, mut st) = apres_un_masquage();
+        let mut bloc = vec![0.0f32; 64 * 2];
+        mixer.mix_into(&mut bloc);
+        mixer.mix_into(&mut bloc);
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert_eq!(st.concealed_premature_frames, 0);
+        assert!(st.last_conceal.is_none(), "jugé");
+    }
 }
 
 /// Revue du 22/09/2026 — un seul inventaire de plugins à la fois.
@@ -7209,5 +7740,236 @@ mod plugin_scan_guard_tests {
         assert!(matches!(*pl.plugin_scan_cache.lock(), PluginScanCache::Scanning));
         drop(super::ScanStuckGuard(pl.plugin_scan_cache.clone()));
         assert!(pl.begin_scan(), "un nouvel inventaire redevient possible");
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod editor_events_tests {
+    use super::*;
+    use jamodio_audio_core::plugin_host::{EditorListener, PluginError};
+
+    /// Hôte minimal : il ne fait que garder l'écouteur qu'on lui donne.
+    #[derive(Default)]
+    struct HoteFactice {
+        listener: Option<EditorListener>,
+    }
+
+    impl PluginHost for HoteFactice {
+        fn load(&mut self, _: &PluginRef, _: u32) -> Result<PluginHandle, PluginError> {
+            Err(PluginError::NotFound)
+        }
+        fn unload(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn process_stereo(&mut self, _: PluginHandle, _: &mut [f32], _: &mut [f32], _: &[MidiEvent]) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn latency_samples(&self, _: PluginHandle) -> u32 {
+            0
+        }
+        fn open_editor(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn close_editor(&mut self, _: PluginHandle) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn set_editor_listener(&mut self, listener: EditorListener) {
+            self.listener = Some(listener);
+        }
+    }
+
+    /// Ce que l'hôte signale sur sa fenêtre arrive sur le canal que chaque
+    /// connexion écoute ; sans personne à l'écoute, rien ne casse.
+    #[test]
+    fn les_etats_de_l_hote_arrivent_sur_le_canal() {
+        let (events, _) = tokio::sync::broadcast::channel::<EditorState>(4);
+        let host = with_editor_events(HoteFactice::default(), &events);
+        let listener = host.listener.clone().expect("écouteur posé");
+        listener(PluginHandle(1), EditorState::Opening); // personne n'écoute encore
+        let mut rx = events.subscribe();
+        listener(PluginHandle(1), EditorState::Open);
+        listener(PluginHandle(1), EditorState::Closed);
+        assert_eq!(rx.try_recv().unwrap(), EditorState::Open);
+        assert_eq!(rx.try_recv().unwrap(), EditorState::Closed);
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod limite_flux_recus_tests {
+    use super::*;
+
+    /// Studio BAND complet : 9 autres musiciens × (instrument + voix) = 18 flux,
+    /// tous acceptés ; au-delà de la limite, refus explicite (garde-fou anti-DoS).
+    /// Règle pure : `add_stream` ouvre aussi la sortie audio, absente des
+    /// machines de CI (la tester par `add_stream` dépendait du matériel).
+    #[test]
+    fn un_studio_band_complet_tient_et_la_limite_reste_un_garde_fou() {
+        let complet = (LARGEST_STUDIO_MUSICIANS - 1) * STREAMS_PER_MUSICIAN;
+        assert_eq!(complet, 18);
+        for deja_recus in 0..MAX_RECV_STREAMS {
+            check_recv_capacity(deja_recus)
+                .unwrap_or_else(|e| panic!("flux n°{} refusé alors que la limite est {MAX_RECV_STREAMS} : {e}", deja_recus + 1));
+        }
+        let refus = check_recv_capacity(MAX_RECV_STREAMS).expect_err("au-delà de la limite, refus");
+        assert!(refus.contains("too many streams"), "{refus}");
+    }
+}
+
+/// Revue 0.6.6, constat A : l'entrée affichée par `get-stats` se lit dans
+/// l'état, sans jamais résoudre un périphérique.
+#[cfg(test)]
+mod stats_device_name_tests {
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    fn pipeline() -> PipelineState {
+        PipelineState::new(Arc::new(AudioMixer::new()))
+    }
+
+    #[test]
+    fn rien_de_choisi_hors_capture_ne_nomme_rien() {
+        assert_eq!(pipeline().stats_device_name(), None);
+    }
+
+    #[test]
+    fn hors_capture_l_entree_choisie_par_le_studio() {
+        let mut pl = pipeline();
+        pl.input_device_id = Some("3:Focusrite USB ASIO".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("Focusrite USB ASIO"));
+    }
+
+    #[test]
+    fn en_capture_l_entree_ouverte_et_son_canal() {
+        let mut pl = pipeline();
+        // Le studio a choisi une entrée, mais c'est l'entrée OUVERTE qui compte.
+        pl.input_device_id = Some("1:Autre".to_string());
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.capture_channels_label = Some("canal 1".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("UMC204HD — canal 1"));
+    }
+
+    #[test]
+    fn la_fin_de_session_oublie_l_entree_ouverte() {
+        let mut pl = pipeline();
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.teardown_session(false);
+        assert_eq!(pl.capture_input_name, None);
+    }
+}
+
+/// Revue 0.6.6, constat C : la voix vit avec la capture — la fin de session et
+/// le changement d'entrée arrêtent aussi le micro talkback DÉDIÉ.
+#[cfg(test)]
+mod voice_teardown_tests {
+    use super::*;
+    use crate::audio::voice_capture::VoiceCaptureHandle;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    /// Talkback sur micro dédié, tel que `start_voice_capture` le laisse.
+    struct Talkback {
+        pl: PipelineState,
+        /// Témoin d'arrêt du flux du micro.
+        micro_arrete: crossbeam_channel::Receiver<()>,
+        /// Ce que lit le fil `voice-encode`.
+        etage_voix: crate::audio::voice_tap::VoiceTapReceiver,
+        /// Émetteur qui SURVIT, comme celui que la fonction de rappel CPAL garde
+        /// sur macOS après la destruction du flux.
+        _emetteur: crate::audio::voice_tap::VoiceTapSender,
+    }
+
+    fn avec_micro_dedie() -> Talkback {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let (handle, micro_arrete) = VoiceCaptureHandle::for_test();
+        let (emetteur, etage_voix) =
+            crate::audio::voice_tap::voice_tap(crate::audio::voice_tap::VOICE_TAP_MAX_MS);
+        pl.voice_encode_stage = Some(VoiceEncodeStage {
+            closer: Some(emetteur.closer()),
+            thread: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        pl.voice_capture = Some(handle);
+        pl.voice_device_label = Some("Casque USB".to_string());
+        pl.voice_active = true;
+        Talkback { pl, micro_arrete, etage_voix, _emetteur: emetteur }
+    }
+
+    fn assert_voix_arretee(t: &Talkback) {
+        assert!(t.micro_arrete.try_recv().is_ok(), "flux du micro arrêté, périphérique relâché");
+        assert_eq!(
+            t.etage_voix.recv_timeout(std::time::Duration::from_millis(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected),
+            "le fil voice-encode sort de sa boucle, même avec un émetteur encore en vie"
+        );
+        assert!(t.pl.voice_capture.is_none());
+        assert!(!t.pl.voice_active);
+        assert_eq!(t.pl.voice_source_label(), None, "la fenêtre ne nomme plus de micro");
+    }
+
+    #[test]
+    fn la_fin_de_session_relache_le_micro_dedie() {
+        let mut t = avec_micro_dedie();
+        t.pl.teardown_session(false);
+        assert_voix_arretee(&t);
+    }
+
+    #[test]
+    fn le_changement_d_entree_relache_le_micro_dedie() {
+        let mut t = avec_micro_dedie();
+        t.pl.teardown_session(true);
+        assert_voix_arretee(&t);
+    }
+
+    /// Chemin réel de `start_voice_capture` (talkback pris sur un canal de
+    /// l'instrument) : la file branchée au tap reçoit la voix tant que le
+    /// talkback vit ; `stop_voice_capture` attend la fin du fil `voice-encode`
+    /// (il rend la main) et le tap ne peut plus pousser.
+    #[tokio::test]
+    async fn un_talkback_demarre_vit_puis_son_fil_s_arrete_a_l_arret() {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<VoiceControl>(4);
+        pl.voice_ctrl_tx = Some(ctrl_tx);
+        pl.capture_channels_in = 2;
+        pl.start_voice_capture(
+            1234,
+            "127.0.0.1".to_string(),
+            9,
+            111,
+            0,
+            SrtpParameters::generate_aead_aes_256_gcm(),
+            None,
+        )
+        .await
+        .expect("talkback démarré");
+        assert!(pl.voice_active);
+        let Ok(VoiceControl::Add { out_tx, .. }) = ctrl_rx.try_recv() else {
+            panic!("le tap doit être greffé sur la capture instrument");
+        };
+        assert!(out_tx.push(vec![0.0; 48]).is_ok(), "talkback en vie : la voix passe");
+
+        pl.stop_voice_capture();
+        // Le fil détient ses propres copies de ces indicateurs : il ne les
+        // rend qu'en se terminant. 1 = seul le pipeline les tient encore.
+        assert_eq!(Arc::strong_count(&pl.isolation_active), 1, "fil voice-encode terminé");
+        assert_eq!(Arc::strong_count(&pl.voice_on_air), 1, "fil voice-encode terminé");
+        assert_eq!(
+            out_tx.push(vec![0.0; 48]),
+            Err(crate::audio::voice_tap::Disconnected),
+            "file fermée : le tap ne pousse plus"
+        );
+    }
+
+    /// Avant le correctif, ce message ne faisait plus rien une fois la session
+    /// finie (`voice_active` à faux, micro toujours ouvert).
+    #[test]
+    fn stop_voice_capture_relache_le_micro_dedie() {
+        let mut t = avec_micro_dedie();
+        t.pl.stop_voice_capture();
+        assert_voix_arretee(&t);
     }
 }

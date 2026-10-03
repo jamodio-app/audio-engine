@@ -85,9 +85,13 @@ const GRACE_MAX_MS: f64 = 10.0;
 ///   au pire. 0,5 ms est donc sous le retard typique d'un réveil Windows.
 ///
 /// On ne la relève pas à l'aveugle : une marge plus grande fait inventer plus
-/// tôt, donc plus souvent pour rien. La trancher demande de savoir si les trous
-/// rendus viennent de réveils tardifs — ce que les compteurs actuels ne
-/// distinguent pas (chantier tampon, après la 0.6.5).
+/// tôt, donc plus souvent pour rien. Les deux mesures qui la trancheront
+/// existent depuis le Lot 1-C (23/09/2026) : le retard réel du réveil de ce
+/// thread (`decode_wake_late_*` dans le journal perfstats) et les trous
+/// survenus alors que le tampon avait été jugé suffisant
+/// (`holesAfterBufferHolds`). Les masquages prématurés, eux, se jugent
+/// désormais au tirage près (cf. [`premature_margin_ms`]). Réglage : après
+/// lecture de ces chiffres, pas avant.
 const WAKE_SLACK_MS: f64 = 0.5;
 
 /// Décision à l'échéance d'une trame.
@@ -264,32 +268,42 @@ pub fn sleep_until_deadline_ms(next_deadline_in_ms: f64) -> f64 {
 /// RÉELLEMENT rendus, donc un masquage réussi et un masquage inutile ont la
 /// même signature (une trame inventée, aucun accroc).
 ///
-/// On compare ce que le tampon pouvait encore tenir À L'INSTANT du masquage
-/// (`fill_ms_at_conceal`) au temps qu'a réellement mis le paquet à arriver
-/// ensuite (`arrival_delay_ms`) :
-/// - le paquet arrive AVANT que le tampon ne se vide → il aurait été joué à sa
-///   place, on a inventé pour rien **et** on lui a volé sa place ;
-/// - il arrive après → le trou aurait été réel, le masquage a fait son travail.
+/// # Le critère exact (Lot 1-B, 23/09/2026)
 ///
-/// Une mesure non finie ne prouve rien : on ne compte pas un prématuré qu'on
-/// n'a pas établi.
+/// La trame inventée est ajoutée APRÈS la vraie matière que le tampon tenait
+/// (`fill_ms_at_conceal`). Tant que la sortie n'a pas fini cette vraie matière,
+/// elle n'a pas touché à l'invention. Donc, quand le vrai paquet arrive :
+/// - la sortie a consommé **au plus** `fill_ms_at_conceal` depuis le masquage →
+///   aucun tirage n'a eu besoin de l'invention ; sans elle, le paquet aurait été
+///   poussé à temps pour le tirage suivant. **Prématuré**, et on lui a volé sa
+///   place ;
+/// - elle a consommé **plus** → un tirage a puisé dans l'invention : sans elle,
+///   ce tirage aurait rendu un trou. Le masquage a fait son travail.
 ///
-/// Rendu : DE COMBIEN le masquage était prématuré, `None` s'il ne l'était pas.
-/// C'est la marge qu'on n'a pas su attendre : le tampon tenait encore
-/// `fill_ms_at_conceal`, le paquet est arrivé au bout de `arrival_delay_ms`, il
-/// restait donc cette différence de rab. Savoir COMBIEN décide du réglage :
-/// quelques dizaines de microsecondes se rattrapent en avançant le seuil de
-/// survie ; plusieurs millisecondes veulent dire que le délai de grâce est trop
-/// court. Sans ce chiffre, on ne saurait pas lequel des deux toucher — et on
-/// réglerait au jugé.
-pub fn premature_margin_ms(fill_ms_at_conceal: f64, arrival_delay_ms: f64) -> Option<f64> {
-    if !fill_ms_at_conceal.is_finite() || !arrival_delay_ms.is_finite() {
+/// `consumed_since_ms` est la consommation RÉELLE de la sortie entre le
+/// masquage et l'arrivée, lue à la position de lecture du tampon
+/// (`ring_buffer::consumed_ms_between`) — pas le temps écoulé. C'est tout le
+/// correctif : l'ancien critère comparait le délai d'arrivée à « le tampon est
+/// vide » en temps continu, alors que la sortie tire par blocs et par à-coups
+/// (un pilote ASIO rappelle à ~945 / ~2 300 µs). Il se trompait donc jusqu'à un
+/// bloc — 1,33 ms, du même ordre que la marge moyenne mesurée (1,1 ms).
+///
+/// Une mesure non finie ou négative ne prouve rien : on ne compte pas un
+/// prématuré qu'on n'a pas établi.
+///
+/// Rendu : DE COMBIEN le masquage était prématuré — la vraie matière que la
+/// sortie n'avait pas encore jouée quand le paquet est arrivé — `None` s'il ne
+/// l'était pas. Quelques dizaines de microsecondes se rattrapent sur le seuil
+/// de survie ; plusieurs millisecondes veulent dire que le délai de grâce est
+/// trop court. Sans ce chiffre, on réglerait au jugé.
+pub fn premature_margin_ms(fill_ms_at_conceal: f64, consumed_since_ms: f64) -> Option<f64> {
+    if !fill_ms_at_conceal.is_finite() || !consumed_since_ms.is_finite() {
         return None;
     }
-    if arrival_delay_ms < 0.0 || arrival_delay_ms >= fill_ms_at_conceal {
+    if fill_ms_at_conceal < 0.0 || consumed_since_ms < 0.0 || consumed_since_ms > fill_ms_at_conceal {
         return None;
     }
-    Some(fill_ms_at_conceal - arrival_delay_ms)
+    Some(fill_ms_at_conceal - consumed_since_ms)
 }
 
 #[cfg(test)]
@@ -299,35 +313,43 @@ mod tests {
     /// Gigue typique du banc : ~2,5 ms de queue.
     const TAIL: Option<f64> = Some(2.5);
 
-    /// Le masquage prématuré, celui qu'on cherche à compter.
+    /// Le masquage prématuré, celui qu'on cherche à compter : la sortie n'avait
+    /// pas fini la vraie matière quand le paquet est arrivé.
     #[test]
-    fn un_paquet_qui_arrive_avant_que_le_tampon_se_vide_prouve_un_masquage_de_trop() {
-        // Le tampon tenait encore 4 ms ; le paquet est arrivé 1,5 ms après le
-        // masquage. Il aurait été joué à sa place.
-        assert!(premature_margin_ms(4.0, 1.5).is_some());
-        // Il arrive après que le tampon se soit vidé : le trou était réel.
-        assert!(premature_margin_ms(4.0, 4.0).is_none());
-        assert!(premature_margin_ms(4.0, 9.0).is_none());
-    }
-
-    #[test]
-    fn la_marge_dit_de_combien_on_a_tire_trop_tot() {
-        // Le tampon tenait 4 ms, le paquet est arrivé au bout de 1,5 ms :
-        // il restait 2,5 ms de rab.
+    fn un_paquet_arrive_avant_que_la_sortie_entame_l_invention_prouve_un_masquage_de_trop() {
+        // Le tampon tenait 4 ms ; la sortie en a joué 1,5 avant l'arrivée.
         assert_eq!(premature_margin_ms(4.0, 1.5), Some(2.5));
-        // Pile à la limite : pas prématuré, donc pas de marge.
-        assert_eq!(premature_margin_ms(4.0, 4.0), None);
-        assert_eq!(premature_margin_ms(4.0, 9.0), None);
-        // Mesure inexploitable : on ne fabrique pas une marge.
-        assert_eq!(premature_margin_ms(f64::NAN, 1.0), None);
-        assert_eq!(premature_margin_ms(4.0, -1.0), None);
+        // Elle a joué exactement la vraie matière : aucun tirage n'a encore
+        // puisé dans l'invention, le paquet serait passé au suivant.
+        assert_eq!(premature_margin_ms(4.0, 4.0), Some(0.0));
     }
 
+    /// Un tirage a puisé dans l'invention : sans elle, il rendait un trou.
     #[test]
-    fn un_tampon_vide_ne_produit_jamais_de_premature() {
-        // Rien à tenir : aucun délai d'arrivée ne peut être « à temps ».
-        assert!(premature_margin_ms(0.0, 0.0).is_none());
-        assert!(premature_margin_ms(0.0, 0.5).is_none());
+    fn une_sortie_qui_a_entame_l_invention_prouve_un_masquage_utile() {
+        assert_eq!(premature_margin_ms(4.0, 4.0 + 1.0 / 96.0), None);
+        assert_eq!(premature_margin_ms(4.0, 9.0), None);
+    }
+
+    /// Tampon vide au masquage, et aucun tirage avant l'arrivée du paquet :
+    /// il aurait été joué à temps. L'ancien critère (en temps) ne pouvait pas
+    /// le voir.
+    #[test]
+    fn un_tampon_vide_sans_tirage_avant_l_arrivee_etait_un_masquage_de_trop() {
+        assert_eq!(premature_margin_ms(0.0, 0.0), Some(0.0));
+        // Un tirage a eu lieu : il a joué l'invention.
+        assert_eq!(premature_margin_ms(0.0, 1.33), None);
+    }
+
+    /// Ce qui juge, c'est la consommation par BLOCS, pas le temps : 3 ms
+    /// écoulées sur un tampon de 3,5 ms, mais la sortie a pris deux blocs de
+    /// 1,33 ms seulement — le paquet arrive à temps.
+    #[test]
+    fn la_consommation_par_blocs_juge_et_pas_le_temps_ecoule() {
+        let deux_blocs = 2.0 * 64.0 * 1000.0 / 48_000.0;
+        assert!(premature_margin_ms(3.5, deux_blocs).is_some());
+        // Trois blocs d'un coup (rafale ASIO) dépassent le tampon : utile.
+        assert!(premature_margin_ms(3.5, 1.5 * deux_blocs).is_none());
     }
 
     #[test]
@@ -336,8 +358,8 @@ mod tests {
         assert!(premature_margin_ms(f64::NAN, 1.0).is_none());
         assert!(premature_margin_ms(4.0, f64::NAN).is_none());
         assert!(premature_margin_ms(f64::INFINITY, 1.0).is_none());
-        // Horloge à l'envers (paquet horodaté avant le masquage) : on s'abstient.
         assert!(premature_margin_ms(4.0, -1.0).is_none());
+        assert!(premature_margin_ms(-1.0, 0.0).is_none());
     }
 
     #[test]

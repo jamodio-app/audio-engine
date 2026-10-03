@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Jamodio's own strings; Tauri adds its default ones. -->
+<WixLocalization Culture="en-us" xmlns="http://schemas.microsoft.com/wix/2006/localization">
+  <String Id="WelcomeDlgDescription">[ProductName] will be installed on your computer.&#13;&#10;&#13;&#10;Jamodio adjusts a Windows network setting to reduce latency and small dropouts (by up to about 10 ms). The setting is removed if you uninstall Jamodio.&#13;&#10;&#13;&#10;Click Next to continue.</String>
+</WixLocalization>

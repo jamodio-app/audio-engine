@@ -73,6 +73,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Le GITHUB_TOKEN (contents: write) ne reste pas dans .git/config, où
+          # tout code de la compilation (build.rs, proc-macros) pourrait le lire.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         # SHA épinglé (branche stable) — cf. review pré-BETA 2026-07-12 (M-infra-1).
@@ -104,43 +108,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install opus pkg-config
 
-      # Windows : libopus via vcpkg (audiopus_sys). SRTP = pure Rust
-      # (webrtc-srtp), donc plus besoin d'OpenSSL/libsrtp côté système depuis
-      # v0.3.0 — voir [target.'cfg(windows)'.dependencies] dans
-      # jamodio-audio-core/Cargo.toml.
-      #
-      # Triplet `x64-windows-static-md` = lib statique + MSVCRT dynamique
-      # (compatible Tauri).
-      - name: Install libopus (Windows via vcpkg)
+      # Windows : libopus (vcpkg), SDK ASIO + LLVM — étapes partagées avec
+      # msi-e2e.yml, cf. .github/actions/windows-build-deps (commentaires là-bas).
+      - name: Dépendances de build Windows (libopus, SDK ASIO, LLVM)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          vcpkg install opus:x64-windows-static-md
-          "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      # ASIO SDK Steinberg : nécessaire pour la feature `asio` de cpal côté
-      # Windows (low-latency 3-5 ms vs WASAPI shared 10-30 ms). cpal-asio-sys
-      # utilise bindgen, qui requiert LLVM/clang.
-      #
-      # ASIO SDK est gratuit (Steinberg Inc., licence ASIO SDK 2.3.3) — URL
-      # stable depuis 2019. Si Steinberg change l'URL, fallback : bundler le
-      # ZIP dans le repo (autorisé pour usage privé / dev).
-      - name: Install ASIO SDK + LLVM (Windows, cpal asio feature)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install llvm -y --no-progress
-          Invoke-WebRequest -Uri "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip" -OutFile asiosdk.zip
-          # Supply-chain : on PIN le SHA256 du SDK ASIO. Sans ça, un téléchargement
-          # compromis (MITM, compromission du miroir Steinberg) serait compilé dans
-          # le binaire signé distribué aux beta-testeurs. Build interrompu si mismatch.
-          $expected = "bc425d9b98701af74b43639798566c48bc005af7328a2251cff722c1885076b2"
-          $actual = (Get-FileHash asiosdk.zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $expected) { Write-Error "ASIO SDK checksum mismatch: $actual (attendu $expected)"; exit 1 }
-          Expand-Archive asiosdk.zip -DestinationPath C:\
-          "CPAL_ASIO_DIR=C:\asiosdk_2.3.3_2019-06-14" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+        uses: ./.github/actions/windows-build-deps
 
       # Le fichier .cargo/config.toml du repo pointe un PKG_CONFIG_PATH
       # relatif vers deps/opus-arm64/ (workaround local pour le dev sur Mac M*
@@ -150,9 +122,37 @@ jobs:
         shell: bash
         run: rm -f .cargo/config.toml
 
+      # Code protégé : aucun nom de fonction dans le binaire macOS publié. Les
+      # noms partent dans un .dSYM PRIVÉ (archivé plus bas avec la release),
+      # qui permet de lire les adresses brutes d'une trace de plantage
+      # (crash_addresses.rs). Réglages de compilation uniquement : le code
+      # généré est le même, aucune latence ajoutée. Windows : l'exe n'embarque
+      # déjà pas de table de symboles (le .pdb est séparé).
+      - name: Remove function names from the macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_PROFILE_RELEASE_STRIP=symbols"
+            echo "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only"
+            echo "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed"
+          } >> "$GITHUB_ENV"
+
+      # CLI Tauri à une version EXACTE, installée dans une étape SANS secret.
+      # Sans ça, tauri-action installait `@tauri-apps/cli@v2` — la dernière 2.x
+      # du jour — dans l'étape qui détient la clé privée de l'updater :
+      # l'épinglage de l'action par SHA ne protégeait plus rien (revue 0.6.6,
+      # constat E). 2.12.1 = version de la release 0.6.6-17. Monter de version
+      # = changer ce numéro ici ET dans msi-e2e.yml.
+      - name: CLI Tauri (version exacte, sans secret)
+        shell: bash
+        run: npm install -g @tauri-apps/cli@2.12.1
+
       - name: Build + upload (tauri-action)
         # SHA épinglé — cette action reçoit la CLÉ PRIVÉE de l'updater ; un tag
         # @v0 repointé exfiltrerait la clé. Cf. review pré-BETA 2026-07-12 (M-infra-1).
+        # Elle appelle la CLI installée à l'étape précédente (`tauriScript`) et
+        # n'en télécharge aucune.
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           # Requis pour créer / uploader la release via l'API GitHub.
@@ -179,28 +179,48 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Jamodio Audio Engine ${{ github.ref_name }}'
           releaseBody: |
-            Voir le [CHANGELOG](./CHANGELOG.md) pour les détails de cette version.
+            Voir le CHANGELOG pour les détails de cette version.
 
-            **Téléchargements** (liens permanents, toujours la dernière version) :
-            - macOS Apple Silicon (M1+) : [Jamodio-Audio-Engine-macOS-AppleSilicon.dmg](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-macOS-AppleSilicon.dmg)
-            - Windows (installeur en français) : [Jamodio-Audio-Engine-Windows.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows.msi)
-            - Windows (English installer) : [Jamodio-Audio-Engine-Windows-en.msi](https://github.com/${{ github.repository }}/releases/latest/download/Jamodio-Audio-Engine-Windows-en.msi)
+            Diffusion : `npm run agent:publish -- ${{ github.ref_name }}` (dépôt web) publie
+            cette version sur https://jamodio.com/installer.
           releaseDraft: true      # chaque matrix complète le draft
-          # Tag semver de pré-release (contient un '-', ex. v0.5.0-rc.1) →
-          # publié en pre-release GitHub, donc JAMAIS marqué "latest". L'updater
-          # Tauri lit releases/latest/download/latest.json → les testeurs en
-          # prod ne se voient PAS proposer la rc ; on installe le .msi à la main
-          # depuis la page de pré-release. Tag final v0.5.0 (sans '-') = release
-          # normale diffusée à tous.
+          # Tag semver de pré-release (contient un '-', ex. v0.6.6-18) → publiée
+          # en pre-release GitHub, jamais marquée "latest". Les agents lisent
+          # https://jamodio.com/installer/latest.json, que SEUL
+          # `npm run agent:publish` d'une version définitive met à jour (une
+          # pré-version y est publiée sous pre/<version>/, sans latest.json) :
+          # c'est ce script qui garde les testeurs hors des mises à jour.
           prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
+          tauriScript: tauri
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      # Freinage réseau de Windows (Lot W3) : le VRAI MSI, installé, mis à jour
+      # depuis la version publiée, réinstallé, désinstallé sur ce runner jetable,
+      # la valeur du registre vérifiée à chaque étape. Échec = la release reste
+      # en brouillon (`publish` dépend de ce job). Cf. le script.
+      - name: Test de bout en bout de l'installeur (freinage réseau)
+        if: matrix.runner == 'windows-2022'
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Get-ChildItem "target/${{ matrix.target }}/release/bundle/msi" -Filter '*_x64_fr-FR.msi' | Select-Object -First 1
+          if (-not $msi) { throw "MSI introuvable" }
+          # Dernière version PUBLIÉE (« latest ») : le point de départ des musiciens équipés.
+          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir old-msi
+          if ($LASTEXITCODE -ne 0) { throw "téléchargement de la version publiée échoué ($LASTEXITCODE)" }
+          $old = Get-ChildItem old-msi -Filter '*.msi' | Select-Object -First 1
+          ./.github/scripts/msi-e2e-network-throttling.ps1 -Msi $msi.FullName -OldMsi $old.FullName
 
       # Symboles de débogage Windows (.pdb) : la table adresse → nom de fonction.
       # Sans elle, une trace ETW ou un crash ne montre que « jamodio-agent.exe+0x… »
       # (diagnostic des gels du 22/09/2026 : threads de l'agent impossibles à
-      # nommer). Jamais installé chez l'utilisateur ; joint à la release, dont le
-      # code source est déjà public. Absent = ÉCHEC : une release sans ses
+      # nommer). Jamais installé chez l'utilisateur ; joint à la release PRIVÉE,
+      # jamais publié sur jamodio.com. Absent = ÉCHEC : une release sans ses
       # symboles ne se découvre pas le jour où on en a besoin.
       - name: Archive Windows debug symbols (.pdb)
         if: matrix.runner == 'windows-2022'
@@ -220,6 +240,63 @@ jobs:
           Compress-Archive -Path $pdb -DestinationPath $out -Force
           gh release upload $env:TAG $out --clobber -R $env:REPO
           if ($LASTEXITCODE -ne 0) { throw "envoi des symboles échoué ($LASTEXITCODE)" }
+
+      # Garde-fou « code protégé » : le binaire publié (celui du .app) ne doit
+      # contenir AUCUN nom de fonction Jamodio, et le .dSYM privé doit les avoir
+      # tous — sinon les traces de plantage deviendraient illisibles pour nous.
+      # Le .dSYM est joint à la release PRIVÉE, jamais publié sur jamodio.com.
+      - name: Check macOS binary has no function names, archive private .dSYM
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          REL="target/${{ matrix.target }}/release"
+          APP_BIN=$(find "$REL/bundle/macos" -path '*.app/Contents/MacOS/jamodio-agent' | head -1)
+          [ -n "$APP_BIN" ] || { echo "binaire du .app introuvable"; exit 1; }
+          # Le .dSYM utile est celui dont l'UUID est CELUI du binaire publié (codesign
+          # ne change pas l'UUID). Cargo le range sous un nom à tirets bas, avec un
+          # fichier DWARF au nom haché (0.6.6-16 : `jamodio-agent.dSYM` introuvable) :
+          # on ne suppose aucun nom, on exige la correspondance.
+          BIN_UUID=$(dwarfdump --uuid "$APP_BIN" | awk 'NR==1{print $2}')
+          DSYM=""; DWARF=""
+          while IFS= read -r d; do
+            for f in "$d"/Contents/Resources/DWARF/*; do
+              [ -f "$f" ] || continue
+              if [ "$(dwarfdump --uuid "$f" | awk 'NR==1{print $2}')" = "$BIN_UUID" ]; then DSYM="$d"; DWARF="$f"; fi
+            done
+          done < <(find "$REL" -maxdepth 2 -name '*.dSYM' -type d)
+          if [ -z "$DSYM" ]; then
+            echo "ÉCHEC : aucun .dSYM d'UUID $BIN_UUID (celui du binaire publié). Trouvés :"
+            find "$REL" -maxdepth 2 -name '*.dSYM' -type d -exec sh -c 'for f in "$1"/Contents/Resources/DWARF/*; do dwarfdump --uuid "$f"; done' _ {} \;
+            exit 1
+          fi
+          echo ".dSYM privé : $DSYM (UUID $BIN_UUID, identique au binaire publié)"
+          in_bin=$( (nm "$APP_BIN" 2>/dev/null || true) | grep -c jamodio || true)
+          in_dsym=$(nm "$DWARF" | grep -c jamodio || true)
+          strings_left=$(strings -a "$APP_BIN" | grep -c 'jamodio_[a-z_]*::' || true)
+          echo "noms de fonctions Jamodio — binaire publié : $in_bin ; .dSYM privé : $in_dsym"
+          echo "mesure : chemins de modules encore lisibles dans le binaire (chaînes) : $strings_left"
+          [ "$in_bin" -eq 0 ] || { echo "ÉCHEC : le binaire publié expose $in_bin noms de fonctions"; exit 1; }
+          [ "$in_dsym" -gt 1000 ] || { echo "ÉCHEC : .dSYM presque vide ($in_dsym noms)"; exit 1; }
+          OUT="Jamodio-Audio-Engine-macOS-symbols-$TAG.zip"
+          (cd "$(dirname "$DSYM")" && zip -qr "$GITHUB_WORKSPACE/$OUT" "$(basename "$DSYM")")
+          gh release upload "$TAG" "$OUT" --clobber -R "$REPO"
+
+      # Mesure (sans échec) de ce que l'exe Windows laisse lisible : base de la
+      # décision sur un éventuel traitement supplémentaire côté Windows.
+      - name: Measure readable names in the Windows exe
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/jamodio-agent.exe"
+          $text = [System.Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          $paths = ([regex]::Matches($text, 'jamodio_[a-z_]+::[A-Za-z_:<>]+')).Count
+          $files = ([regex]::Matches($text, 'jamodio-[a-z0-9-]+[/\\]src[/\\][A-Za-z0-9_/\\]+\.rs')).Count
+          "mesure : chemins de modules Jamodio lisibles dans l'exe : $paths ; chemins de fichiers source : $files"
 
   publish:
     needs: build

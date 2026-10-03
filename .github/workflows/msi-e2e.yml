@@ -1,0 +1,101 @@
+name: MSI e2e
+
+# Test de bout en bout de l'installeur Windows (freinage réseau, Lots W3 et
+# W3-bis) sur l'installeur CONSTRUIT DEPUIS LA BRANCHE — avant tout tag. Le même
+# script tourne dans release.yml, où il bloque la publication. Une modification
+# de l'installeur, du module ou du test se vérifie ici, jamais d'abord au tag
+# (leçon du 29/09 : deux constructions de version perdues).
+# Cf. .github/scripts/msi-e2e-network-throttling.ps1.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '.github/scripts/msi-e2e-network-throttling.ps1'
+      - '.github/workflows/msi-e2e.yml'
+      - '.github/actions/windows-build-deps/**'
+      - 'jamodio-agent/wix/**'
+      - 'jamodio-agent/tauri.conf.json'
+      - 'jamodio-agent/src/net_throttling.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msi-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: './ -> target'
+          key: x86_64-pc-windows-msvc
+
+      - name: Dépendances de build Windows (libopus, SDK ASIO, LLVM)
+        uses: ./.github/actions/windows-build-deps
+
+      - name: Remove local dev .cargo/config.toml override
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      # Même version exacte que release.yml (y changer les deux à la fois).
+      - name: CLI Tauri (version exacte)
+        shell: pwsh
+        run: npm install -g @tauri-apps/cli@2.12.1
+
+      # Même installeur que la version publiée (même config Tauri, même WiX),
+      # sans rien publier — et SANS la clé privée de l'updater : ce test n'a
+      # besoin que du MSI, pas de sa signature de mise à jour (un .sig à part).
+      # Avant, chaque push de branche passait la clé à une CLI npm non épinglée
+      # (revue 0.6.6, constat E).
+      - name: Construire l'installeur de la branche
+        shell: pwsh
+        working-directory: jamodio-agent
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: |
+          Set-Content -Path e2e.tauri.conf.json -Value '{"bundle":{"createUpdaterArtifacts":false}}'
+          tauri build --target x86_64-pc-windows-msvc --bundles msi --config e2e.tauri.conf.json
+          if ($LASTEXITCODE -ne 0) { throw "construction de l'installeur échouée ($LASTEXITCODE)" }
+
+      - name: Dernière version publiée (point de départ des musiciens équipés)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Dossier AVEC espace, comme le chemin du MSI construit
+          # (« …\bundle\msi\Jamodio Audio Engine_x.msi ») : le test doit le tenir.
+          gh release download -R $env:REPO --pattern '*_x64_fr-FR.msi' --dir 'old msi'
+          if ($LASTEXITCODE -ne 0) { throw "téléchargement de la version publiée échoué" }
+
+      - name: Test de bout en bout
+        shell: pwsh
+        run: |
+          $new = Get-ChildItem "target/x86_64-pc-windows-msvc/release/bundle/msi" -Filter '*_x64_fr-FR.msi' | Select-Object -First 1
+          if (-not $new) { throw "MSI construit introuvable" }
+          $old = Get-ChildItem 'old msi' -Filter '*.msi' | Select-Object -First 1
+          Write-Host "Installeur testé : $($new.FullName)"
+          ./.github/scripts/msi-e2e-network-throttling.ps1 -Msi $new.FullName -OldMsi $old.FullName
+
+      - name: Journaux msiexec
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msi-logs
+          path: msi-logs

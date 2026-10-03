@@ -67,6 +67,8 @@ use windows_sys::Win32::{
     },
 };
 
+use jamodio_audio_core::plugin_host::EditorState as WindowState;
+
 use crate::conn_proxy::ConnectionProxy;
 use crate::host::Instance;
 use crate::host_app::MinimalHost;
@@ -259,6 +261,20 @@ struct EditorShared {
     /// STATE_PENDING → STATE_OPEN → STATE_CLOSED (ou PENDING → CLOSED si le
     /// setup échoue).
     state: AtomicU8,
+    /// Prévient l'Audio Engine de chaque étape (`Opening` → `Open` → `Closed`,
+    /// ou `Failed`) pour que le studio le dise au musicien.
+    notify: Option<EditorNotify>,
+}
+
+/// Rappel d'état d'une fenêtre, déjà lié au plugin concerné par `Vst3Host`.
+pub(crate) type EditorNotify = Arc<dyn Fn(WindowState) + Send + Sync>;
+
+impl EditorShared {
+    fn emit(&self, state: WindowState) {
+        if let Some(notify) = &self.notify {
+            notify(state);
+        }
+    }
 }
 
 /// Handle public exposé au `Vst3Host`. L'ouverture est asynchrone (job posté
@@ -276,11 +292,16 @@ impl EditorWindow {
         instance: &Instance,
         module: Arc<LoadedModule>,
         title: &str,
+        notify: Option<EditorNotify>,
     ) -> Result<Self, String> {
         let shared = Arc::new(EditorShared {
             hwnd: AtomicPtr::new(std::ptr::null_mut()),
             state: AtomicU8::new(STATE_PENDING),
+            notify,
         });
+        // La construction peut durer (11 s pour AmpliTube au NUC, 29/09) :
+        // on le dit AVANT de poster le travail sur vst3-main.
+        shared.emit(WindowState::Opening);
         let shared_job = shared.clone();
         let component = instance.component.clone();
         let title = title.to_string();
@@ -289,6 +310,7 @@ impl EditorWindow {
             if let Err(e) = open_editor_on_main_thread(component, module, &title, &shared_job) {
                 tracing::error!(target: "jamodio::vst3::editor", error = %e, "editor setup failed");
                 shared_job.state.store(STATE_CLOSED, Ordering::SeqCst);
+                shared_job.emit(WindowState::Failed);
             }
         });
 
@@ -476,6 +498,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 target: "jamodio::vst3::editor",
                 "editor window destroyed — view removed, connections disconnected, controller released"
             );
+            shared.emit(WindowState::Closed);
         }
         return 0;
     }
@@ -716,6 +739,7 @@ fn open_editor_on_main_thread(
     //     les messages de cette fenêtre ; cleanup sur WM_DESTROY.
     shared.hwnd.store(hwnd, Ordering::SeqCst);
     shared.state.store(STATE_OPEN, Ordering::SeqCst);
+    shared.emit(WindowState::Open);
     OPEN_EDITORS.with(|m| {
         m.borrow_mut().insert(
             hwnd as isize,

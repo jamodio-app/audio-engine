@@ -1,6 +1,6 @@
 [package]
 name = "jamodio-agent"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 license = "LicenseRef-Jamodio-Proprietary"
 publish = false
@@ -17,6 +17,9 @@ cpal = "0.15"
 # resampler n'y est autorisé. Déjà présent dans l'arbre via DeepFilterNet.
 rubato = "0.14"
 tokio = { version = "1", features = ["full"] }
+# Lot 1-D3 — fil de réception dédié : attente de toutes les sockets reçues
+# (kqueue / IOCP) hors du runtime tokio. Même version que celle de tokio.
+mio = { version = "1", features = ["os-poll", "net"] }
 axum = { version = "0.7", features = ["ws"] }
 # socket2 : bind du serveur WS avec SO_REUSEADDR (tokio ne le pose pas sur
 # Windows) → permet de re-binder le port 9876 immédiatement après un
@@ -49,10 +52,18 @@ tauri-plugin-deep-link = "2"
 # Empêche un 2e process agent de démarrer (fix double-launch macOS/Windows).
 # Doit être enregistré AVANT deep-link cf. doc Tauri.
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
-# Auto-update via GitHub releases (config endpoint dans tauri.conf.json).
-# Sans ce plugin, le bloc `updater` de tauri.conf.json est inerte → les
-# users ne sont jamais notifiés (cf. mémoire agent_release_checklist).
+# Mise à jour automatique : manifeste lu sur jamodio.com/installer (endpoint dans
+# tauri.conf.json). Sans ce plugin, le bloc `updater` de tauri.conf.json est inerte.
 tauri-plugin-updater = "2"
+# Décompression des réponses HTTP de l'updater. Le plugin tire `reqwest` sans
+# AUCUN décodeur (default-features = false) ; or jamodio.com sert latest.json
+# compressé en brotli à tous les clients (mesuré le 02/10/2026, y compris à ceux
+# qui ne l'acceptent pas). Déclarer `reqwest` ici avec gzip + brotli active ces
+# décodeurs dans le crate partagé (unification des fonctionnalités Cargo) : le
+# client de l'updater décode alors comme tout client HTTP. Même version majeure
+# que celle du plugin, sinon deux crates distincts et rien d'unifié — garde :
+# tests/updater_http.rs. Hors chemin audio.
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "brotli"] }
 
 # ASIO support on Windows
 [target.'cfg(windows)'.dependencies]
@@ -103,6 +114,15 @@ windows-sys = { version = "0.59", features = [
     # signale ces transitions. Le GUID vit dans SystemServices.
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
+    # Sonde d'horodatage noyau de la réception (examples/recv_timestamp_probe.rs) :
+    # WSAIoctl (déclarée sous System_IO, qui porte OVERLAPPED) et
+    # QueryPerformanceCounter (horloge des horodatages logiciels de Winsock).
+    "Win32_System_IO",
+    "Win32_System_Performance",
+    # Traces de plantage sans noms de fonctions (crash_addresses.rs) : adresses
+    # brutes de la pile + adresse de chargement de l'exécutable.
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
 ] }
 # Chantier quit UX — promotion de l'icone tray Win11 (IsPromoted=1 dans
 # HKCU\Control Panel\NotifyIconSettings). Cf. tray_promote.rs.
@@ -128,3 +148,8 @@ libc = "0.2"
 # décoché n'était pas respecté sur Mac. On opte-out de cette restauration pour
 # que le LaunchAgent (= notre toggle) soit l'UNIQUE mécanisme de démarrage.
 objc2 = "0.6"
+
+[dev-dependencies]
+# tests/updater_http.rs : installe le fournisseur TLS exactement comme le plugin
+# updater avant de construire son client (`reqwest` y est sans fournisseur).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
