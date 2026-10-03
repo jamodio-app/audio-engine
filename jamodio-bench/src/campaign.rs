@@ -463,6 +463,7 @@ pub fn compare_scenario(current: &Metrics, reference: Option<&Metrics>, tol: &dy
     }
     let mut regressions = Vec::new();
     let mut improvements = Vec::new();
+    let mut unmeasured = Vec::new();
     for s in &current.streams {
         let Some(rs) = r.streams.iter().find(|x| x.stream == s.stream) else {
             regressions.push(format!("{} : absent de la référence", s.stream));
@@ -477,7 +478,10 @@ pub fn compare_scenario(current: &Metrics, reference: Option<&Metrics>, tol: &dy
                 improvements.push(format!("{} : {what} {rv:.1} → {c:.1} {unit} ({:+.1})", s.stream, c - rv))
             }
             (None, Some(_)) => regressions.push(format!("{} : {what} non mesuré cette fois", s.stream)),
-            _ => {}
+            // Mesure présente, référence sans elle (référence d'avant la mesure) :
+            // rien n'a été comparé — le dire, jamais conclure « aucune régression ».
+            (Some(_), None) => unmeasured.push(format!("{} : {what} absent de la référence", s.stream)),
+            (Some(_), Some(_)) | (None, None) => {}
         };
         check("cible médiane", "ms", s.target_median_ms, rs.target_median_ms, t.target_ms);
         check("trous", "/min", s.holes_per_min, rs.holes_per_min, t.holes_per_min);
@@ -488,8 +492,20 @@ pub fn compare_scenario(current: &Metrics, reference: Option<&Metrics>, tol: &dy
             regressions.push(format!("critère {} : tenu dans la référence, non tenu cette fois", c.id));
         }
     }
-    let outcome = if regressions.is_empty() { Outcome::NoRegression } else { Outcome::Regression };
+    let outcome = if !regressions.is_empty() {
+        Outcome::Regression
+    } else if !unmeasured.is_empty() {
+        Outcome::Inconclusive
+    } else {
+        Outcome::NoRegression
+    };
     let mut lines: Vec<String> = regressions.into_iter().map(|l| format!("✖ {l}")).collect();
+    if !unmeasured.is_empty() {
+        lines.push(format!(
+            "○ non comparé — {} ; relire la référence : session-bench reanalyser <dossier du scénario>",
+            unmeasured.join(", ")
+        ));
+    }
     lines.extend(improvements.into_iter().map(|l| format!("▲ amélioration — {l}")));
     verdict(outcome, lines)
 }
@@ -1049,6 +1065,21 @@ mod tests {
         assert!(v.lines[0].contains("son inventé"), "{:?}", v.lines);
         let v = compare_scenario(&with(115.0), Some(&with(490.0)), &|_| TOL_FLOOR);
         assert_eq!(v.outcome, Outcome::NoRegression, "moins de son inventé : amélioration");
+    }
+
+    /// Revue : une référence d'avant la mesure ne permet pas de conclure « aucune
+    /// régression » — le verdict dit que rien n'a été comparé.
+    #[test]
+    fn une_reference_sans_la_mesure_rend_le_verdict_non_concluant() {
+        let mut old = stream("m7-wifi-charge", 9.0, 60.0);
+        old.invented_per_min = None;
+        let v = compare_scenario(
+            &metrics(vec![stream("m7-wifi-charge", 9.0, 60.0)], Verdict::Holds),
+            Some(&metrics(vec![old], Verdict::Holds)),
+            &|_| TOL_FLOOR,
+        );
+        assert_eq!(v.outcome, Outcome::Inconclusive);
+        assert!(v.lines.iter().any(|l| l.contains("absent de la référence")), "{:?}", v.lines);
     }
 
     /// Les fichiers d'avant le 03/10/2026 (sans la mesure) se relisent : mesure

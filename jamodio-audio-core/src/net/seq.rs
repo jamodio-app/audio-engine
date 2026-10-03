@@ -371,6 +371,13 @@ mod tests {
         t.on_concealed(); // place 103 inventée à l'échéance
         t.on_packet(104);
         assert_eq!(t.on_packet(103), Arrival::Late { replaced: true });
+        // Au passage par zéro des numéros, même distinction.
+        let mut t = SeqTracker::new();
+        t.on_packet(65_534);
+        t.on_concealed(); // place 65 535 inventée à l'échéance
+        assert_eq!(t.on_packet(1), Arrival::Next { missing: 1 }); // place 0 sautée
+        assert_eq!(t.on_packet(0), Arrival::Late { replaced: false });
+        assert_eq!(t.on_packet(65_535), Arrival::Late { replaced: true });
     }
 
     #[test]

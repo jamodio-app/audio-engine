@@ -42,7 +42,7 @@ jamodio.com.**
   remplaçait par du son reconstitué, sans en tirer de leçon : sur un lien
   irrégulier, cela pouvait arriver plusieurs dizaines de fois par minute. Le
   tampon de chaque musicien apprend désormais de ces arrivées tardives et garde
-  juste la marge qu'il faut : quelques millisecondes de plus, sur ce seul
+  juste la marge qu'il faut : quelques millisecondes de plus (jamais plus de 15), sur ce seul
   musicien, tant que sa connexion a des à-coups, puis il la rend peu à peu. Une
   connexion sans à-coups ne change pas.
 

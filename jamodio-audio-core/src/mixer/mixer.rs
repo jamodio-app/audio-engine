@@ -998,6 +998,15 @@ impl AudioMixer {
         })
     }
 
+    /// 0.6.6-20 — un flux reprend après un silence : sa marge apprise redescend
+    /// du temps écoulé avant le ré-amorçage (cf. `JitterBuffer::refresh_late_floor`).
+    pub fn refresh_late_floor(&self, producer_id: &str, now: std::time::Instant) {
+        let cell = self.streams.read().get(producer_id).cloned();
+        if let Some(cell) = cell {
+            cell.jitter.lock().refresh_late_floor(now);
+        }
+    }
+
     /// 0.6.6-20 — le paquet de ce flux qu'un masquage à l'échéance a remplacé
     /// vient d'arriver : la marge du tampon était trop courte (cf.
     /// `JitterBuffer::note_late_arrival`). Comme `observe_jitter` : l'Arc est

@@ -37,6 +37,9 @@ pub const PEER_FIELDS: &[&str] = &[
     "jitterTailMs",
     "concealedUnderrunFrames",
     "concealedPrematureFrames",
+    // Masquage à l'arrivée (trou de numérotation), relevé à côté de celui à
+    // l'échéance (absent avant le 03/10/2026 : colonne vide, relue inconnue).
+    "concealedFrames",
     "packetsLost",
     "packetsLate",
     "zeroFilledMs",
@@ -639,9 +642,12 @@ pub struct MusicianSummary {
     pub causes_per_min: [f64; 5],
     pub target_median_ms: f64,
     pub target_p95_ms: f64,
-    /// Trames de son INVENTÉ à l'échéance (masquage d'un paquet absent à son
+    /// Trames de son INVENTÉ À L'ÉCHÉANCE (masquage d'un paquet absent à son
     /// heure) par minute — ce que l'oreille entend comme « corrigé » (écoute de
-    /// Ben du 03/10/2026 : invisible dans les trous et la cible).
+    /// Ben du 03/10/2026 : invisible dans les trous et la cible). Le masquage à
+    /// l'ARRIVÉE (trou de numérotation) est relevé à part (`concealedFrames`) : les
+    /// `peers.csv` d'avant le 03/10 ne l'ont pas, l'additionner rendrait leurs
+    /// références inconnues.
     pub invented_per_min: f64,
     /// Paquets écartés en retard (désordre compris), perdus, et audio rattrapé
     /// d'un coup (vidage du tampon trop plein), sur la fenêtre.
@@ -1006,7 +1012,7 @@ pub fn markdown(
         s.push_str(
             "\n## Par musicien simulé (dernier palier, instruments)\n\n\
 | Flux | Lien | Dérive simulée / lue (ppm) | Trous/min | arrivée | réception | décodage | consommation | séquence \
-| Cible médiane / p95 (ms) | Son inventé (trames/min) | Paquets en retard | Paquets perdus | Audio rattrapé (échantillons) |\n\
+| Cible médiane / p95 (ms) | Son inventé à l'échéance (trames/min) | Paquets en retard | Paquets perdus | Audio rattrapé (échantillons) |\n\
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for m in musicians {

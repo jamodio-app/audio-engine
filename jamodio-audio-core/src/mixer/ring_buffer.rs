@@ -4,7 +4,7 @@ use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
 pub struct JitterBuffer {
     producer: ringbuf::HeapProd<f32>,
     consumer: ringbuf::HeapCons<f32>,
-    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Cible EFFECTIVE de remplissage (samples) = `clamp(MIN, plancher de gigue + plancher de glitch + marge apprise + filet réactif, cap)`.
     /// Valeur dérivée, recalculée par `recompute_target()` à chaque changement de
     /// `floor_samples` ou `reactive_extra_samples`. Lue par `pull` (pre-fill +
     /// seuil de drift-drain).
@@ -812,6 +812,11 @@ impl JitterBuffer {
         self.jitter_auto = false;
         self.floor_samples = clamped * SAMPLE_RATE * CHANNELS / 1000;
         self.reactive_extra_samples = 0;
+        // La marge apprise des paquets remplacés ne s'ajoute pas à une cible
+        // choisie (elle ne pourrait plus ni monter ni redescendre).
+        self.late_floor_ms = 0.0;
+        self.last_late_step = None;
+        self.late_settled_at = None;
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
         self.primed = false;
@@ -838,7 +843,8 @@ impl JitterBuffer {
         self.recompute_target();
     }
 
-    /// Recalcule la cible effective = `clamp(MIN, floor + reactive_extra, cap)`.
+    /// Recalcule la cible effective = `clamp(MIN, plancher de gigue + plancher de
+    /// glitch + marge apprise des paquets remplacés + filet réactif, cap)`.
     /// `cap` = `LOCAL_MAX_TARGET_MS` en mode self-monitor, sinon `MAX_TARGET_MS`.
     fn recompute_target(&mut self) {
         let cap_ms = if self.local_mode { LOCAL_MAX_TARGET_MS } else { MAX_TARGET_MS };
@@ -957,7 +963,20 @@ impl JitterBuffer {
             let secs = now.saturating_duration_since(t).as_secs_f64();
             self.late_floor_ms = (self.late_floor_ms - secs * LATE_FLOOR_DECAY_MS_PER_SEC).max(0.0);
         }
-        self.late_settled_at = Some(now);
+        // Un instant plus ancien (non attendu : `recv_instant` est pris à la
+        // lecture, dans l'ordre) ne fait pas reculer la référence.
+        self.late_settled_at = Some(self.late_settled_at.map_or(now, |t| t.max(now)));
+    }
+
+    /// Applique la redescente due au temps écoulé et recalcule la cible — à la
+    /// reprise d'un flux après un silence, pour ne pas se ré-amorcer sur une marge
+    /// périmée (la redescente ne s'applique sinon qu'aux observations ~10×/s).
+    pub fn refresh_late_floor(&mut self, now: std::time::Instant) {
+        if self.local_mode || !self.jitter_auto {
+            return;
+        }
+        self.settle_late_floor(now);
+        self.recompute_target();
     }
 
     /// 0.6.6-20 — part de la cible due aux paquets remplacés à l'échéance (ms).
@@ -985,7 +1004,8 @@ impl JitterBuffer {
         }
         // Borne le filet pour que `floor + glitch_floor + extra` ne dépasse jamais
         // le cap : sinon une accumulation sans effet rendrait la redescente lente.
-        let max_extra = cap_s.saturating_sub(self.floor_samples + self.glitch_floor_samples);
+        let max_extra = cap_s
+            .saturating_sub(self.floor_samples + self.glitch_floor_samples + ms_f64_to_samples(self.late_floor_ms));
         self.reactive_extra_samples = (self.reactive_extra_samples + grow).min(max_extra);
         self.recompute_target();
         self.last_adapt = std::time::Instant::now();
@@ -1638,6 +1658,34 @@ mod tests {
             jb.note_late_arrival(t0 + D::from_secs(20 * k));
         }
         assert!(jb.late_floor_ms() <= 1.0, "{}", jb.late_floor_ms());
+    }
+
+    /// Revue : une marge apprise AVANT qu'on choisisse une cible ne s'y ajoute pas.
+    #[test]
+    fn une_cible_choisie_apres_une_marge_apprise_est_celle_choisie() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        for k in 0..6 {
+            jb.note_late_arrival(t0 + D::from_secs(k));
+        }
+        assert!(jb.late_floor_ms() > 4.0);
+        jb.set_target_ms(12);
+        assert_eq!(jb.target_ms(), 12);
+        assert_eq!(jb.late_floor_ms(), 0.0);
+    }
+
+    /// Revue : à la reprise d'un flux après un silence, la marge a redescendu du
+    /// temps écoulé AVANT que le tampon se ré-amorce.
+    #[test]
+    fn la_reprise_apres_un_silence_part_d_une_marge_a_jour() {
+        let t0 = I::now();
+        let mut jb = au_plancher(t0);
+        jb.note_late_arrival(t0);
+        jb.note_late_arrival(t0 + D::from_secs(1));
+        assert_eq!(jb.target_ms(), 6);
+        jb.refresh_late_floor(t0 + D::from_secs(60));
+        assert_eq!(jb.late_floor_ms(), 0.0);
+        assert_eq!(jb.target_ms(), 5);
     }
 
     #[test]

@@ -6056,6 +6056,12 @@ fn decode_one_packet(
     // ne peut prendre que ce qui reste du même budget (cf. `Arrival::Next`).
     let invented_at_deadline = st.consecutive_concealed;
     if matches!(arrival, Arrival::Start | Arrival::Next { .. }) {
+        // Reprise après un silence (échéance désarmée) : la marge apprise des
+        // paquets remplacés redescend du temps écoulé avant que le tampon se
+        // ré-amorce (0.6.6-20, revue).
+        if st.next_deadline.is_none() {
+            mixer.refresh_late_floor(producer_id, recv_instant);
+        }
         // Le flux a repris sa place : le masquage précédent n'a plus de
         // retardataire à attendre, il n'y a plus rien à juger.
         st.last_conceal = None;
@@ -6140,6 +6146,9 @@ fn decode_one_packet(
             // 0.6.6-20 — remplacé à l'échéance : la marge de ce flux était trop
             // courte, le tampon l'apprend. Un paquet simplement dans le désordre
             // (`replaced == false`) n'apprend rien : aucune marge ne l'aurait sauvé.
+            // Choix assumé : après un pic qui finit en trou, le trou monte le
+            // plancher de glitch ET le retardataire la marge apprise — deux
+            // signaux, deux redescentes (la seconde, rapide : 1 ms / 10 s).
             if replaced {
                 mixer.note_late_arrival(producer_id, recv_instant);
             }
