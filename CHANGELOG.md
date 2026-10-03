@@ -7,7 +7,50 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
 
 ## [Non publié]
 
+**Moins de trous sur PC, un studio complet, et des mises à jour servies par
+jamodio.com.**
+
+### Modifié
+
+- **Windows : l'installeur désactive le « freinage réseau » de Windows.**
+  Windows bride par défaut le réseau des applications qui jouent du son
+  (réglage système `NetworkThrottlingIndex`) ; c'était la cause prouvée de
+  trous dans le son reçu sur PC. L'installeur pose la valeur qui le désactive
+  (`ffffffff`), **mémorise la valeur d'origine et la remet à la
+  désinstallation**, et propose une fois de redémarrer Windows (le réglage ne
+  s'applique qu'après un redémarrage). L'écran d'accueil de l'installation le
+  dit. C'est un réglage de **tout le système**, pas seulement de l'Audio
+  Engine.
+- **Réception des autres musiciens : un fil prioritaire dédié** lit et décode
+  tous les flux reçus, au lieu d'une tâche par musicien. Moins de trous dus à
+  la machine, surtout sur PC.
+- **Un studio BAND complet tient** : jusqu'à 32 flux reçus (instrument et voix
+  de chaque musicien), contre 16.
+- **Plugins : un chargement de plugin ne retient plus l'arrivée d'un
+  musicien**, et la fenêtre du plugin dit où elle en est (ouverture, ouverte,
+  fermée).
+- **Métronome : clic à −12 dB**, réglé à la source.
+- **Mises à jour lues sur jamodio.com** (plus sur GitHub), réponses
+  compressées comprises.
+- **Installeur Windows en français jusqu'au bout** (« Lancer Jamodio Audio
+  Engine »).
+
 ### Corrigé
+
+- **Windows (ASIO) : l'Audio Engine ne réinterroge plus tous les pilotes audio
+  pendant qu'on le consulte.** Le relevé d'état (toutes les 1,5 à 2 secondes,
+  studio ouvert ou non) parcourait la liste des pilotes ASIO tant qu'aucune
+  entrée n'était choisie, ou pendant toute une session ouverte sur l'entrée
+  par défaut, en bloquant les autres commandes (« Audio Engine occupé »,
+  nettoyage de fin de session sauté). L'entrée affichée est désormais celle
+  qui est ouverte ou choisie, sans aucune recherche.
+- **Talkback sur un micro séparé (casque, micro USB) : le micro est relâché en
+  quittant le studio.** Il restait ouvert — et la voix encodée — après la fin
+  de la session ou un changement d'entrée, jusqu'au talkback suivant ou à la
+  fermeture de l'Audio Engine.
+- **Le relevé des mesures n'interrompt plus la réception.** Le calcul des
+  statistiques de chaque seconde se faisait en tenant un verrou que la
+  réception prend à chaque paquet ; il se fait maintenant à part.
 
 - **Windows (ASIO) : une interface bien réglée en 48 kHz n'est plus refusée
   à l'entrée en studio.** Certains pilotes (Yamaha Steinberg USB, UR22C)
@@ -36,8 +79,18 @@ Versioning : [Semantic Versioning](https://semver.org/lang/fr/).
   toujours pas, le talkback passe en voix brute pour le reste de la session,
   affiché « VOIX BRUTE » sur la tranche, au lieu d'une voix inintelligible.
 
+### Sécurité
+
+- Binaire macOS publié sans noms de fonctions ; les traces de plantage
+  donnent des adresses brutes, lues avec les symboles gardés en privé.
+- Chaîne de publication : la clé qui signe les mises à jour n'est plus
+  exposée à des outils téléchargés sans version fixe.
+
 ### Interne
 
+- Mesure de chaque trou dans le son reçu et de sa cause (arrivée, réception,
+  décodage, consommation), horodatage de la réception par le système, et
+  découpe des réveils longs du fil de réception, au journal perfstats.
 - Journal : la pause de démarrage d'un pilote est nommée (durée, pilote), et
   une mesure non concluante est dite telle quelle au lieu d'être présentée
   comme la fréquence de l'interface.

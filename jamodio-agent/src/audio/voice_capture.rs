@@ -316,6 +316,21 @@ impl Drop for VoiceCaptureHandle {
     }
 }
 
+#[cfg(test)]
+impl VoiceCaptureHandle {
+    /// Poignée sans périphérique, pour les tests : son fil propriétaire attend
+    /// l'ordre d'arrêt et le signale sur le canal rendu.
+    pub(crate) fn for_test() -> (Self, crossbeam_channel::Receiver<()>) {
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let (stopped_tx, stopped_rx) = crossbeam_channel::bounded::<()>(1);
+        let join = std::thread::spawn(move || {
+            let _ = stop_rx.recv();
+            let _ = stopped_tx.send(());
+        });
+        (Self { stop_tx, join: Some(join) }, stopped_rx)
+    }
+}
+
 /// Ouvre le périphérique voix `device_id` sur un thread propriétaire et pousse
 /// des blocs mono 48 kHz dans `out_tx`.
 ///

@@ -16,7 +16,7 @@ use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::net::uplink;
-use jamodio_audio_core::perfstats::Histogram;
+use jamodio_audio_core::perfstats::{Histogram, HistogramReader, HistogramSnapshot};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{EditorState, MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -714,6 +714,15 @@ pub struct PipelineState {
     /// des DEUX lignes (Instrument et Talkback) ou d'aucune — montrer le canal
     /// d'un seul côté laissait croire à deux réglages de nature différente.
     capture_channels_label: Option<String>,
+    /// Nom de l'entrée RÉELLEMENT ouverte par la capture en cours (rendu par
+    /// l'ouverture, sur le fil COM ; remis à jour quand le superviseur rouvre
+    /// les flux). `None` hors capture. Seule
+    /// source des libellés d'affichage : les relire ne doit JAMAIS résoudre un
+    /// périphérique — `get-stats` (1,5 s) et la fenêtre interne (2 s) les
+    /// demandent sans cesse, et une énumération ASIO sous le verrou du pipeline
+    /// bloquait les autres messages, voire libérait le pilote en service
+    /// (revue 0.6.6, constat A).
+    capture_input_name: Option<String>,
     /// Canal physique sur lequel la voix est prélevée (0-based). Sert UNIQUEMENT
     /// à l'affichage : quand la voix vient d'un canal de l'interface instrument,
     /// la fenêtre nomme l'interface ET le canal plutôt qu'un vague « canal de
@@ -1167,8 +1176,10 @@ impl PerfHandles {
         // Mesures de la RÉCEPTION : une observation par paquet (ou par réveil),
         // soit jusqu'à ~400 × N par seconde. À 512 places, le relevé 1 Hz ne
         // voyait que les ~0,15 dernière seconde à 9 musiciens — et pouvait
-        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à 16
-        // flux (le maximum accepté).
+        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à ~20
+        // flux ; au-delà (limite `MAX_RECV_STREAMS`), le relevé porte sur les
+        // 8 192 dernières mesures de la seconde. Le relevé ne trie plus sous le
+        // verrou (`HistogramReader`) : la taille ne coûte rien au fil de réception.
         const RECV_HISTOGRAM_CAPACITY: usize = 8192;
         Self {
             heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1196,6 +1207,81 @@ impl PerfHandles {
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
             voice_stage: Arc::new(crate::audio::voice_tap::VoiceStageStats::default()),
+        }
+    }
+
+    /// Lecteurs des histogrammes, pour l'UNIQUE relevé 1 Hz (tâche perfstats).
+    /// Alloue les réserves et tampons de tri une fois ; à créer au premier relevé.
+    pub fn readers(&self) -> PerfReaders {
+        PerfReaders {
+            pipeline: HistogramReader::for_histogram(&self.pipeline_latency),
+            plugin: HistogramReader::for_histogram(&self.plugin_latency),
+            capture: HistogramReader::for_histogram(&self.capture_latency),
+            process: HistogramReader::for_histogram(&self.process_latency),
+            encode: HistogramReader::for_histogram(&self.encode_latency),
+            send_path: HistogramReader::for_histogram(&self.send_path_latency),
+            emit_burst: HistogramReader::for_histogram(&self.emit_burst),
+            recv_path: HistogramReader::for_histogram(&self.recv_path),
+            recv_work: HistogramReader::for_histogram(&self.recv_work),
+            decode_wake_late: HistogramReader::for_histogram(&self.decode_wake_late),
+            recv_stack: HistogramReader::for_histogram(&self.recv_stack_delay),
+        }
+    }
+}
+
+/// Part « nom » d'un id de périphérique `{idx}:{name}` — l'id entier s'il n'a
+/// pas cette forme. Pour l'affichage seulement.
+fn device_name_of(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, name)| name)
+}
+
+/// Lecteurs des histogrammes de [`PerfHandles`] : chaque lecture n'échange
+/// qu'un tampon sous le verrou, le calcul se fait verrou relâché (revue 0.6.6,
+/// constat B — le fil de réception prioritaire attendait le tri).
+pub struct PerfReaders {
+    pipeline: HistogramReader,
+    plugin: HistogramReader,
+    capture: HistogramReader,
+    process: HistogramReader,
+    encode: HistogramReader,
+    send_path: HistogramReader,
+    emit_burst: HistogramReader,
+    recv_path: HistogramReader,
+    recv_work: HistogramReader,
+    decode_wake_late: HistogramReader,
+    recv_stack: HistogramReader,
+}
+
+/// Fenêtre écoulée de chaque histogramme (lecture destructive).
+pub struct PerfWindow {
+    pub pipeline: HistogramSnapshot,
+    pub plugin: HistogramSnapshot,
+    pub capture: HistogramSnapshot,
+    pub process: HistogramSnapshot,
+    pub encode: HistogramSnapshot,
+    pub send_path: HistogramSnapshot,
+    pub emit_burst: HistogramSnapshot,
+    pub recv_path: HistogramSnapshot,
+    pub recv_work: HistogramSnapshot,
+    pub decode_wake_late: HistogramSnapshot,
+    pub recv_stack: HistogramSnapshot,
+}
+
+impl PerfReaders {
+    /// Lit et vide la fenêtre de chaque histogramme de `h`.
+    pub fn read(&mut self, h: &PerfHandles) -> PerfWindow {
+        PerfWindow {
+            pipeline: self.pipeline.read(&h.pipeline_latency),
+            plugin: self.plugin.read(&h.plugin_latency),
+            capture: self.capture.read(&h.capture_latency),
+            process: self.process.read(&h.process_latency),
+            encode: self.encode.read(&h.encode_latency),
+            send_path: self.send_path.read(&h.send_path_latency),
+            emit_burst: self.emit_burst.read(&h.emit_burst),
+            recv_path: self.recv_path.read(&h.recv_path),
+            recv_work: self.recv_work.read(&h.recv_work),
+            decode_wake_late: self.decode_wake_late.read(&h.decode_wake_late),
+            recv_stack: self.recv_stack.read(&h.recv_stack_delay),
         }
     }
 }
@@ -1350,11 +1436,11 @@ impl PluginControl {
         *self.instrument_plugin_handle.lock() = Some(handle);
         self.instrument_plugin_bypass
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset le flag overload + flush l'histogramme plugin_latency pour
+        // S5 — reset le flag overload + vide l'histogramme plugin_latency pour
         // ne pas mélanger les mesures de l'ancien plugin avec le nouveau.
         self.plugin_auto_bypass_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.plugin_latency.lock().flush();
+        self.plugin_latency.lock().reset();
         // S1.5 — snapshot complet pour resync au reconnect.
         *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
             plugin_ref: plugin_ref.clone(),
@@ -1476,6 +1562,7 @@ impl PipelineState {
             voice_capture: None,
             voice_device_label: None,
             capture_channels_label: None,
+            capture_input_name: None,
             voice_channel_index: None,
             #[cfg(target_os = "windows")]
             asio_host: None,
@@ -2013,12 +2100,12 @@ impl PipelineState {
         let _ = self.restart_playback();
     }
 
-    /// Renvoie l'id du device sélectionné par le browser (s'il y en a un),
-    /// sinon l'id du default système. Utilisé uniquement pour les Stats UI
-    /// (pas un point de résolution de capture — le start_capture fait sa
-    /// propre résolution stricte).
-    pub fn selected_input_id(&self) -> Option<String> {
-        self.input_device_id.clone().or_else(crate::audio::device::default_input_id)
+    /// Entrée à afficher dans `get-stats` : l'interface et le canal captés
+    /// pendant une capture, sinon l'entrée choisie par le studio, sinon rien
+    /// (« — »). Ne résout JAMAIS de périphérique (cf. `capture_input_name`).
+    pub fn stats_device_name(&self) -> Option<String> {
+        self.instrument_source_label()
+            .or_else(|| self.input_device_id.as_deref().map(|id| device_name_of(id).to_string()))
     }
 
     /// 0.5.4-5 — host audio actif = ASIO (Windows) ? Gouverne le keep-warm.
@@ -2071,12 +2158,17 @@ impl PipelineState {
         }
         // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
         self.uplink = None;
-        // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
-        // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
-        // le thread `voice_encode` termine en cascade (Disconnected). On lâche
-        // notre Sender de commande et on remet l'état voix à zéro.
+        // Talkback : la voix vit avec la capture. Fin de session OU changement
+        // d'entrée → la voix s'arrête, QUELLE QUE SOIT sa source : tap sur le flux
+        // instrument (il vivait sur le `capture_stage` qu'on vient d'arrêter) ou
+        // micro dédié (flux indépendant, qui sinon restait ouvert et continuait
+        // d'encoder et d'envoyer après la sortie du studio — revue 0.6.6,
+        // constat C). Le studio republie le talkback après un changement
+        // d'entrée (`reestablishAgentTalkbackAfterInputSwap`).
+        self.stop_voice();
         self.voice_ctrl_tx = None;
-        self.voice_active = false;
+        // Plus de capture : plus d'entrée ouverte à nommer.
+        self.capture_input_name = None;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
         self.mixer.remove_local_stream();
         // Hot-swap d'entrée (session_continues) : la réception des pairs est
@@ -2480,11 +2572,11 @@ impl PipelineState {
 
         // Talkback (Lot 2) : mémorise la géométrie de capture pour pouvoir
         // greffer un producteur voix plus tard (validation canal) sans redémarrer
-        // l'instrument. Fresh capture ⇒ pas de voix active. `native_sr` est
+        // l'instrument. Aucune voix active ici : `prepare_audio_for_session` est
+        // passé par `teardown_session` → `stop_voice`. `native_sr` est
         // invariablement 48 kHz ici (R2 ci-dessus).
         self.capture_channels_in = channels_in;
         self.capture_native_sr = native_sr;
-        self.voice_active = false;
         // ENTRÉE (input_cut) — le pipeline est UNIQUE et à vie (construit 1× au
         // boot). Sans reset, `input_cut` SURVIT d'une session studio à l'autre :
         // quitter en ENTRÉE OFF laissait l'instrument coupé à la source au join
@@ -2700,6 +2792,7 @@ impl PipelineState {
             (None, Some(n)) => Some(format!("canaux {}-{}", u16::from(n) + 1, u16::from(n) + 2)),
             (None, None) => Some("canaux 1-2".to_string()),
         };
+        self.capture_input_name = Some(in_name.clone());
         // Buffer CPAL effectif des deux côtés (cf. champs doc). `input_buf` est
         // toujours connu ici (la branche capture vient de réussir). Pour
         // l'output, soit on vient d'ouvrir un stream (= `output_buffer_samples`
@@ -2778,22 +2871,13 @@ impl PipelineState {
         // 3. Idempotence : retire l'ancien tap ET/OU ferme l'ancien flux dédié
         //    (changement de micro). Le drop de la poignée relâche le périphérique
         //    AVANT qu'on en ouvre un autre.
-        if self.voice_active {
-            if let Some(tx) = voice_ctrl_tx.as_ref() {
-                let _ = tx.try_send(VoiceControl::Remove);
-            }
-        }
-        self.voice_capture = None;
-        // À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
-        // active : l'ancienne est démontée et la nouvelle pas encore branchée.
-        // Sans ce passage à false, un échec en cours de route (micro débranché
-        // entre l'affichage de la liste et le clic) laisserait l'agent convaincu
-        // qu'un talkback tourne — la fenêtre afficherait un micro pour un flux
-        // inexistant, et le prochain démarrage prendrait la branche « idempotence »
-        // sur un état fantôme.
-        self.voice_active = false;
-        self.voice_device_label = None;
-        self.voice_channel_index = None;
+        //    À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
+        //    active : l'ancienne est démontée et la nouvelle pas encore branchée.
+        //    Un échec en cours de route (micro débranché entre l'affichage de la
+        //    liste et le clic) ne laisse donc pas l'agent convaincu qu'un
+        //    talkback tourne — ni la fenêtre afficher un micro pour un flux
+        //    inexistant.
+        self.stop_voice();
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2859,7 +2943,6 @@ impl PipelineState {
             // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
             // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
             Ok(Err(_)) => {
-                self.voice_active = false;
                 return Err("voice encode thread failed to start".to_string());
             }
             // Machine très lente : on greffe quand même (comportement d'avant), mais
@@ -2955,9 +3038,7 @@ impl PipelineState {
         if !matches!(self.state, AgentState::Capturing) {
             return None;
         }
-        let name = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()))?;
+        let name = self.capture_input_name.clone()?;
         Some(match self.capture_channels_label.as_deref() {
             Some(ch) => format!("{name} — {ch}"),
             None => name,
@@ -2979,35 +3060,45 @@ impl PipelineState {
         // croire à une autre source que celle affichée juste au-dessus.
         // Le nom est relu à CHAQUE appel (jamais figé au démarrage du talkback)
         // pour ne pas afficher l'ancienne interface après un changement d'entrée.
-        let iface = self
-            .selected_input_id()
-            .and_then(|id| id.split_once(':').map(|(_, n)| n.to_string()));
+        let iface = self.capture_input_name.clone();
         Some(match (iface, self.voice_channel_index) {
             (Some(name), Some(ch)) => format!("{} — canal {}", name, u16::from(ch) + 1),
             (Some(name), None) => name,
-            // Pas d'entrée sélectionnée alors qu'une voix est active : état
+            // Pas d'entrée ouverte alors qu'une voix est active : état
             // incohérent, on le dit au lieu d'inventer un nom.
             (None, _) => "source inconnue".to_string(),
         })
     }
 
-    /// Talkback (Lot 2) — retire le producteur voix. No-op si aucune voix active.
-    /// NE touche PAS à la capture instrument. Le thread `voice_encode` termine en
-    /// cascade quand `capture_stage` drop son `out_tx`.
+    /// Talkback (Lot 2) — retire le producteur voix (message `stop-voice-capture`).
+    /// NE touche PAS à la capture instrument.
     pub fn stop_voice_capture(&mut self) {
-        if !self.voice_active {
-            return;
+        let was_running = self.voice_active || self.voice_capture.is_some();
+        self.stop_voice();
+        if was_running {
+            tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
         }
-        if let Some(tx) = self.voice_ctrl_tx.as_ref() {
-            let _ = tx.try_send(VoiceControl::Remove);
+    }
+
+    /// Arrête la voix, quelle que soit sa source, et remet son état à zéro :
+    /// - tap sur le flux instrument : retiré du `capture_stage` → son `out_tx`
+    ///   voix est lâché, le thread `voice_encode` termine en cascade ;
+    /// - micro dédié : la poignée est lâchée → flux arrêté, périphérique RELÂCHÉ
+    ///   (sinon le casque reste tenu par l'agent), et le thread `voice_encode`
+    ///   termine de même. Le drop ATTEND la fin du fil propriétaire du flux.
+    ///
+    /// Seul point d'arrêt de la voix (`stop_voice_capture`, changement de micro,
+    /// `teardown_session`) : `voice_active` dit toujours la vérité.
+    fn stop_voice(&mut self) {
+        if self.voice_active {
+            if let Some(tx) = self.voice_ctrl_tx.as_ref() {
+                let _ = tx.try_send(VoiceControl::Remove);
+            }
         }
-        // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
-        // périphérique (sinon le casque resterait tenu par l'agent).
         self.voice_capture = None;
         self.voice_device_label = None;
         self.voice_channel_index = None;
         self.voice_active = false;
-        tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
 
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
@@ -3134,6 +3225,9 @@ impl PipelineState {
             BuiltDuplex::Cpal { input, output } => {
                 self.input_buffer_samples = input.input_buf;
                 self.input_hw = crate::audio::declared_latency::input(&input.name);
+                // Sans entrée choisie, le défaut a pu changer (débranché) : on
+                // nomme ce qui est réellement rouvert.
+                self.capture_input_name = Some(input.name);
                 self.capture_stream = Some(input.stream);
                 // Rien ici : un pilote qui se rouvre ne prouve pas que le son revient
                 // (recette PC 17/09). C'est le superviseur qui déclare l'entrée
@@ -3177,6 +3271,7 @@ impl PipelineState {
                 self.input_hw = a.host.input_hw;
                 self.output_hw = a.host.output_hw;
                 let new_sr = a.native_sr;
+                self.capture_input_name = Some(a.name.clone());
                 self.output_device_name = Some(a.name.clone());
                 self.asio_host = Some(a.host);
                 // Interface rouverte — mais « ouverte » n'est pas « vivante » : c'est
@@ -7429,7 +7524,7 @@ mod conceal_loop_tests {
         let lu = Instant::now() - Duration::from_millis(3);
         let stats = Arc::new(Mutex::new(HashMap::new()));
         decode_one_packet(&mut st, "peer-test", lu, &recv_thread::tests::paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None);
-        let path = h.lock().flush();
+        let path = HistogramReader::for_histogram(&h).read(&h);
         assert_eq!(path.count, 1);
         assert!(path.max_ms >= 3.0, "lecture → push {} ms", path.max_ms);
     }
@@ -7585,5 +7680,100 @@ mod limite_flux_recus_tests {
         }
         let refus = check_recv_capacity(MAX_RECV_STREAMS).expect_err("au-delà de la limite, refus");
         assert!(refus.contains("too many streams"), "{refus}");
+    }
+}
+
+/// Revue 0.6.6, constat A : l'entrée affichée par `get-stats` se lit dans
+/// l'état, sans jamais résoudre un périphérique.
+#[cfg(test)]
+mod stats_device_name_tests {
+    use super::*;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    fn pipeline() -> PipelineState {
+        PipelineState::new(Arc::new(AudioMixer::new()))
+    }
+
+    #[test]
+    fn rien_de_choisi_hors_capture_ne_nomme_rien() {
+        assert_eq!(pipeline().stats_device_name(), None);
+    }
+
+    #[test]
+    fn hors_capture_l_entree_choisie_par_le_studio() {
+        let mut pl = pipeline();
+        pl.input_device_id = Some("3:Focusrite USB ASIO".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("Focusrite USB ASIO"));
+    }
+
+    #[test]
+    fn en_capture_l_entree_ouverte_et_son_canal() {
+        let mut pl = pipeline();
+        // Le studio a choisi une entrée, mais c'est l'entrée OUVERTE qui compte.
+        pl.input_device_id = Some("1:Autre".to_string());
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.capture_channels_label = Some("canal 1".to_string());
+        assert_eq!(pl.stats_device_name().as_deref(), Some("UMC204HD — canal 1"));
+    }
+
+    #[test]
+    fn la_fin_de_session_oublie_l_entree_ouverte() {
+        let mut pl = pipeline();
+        pl.state = AgentState::Capturing;
+        pl.capture_input_name = Some("UMC204HD".to_string());
+        pl.teardown_session(false);
+        assert_eq!(pl.capture_input_name, None);
+    }
+}
+
+/// Revue 0.6.6, constat C : la voix vit avec la capture — la fin de session et
+/// le changement d'entrée arrêtent aussi le micro talkback DÉDIÉ.
+#[cfg(test)]
+mod voice_teardown_tests {
+    use super::*;
+    use crate::audio::voice_capture::VoiceCaptureHandle;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    /// Pipeline avec un talkback sur micro dédié ; rend le témoin d'arrêt du flux.
+    fn avec_micro_dedie() -> (PipelineState, crossbeam_channel::Receiver<()>) {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let (handle, arrete) = VoiceCaptureHandle::for_test();
+        pl.voice_capture = Some(handle);
+        pl.voice_device_label = Some("Casque USB".to_string());
+        pl.voice_active = true;
+        (pl, arrete)
+    }
+
+    fn assert_voix_arretee(pl: &PipelineState, arrete: &crossbeam_channel::Receiver<()>) {
+        assert!(arrete.try_recv().is_ok(), "flux du micro arrêté, périphérique relâché");
+        assert!(pl.voice_capture.is_none());
+        assert!(!pl.voice_active);
+        assert_eq!(pl.voice_source_label(), None, "la fenêtre ne nomme plus de micro");
+    }
+
+    #[test]
+    fn la_fin_de_session_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.teardown_session(false);
+        assert_voix_arretee(&pl, &arrete);
+    }
+
+    #[test]
+    fn le_changement_d_entree_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.teardown_session(true);
+        assert_voix_arretee(&pl, &arrete);
+    }
+
+    /// Avant le correctif, ce message ne faisait plus rien une fois la session
+    /// finie (`voice_active` à faux, micro toujours ouvert).
+    #[test]
+    fn stop_voice_capture_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.stop_voice_capture();
+        assert_voix_arretee(&pl, &arrete);
     }
 }

@@ -73,6 +73,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Le GITHUB_TOKEN (contents: write) ne reste pas dans .git/config, où
+          # tout code de la compilation (build.rs, proc-macros) pourrait le lire.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         # SHA épinglé (branche stable) — cf. review pré-BETA 2026-07-12 (M-infra-1).
@@ -134,9 +138,21 @@ jobs:
             echo "CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed"
           } >> "$GITHUB_ENV"
 
+      # CLI Tauri à une version EXACTE, installée dans une étape SANS secret.
+      # Sans ça, tauri-action installait `@tauri-apps/cli@v2` — la dernière 2.x
+      # du jour — dans l'étape qui détient la clé privée de l'updater :
+      # l'épinglage de l'action par SHA ne protégeait plus rien (revue 0.6.6,
+      # constat E). 2.12.1 = version de la release 0.6.6-17. Monter de version
+      # = changer ce numéro ici ET dans msi-e2e.yml.
+      - name: CLI Tauri (version exacte, sans secret)
+        shell: bash
+        run: npm install -g @tauri-apps/cli@2.12.1
+
       - name: Build + upload (tauri-action)
         # SHA épinglé — cette action reçoit la CLÉ PRIVÉE de l'updater ; un tag
         # @v0 repointé exfiltrerait la clé. Cf. review pré-BETA 2026-07-12 (M-infra-1).
+        # Elle appelle la CLI installée à l'étape précédente (`tauriScript`) et
+        # n'en télécharge aucune.
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           # Requis pour créer / uploader la release via l'API GitHub.
@@ -168,14 +184,15 @@ jobs:
             Diffusion : `npm run agent:publish -- ${{ github.ref_name }}` (dépôt web) publie
             cette version sur https://jamodio.com/installer.
           releaseDraft: true      # chaque matrix complète le draft
-          # Tag semver de pré-release (contient un '-', ex. v0.5.0-rc.1) →
-          # publié en pre-release GitHub, donc JAMAIS marqué "latest". L'updater
-          # Tauri lit releases/latest/download/latest.json → les testeurs en
-          # prod ne se voient PAS proposer la rc ; on installe le .msi à la main
-          # depuis la page de pré-release. Tag final v0.5.0 (sans '-') = release
-          # normale diffusée à tous.
+          # Tag semver de pré-release (contient un '-', ex. v0.6.6-18) → publiée
+          # en pre-release GitHub, jamais marquée "latest". Les agents lisent
+          # https://jamodio.com/installer/latest.json, que SEUL
+          # `npm run agent:publish` d'une version définitive met à jour (une
+          # pré-version y est publiée sous pre/<version>/, sans latest.json) :
+          # c'est ce script qui garde les testeurs hors des mises à jour.
           prerelease: ${{ contains(github.ref_name, '-') }}
           includeUpdaterJson: true  # génère latest.json signé (Tauri updater)
+          tauriScript: tauri
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       # Freinage réseau de Windows (Lot W3) : le VRAI MSI, installé, mis à jour

@@ -483,6 +483,7 @@ fn remove(poll: &mut Poll, streams: &mut HashMap<Token, Stream>, token: Token, c
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use jamodio_audio_core::perfstats::HistogramReader;
     use crate::pipeline::ProducerNetStats;
     use jamodio_audio_core::codec::encoder::MusicEncoder;
     use jamodio_audio_core::mixer::mixer::AudioMixer;
@@ -600,10 +601,11 @@ pub(super) mod tests {
         let s = b.stats.lock().get("peer-a").copied().unwrap();
         assert_eq!((s.packets_expected, s.packets_lost, s.packets_late), (40, 0, 0));
         assert!(b.mixer.playout("peer-a").is_some_and(|p| p.buffered_ms > 0.0), "le son est dans le tampon");
+        let mesures = |h: &Mutex<Histogram>| HistogramReader::for_histogram(h).read(h).count;
         if cfg!(target_os = "macos") {
-            assert!(!b.stack.lock().is_empty(), "attente système → lecture mesurée");
+            assert!(mesures(&b.stack) > 0, "attente système → lecture mesurée");
         }
-        assert!(!b.work.lock().is_empty(), "travail par réveil mesuré");
+        assert!(mesures(&b.work) > 0, "travail par réveil mesuré");
         assert!(activity.silent_ms(Instant::now()) < 1_000, "activité marquée");
         b.rt.shutdown();
     }
