@@ -1312,6 +1312,9 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
         // écoulé) y seraient lus comme UNE seconde. On la lit pour remettre les
         // compteurs à zéro, sans la publier ni la juger — comme les mètres VU.
         let mut first_window = true;
+        // Lecteurs des histogrammes (réserves + tampons de tri), créés au premier
+        // relevé puis réutilisés : aucune allocation par seconde.
+        let mut readers: Option<crate::pipeline::PerfReaders> = None;
         loop {
             interval.tick().await;
             // Même règle que les mètres VU : la lecture est DESTRUCTIVE (swap(0)
@@ -1343,27 +1346,32 @@ async fn handle_connection(socket: WebSocket, handle: WsServerHandle, is_interna
                     report_age_ms: report.received_at.elapsed().as_millis() as u64,
                 }
             });
-            // Flush histograms (acquièrent le lock parking_lot une fois chacun)
-            let pipeline_snap = pl.perfstats.pipeline_latency.lock().flush();
-            let plugin_snap = pl.perfstats.plugin_latency.lock().flush();
-            // v0.4.8 — 3 histogrammes par stage pour discriminer "spike
-            // traitement" vs "spike file en queue ringbuf".
-            let capture_snap = pl.perfstats.capture_latency.lock().flush();
-            let process_snap = pl.perfstats.process_latency.lock().flush();
-            let encode_snap = pl.perfstats.encode_latency.lock().flush();
-            let send_path_snap = pl.perfstats.send_path_latency.lock().flush();
-            // 0.5.3 — rafale d'émission (frames Opus/bloc à encode_stage).
-            let emit_burst_snap = pl.perfstats.emit_burst.lock().flush();
-            // 0.5.3-2 — latence du chemin de réception (arrivée → avant push mixer).
-            let recv_path_snap = pl.perfstats.recv_path.lock().flush();
-            // Lot 1-D4 — travail du fil de réception par réveil, et réveils qui
-            // dépassent son contrat de calcul (macOS) depuis le dernier relevé.
-            let recv_work_snap = pl.perfstats.recv_work.lock().flush();
+            // Histogrammes : sous chaque verrou, un seul échange de tampon ; le
+            // tri se fait ensuite, sans faire attendre le fil de réception ni le
+            // callback audio qui les alimentent (revue 0.6.6, constat B).
+            // v0.4.8 — capture / process / encode discriminent « pic de
+            // traitement » et « pic de file » ; 0.5.3 — rafale d'émission ;
+            // 0.5.3-2 — chemin de réception (lecture → avant push mixer) ;
+            // Lot 1-D4 — travail du fil de réception par réveil ; Lot 1-C —
+            // retard de son réveil ; Lot 1-D2 — attente système → lecture.
+            let crate::pipeline::PerfWindow {
+                pipeline: pipeline_snap,
+                plugin: plugin_snap,
+                capture: capture_snap,
+                process: process_snap,
+                encode: encode_snap,
+                send_path: send_path_snap,
+                emit_burst: emit_burst_snap,
+                recv_path: recv_path_snap,
+                recv_work: recv_work_snap,
+                decode_wake_late: decode_wake_late_snap,
+                recv_stack: recv_stack_snap,
+            } = readers
+                .get_or_insert_with(|| pl.perfstats.readers())
+                .read(&pl.perfstats);
+            // Réveils du fil de réception hors de son contrat de calcul (macOS)
+            // depuis le dernier relevé.
             let recv_work_over_budget = pl.perfstats.recv_work_over_budget.swap(0, Ordering::Relaxed);
-            // Lot 1-C — retard du réveil du fil de réception sur l'instant prévu.
-            let decode_wake_late_snap = pl.perfstats.decode_wake_late.lock().flush();
-            // Lot 1-D2 — attente entre la réception d'un paquet par le système et sa lecture.
-            let recv_stack_snap = pl.perfstats.recv_stack_delay.lock().flush();
             // 0.5.3-4 — débit de callbacks CPAL sur la fenêtre 1 s (liveness ASIO).
             // Compteurs cumulés → on logue le delta. 0 en session active = sortie
             // ou entrée muette (cold-start), sinon ≈370/s.

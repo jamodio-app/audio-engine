@@ -16,7 +16,7 @@ use jamodio_audio_core::net::seq::{Arrival, SeqTracker};
 use jamodio_audio_core::net::srtp::{SrtcpContext, SrtpContext, SrtpParameters};
 use jamodio_audio_core::net::udp::{RtpReceiver, RtpSender};
 use jamodio_audio_core::net::uplink;
-use jamodio_audio_core::perfstats::Histogram;
+use jamodio_audio_core::perfstats::{Histogram, HistogramReader, HistogramSnapshot};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use jamodio_audio_core::plugin_host::{EditorState, MidiEvent, PluginHandle, PluginHost, PluginInfo, PluginRef};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1167,8 +1167,10 @@ impl PerfHandles {
         // Mesures de la RÉCEPTION : une observation par paquet (ou par réveil),
         // soit jusqu'à ~400 × N par seconde. À 512 places, le relevé 1 Hz ne
         // voyait que les ~0,15 dernière seconde à 9 musiciens — et pouvait
-        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à 16
-        // flux (le maximum accepté).
+        // manquer le pire. 8 192 places couvrent la seconde entière jusqu'à ~20
+        // flux ; au-delà (limite `MAX_RECV_STREAMS`), le relevé porte sur les
+        // 8 192 dernières mesures de la seconde. Le relevé ne trie plus sous le
+        // verrou (`HistogramReader`) : la taille ne coûte rien au fil de réception.
         const RECV_HISTOGRAM_CAPACITY: usize = 8192;
         Self {
             heard_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1196,6 +1198,75 @@ impl PerfHandles {
             output_total_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             callback_health: Arc::new(crate::audio::callback_health::CallbackHealth::new()),
             voice_stage: Arc::new(crate::audio::voice_tap::VoiceStageStats::default()),
+        }
+    }
+
+    /// Lecteurs des histogrammes, pour l'UNIQUE relevé 1 Hz (tâche perfstats).
+    /// Alloue les réserves et tampons de tri une fois ; à créer au premier relevé.
+    pub fn readers(&self) -> PerfReaders {
+        PerfReaders {
+            pipeline: HistogramReader::for_histogram(&self.pipeline_latency),
+            plugin: HistogramReader::for_histogram(&self.plugin_latency),
+            capture: HistogramReader::for_histogram(&self.capture_latency),
+            process: HistogramReader::for_histogram(&self.process_latency),
+            encode: HistogramReader::for_histogram(&self.encode_latency),
+            send_path: HistogramReader::for_histogram(&self.send_path_latency),
+            emit_burst: HistogramReader::for_histogram(&self.emit_burst),
+            recv_path: HistogramReader::for_histogram(&self.recv_path),
+            recv_work: HistogramReader::for_histogram(&self.recv_work),
+            decode_wake_late: HistogramReader::for_histogram(&self.decode_wake_late),
+            recv_stack: HistogramReader::for_histogram(&self.recv_stack_delay),
+        }
+    }
+}
+
+/// Lecteurs des histogrammes de [`PerfHandles`] : chaque lecture n'échange
+/// qu'un tampon sous le verrou, le calcul se fait verrou relâché (revue 0.6.6,
+/// constat B — le fil de réception prioritaire attendait le tri).
+pub struct PerfReaders {
+    pipeline: HistogramReader,
+    plugin: HistogramReader,
+    capture: HistogramReader,
+    process: HistogramReader,
+    encode: HistogramReader,
+    send_path: HistogramReader,
+    emit_burst: HistogramReader,
+    recv_path: HistogramReader,
+    recv_work: HistogramReader,
+    decode_wake_late: HistogramReader,
+    recv_stack: HistogramReader,
+}
+
+/// Fenêtre écoulée de chaque histogramme (lecture destructive).
+pub struct PerfWindow {
+    pub pipeline: HistogramSnapshot,
+    pub plugin: HistogramSnapshot,
+    pub capture: HistogramSnapshot,
+    pub process: HistogramSnapshot,
+    pub encode: HistogramSnapshot,
+    pub send_path: HistogramSnapshot,
+    pub emit_burst: HistogramSnapshot,
+    pub recv_path: HistogramSnapshot,
+    pub recv_work: HistogramSnapshot,
+    pub decode_wake_late: HistogramSnapshot,
+    pub recv_stack: HistogramSnapshot,
+}
+
+impl PerfReaders {
+    /// Lit et vide la fenêtre de chaque histogramme de `h`.
+    pub fn read(&mut self, h: &PerfHandles) -> PerfWindow {
+        PerfWindow {
+            pipeline: self.pipeline.read(&h.pipeline_latency),
+            plugin: self.plugin.read(&h.plugin_latency),
+            capture: self.capture.read(&h.capture_latency),
+            process: self.process.read(&h.process_latency),
+            encode: self.encode.read(&h.encode_latency),
+            send_path: self.send_path.read(&h.send_path_latency),
+            emit_burst: self.emit_burst.read(&h.emit_burst),
+            recv_path: self.recv_path.read(&h.recv_path),
+            recv_work: self.recv_work.read(&h.recv_work),
+            decode_wake_late: self.decode_wake_late.read(&h.decode_wake_late),
+            recv_stack: self.recv_stack.read(&h.recv_stack_delay),
         }
     }
 }
@@ -1350,11 +1421,11 @@ impl PluginControl {
         *self.instrument_plugin_handle.lock() = Some(handle);
         self.instrument_plugin_bypass
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // S5 — reset le flag overload + flush l'histogramme plugin_latency pour
+        // S5 — reset le flag overload + vide l'histogramme plugin_latency pour
         // ne pas mélanger les mesures de l'ancien plugin avec le nouveau.
         self.plugin_auto_bypass_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.plugin_latency.lock().flush();
+        self.plugin_latency.lock().reset();
         // S1.5 — snapshot complet pour resync au reconnect.
         *self.instrument_plugin_info.lock() = Some(LoadedPluginInfo {
             plugin_ref: plugin_ref.clone(),
@@ -7429,7 +7500,7 @@ mod conceal_loop_tests {
         let lu = Instant::now() - Duration::from_millis(3);
         let stats = Arc::new(Mutex::new(HashMap::new()));
         decode_one_packet(&mut st, "peer-test", lu, &recv_thread::tests::paquet(1001), &mixer, &stats, &h, BLOC_ASIO_MS, None);
-        let path = h.lock().flush();
+        let path = HistogramReader::for_histogram(&h).read(&h);
         assert_eq!(path.count, 1);
         assert!(path.max_ms >= 3.0, "lecture → push {} ms", path.max_ms);
     }
