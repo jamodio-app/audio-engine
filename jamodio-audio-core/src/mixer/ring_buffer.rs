@@ -113,6 +113,9 @@ pub struct JitterBuffer {
     /// P0 — compteur de pulls calmes consécutifs, pour la décroissance très lente
     /// de `glitch_floor_samples`.
     glitch_calm_pulls: u32,
+    /// 0.6.6-20 — instant du dernier pas de plancher dû à un paquet en retard
+    /// (cf. [`JitterBuffer::note_late_arrival`]).
+    last_late_step: Option<std::time::Instant>,
     /// Lot 1-A (23/09/2026) — ce que le tirage a trouvé au dernier trou, en
     /// attente d'être rendu au thread de décodage par le `push` suivant (cf.
     /// [`HoleAtPull`]). Un seul à la fois : après un trou le tampon se ré-amorce,
@@ -266,6 +269,10 @@ const GLITCH_FLOOR_MAX_MS: usize = 20;
 /// lent : à ~750 pull/s, 500 ⇒ ~5 ms récupérés en ~5 min de calme TOTAL (un
 /// underrun remet le compteur à zéro). CONSTANTE DE CALIBRATION.
 const GLITCH_FLOOR_DECAY_CALM_PULLS: u32 = 500;
+/// 0.6.6-20 — au plus UN pas de plancher par paquet en retard et par seconde :
+/// une salve (pic de 60 ms, des dizaines de paquets en retard d'un coup) ne vaut
+/// qu'une marche. CONSTANTE DE CALIBRATION.
+const LATE_ARRIVAL_STEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Convertit une durée en ms (f64) vers un nombre de samples interleaved stéréo.
 fn ms_f64_to_samples(ms: f64) -> usize {
@@ -393,6 +400,7 @@ impl JitterBuffer {
             shrink_accum: 0.0,
             glitch_floor_samples: 0,
             glitch_calm_pulls: 0,
+            last_late_step: None,
             zero_filled_samples: 0,
             continuous_zero_filled: 0,
             fill_obs: [0; FILL_OBS_LEN],
@@ -430,6 +438,7 @@ impl JitterBuffer {
         self.shrink_accum = 0.0;
         self.glitch_floor_samples = 0;
         self.glitch_calm_pulls = 0;
+        self.last_late_step = None;
         self.floor_samples = initial;
         self.target_samples = initial;
         self.last_adapt = std::time::Instant::now();
@@ -879,6 +888,39 @@ impl JitterBuffer {
     /// la dérive d'horloge compensée en continu. `(speed - 1)·1e6` ≈ ppm corrigés.
     pub fn resample_speed(&self) -> f64 {
         self.rs_speed
+    }
+
+    /// 0.6.6-20 — un paquet est arrivé APRÈS que sa place a été remplie par du
+    /// son inventé (masquage à l'échéance) : la marge de ce flux était trop courte
+    /// d'un rien. Ce n'est pas un trou (la sortie n'a pas manqué de son), mais
+    /// c'est le même enseignement : le plancher de glitch monte d'un pas, et le
+    /// calme repart de zéro (redescente lente inchangée, celle des trous).
+    ///
+    /// Pourquoi (03/10/2026, prouvé) : sur un lien irrégulier la 0.6.6 posait la
+    /// cible 2 à 4 ms sous la 0.6.5 et inventait 4 à 5 fois plus de son — à cible
+    /// égale les deux masquaient autant ; seuls les TROUS montaient le plancher,
+    /// jamais ces paquets « juste en retard ».
+    ///
+    /// Au plus un pas par [`LATE_ARRIVAL_STEP_INTERVAL`] ; réseau seulement (le
+    /// retour casque n'a pas de paquets) ; un paquet PERDU n'arrive jamais ici.
+    pub fn note_late_arrival(&mut self, now: std::time::Instant) {
+        if self.local_mode {
+            return;
+        }
+        self.glitch_calm_pulls = 0;
+        if self
+            .last_late_step
+            .is_some_and(|t| now.saturating_duration_since(t) < LATE_ARRIVAL_STEP_INTERVAL)
+        {
+            return;
+        }
+        self.last_late_step = Some(now);
+        let cap_s = MAX_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        let min_s = MIN_TARGET_MS * SAMPLE_RATE * CHANNELS / 1000;
+        let gf_cap = (GLITCH_FLOOR_MAX_MS * SAMPLE_RATE * CHANNELS / 1000).min(cap_s.saturating_sub(min_s));
+        let step = GLITCH_FLOOR_STEP_MS * SAMPLE_RATE * CHANNELS / 1000;
+        self.glitch_floor_samples = (self.glitch_floor_samples + step).min(gf_cap);
+        self.recompute_target();
     }
 
     fn adapt_up(&mut self) {
@@ -1494,6 +1536,63 @@ mod tests {
         drive_full_pulls(&mut jb, 240, 3000); // calme, jamais d'underrun
         assert_eq!(jb.glitch_floor_samples, 0, "aucun glitch → plancher inerte");
         assert_eq!(jb.target_ms(), 5, "cible = plancher tail (comportement d'avant)");
+    }
+
+    // ─── 0.6.6-20 — la cible apprend des paquets arrivés juste en retard ──────
+
+    #[test]
+    fn un_paquet_en_retard_monte_la_cible_d_un_pas() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7); // plancher tail = 5 ms
+        assert_eq!(jb.target_ms(), 5);
+        jb.note_late_arrival(std::time::Instant::now());
+        assert_eq!(jb.target_ms(), 6, "un paquet remplacé par du son inventé : +1 ms de marge");
+    }
+
+    #[test]
+    fn une_salve_de_paquets_en_retard_ne_monte_que_d_un_pas_par_seconde() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        let t0 = std::time::Instant::now();
+        for i in 0..40 {
+            jb.note_late_arrival(t0 + std::time::Duration::from_millis(i * 2));
+        }
+        assert_eq!(jb.target_ms(), 6, "un pic de 80 ms ne vaut qu'une marche");
+        jb.note_late_arrival(t0 + std::time::Duration::from_millis(1_100));
+        assert_eq!(jb.target_ms(), 7, "une seconde plus tard, un nouveau pas");
+    }
+
+    #[test]
+    fn sans_paquet_en_retard_un_lien_regulier_reste_au_plancher() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        drive_full_pulls(&mut jb, 240, 3000);
+        assert_eq!(jb.target_ms(), 5, "liens réguliers : cible inchangée");
+    }
+
+    #[test]
+    fn le_retour_casque_n_apprend_pas_des_paquets_en_retard() {
+        let mut jb = JitterBuffer::new();
+        jb.set_local_mode(true);
+        jb.set_target_ms(3);
+        let avant = jb.target_ms();
+        jb.note_late_arrival(std::time::Instant::now());
+        assert_eq!(jb.target_ms(), avant, "self-monitor jamais touché");
+    }
+
+    #[test]
+    fn la_marge_apprise_redescend_au_calme() {
+        let mut jb = JitterBuffer::new();
+        jb.observe_jitter(0.7);
+        let t0 = std::time::Instant::now();
+        for i in 0..3 {
+            jb.note_late_arrival(t0 + std::time::Duration::from_secs(2 * i));
+        }
+        assert_eq!(jb.target_ms(), 8);
+        // Calme prolongé : la redescente lente des trous s'applique (≈ 1 ms / 500
+        // pulls par échantillon → 3 ms en ~144 000 pulls).
+        drive_full_pulls(&mut jb, 240, 150_000);
+        assert_eq!(jb.target_ms(), 5, "revenu au plancher après un long calme");
     }
 
     #[test]

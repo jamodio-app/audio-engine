@@ -6137,6 +6137,9 @@ fn decode_one_packet(
         }
         Arrival::Late => {
             st.last_discard = Some(recv_instant);
+            // 0.6.6-20 — la marge de ce flux était trop courte : le tampon l'apprend
+            // (plancher de glitch, au plus un pas par seconde).
+            mixer.note_late_arrival(producer_id, recv_instant);
             // Le paquet qu'un masquage a remplacé vient d'arriver. Aurait-il été
             // joué à temps si l'on n'avait rien inventé ? C'est la question que
             // `underruns` ne sait pas poser.
@@ -7635,6 +7638,23 @@ mod conceal_loop_tests {
         recevoir(&mut st, &mixer, 1001, Instant::now() + Duration::from_millis(5));
         assert_eq!(st.concealed_premature_frames, 1);
         assert!((st.concealed_premature_margin_ms - 1.0).abs() < 0.05, "{}", st.concealed_premature_margin_ms);
+    }
+
+    /// 0.6.6-20 — le paquet qu'un masquage a remplacé arrive : le tampon de ce
+    /// flux apprend que sa marge était trop courte (plancher de glitch +1 ms).
+    #[test]
+    fn un_paquet_arrive_apres_son_masquage_releve_la_marge_du_flux() {
+        let glitch = |m: &AudioMixer| {
+            m.stream_perf_stats()
+                .into_iter()
+                .find(|p| p.producer_id == "peer-test")
+                .map(|p| p.target_glitch_ms)
+                .unwrap()
+        };
+        let (mixer, mut st) = apres_un_masquage();
+        let avant = glitch(&mixer);
+        recevoir(&mut st, &mixer, 1001, Instant::now());
+        assert!((glitch(&mixer) - avant - 1.0).abs() < 0.05, "marge +1 ms : {avant} → {}", glitch(&mixer));
     }
 
     /// Deux tirages (2,67 ms) ont passé la vraie matière (1 ms) : ils ont joué

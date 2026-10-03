@@ -995,6 +995,15 @@ impl AudioMixer {
         })
     }
 
+    /// 0.6.6-20 — le paquet de ce flux qu'un masquage a remplacé vient d'arriver :
+    /// la marge du tampon était trop courte (cf. `JitterBuffer::note_late_arrival`).
+    /// Même verrou court que `push_samples` ; flux inconnu = rien à faire.
+    pub fn note_late_arrival(&self, producer_id: &str, now: std::time::Instant) {
+        if let Some(cell) = self.streams.read().get(producer_id).cloned() {
+            cell.jitter.lock().note_late_arrival(now);
+        }
+    }
+
     /// Push decoded samples into a stream's jitter buffer.
     ///
     /// Le jitter buffer applique drop-oldest sur overflow (cf. `JitterBuffer::push`).
