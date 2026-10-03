@@ -2157,12 +2157,15 @@ impl PipelineState {
         }
         // Plus de flux montant : fin des rapports RTCP (et de leurs chiffres).
         self.uplink = None;
-        // Talkback (Lot 2) : le tap voix vit sur le `capture_stage` qu'on vient
-        // d'arrêter. À la sortie de sa boucle, son `out_tx` voix est droppé →
-        // le thread `voice_encode` termine en cascade (Disconnected). On lâche
-        // notre Sender de commande et on remet l'état voix à zéro.
+        // Talkback : la voix vit avec la capture. Fin de session OU changement
+        // d'entrée → la voix s'arrête, QUELLE QUE SOIT sa source : tap sur le flux
+        // instrument (il vivait sur le `capture_stage` qu'on vient d'arrêter) ou
+        // micro dédié (flux indépendant, qui sinon restait ouvert et continuait
+        // d'encoder et d'envoyer après la sortie du studio — revue 0.6.6,
+        // constat C). Le studio republie le talkback après un changement
+        // d'entrée (`reestablishAgentTalkbackAfterInputSwap`).
+        self.stop_voice();
         self.voice_ctrl_tx = None;
-        self.voice_active = false;
         // Plus de capture : plus d'entrée ouverte à nommer.
         self.capture_input_name = None;
         // Retire le self-monitor du mixer (re-`add_local_stream` au prochain start).
@@ -2867,22 +2870,13 @@ impl PipelineState {
         // 3. Idempotence : retire l'ancien tap ET/OU ferme l'ancien flux dédié
         //    (changement de micro). Le drop de la poignée relâche le périphérique
         //    AVANT qu'on en ouvre un autre.
-        if self.voice_active {
-            if let Some(tx) = voice_ctrl_tx.as_ref() {
-                let _ = tx.try_send(VoiceControl::Remove);
-            }
-        }
-        self.voice_capture = None;
-        // À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
-        // active : l'ancienne est démontée et la nouvelle pas encore branchée.
-        // Sans ce passage à false, un échec en cours de route (micro débranché
-        // entre l'affichage de la liste et le clic) laisserait l'agent convaincu
-        // qu'un talkback tourne — la fenêtre afficherait un micro pour un flux
-        // inexistant, et le prochain démarrage prendrait la branche « idempotence »
-        // sur un état fantôme.
-        self.voice_active = false;
-        self.voice_device_label = None;
-        self.voice_channel_index = None;
+        //    À partir d'ici et jusqu'à la fin de cette fonction, AUCUNE voix n'est
+        //    active : l'ancienne est démontée et la nouvelle pas encore branchée.
+        //    Un échec en cours de route (micro débranché entre l'affichage de la
+        //    liste et le clic) ne laisse donc pas l'agent convaincu qu'un
+        //    talkback tourne — ni la fenêtre afficher un micro pour un flux
+        //    inexistant.
+        self.stop_voice();
         // 4. SRTP + socket UDP dédiés (destination SFU distincte de l'instrument).
         let sfu_addr: SocketAddr = format!("{}:{}", sfu_ip, sfu_port)
             .parse()
@@ -2948,7 +2942,6 @@ impl PipelineState {
             // Le thread est mort avant d'être prêt (encodeur Opus KO) : le talkback
             // serait muet sans qu'on le dise → erreur explicite, pas de greffe.
             Ok(Err(_)) => {
-                self.voice_active = false;
                 return Err("voice encode thread failed to start".to_string());
             }
             // Machine très lente : on greffe quand même (comportement d'avant), mais
@@ -3076,23 +3069,35 @@ impl PipelineState {
         })
     }
 
-    /// Talkback (Lot 2) — retire le producteur voix. No-op si aucune voix active.
-    /// NE touche PAS à la capture instrument. Le thread `voice_encode` termine en
-    /// cascade quand `capture_stage` drop son `out_tx`.
+    /// Talkback (Lot 2) — retire le producteur voix (message `stop-voice-capture`).
+    /// NE touche PAS à la capture instrument.
     pub fn stop_voice_capture(&mut self) {
-        if !self.voice_active {
-            return;
+        let was_running = self.voice_active || self.voice_capture.is_some();
+        self.stop_voice();
+        if was_running {
+            tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
         }
-        if let Some(tx) = self.voice_ctrl_tx.as_ref() {
-            let _ = tx.try_send(VoiceControl::Remove);
+    }
+
+    /// Arrête la voix, quelle que soit sa source, et remet son état à zéro :
+    /// - tap sur le flux instrument : retiré du `capture_stage` → son `out_tx`
+    ///   voix est lâché, le thread `voice_encode` termine en cascade ;
+    /// - micro dédié : la poignée est lâchée → flux arrêté, périphérique RELÂCHÉ
+    ///   (sinon le casque reste tenu par l'agent), et le thread `voice_encode`
+    ///   termine de même. Le drop ATTEND la fin du fil propriétaire du flux.
+    ///
+    /// Seul point d'arrêt de la voix (`stop_voice_capture`, changement de micro,
+    /// `teardown_session`) : `voice_active` dit toujours la vérité.
+    fn stop_voice(&mut self) {
+        if self.voice_active {
+            if let Some(tx) = self.voice_ctrl_tx.as_ref() {
+                let _ = tx.try_send(VoiceControl::Remove);
+            }
         }
-        // Micro dédié : le drop de la poignée arrête le flux et RELÂCHE le
-        // périphérique (sinon le casque resterait tenu par l'agent).
         self.voice_capture = None;
         self.voice_device_label = None;
         self.voice_channel_index = None;
         self.voice_active = false;
-        tracing::info!(target: "jamodio::pipeline", "voice capture stopped");
     }
 
     /// 0.5.3-5 — vrai si un stream CPAL d'entrée est ouvert (capture en cours).
@@ -7715,5 +7720,55 @@ mod stats_device_name_tests {
         pl.capture_input_name = Some("UMC204HD".to_string());
         pl.teardown_session(false);
         assert_eq!(pl.capture_input_name, None);
+    }
+}
+
+/// Revue 0.6.6, constat C : la voix vit avec la capture — la fin de session et
+/// le changement d'entrée arrêtent aussi le micro talkback DÉDIÉ.
+#[cfg(test)]
+mod voice_teardown_tests {
+    use super::*;
+    use crate::audio::voice_capture::VoiceCaptureHandle;
+    use jamodio_audio_core::mixer::mixer::AudioMixer;
+    use std::sync::Arc;
+
+    /// Pipeline avec un talkback sur micro dédié ; rend le témoin d'arrêt du flux.
+    fn avec_micro_dedie() -> (PipelineState, crossbeam_channel::Receiver<()>) {
+        let mut pl = PipelineState::new(Arc::new(AudioMixer::new()));
+        let (handle, arrete) = VoiceCaptureHandle::for_test();
+        pl.voice_capture = Some(handle);
+        pl.voice_device_label = Some("Casque USB".to_string());
+        pl.voice_active = true;
+        (pl, arrete)
+    }
+
+    fn assert_voix_arretee(pl: &PipelineState, arrete: &crossbeam_channel::Receiver<()>) {
+        assert!(arrete.try_recv().is_ok(), "flux du micro arrêté, périphérique relâché");
+        assert!(pl.voice_capture.is_none());
+        assert!(!pl.voice_active);
+        assert_eq!(pl.voice_source_label(), None, "la fenêtre ne nomme plus de micro");
+    }
+
+    #[test]
+    fn la_fin_de_session_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.teardown_session(false);
+        assert_voix_arretee(&pl, &arrete);
+    }
+
+    #[test]
+    fn le_changement_d_entree_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.teardown_session(true);
+        assert_voix_arretee(&pl, &arrete);
+    }
+
+    /// Avant le correctif, ce message ne faisait plus rien une fois la session
+    /// finie (`voice_active` à faux, micro toujours ouvert).
+    #[test]
+    fn stop_voice_capture_relache_le_micro_dedie() {
+        let (mut pl, arrete) = avec_micro_dedie();
+        pl.stop_voice_capture();
+        assert_voix_arretee(&pl, &arrete);
     }
 }
