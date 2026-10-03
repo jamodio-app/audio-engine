@@ -87,6 +87,9 @@ jamodio.com.**
   donnent des adresses brutes, lues avec les symboles gardés en privé.
 - Chaîne de publication : la clé qui signe les mises à jour n'est plus
   exposée à des outils téléchargés sans version fixe.
+- Seul **jamodio.com** pilote l'Audio Engine d'un musicien : les pages de
+  prévisualisation (`…vercel.app`) ne sont plus acceptées que sur les machines
+  de test, où un fichier `allow-vercel-previews` est posé à côté des journaux.
 
 ### Interne
 

@@ -28,11 +28,50 @@ use crate::pipeline::{PipelineState, ProducerNetStats};
 /// pic CPU local sans perdre la session.
 const LOCK_TIMEOUT_MS: u64 = 200;
 
-/// Suffixe du scope Vercel de l'équipe Jamodio (previews). Seul ce compte peut
-/// déployer sous ce suffixe → un projet tiers `jamodio-*.vercel.app` d'un autre
-/// scope est rejeté. ⚠️ Doit rester synchro avec le SFU (server/sfu.js
-/// VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
+/// Suffixe du scope Vercel de l'équipe Jamodio (previews). ⚠️ Même règle que le
+/// SFU (server/sfu.js VERCEL_PREVIEW_RE). Cf. review pré-BETA 2026-07-12 (C5).
+///
+/// Ce suffixe NE SUFFIT PAS à prouver l'équipe : `.vercel.app` est un suffixe
+/// public, et rien ne garantit qu'un autre compte ne puisse pas obtenir
+/// `jamodio-x-bengo82-9540s-projects.vercel.app` comme adresse de production
+/// d'un projet ainsi nommé (revue 0.6.6, constat I). D'où le fichier
+/// [`PREVIEW_ORIGINS_FILE`] : ces pages ne pilotent l'Audio Engine que sur les
+/// machines de test où il est posé.
 const VERCEL_TEAM_SUFFIX: &str = "-bengo82-9540s-projects.vercel.app";
+
+/// Fichier, dans le dossier des journaux (`logging::log_dir`), qui autorise les
+/// pages de prévisualisation Vercel de l'équipe à piloter l'Audio Engine sur
+/// CETTE machine. Son contenu est ignoré ; sa présence est lue au démarrage du
+/// serveur WS (relancer l'Audio Engine après l'avoir posé) et toujours
+/// journalisée. Absent — le cas de tous les musiciens — : seul jamodio.com.
+const PREVIEW_ORIGINS_FILE: &str = "allow-vercel-previews";
+
+/// Page de prévisualisation Vercel de l'équipe (forme, pas une preuve : cf.
+/// [`VERCEL_TEAM_SUFFIX`]).
+fn is_team_preview_origin(origin: &str) -> bool {
+    origin.starts_with("https://jamodio-") && origin.ends_with(VERCEL_TEAM_SUFFIX)
+}
+
+/// Lit, une fois, si cette machine accepte les pages de prévisualisation, et le
+/// dit au journal dans les deux cas.
+fn previews_allowed_on_this_machine() -> bool {
+    let path = crate::logging::log_dir().join(PREVIEW_ORIGINS_FILE);
+    let allowed = path.exists();
+    if allowed {
+        tracing::warn!(
+            target: "jamodio::ws",
+            path = %path.display(),
+            "pages de prévisualisation Vercel ACCEPTÉES sur cette machine (machine de test)"
+        );
+    } else {
+        tracing::info!(
+            target: "jamodio::ws",
+            path = %path.display(),
+            "pages de prévisualisation Vercel refusées : seul jamodio.com pilote l'Audio Engine"
+        );
+    }
+    allowed
+}
 
 /// Cadence d'envoi des niveaux VU (Lot 3). 40 ms = 25 Hz — voir le commentaire
 /// du sender pour le pourquoi. La mesure elle-même ne dépend pas de cette
@@ -41,7 +80,9 @@ const LEVELS_PERIOD: Duration = Duration::from_millis(40);
 
 /// Vérifie l'origin de la requête WS upgrade. On accepte uniquement :
 ///   - https://jamodio.com (prod)
-///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope Jamodio)
+///   - https://jamodio-<hash|branch>-<scope>.vercel.app (previews DU scope
+///     Jamodio) — SEULEMENT si `previews_allowed` (machine de test, cf.
+///     [`PREVIEW_ORIGINS_FILE`])
 ///   - http://localhost:* / http://127.0.0.1:* (dev local + browser-side dev)
 ///   - tauri://localhost ou http://tauri.localhost (UI WEBVIEW INTERNE
 ///     de l'agent — Tauri 2 sert sa webview sous ces schemes selon l'OS).
@@ -53,7 +94,7 @@ const LEVELS_PERIOD: Duration = Duration::from_millis(40);
 ///
 /// Empêche une page web random sur localhost:1234 de piloter l'agent
 /// silencieusement.
-fn origin_allowed(origin: Option<&str>) -> bool {
+fn origin_allowed(origin: Option<&str>, previews_allowed: bool) -> bool {
     let Some(origin) = origin else {
         // Origin absent : un navigateur envoie TOUJOURS un en-tête Origin ;
         // seul un client non-browser (test CLI) ou un process natif local peut
@@ -65,14 +106,11 @@ fn origin_allowed(origin: Option<&str>) -> bool {
     // Origins de PRODUCTION (build release ET debug).
     if origin == "https://jamodio.com"
         || origin == "https://www.jamodio.com"
-        // Previews Vercel : on épingle le SCOPE de l'équipe Jamodio. Un
-        // `ends_with(".vercel.app")` — ou même `starts_with("https://jamodio")`
-        // — laisserait n'importe qui enregistrer `jamodio-x.vercel.app` (gratuit)
-        // et piloter l'agent en drive-by. Les URLs de preview sont
-        // `jamodio-<hash|git-branch>-<scope>.vercel.app` ; seul VERCEL_TEAM_SUFFIX
-        // (le scope de l'équipe) n'est pas usurpable. ⚠️ Doit rester synchro avec
-        // le SFU (server/sfu.js VERCEL_PREVIEW_RE).
-        || (origin.starts_with("https://jamodio-") && origin.ends_with(VERCEL_TEAM_SUFFIX))
+        // Previews Vercel du scope de l'équipe, sur les machines de test
+        // seulement. Un `ends_with(".vercel.app")` laisserait n'importe qui
+        // piloter l'agent en drive-by ; le suffixe d'équipe lui-même n'est pas
+        // une preuve (cf. VERCEL_TEAM_SUFFIX).
+        || (previews_allowed && is_team_preview_origin(origin))
         || is_internal_client_origin(origin)
         || origin == "file://"
     {
@@ -356,6 +394,7 @@ fn spawn_awaited_relaunch(exe: &std::path::Path) -> std::io::Result<()> {
 
 /// Start the localhost WebSocket server on port 9876.
 pub async fn start(handle: WsServerHandle) {
+    let previews_allowed = previews_allowed_on_this_machine();
     let app = Router::new().route(
         "/",
         get(move |ws: WebSocketUpgrade, headers: HeaderMap, uri: Uri| {
@@ -365,12 +404,23 @@ pub async fn start(handle: WsServerHandle) {
                 let origin = headers
                     .get("origin")
                     .and_then(|h| h.to_str().ok());
-                if !origin_allowed(origin) {
-                    tracing::warn!(
-                        target: "jamodio::ws",
-                        origin = ?origin,
-                        "WS upgrade rejected — origin not whitelisted"
-                    );
+                if !origin_allowed(origin, previews_allowed) {
+                    if origin.is_some_and(is_team_preview_origin) {
+                        // Refus attendu chez un musicien ; sur une machine de
+                        // test, il dit quoi faire.
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            origin = ?origin,
+                            file = %crate::logging::log_dir().join(PREVIEW_ORIGINS_FILE).display(),
+                            "page de prévisualisation Vercel refusée — machine de test : créer ce fichier puis relancer l'Audio Engine"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "jamodio::ws",
+                            origin = ?origin,
+                            "WS upgrade rejected — origin not whitelisted"
+                        );
+                    }
                     return axum::http::Response::builder()
                         .status(403)
                         .body(axum::body::Body::from("forbidden origin"))
@@ -5156,5 +5206,44 @@ mod file_des_plugins_tests {
         for j in [RECEVOIR, r#"{"type":"play-midi-note","status":144,"data1":60,"data2":100}"#] {
             assert!(!is_plugin_message(&parse(j)), "{j}");
         }
+    }
+}
+
+/// Revue 0.6.6, constat I : qui peut piloter l'Audio Engine.
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    const PREVIEW: &str = "https://jamodio-git-main-bengo82-9540s-projects.vercel.app";
+
+    #[test]
+    fn jamodio_com_et_la_fenetre_interne_pilotent_toujours() {
+        for o in ["https://jamodio.com", "https://www.jamodio.com", "tauri://localhost", "http://tauri.localhost"] {
+            assert!(origin_allowed(Some(o), false), "{o}");
+        }
+    }
+
+    #[test]
+    fn une_preview_de_l_equipe_ne_pilote_que_sur_une_machine_de_test() {
+        assert!(!origin_allowed(Some(PREVIEW), false), "machine d'un musicien : refusée");
+        assert!(origin_allowed(Some(PREVIEW), true), "machine de test (fichier posé) : acceptée");
+    }
+
+    #[test]
+    fn une_page_hors_de_l_equipe_ne_pilote_jamais() {
+        for o in [
+            "https://jamodio-x.vercel.app",
+            "https://jamodio-x-autre-scope.vercel.app",
+            "https://evil.com",
+            "https://jamodio.com.evil.com",
+            "tauri://localhost.evil",
+        ] {
+            assert!(!origin_allowed(Some(o), true), "{o}");
+        }
+    }
+
+    #[test]
+    fn sans_origine_refuse_en_version_publiee() {
+        assert_eq!(origin_allowed(None, true), cfg!(debug_assertions));
     }
 }
