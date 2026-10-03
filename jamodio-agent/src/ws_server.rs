@@ -46,16 +46,28 @@ const VERCEL_TEAM_SUFFIX: &str = "-bengo82-9540s-projects.vercel.app";
 /// journalisée. Absent — le cas de tous les musiciens — : seul jamodio.com.
 const PREVIEW_ORIGINS_FILE: &str = "allow-vercel-previews";
 
-/// Page de prévisualisation Vercel de l'équipe (forme, pas une preuve : cf.
-/// [`VERCEL_TEAM_SUFFIX`]).
+/// Page de prévisualisation Vercel de l'équipe — même forme que le SFU
+/// (`^https://jamodio-[a-z0-9-]+-bengo82-9540s-projects\.vercel\.app$`). Une
+/// forme, pas une preuve : cf. [`VERCEL_TEAM_SUFFIX`].
 fn is_team_preview_origin(origin: &str) -> bool {
-    origin.starts_with("https://jamodio-") && origin.ends_with(VERCEL_TEAM_SUFFIX)
+    origin
+        .strip_prefix("https://jamodio-")
+        .and_then(|rest| rest.strip_suffix(VERCEL_TEAM_SUFFIX))
+        .is_some_and(|middle| {
+            !middle.is_empty()
+                && middle.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 /// Lit, une fois, si cette machine accepte les pages de prévisualisation, et le
 /// dit au journal dans les deux cas.
 fn previews_allowed_on_this_machine() -> bool {
-    let path = crate::logging::log_dir().join(PREVIEW_ORIGINS_FILE);
+    previews_allowed_in(&crate::logging::log_dir())
+}
+
+/// [`previews_allowed_on_this_machine`] pour un dossier donné (testable).
+fn previews_allowed_in(log_dir: &std::path::Path) -> bool {
+    let path = log_dir.join(PREVIEW_ORIGINS_FILE);
     let allowed = path.exists();
     if allowed {
         tracing::warn!(
@@ -5240,6 +5252,33 @@ mod origin_tests {
         ] {
             assert!(!origin_allowed(Some(o), true), "{o}");
         }
+    }
+
+    #[test]
+    fn la_forme_d_une_preview_est_celle_du_sfu() {
+        assert!(is_team_preview_origin(PREVIEW));
+        assert!(is_team_preview_origin("https://jamodio-a1b2c3d4e-bengo82-9540s-projects.vercel.app"));
+        for o in [
+            "https://jamodio--bengo82-9540s-projects.vercel.app",
+            "https://jamodio-x.y-bengo82-9540s-projects.vercel.app",
+            "https://jamodio-X-bengo82-9540s-projects.vercel.app",
+            "https://jamodio-bengo82-9540s-projects.vercel.app",
+        ] {
+            assert!(!is_team_preview_origin(o), "{o}");
+        }
+    }
+
+    /// Le fichier d'autorisation est lu sous son nom exact, dans le dossier des
+    /// journaux.
+    #[test]
+    fn le_fichier_d_autorisation_decide() {
+        let dir = std::env::temp_dir().join(format!("jamodio-previews-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!previews_allowed_in(&dir), "absent : refusées");
+        std::fs::write(dir.join("allow-vercel-previews"), "").unwrap();
+        assert!(previews_allowed_in(&dir), "posé : acceptées");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

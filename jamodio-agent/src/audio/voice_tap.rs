@@ -157,7 +157,6 @@ impl VoiceTapReceiver {
         Ok(block)
     }
 
-
     /// Échantillons jetés depuis la création (monotone).
     pub fn dropped_samples_total(&self) -> u64 {
         self.shared.dropped.load(Relaxed)
@@ -309,6 +308,24 @@ mod tests {
             "file fermée : l'étage voix sort de sa boucle"
         );
         assert_eq!(tx.push(vec![0.0; BLOC_48]), Err(Disconnected), "le producteur cesse de pousser");
+    }
+
+    /// La fermeture RÉVEILLE un étage voix qui attend : il n'attend pas la fin
+    /// de son délai (100 ms dans la boucle voix, 10 s ici).
+    #[test]
+    fn la_fermeture_reveille_un_etage_voix_en_attente() {
+        let (tx, rx) = voice_tap(VOICE_TAP_MAX_MS);
+        let fermeture = tx.closer();
+        let attente = std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            (rx.recv_timeout(Duration::from_secs(10)), t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(fermeture);
+        let (res, attendu) = attente.join().unwrap();
+        assert_eq!(res, Err(RecvTimeoutError::Disconnected));
+        assert!(attendu < Duration::from_secs(1), "réveillé, pas expiré : {attendu:?}");
+        drop(tx);
     }
 
     #[test]
